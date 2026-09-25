@@ -6,6 +6,7 @@ import sqlite3
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import FrozenInstanceError, replace
 from decimal import Decimal
 from hashlib import sha256
@@ -494,6 +495,17 @@ class _ControlledClock:
         self.now_ns = now_ns
 
     def time_ns(self):
+        return self.now_ns
+
+    def monotonic_ns(self):
+        return self.now_ns
+
+
+class _ControlledMonotonicClock:
+    def __init__(self, now_ns):
+        self.now_ns = now_ns
+
+    def monotonic_ns(self):
         return self.now_ns
 
 
@@ -3398,10 +3410,154 @@ def test_cancel_target_projection_is_immutable_persisted_and_gates_claim(tmp_pat
             == handle.projection
         )
         monkeypatch.setattr(
-            execution_store_module.time, "time_ns", lambda: handle.projection.expires_at_ns
+            execution_store_module.time,
+            "monotonic_ns",
+            lambda: handle.projection.expires_at_ns,
         )
         with pytest.raises(ContractValidationError, match="target handle is stale"):
             store.require_fresh_ctp_cancel_target_for_command(scope, command.command_id)
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+def test_cancel_stage_rechecks_projection_after_transaction_lock_delay(tmp_path, monkeypatch):
+    store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
+    scope = _scope()
+    lease = _lease(store, scope)
+    clock = _ControlledMonotonicClock(100_000_000_000)
+    monkeypatch.setattr(execution_store_module.time, "monotonic_ns", clock.monotonic_ns)
+    try:
+        reservation = _reserve_seeded(store, scope, lease)
+        handle = _issue_target_projection(store, scope, reservation)
+        transaction = store._transaction
+
+        @contextmanager
+        def delay_after_lock():
+            with transaction() as cursor:
+                # The transaction lock is held; model a wait that consumes the
+                # complete query TTL before the staging readback.
+                clock.now_ns = handle.projection.expires_at_ns
+                yield cursor
+
+        monkeypatch.setattr(store, "_transaction", delay_after_lock)
+        with pytest.raises(ContractValidationError, match="target handle is stale"):
+            _stage_cancel_with_projection(
+                store,
+                scope,
+                lease,
+                reservation,
+                handle,
+                command_id="cancel-stage-delay",
+            )
+        assert store.read_ctp_dispatch_command(scope, "cancel-stage-delay") is None
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_order_target_projection_consumptions"
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+def test_cancel_claim_rolls_back_if_authority_verifier_crosses_target_expiry(
+    tmp_path, monkeypatch
+):
+    store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
+    scope = _scope()
+    lease = _lease(store, scope)
+    try:
+        reservation = _reserve_seeded(store, scope, lease)
+        handle = _issue_target_projection(store, scope, reservation)
+        command = _stage_cancel_with_projection(
+            store, scope, lease, reservation, handle, command_id="cancel-claim-delay"
+        )
+        clock = _ControlledMonotonicClock(handle.projection.expires_at_ns - 1)
+        monkeypatch.setattr(execution_store_module.time, "monotonic_ns", clock.monotonic_ns)
+
+        def cross_target_expiry(_command, _now_ns, _authority):
+            clock.now_ns = handle.projection.expires_at_ns
+
+        verifier = _FakeCtpDispatchAuthorityVerifier(after_verify=cross_target_expiry)
+        with pytest.raises(ContractValidationError, match="target handle is stale"):
+            store.claim_ctp_dispatch_command(
+                scope,
+                command.command_id,
+                writer_lease=lease,
+                authority_verifier=verifier,
+            )
+        assert len(verifier.calls) == 1
+        assert store.read_ctp_dispatch_command(scope, command.command_id).status == "READY"
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_authority_uses"
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+def test_cancel_claim_rechecks_single_use_consumption_after_authority_verifier(tmp_path):
+    store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
+    scope = _scope()
+    lease = _lease(store, scope)
+    try:
+        reservation = _reserve_seeded(store, scope, lease)
+        handle = _issue_target_projection(store, scope, reservation)
+        command = _stage_cancel_with_projection(
+            store, scope, lease, reservation, handle, command_id="cancel-consumption-recheck"
+        )
+
+        def remove_consumption_during_verification(_command, _now_ns, _authority):
+            # Model a same-connection reentrant mutation by an injected test
+            # verifier. The production table remains immutable; the dropped
+            # trigger and deletion roll back with the rejected claim.
+            store._connection.execute(
+                "DROP TRIGGER ctp_order_target_consumptions_immutable_delete"
+            )
+            store._connection.execute(
+                "DELETE FROM ctp_order_target_projection_consumptions "
+                "WHERE account_key = ? AND projection_id = ?",
+                (scope.account_key, handle.projection_id),
+            )
+
+        verifier = _FakeCtpDispatchAuthorityVerifier(
+            after_verify=remove_consumption_during_verification
+        )
+        with pytest.raises(
+            ContractValidationError, match="no persisted target projection"
+        ):
+            store.claim_ctp_dispatch_command(
+                scope,
+                command.command_id,
+                writer_lease=lease,
+                authority_verifier=verifier,
+            )
+        assert len(verifier.calls) == 1
+        assert store.read_ctp_dispatch_command(scope, command.command_id).status == "READY"
+        assert (
+            store._connection.execute(
+                "SELECT command_id FROM ctp_order_target_projection_consumptions "
+                "WHERE projection_id = ?",
+                (handle.projection_id,),
+            ).fetchone()["command_id"]
+            == command.command_id
+        )
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_authority_uses"
+            ).fetchone()[0]
+            == 0
+        )
+        trigger = store._connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'trigger' "
+            "AND name = 'ctp_order_target_consumptions_immutable_delete'"
+        ).fetchone()
+        assert trigger is not None
     finally:
         store.close()
 
@@ -3534,7 +3690,7 @@ def test_cancel_target_projection_defaults_to_reject_and_rejects_ambiguous_stale
                 scope,
                 reservation,
                 verifier=_FakeOrderTargetProjectionVerifier(
-                    overrides={"verified_at_ns": time.time_ns() - 1}
+                    overrides={"verified_at_ns": time.monotonic_ns() - 1}
                 ),
             )
     finally:

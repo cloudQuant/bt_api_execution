@@ -671,8 +671,9 @@ class CtpOrderTargetProjectionVerifier(Protocol):
 
     The adapter must verify the native query result and its current SDK-owned
     readback, then bind exactly one OPEN/PARTIAL row to the supplied I9
-    reservation. This package provides only the durable contract and rejecting
-    default; a fake verifier is suitable for local contract tests only.
+    reservation. This package does not implement a native verifier. The
+    durable contract and rejecting default do not authorize production
+    cancellation; a fake verifier is suitable for local tests only.
     """
 
     def verify_order_target(
@@ -2475,14 +2476,16 @@ class SqliteExecutionStore:
         readback returns an ephemeral handle held by this exact store instance.
         Persisted OPEN/PARTIAL rows from an earlier process cannot be recovered
         as fresh handles after restart; a new native query and verifier result
-        are required before a cancel may be staged or claimed.
+        are required before a cancel may be staged or claimed. No native query
+        verifier ships in this package, and this contract grants no production
+        cancel authority.
         """
 
         account_key, trading_day, scope_key = self._validate_ctp_order_identity_scope(scope)
         reservation = self.read_ctp_order_identity(scope, managed_intent_id)
         if type(reservation) is not CtpOrderIdentityReservation:
             raise ContractValidationError("CTP target has no same-store OrderRef reservation")
-        check_started_ns = time.time_ns()
+        check_started_ns = time.monotonic_ns()
         authority = (
             _REJECT_CTP_ORDER_TARGET_PROJECTION_VERIFIER if verifier is None else verifier
         )
@@ -2515,9 +2518,10 @@ class SqliteExecutionStore:
         projection_json = canonical_json(projection_payload)
         projection_digest = payload_sha256(projection_payload)
         projection_id = uuid.uuid4().hex
-        created_at_ns = time.time_ns()
-        if projection.expires_at_ns <= created_at_ns:
+        persistence_check_ns = time.monotonic_ns()
+        if projection.expires_at_ns <= persistence_check_ns:
             raise ContractValidationError("CTP order-target query expired before persistence")
+        created_at_ns = time.time_ns()
         try:
             with self._transaction() as cursor:
                 current = cursor.execute(
@@ -2607,7 +2611,7 @@ class SqliteExecutionStore:
             or projection.trading_day != trading_day
         ):
             raise ContractValidationError("CTP target handle belongs to another scope")
-        now = time.time_ns() if now_ns is None else now_ns
+        now = time.monotonic_ns() if now_ns is None else now_ns
         if type(now) is not int or now >= projection.expires_at_ns:
             raise ContractValidationError("CTP target handle is stale")
         if handle.projection_sha256 != payload_sha256(projection.to_payload()):
@@ -2747,6 +2751,19 @@ class SqliteExecutionStore:
         if consumption is None:
             raise ContractValidationError("CTP cancel action has no persisted target projection")
         projection_id = str(consumption["projection_id"])
+        matching_consumption = cursor.execute(
+            """
+            SELECT command_id FROM ctp_order_target_projection_consumptions
+            WHERE account_key = ? AND projection_id = ?
+            """,
+            (account_key, projection_id),
+        ).fetchall()
+        if (
+            len(matching_consumption) != 1
+            or str(matching_consumption[0]["command_id"])
+            != str(command_row["command_id"])
+        ):
+            raise ContractValidationError("CTP target projection is not singly consumed by this action")
         handle = self._issued_ctp_order_target_projections.get(projection_id)
         if handle is None:
             raise ContractValidationError("fresh CTP target query is required after store restart")
@@ -2814,7 +2831,7 @@ class SqliteExecutionStore:
             if row is None or str(row["status"]) != "CLAIMED":
                 raise ContractValidationError("fresh CTP cancel target requires a claimed command")
             return self._require_fresh_ctp_cancel_target_row(
-                cursor, scope, row, now_ns=time.time_ns()
+                cursor, scope, row, now_ns=time.monotonic_ns()
             )
 
     @staticmethod
@@ -4192,12 +4209,13 @@ class SqliteExecutionStore:
             reservation_managed_intent_id = ""
             if type(cancel_target_projection) is not CtpOrderTargetProjectionHandle:
                 raise ContractValidationError("CANCEL requires a fresh verified CTP order target")
-            target_projection = self._read_ctp_order_target_projection_row(
-                scope, cancel_target_projection
-            )
+            if type(cancel_target_projection.projection) is not CtpVerifiedOrderTargetProjection:
+                raise ContractValidationError("invalid typed CTP cancel target projection")
+            target_projection = cancel_target_projection.projection
 
-        now_ns = time.time_ns()
         with self._transaction() as cursor:
+            target_check_now_ns = time.monotonic_ns()
+            now_ns = time.time_ns()
             self._assert_active_writer_lease(cursor, scope, writer_lease)
             if operation == "SUBMIT":
                 reservation = cursor.execute(
@@ -4254,7 +4272,7 @@ class SqliteExecutionStore:
                     scope,
                     cancel_target_projection,
                     cursor=cursor,
-                    now_ns=now_ns,
+                    now_ns=target_check_now_ns,
                 )
             if operation == "CANCEL" and managed_action_id == reservation_managed_intent_id:
                 raise ContractValidationError(
@@ -4923,6 +4941,7 @@ class SqliteExecutionStore:
             raise ContractValidationError("invalid required CTP local queue receipt id")
         with self._transaction() as cursor:
             verification_started_ns = time.time_ns()
+            target_check_started_ns = time.monotonic_ns()
             self._assert_active_writer_lease(
                 cursor, scope, writer_lease, now_ns=verification_started_ns
             )
@@ -4946,7 +4965,7 @@ class SqliteExecutionStore:
                 return None
             if str(row["operation"]) == "CANCEL":
                 self._require_fresh_ctp_cancel_target_row(
-                    cursor, scope, row, now_ns=verification_started_ns
+                    cursor, scope, row, now_ns=target_check_started_ns
                 )
             unresolved = cursor.execute(
                 """
@@ -5050,6 +5069,22 @@ class SqliteExecutionStore:
                 raise ContractValidationError("CTP dispatch authority is expired")
             if claim_now_ns < authority.verified_at_ns:
                 raise ContractValidationError("CTP dispatch authority clock moved backwards")
+            row_after_verification = cursor.execute(
+                """
+                SELECT * FROM ctp_dispatch_commands
+                WHERE account_key = ? AND scope_key = ? AND command_id = ?
+                """,
+                (account_key, scope_key, command_id),
+            ).fetchone()
+            if row_after_verification is None or str(row_after_verification["status"]) != "READY":
+                return None
+            if str(row_after_verification["operation"]) == "CANCEL":
+                self._require_fresh_ctp_cancel_target_row(
+                    cursor,
+                    scope,
+                    row_after_verification,
+                    now_ns=time.monotonic_ns(),
+                )
             cursor.execute(
                 """
                 UPDATE ctp_dispatch_commands
@@ -5096,6 +5131,13 @@ class SqliteExecutionStore:
                 (account_key, command_id),
             ).fetchone()
             assert claimed is not None
+            if str(claimed["operation"]) == "CANCEL":
+                self._require_fresh_ctp_cancel_target_row(
+                    cursor,
+                    scope,
+                    claimed,
+                    now_ns=time.monotonic_ns(),
+                )
             return self._ctp_dispatch_command_from_row(claimed)
 
     @staticmethod
