@@ -576,6 +576,71 @@ def test_v7_typed_command_migrates_to_callback_ledger_without_reopening_dispatch
 
 
 @pytest.mark.unit
+def test_v7_schema_migration_rolls_back_ddl_version_and_trigger_on_failure(tmp_path):
+    store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
+    connection = store._connection
+    try:
+        connection.executescript(
+            """
+            DROP TRIGGER ctp_dispatch_callback_immutable_update;
+            DROP TRIGGER ctp_dispatch_callback_immutable_delete;
+            DROP TRIGGER ctp_dispatch_resolution_immutable_update;
+            DROP TRIGGER ctp_dispatch_resolution_immutable_delete;
+            DROP TABLE ctp_dispatch_unknown_resolutions;
+            DROP TABLE ctp_dispatch_cancel_projection;
+            DROP TABLE ctp_dispatch_order_projection;
+            DROP TABLE ctp_dispatch_callback_ledger;
+            UPDATE execution_meta SET value = '7' WHERE key = 'schema_version';
+            """
+        )
+        schema_before = tuple(
+            tuple(row)
+            for row in connection.execute(
+                """
+                SELECT type, name, tbl_name, sql FROM sqlite_master
+                WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name
+                """
+            ).fetchall()
+        )
+        denied_triggers = []
+
+        def deny_command_trigger_recreate(action, name, _table, _database, _source):
+            if (
+                action == sqlite3.SQLITE_CREATE_TRIGGER
+                and name == "ctp_dispatch_commands_immutable"
+            ):
+                denied_triggers.append(name)
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        connection.set_authorizer(deny_command_trigger_recreate)
+        with pytest.raises(DurableStoreError, match="transaction failed"):
+            store._create_schema()
+        connection.set_authorizer(None)
+
+        schema_after = tuple(
+            tuple(row)
+            for row in connection.execute(
+                """
+                SELECT type, name, tbl_name, sql FROM sqlite_master
+                WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name
+                """
+            ).fetchall()
+        )
+        assert denied_triggers == ["ctp_dispatch_commands_immutable"]
+        assert schema_after == schema_before
+        assert (
+            connection.execute(
+                "SELECT value FROM execution_meta WHERE key = 'schema_version'"
+            ).fetchone()[0]
+            == "7"
+        )
+    finally:
+        connection.set_authorizer(None)
+        store.close()
+
+
+@pytest.mark.unit
 def test_initial_seed_and_first_reservation_commit_atomically(tmp_path):
     store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
     scope = _scope()

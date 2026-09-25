@@ -849,7 +849,8 @@ class SqliteExecutionStore:
 
     def _create_schema(self) -> None:
         with self._transaction() as cursor:
-            cursor.executescript(
+            self._execute_schema_statements(
+                cursor,
                 """
                 CREATE TABLE IF NOT EXISTS execution_meta (
                     key TEXT PRIMARY KEY,
@@ -1188,7 +1189,7 @@ class SqliteExecutionStore:
                 BEGIN
                     SELECT RAISE(ABORT, 'CTP dispatch authority use is immutable');
                 END;
-                """
+                """,
             )
             row = cursor.execute(
                 "SELECT value FROM execution_meta WHERE key = ?", ("schema_version",)
@@ -1280,6 +1281,27 @@ class SqliteExecutionStore:
                 END;
                 """
             )
+
+    @staticmethod
+    def _execute_schema_statements(cursor: sqlite3.Cursor, script: str) -> None:
+        """Execute each schema statement without escaping the current transaction.
+
+        ``sqlite3.Cursor.executescript`` commits a pending transaction before it
+        runs the script. Schema creation and migrations must instead stay inside
+        the ``BEGIN IMMEDIATE`` transaction owned by ``_create_schema``.
+        ``sqlite3.complete_statement`` keeps compound trigger bodies together.
+        """
+
+        pending: list[str] = []
+        for line in script.splitlines():
+            pending.append(line)
+            statement = "\n".join(pending)
+            if sqlite3.complete_statement(statement):
+                if statement.strip():
+                    cursor.execute(statement)
+                pending.clear()
+        if "\n".join(pending).strip():
+            raise sqlite3.OperationalError("incomplete SQL statement in execution schema")
 
     @staticmethod
     def _validate_ctp_order_identity_scope(scope: ExecutionScope) -> tuple[str, str, str]:
