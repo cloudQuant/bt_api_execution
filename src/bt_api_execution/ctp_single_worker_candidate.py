@@ -322,7 +322,13 @@ class CtpManagedDispatchBinding:
 
 @dataclass(frozen=True, slots=True)
 class CtpNativeDispatchResult:
-    """Fake-injectable local sender result; it is never a provider ACK."""
+    """Fake-injectable local sender result; it is never a provider ACK.
+
+    ``REJECTED`` is accepted as a sender report for compatibility with the
+    fake boundary, but this candidate has no trusted proof verifier for
+    no-send/no-callback claims. The worker therefore persists it as UNKNOWN.
+    Only the pre-send durable queue receipt can establish a local rejection.
+    """
 
     outcome: Literal["QUEUED", "REJECTED", "UNKNOWN"]
     receipt_payload: Mapping[str, Any]
@@ -479,12 +485,19 @@ class CtpManagedSingleWorkerCandidate:
                 result = await result
             if type(result) is not CtpNativeDispatchResult:
                 raise ContractValidationError("managed CTP sender returned an untyped result")
-            outcome = result.outcome
-            receipt_payload = dict(result.receipt_payload)
-            # A fake/native adapter may include an unsafe or non-canonical
-            # payload. Treat it as ambiguous and persist only a fixed marker.
-            canonical_json(receipt_payload)
-            self._store._reject_sensitive_command_fields(receipt_payload)
+            if result.outcome == "REJECTED":
+                # Sender-provided data cannot prove that native send and every
+                # callback were absent. There is no trusted no-send proof port
+                # in this candidate, so a post-claim rejection is ambiguous.
+                outcome = "UNKNOWN"
+                receipt_payload = {"kind": "native_dispatch", "outcome": "UNKNOWN"}
+            else:
+                outcome = result.outcome
+                receipt_payload = dict(result.receipt_payload)
+                # A fake/native adapter may include an unsafe or non-canonical
+                # payload. Treat it as ambiguous and persist only a fixed marker.
+                canonical_json(receipt_payload)
+                self._store._reject_sensitive_command_fields(receipt_payload)
         except Exception:
             # Deliberately discard exception text; it may contain credentials.
             outcome = "UNKNOWN"

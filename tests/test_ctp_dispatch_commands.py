@@ -1167,6 +1167,63 @@ async def test_single_worker_sender_exception_persists_unknown_and_is_not_replay
 
 
 @pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "untrusted_receipt",
+    [
+        {"kind": "native-rejected", "no_send": True, "callback_count": 0},
+        {"native_return_code": -1},
+    ],
+)
+async def test_single_worker_sender_rejection_without_trusted_proof_is_unknown_and_not_replayed(
+    tmp_path, untrusted_receipt
+):
+    store = SqliteExecutionStore(tmp_path / "untrusted-reject-single-worker.sqlite3")
+    scope = _scope()
+    lease = _lease(store, scope)
+    try:
+        reservation = _reserve_seeded(store, scope, lease)
+        prepared = _prepared_managed_dispatch(reservation)
+        worker = CtpManagedSingleWorkerCandidate(store, scope, lease, _authority_verifier())
+        binding = worker.stage_prepared_dispatch(prepared)
+        ready_binding = worker.record_managed_queue_receipt(
+            prepared.command_id,
+            binding,
+            {
+                "kind": "command_receipt",
+                "command": "submit",
+                "receipt_id": prepared.local_queue_receipt_id,
+                "queued": True,
+            },
+        )
+        sent = []
+
+        async def fake_sender(command):
+            sent.append(command.command_id)
+            return CtpNativeDispatchResult("REJECTED", untrusted_receipt)
+
+        projection = await worker.dispatch_managed_command(
+            prepared.command_id, ready_binding, fake_sender
+        )
+        assert projection.command_status == "UNKNOWN"
+        assert projection.local_dispatch_outcome == "UNKNOWN"
+        assert projection.local_queue_receipt_queued is True
+        command = store.read_ctp_dispatch_command(scope, prepared.command_id)
+        assert command.native_receipt_payload == {
+            "kind": "native_dispatch",
+            "outcome": "UNKNOWN",
+        }
+
+        replay = await worker.dispatch_managed_command(
+            prepared.command_id, ready_binding, fake_sender
+        )
+        assert replay == projection
+        assert sent == [prepared.command_id]
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
 def test_cutover_import_and_account_watermark_survive_restart(tmp_path):
     path = tmp_path / "execution.sqlite3"
     scope = _scope()
