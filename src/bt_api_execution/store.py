@@ -163,19 +163,42 @@ class CtpOrderIdentityReservation:
     created_at_ns: int
 
 
-@dataclass(frozen=True)
-class CtpOrderRefSeedProof:
-    """Explicit offline evidence used to fence new CTP OrderRefs.
+@dataclass(frozen=True, slots=True)
+class CtpOrderRefLegacyMapping:
+    """One exact mapping imported from a pre-cutover CTP identity source."""
 
-    This records caller-supplied observations of native MaxOrderRef and the
-    legacy reservation ledger. It is not provider verification or write
-    authorization; no registered runtime currently creates this proof.
+    source_name: str
+    account_key: str
+    trading_day: str
+    scope_key: str
+    managed_intent_id: str
+    runtime_order_id: str
+    order_ref: str
+
+
+@dataclass(frozen=True, slots=True)
+class CtpOrderRefSeedProof:
+    """Caller-supplied, session-bound inputs for an offline OrderRef cutover.
+
+    The typed mapping inventory and separate source digests let the store
+    import the exact legacy identities it was given. They do not prove the
+    source files were complete, authenticate a native login observation, or
+    establish an external account-wide writer fence. No registered runtime
+    currently creates this proof.
     """
 
     trading_day: str
     native_max_order_ref: str
     legacy_ledger_max_order_ref: str
     legacy_ledger_sha256: str
+    account_key: str
+    scope_key: str
+    session_generation_id: str
+    native_front_id: int
+    native_session_id: int
+    existing_native_order_refs: tuple[str, ...]
+    legacy_source_sha256: tuple[tuple[str, str], ...]
+    legacy_mappings: tuple[CtpOrderRefLegacyMapping, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1041,7 +1064,9 @@ class SqliteExecutionStore:
     # Version 7 binds typed runtime/action/session/request identities to commands.
     # Version 8 adds an injected-source callback ledger, separate projections,
     # and an external-reconciliation-only UNKNOWN fence resolution record.
-    _SCHEMA_VERSION = 8
+    # Version 9 adds an account-wide allocated OrderRef watermark and exact,
+    # session-bound cutover evidence with imported legacy identity mappings.
+    _SCHEMA_VERSION = 9
 
     def __init__(self, path: str | Path, *, busy_timeout_ms: int = 5_000) -> None:
         if type(busy_timeout_ms) is not int or busy_timeout_ms <= 0:
@@ -1182,6 +1207,78 @@ class SqliteExecutionStore:
                     updated_at_ns INTEGER NOT NULL,
                     PRIMARY KEY(account_key, trading_day)
                 );
+                CREATE TABLE IF NOT EXISTS ctp_order_ref_account_watermarks (
+                    account_key TEXT PRIMARY KEY,
+                    watermark_order_ref TEXT NOT NULL
+                        CHECK(length(watermark_order_ref) = 12
+                              AND watermark_order_ref NOT GLOB '*[^0-9]*'),
+                    cutover_established INTEGER NOT NULL CHECK(cutover_established IN (0, 1)),
+                    last_trading_day TEXT,
+                    last_cutover_evidence_sha256 TEXT
+                        CHECK(last_cutover_evidence_sha256 IS NULL
+                              OR length(last_cutover_evidence_sha256) = 64),
+                    updated_at_ns INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS ctp_order_ref_cutover_sessions (
+                    account_key TEXT NOT NULL,
+                    trading_day TEXT NOT NULL,
+                    scope_key TEXT NOT NULL,
+                    session_generation_id TEXT NOT NULL,
+                    native_front_id INTEGER NOT NULL CHECK(native_front_id > 0),
+                    native_session_id INTEGER NOT NULL CHECK(native_session_id > 0),
+                    native_max_order_ref TEXT NOT NULL
+                        CHECK(length(native_max_order_ref) = 12
+                              AND native_max_order_ref NOT GLOB '*[^0-9]*'),
+                    native_refs_sha256 TEXT NOT NULL CHECK(length(native_refs_sha256) = 64),
+                    legacy_ledger_max_order_ref TEXT NOT NULL
+                        CHECK(length(legacy_ledger_max_order_ref) = 12
+                              AND legacy_ledger_max_order_ref NOT GLOB '*[^0-9]*'),
+                    backtrader_prototype_sha256 TEXT NOT NULL
+                        CHECK(length(backtrader_prototype_sha256) = 64),
+                    sdk_jsonl_sha256 TEXT NOT NULL CHECK(length(sdk_jsonl_sha256) = 64),
+                    legacy_ledger_sha256 TEXT NOT NULL CHECK(length(legacy_ledger_sha256) = 64),
+                    legacy_mappings_sha256 TEXT NOT NULL
+                        CHECK(length(legacy_mappings_sha256) = 64),
+                    evidence_sha256 TEXT NOT NULL CHECK(length(evidence_sha256) = 64),
+                    created_at_ns INTEGER NOT NULL,
+                    PRIMARY KEY(account_key, trading_day, scope_key, session_generation_id)
+                );
+                CREATE TABLE IF NOT EXISTS ctp_order_ref_legacy_imports (
+                    account_key TEXT NOT NULL,
+                    source_name TEXT NOT NULL
+                        CHECK(source_name IN ('backtrader_prototype', 'sdk_jsonl')),
+                    order_ref TEXT NOT NULL
+                        CHECK(length(order_ref) = 12 AND order_ref NOT GLOB '*[^0-9]*'),
+                    trading_day TEXT NOT NULL,
+                    scope_key TEXT NOT NULL,
+                    managed_intent_id TEXT NOT NULL,
+                    runtime_order_id TEXT NOT NULL,
+                    mapping_sha256 TEXT NOT NULL CHECK(length(mapping_sha256) = 64),
+                    imported_at_ns INTEGER NOT NULL,
+                    PRIMARY KEY(account_key, source_name, order_ref),
+                    FOREIGN KEY(account_key, order_ref)
+                        REFERENCES ctp_order_identity_reservations(account_key, order_ref)
+                );
+                CREATE TRIGGER IF NOT EXISTS ctp_order_ref_cutover_immutable_update
+                BEFORE UPDATE ON ctp_order_ref_cutover_sessions
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP OrderRef cutover evidence is immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS ctp_order_ref_cutover_immutable_delete
+                BEFORE DELETE ON ctp_order_ref_cutover_sessions
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP OrderRef cutover evidence is immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS ctp_order_ref_legacy_import_immutable_update
+                BEFORE UPDATE ON ctp_order_ref_legacy_imports
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP legacy OrderRef import is immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS ctp_order_ref_legacy_import_immutable_delete
+                BEFORE DELETE ON ctp_order_ref_legacy_imports
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP legacy OrderRef import is immutable');
+                END;
                 CREATE TABLE IF NOT EXISTS ctp_dispatch_commands (
                     account_key TEXT NOT NULL,
                     scope_key TEXT NOT NULL,
@@ -1435,7 +1532,7 @@ class SqliteExecutionStore:
                     cursor.execute(
                         "ALTER TABLE execution_records ADD COLUMN cumulative_commission TEXT"
                     )
-            elif version not in {"3", "4", "5", "6", "7", str(self._SCHEMA_VERSION)}:
+            elif version not in {"3", "4", "5", "6", "7", "8", str(self._SCHEMA_VERSION)}:
                 raise DurableStoreError("unsupported execution store schema")
 
             columns = {
@@ -1458,20 +1555,41 @@ class SqliteExecutionStore:
                         f"ALTER TABLE ctp_dispatch_commands ADD COLUMN {name} {declaration}"
                     )
             if version != str(self._SCHEMA_VERSION):
-                # Old staged/claimed rows lack session and action correlation.
-                # Never let an automatic migration make them dispatchable.
+                # Old rows have no exact OrderRef cutover-session evidence.
+                # Never let migration make those commands dispatchable.
                 cursor.execute(
                     """
                     UPDATE ctp_dispatch_commands
                     SET status = 'UNKNOWN', unknown_at_ns = COALESCE(unknown_at_ns, updated_at_ns),
-                        unknown_reason = 'legacy_command_missing_correlation_keys'
-                    WHERE correlation_version = 0 AND status IN ('READY', 'CLAIMED')
+                        unknown_reason = 'schema_upgrade_requires_ctp_orderref_cutover'
+                    WHERE status IN ('READY', 'CLAIMED')
                     """
                 )
                 cursor.execute(
                     "UPDATE execution_meta SET value = ? WHERE key = ?",
                     (str(self._SCHEMA_VERSION), "schema_version"),
                 )
+            cursor.execute(
+                """
+                INSERT OR IGNORE INTO ctp_order_ref_account_watermarks(
+                    account_key, watermark_order_ref, cutover_established,
+                    last_trading_day, last_cutover_evidence_sha256, updated_at_ns
+                )
+                SELECT account_key, printf('%012d', MAX(CAST(order_ref AS INTEGER))),
+                       0, NULL, NULL, MAX(updated_at_ns)
+                FROM (
+                    SELECT account_key, order_ref, created_at_ns AS updated_at_ns
+                    FROM ctp_order_identity_reservations
+                    UNION ALL
+                    SELECT account_key, native_max_order_ref, updated_at_ns
+                    FROM ctp_order_ref_watermarks
+                    UNION ALL
+                    SELECT account_key, legacy_ledger_max_order_ref, updated_at_ns
+                    FROM ctp_order_ref_watermarks
+                ) AS known_refs
+                GROUP BY account_key
+                """
+            )
             cursor.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS ctp_dispatch_session_request_unique
@@ -1565,11 +1683,12 @@ class SqliteExecutionStore:
     ) -> CtpOrderIdentityReservation:
         """Durably bind one CTP intent/runtime identity to a fresh 12-digit ref.
 
-        The sequence is account-wide across trading days, so a committed or
-        reservation-only reference is never reused after restart or when the
-        scope's trading day changes.  ``BEGIN IMMEDIATE`` serializes allocation
-        across independent store instances.  Repeating the identical mapping
-        is idempotent; reusing either identity in a conflicting mapping fails.
+        A new reservation requires an already established exact-session cutover;
+        the first one must use ``seed_ctp_order_ref_and_reserve_identity``.
+        The sequence is account-wide across trading days and persists every
+        allocated value. ``BEGIN IMMEDIATE`` serializes allocation across
+        independent store instances. Repeating an existing mapping is
+        idempotent; reusing either identity in a conflicting mapping fails.
 
         This reservation is intentionally not an execution/outbox dispatch and
         grants no provider or write authority.
@@ -1628,6 +1747,60 @@ class SqliteExecutionStore:
             if runtime_owner is not None:
                 raise IntentConflictError("managed CTP runtime identity is already reserved")
 
+            account_watermark = cursor.execute(
+                """
+                SELECT watermark_order_ref, cutover_established, last_trading_day,
+                       last_cutover_evidence_sha256
+                FROM ctp_order_ref_account_watermarks WHERE account_key = ?
+                """,
+                (account_key,),
+            ).fetchone()
+            daily_watermark = cursor.execute(
+                """
+                SELECT native_max_order_ref, legacy_ledger_max_order_ref
+                FROM ctp_order_ref_watermarks
+                WHERE account_key = ? AND trading_day = ?
+                """,
+                (account_key, trading_day),
+            ).fetchone()
+            if (
+                account_watermark is None
+                or not bool(account_watermark["cutover_established"])
+                or str(account_watermark["last_trading_day"]) != trading_day
+                or daily_watermark is None
+            ):
+                raise ContractValidationError(
+                    "CTP OrderRef cutover is required before a new reservation"
+                )
+            cutover_session = cursor.execute(
+                """
+                SELECT session_generation_id, native_front_id, native_session_id
+                FROM ctp_order_ref_cutover_sessions
+                WHERE account_key = ? AND trading_day = ? AND scope_key = ?
+                  AND evidence_sha256 = ?
+                """,
+                (
+                    account_key,
+                    trading_day,
+                    scope_key,
+                    str(account_watermark["last_cutover_evidence_sha256"]),
+                ),
+            ).fetchone()
+            if cutover_session is None:
+                raise ContractValidationError(
+                    "CTP OrderRef cutover is required before a new reservation"
+                )
+            self._require_ctp_order_ref_cutover_session(
+                cursor,
+                account_key=account_key,
+                trading_day=trading_day,
+                scope_key=scope_key,
+                session_generation_id=str(cutover_session["session_generation_id"]),
+                native_front_id=int(cutover_session["native_front_id"]),
+                native_session_id=int(cutover_session["native_session_id"]),
+                order_ref=str(account_watermark["watermark_order_ref"]),
+            )
+
             latest = cursor.execute(
                 """
                 SELECT order_ref
@@ -1639,21 +1812,14 @@ class SqliteExecutionStore:
                 (account_key,),
             ).fetchone()
             next_value = 1 if latest is None else int(str(latest["order_ref"])) + 1
-            watermark = cursor.execute(
-                """
-                SELECT native_max_order_ref, legacy_ledger_max_order_ref,
-                       legacy_ledger_sha256
-                FROM ctp_order_ref_watermarks
-                WHERE account_key = ? AND trading_day = ?
-                """,
-                (account_key, trading_day),
-            ).fetchone()
-            if watermark is not None:
-                seeded_floor = max(
-                    int(str(watermark["native_max_order_ref"])),
-                    int(str(watermark["legacy_ledger_max_order_ref"])),
-                )
-                next_value = max(next_value, seeded_floor + 1)
+            next_value = max(
+                next_value, int(str(account_watermark["watermark_order_ref"])) + 1
+            )
+            seeded_floor = max(
+                int(str(daily_watermark["native_max_order_ref"])),
+                int(str(daily_watermark["legacy_ledger_max_order_ref"])),
+            )
+            next_value = max(next_value, seeded_floor + 1)
             if next_value > 999_999_999_999:
                 raise DurableStoreError("CTP OrderRef sequence is exhausted")
             order_ref = f"{next_value:012d}"
@@ -1692,6 +1858,9 @@ class SqliteExecutionStore:
                 (account_key, scope_key, managed_intent_id),
             ).fetchone()
             assert row is not None
+            self._advance_ctp_account_order_ref_watermark(
+                cursor, account_key, order_ref, now_ns=now_ns
+            )
             return self._ctp_order_identity_from_row(row)
 
     def read_ctp_order_identity(
@@ -1735,6 +1904,532 @@ class SqliteExecutionStore:
         ):
             raise ContractValidationError("invalid " + field_name)
         return value
+
+    @staticmethod
+    def _ctp_legacy_mapping_payload(mapping: CtpOrderRefLegacyMapping) -> dict[str, str]:
+        return {
+            "source_name": mapping.source_name,
+            "account_key": mapping.account_key,
+            "trading_day": mapping.trading_day,
+            "scope_key": mapping.scope_key,
+            "managed_intent_id": mapping.managed_intent_id,
+            "runtime_order_id": mapping.runtime_order_id,
+            "order_ref": mapping.order_ref,
+        }
+
+    @staticmethod
+    def _ctp_legacy_mapping_sha256(mapping: CtpOrderRefLegacyMapping) -> str:
+        return payload_sha256(SqliteExecutionStore._ctp_legacy_mapping_payload(mapping))
+
+    def _validate_ctp_order_ref_seed_proof(
+        self,
+        scope: ExecutionScope,
+        proof: CtpOrderRefSeedProof,
+    ) -> tuple[str, str, tuple[dict[str, str], ...]]:
+        """Validate exact offline cutover facts and return manifest/evidence digests."""
+
+        account_key, trading_day, scope_key = self._validate_ctp_order_identity_scope(scope)
+        if (
+            type(proof) is not CtpOrderRefSeedProof
+            or proof.trading_day != trading_day
+            or proof.account_key != account_key
+            or proof.scope_key != scope_key
+        ):
+            raise ContractValidationError("CTP OrderRef proof does not bind the exact account/scope/day")
+        self._validate_ctp_order_ref(proof.native_max_order_ref, "native MaxOrderRef")
+        self._validate_ctp_order_ref(
+            proof.legacy_ledger_max_order_ref, "legacy ledger MaxOrderRef"
+        )
+        self._validate_sha256(proof.legacy_ledger_sha256, "legacy ledger digest")
+        _validate_correlation_text(proof.session_generation_id, "OrderRef proof session generation")
+        if type(proof.native_front_id) is not int or proof.native_front_id <= 0:
+            raise ContractValidationError("invalid OrderRef proof FrontID")
+        if type(proof.native_session_id) is not int or proof.native_session_id <= 0:
+            raise ContractValidationError("invalid OrderRef proof SessionID")
+
+        source_digests: dict[str, str] = {}
+        if type(proof.legacy_source_sha256) is not tuple or len(proof.legacy_source_sha256) != 2:
+            raise ContractValidationError("both legacy OrderRef source digests are required")
+        for pair in proof.legacy_source_sha256:
+            if type(pair) is not tuple or len(pair) != 2:
+                raise ContractValidationError("invalid legacy OrderRef source digest entry")
+            source_name, digest = pair
+            if source_name not in {"backtrader_prototype", "sdk_jsonl"}:
+                raise ContractValidationError("unknown legacy OrderRef source")
+            self._validate_sha256(digest, "legacy source digest")
+            if source_name in source_digests:
+                raise ContractValidationError("duplicate legacy OrderRef source digest")
+            source_digests[source_name] = digest
+        if set(source_digests) != {"backtrader_prototype", "sdk_jsonl"}:
+            raise ContractValidationError("both legacy OrderRef sources must be inventoried")
+        if payload_sha256(source_digests) != proof.legacy_ledger_sha256:
+            raise ContractValidationError("legacy source digests do not match the ledger digest")
+
+        if type(proof.existing_native_order_refs) is not tuple:
+            raise ContractValidationError("verified native OrderRefs must be a tuple")
+        native_refs = tuple(proof.existing_native_order_refs)
+        for reference in native_refs:
+            self._validate_ctp_order_ref(reference, "verified native OrderRef")
+        if len(set(native_refs)) != len(native_refs):
+            raise ContractValidationError("duplicate verified native OrderRef")
+        if native_refs and max(map(int, native_refs)) > int(proof.native_max_order_ref):
+            raise ContractValidationError("native MaxOrderRef is below a verified existing OrderRef")
+
+        if type(proof.legacy_mappings) is not tuple:
+            raise ContractValidationError("legacy OrderRef mappings must be a tuple")
+        mapping_payloads: list[dict[str, str]] = []
+        source_refs: set[tuple[str, str]] = set()
+        legacy_refs: list[int] = []
+        for mapping in proof.legacy_mappings:
+            if type(mapping) is not CtpOrderRefLegacyMapping:
+                raise ContractValidationError("invalid typed legacy OrderRef mapping")
+            if mapping.source_name not in source_digests:
+                raise ContractValidationError("legacy mapping has no inventoried source")
+            if mapping.account_key != account_key:
+                raise ContractValidationError("legacy OrderRef mapping belongs to another account")
+            if (
+                type(mapping.trading_day) is not str
+                or len(mapping.trading_day) != 8
+                or not mapping.trading_day.isascii()
+                or not mapping.trading_day.isdigit()
+            ):
+                raise ContractValidationError("legacy OrderRef mapping has an invalid trading day")
+            try:
+                date(
+                    int(mapping.trading_day[:4]),
+                    int(mapping.trading_day[4:6]),
+                    int(mapping.trading_day[6:8]),
+                )
+            except ValueError as error:
+                raise ContractValidationError(
+                    "legacy OrderRef mapping has an invalid trading day"
+                ) from error
+            if not _is_prefixed_digest(mapping.scope_key, "scope:"):
+                raise ContractValidationError("legacy OrderRef mapping has an invalid scope key")
+            self._validate_command_identifier(mapping.managed_intent_id, "legacy managed intent id")
+            self._validate_command_identifier(mapping.runtime_order_id, "legacy runtime order id")
+            self._validate_ctp_order_ref(mapping.order_ref, "legacy OrderRef")
+            source_ref = (mapping.source_name, mapping.order_ref)
+            if source_ref in source_refs:
+                raise ContractValidationError("duplicate source OrderRef mapping")
+            source_refs.add(source_ref)
+            legacy_refs.append(int(mapping.order_ref))
+            mapping_payloads.append(self._ctp_legacy_mapping_payload(mapping))
+        expected_legacy_max = f"{max(legacy_refs, default=0):012d}"
+        if expected_legacy_max != proof.legacy_ledger_max_order_ref:
+            raise ContractValidationError(
+                "legacy ledger maximum does not match the complete imported mapping set"
+            )
+
+        native_refs_sha256 = payload_sha256(sorted(native_refs))
+        mapping_payloads.sort(
+            key=lambda item: (
+                item["source_name"],
+                item["trading_day"],
+                item["scope_key"],
+                item["managed_intent_id"],
+                item["order_ref"],
+            )
+        )
+        mappings_sha256 = payload_sha256(mapping_payloads)
+        evidence_sha256 = payload_sha256(
+            {
+                "account_key": account_key,
+                "scope_key": scope_key,
+                "trading_day": trading_day,
+                "session_generation_id": proof.session_generation_id,
+                "native_front_id": proof.native_front_id,
+                "native_session_id": proof.native_session_id,
+                "native_max_order_ref": proof.native_max_order_ref,
+                "native_refs_sha256": native_refs_sha256,
+                "legacy_ledger_max_order_ref": proof.legacy_ledger_max_order_ref,
+                "legacy_ledger_sha256": proof.legacy_ledger_sha256,
+                "legacy_source_sha256": source_digests,
+                "legacy_mappings_sha256": mappings_sha256,
+            }
+        )
+        return mappings_sha256, evidence_sha256, tuple(mapping_payloads)
+
+    def _import_ctp_legacy_order_ref_mappings(
+        self,
+        cursor: sqlite3.Cursor,
+        proof: CtpOrderRefSeedProof,
+        *,
+        now_ns: int,
+    ) -> None:
+        """Import exact legacy mappings, preserving their original identities."""
+
+        proof_mappings = {
+            (mapping.source_name, mapping.order_ref): self._ctp_legacy_mapping_sha256(mapping)
+            for mapping in proof.legacy_mappings
+        }
+        prior_imports = cursor.execute(
+            """
+            SELECT source_name, order_ref, mapping_sha256
+            FROM ctp_order_ref_legacy_imports WHERE account_key = ?
+            """,
+            (proof.account_key,),
+        ).fetchall()
+        if any(
+            proof_mappings.get((str(row["source_name"]), str(row["order_ref"])))
+            != str(row["mapping_sha256"])
+            for row in prior_imports
+        ):
+            raise IntentConflictError("legacy OrderRef cutover omits an imported mapping")
+
+        for mapping in proof.legacy_mappings:
+            existing = cursor.execute(
+                """
+                SELECT account_key, trading_day, scope_key, managed_intent_id,
+                       runtime_order_id, order_ref, created_at_ns
+                FROM ctp_order_identity_reservations
+                WHERE account_key = ? AND scope_key = ? AND managed_intent_id = ?
+                """,
+                (mapping.account_key, mapping.scope_key, mapping.managed_intent_id),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    str(existing["trading_day"]) != mapping.trading_day
+                    or str(existing["runtime_order_id"]) != mapping.runtime_order_id
+                    or str(existing["order_ref"]) != mapping.order_ref
+                ):
+                    raise IntentConflictError("legacy CTP identity conflicts with a reservation")
+            else:
+                try:
+                    cursor.execute(
+                        """
+                        INSERT INTO ctp_order_identity_reservations(
+                            account_key, trading_day, scope_key, managed_intent_id,
+                            runtime_order_id, order_ref, created_at_ns
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            mapping.account_key,
+                            mapping.trading_day,
+                            mapping.scope_key,
+                            mapping.managed_intent_id,
+                            mapping.runtime_order_id,
+                            mapping.order_ref,
+                            now_ns,
+                        ),
+                    )
+                except sqlite3.IntegrityError as error:
+                    error_name = getattr(error, "sqlite_errorname", "")
+                    if error_name in {
+                        "SQLITE_CONSTRAINT_PRIMARYKEY",
+                        "SQLITE_CONSTRAINT_UNIQUE",
+                    }:
+                        raise IntentConflictError(
+                            "legacy CTP identity conflicts with an account reservation"
+                        ) from error
+                    raise DurableStoreError(
+                        "unable to persist CTP order identity"
+                    ) from error
+
+            mapping_sha256 = self._ctp_legacy_mapping_sha256(mapping)
+            prior = cursor.execute(
+                """
+                SELECT trading_day, scope_key, managed_intent_id, runtime_order_id,
+                       mapping_sha256
+                FROM ctp_order_ref_legacy_imports
+                WHERE account_key = ? AND source_name = ? AND order_ref = ?
+                """,
+                (proof.account_key, mapping.source_name, mapping.order_ref),
+            ).fetchone()
+            if prior is not None:
+                if (
+                    str(prior["trading_day"]) != mapping.trading_day
+                    or str(prior["scope_key"]) != mapping.scope_key
+                    or str(prior["managed_intent_id"]) != mapping.managed_intent_id
+                    or str(prior["runtime_order_id"]) != mapping.runtime_order_id
+                    or str(prior["mapping_sha256"]) != mapping_sha256
+                ):
+                    raise IntentConflictError("legacy source mapping conflicts with prior import")
+                continue
+            cursor.execute(
+                """
+                INSERT INTO ctp_order_ref_legacy_imports(
+                    account_key, source_name, order_ref, trading_day, scope_key,
+                    managed_intent_id, runtime_order_id, mapping_sha256, imported_at_ns
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    proof.account_key,
+                    mapping.source_name,
+                    mapping.order_ref,
+                    mapping.trading_day,
+                    mapping.scope_key,
+                    mapping.managed_intent_id,
+                    mapping.runtime_order_id,
+                    mapping_sha256,
+                    now_ns,
+                ),
+            )
+
+    def _store_ctp_order_ref_cutover_evidence(
+        self,
+        cursor: sqlite3.Cursor,
+        proof: CtpOrderRefSeedProof,
+        *,
+        mappings_sha256: str,
+        evidence_sha256: str,
+        now_ns: int,
+    ) -> None:
+        """Persist immutable session evidence and the per-day collision floor."""
+
+        native_refs_sha256 = payload_sha256(sorted(proof.existing_native_order_refs))
+        source_digests = dict(proof.legacy_source_sha256)
+        existing = cursor.execute(
+            """
+            SELECT scope_key, native_front_id, native_session_id, native_max_order_ref,
+                   native_refs_sha256, legacy_ledger_max_order_ref,
+                   backtrader_prototype_sha256, sdk_jsonl_sha256,
+                   legacy_ledger_sha256, legacy_mappings_sha256, evidence_sha256
+            FROM ctp_order_ref_cutover_sessions
+            WHERE account_key = ? AND trading_day = ? AND scope_key = ?
+              AND session_generation_id = ?
+            """,
+            (proof.account_key, proof.trading_day, proof.scope_key, proof.session_generation_id),
+        ).fetchone()
+        session_was_present = existing is not None
+        expected = (
+            proof.scope_key,
+            proof.native_front_id,
+            proof.native_session_id,
+            proof.native_max_order_ref,
+            native_refs_sha256,
+            proof.legacy_ledger_max_order_ref,
+            source_digests["backtrader_prototype"],
+            source_digests["sdk_jsonl"],
+            proof.legacy_ledger_sha256,
+            mappings_sha256,
+            evidence_sha256,
+        )
+        if existing is None:
+            cursor.execute(
+                """
+                INSERT INTO ctp_order_ref_cutover_sessions(
+                    account_key, trading_day, scope_key, session_generation_id,
+                    native_front_id, native_session_id, native_max_order_ref,
+                    native_refs_sha256, legacy_ledger_max_order_ref,
+                    backtrader_prototype_sha256, sdk_jsonl_sha256,
+                    legacy_ledger_sha256, legacy_mappings_sha256, evidence_sha256,
+                    created_at_ns
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    proof.account_key,
+                    proof.trading_day,
+                    proof.scope_key,
+                    proof.session_generation_id,
+                    proof.native_front_id,
+                    proof.native_session_id,
+                    proof.native_max_order_ref,
+                    native_refs_sha256,
+                    proof.legacy_ledger_max_order_ref,
+                    source_digests["backtrader_prototype"],
+                    source_digests["sdk_jsonl"],
+                    proof.legacy_ledger_sha256,
+                    mappings_sha256,
+                    evidence_sha256,
+                    now_ns,
+                ),
+            )
+        elif tuple(
+            str(existing[name]) if name in {
+                "scope_key",
+                "native_max_order_ref",
+                "native_refs_sha256",
+                "legacy_ledger_max_order_ref",
+                "backtrader_prototype_sha256",
+                "sdk_jsonl_sha256",
+                "legacy_ledger_sha256",
+                "legacy_mappings_sha256",
+                "evidence_sha256",
+            } else int(existing[name])
+            for name in (
+                "scope_key",
+                "native_front_id",
+                "native_session_id",
+                "native_max_order_ref",
+                "native_refs_sha256",
+                "legacy_ledger_max_order_ref",
+                "backtrader_prototype_sha256",
+                "sdk_jsonl_sha256",
+                "legacy_ledger_sha256",
+                "legacy_mappings_sha256",
+                "evidence_sha256",
+            )
+        ) != expected:
+            raise IntentConflictError("CTP OrderRef session evidence conflicts with prior cutover")
+
+        watermark = cursor.execute(
+            """
+            SELECT native_max_order_ref, legacy_ledger_max_order_ref,
+                   legacy_ledger_sha256, updated_at_ns
+            FROM ctp_order_ref_watermarks
+            WHERE account_key = ? AND trading_day = ?
+            """,
+            (proof.account_key, proof.trading_day),
+        ).fetchone()
+        if (
+            watermark is not None
+            and session_was_present
+            and str(watermark["native_max_order_ref"]) == proof.native_max_order_ref
+            and str(watermark["legacy_ledger_max_order_ref"])
+            == proof.legacy_ledger_max_order_ref
+            and str(watermark["legacy_ledger_sha256"]) == proof.legacy_ledger_sha256
+        ):
+            return
+        if watermark is None:
+            cursor.execute(
+                """
+                INSERT INTO ctp_order_ref_watermarks(
+                    account_key, trading_day, native_max_order_ref,
+                    legacy_ledger_max_order_ref, legacy_ledger_sha256, updated_at_ns
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    proof.account_key,
+                    proof.trading_day,
+                    proof.native_max_order_ref,
+                    proof.legacy_ledger_max_order_ref,
+                    proof.legacy_ledger_sha256,
+                    now_ns,
+                ),
+            )
+        else:
+            if (
+                int(proof.native_max_order_ref) < int(str(watermark["native_max_order_ref"]))
+                or int(proof.legacy_ledger_max_order_ref)
+                < int(str(watermark["legacy_ledger_max_order_ref"]))
+            ):
+                raise IntentConflictError("CTP OrderRef seed watermark cannot move backward")
+            cursor.execute(
+                """
+                UPDATE ctp_order_ref_watermarks
+                SET native_max_order_ref = ?, legacy_ledger_max_order_ref = ?,
+                    legacy_ledger_sha256 = ?, updated_at_ns = ?
+                WHERE account_key = ? AND trading_day = ?
+                """,
+                (
+                    proof.native_max_order_ref,
+                    proof.legacy_ledger_max_order_ref,
+                    proof.legacy_ledger_sha256,
+                    now_ns,
+                    proof.account_key,
+                    proof.trading_day,
+                ),
+            )
+
+    @staticmethod
+    def _advance_ctp_account_order_ref_watermark(
+        cursor: sqlite3.Cursor,
+        account_key: str,
+        order_ref: str,
+        *,
+        now_ns: int,
+        trading_day: str | None = None,
+        evidence_sha256: str | None = None,
+        cutover_established: bool | None = None,
+    ) -> None:
+        """Persist the account-wide maximum without ever lowering it."""
+
+        row = cursor.execute(
+            """
+            SELECT watermark_order_ref, cutover_established
+            FROM ctp_order_ref_account_watermarks WHERE account_key = ?
+            """,
+            (account_key,),
+        ).fetchone()
+        if row is None:
+            cursor.execute(
+                """
+                INSERT INTO ctp_order_ref_account_watermarks(
+                    account_key, watermark_order_ref, cutover_established,
+                    last_trading_day, last_cutover_evidence_sha256, updated_at_ns
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    account_key,
+                    order_ref,
+                    int(bool(cutover_established)),
+                    trading_day,
+                    evidence_sha256,
+                    now_ns,
+                ),
+            )
+            return
+        current = str(row["watermark_order_ref"])
+        advanced = f"{max(int(current), int(order_ref)):012d}"
+        established = bool(row["cutover_established"]) or bool(cutover_established)
+        cursor.execute(
+            """
+            UPDATE ctp_order_ref_account_watermarks
+            SET watermark_order_ref = ?, cutover_established = ?,
+                last_trading_day = COALESCE(?, last_trading_day),
+                last_cutover_evidence_sha256 = COALESCE(?, last_cutover_evidence_sha256),
+                updated_at_ns = ?
+            WHERE account_key = ?
+            """,
+            (
+                advanced,
+                int(established),
+                trading_day,
+                evidence_sha256,
+                now_ns,
+                account_key,
+            ),
+        )
+
+    @staticmethod
+    def _require_ctp_order_ref_cutover_session(
+        cursor: sqlite3.Cursor,
+        *,
+        account_key: str,
+        trading_day: str,
+        scope_key: str,
+        session_generation_id: str,
+        native_front_id: int,
+        native_session_id: int,
+        order_ref: str,
+    ) -> None:
+        account_watermark = cursor.execute(
+            """
+            SELECT watermark_order_ref, cutover_established, last_trading_day,
+                   last_cutover_evidence_sha256
+            FROM ctp_order_ref_account_watermarks WHERE account_key = ?
+            """,
+            (account_key,),
+        ).fetchone()
+        evidence = cursor.execute(
+            """
+            SELECT evidence_sha256 FROM ctp_order_ref_cutover_sessions
+            WHERE account_key = ? AND trading_day = ? AND scope_key = ?
+              AND session_generation_id = ? AND native_front_id = ?
+              AND native_session_id = ?
+            """,
+            (
+                account_key,
+                trading_day,
+                scope_key,
+                session_generation_id,
+                native_front_id,
+                native_session_id,
+            ),
+        ).fetchone()
+        if (
+            account_watermark is None
+            or not bool(account_watermark["cutover_established"])
+            or evidence is None
+            or str(account_watermark["last_trading_day"]) != trading_day
+            or str(account_watermark["last_cutover_evidence_sha256"])
+            != str(evidence["evidence_sha256"])
+            or int(order_ref) > int(str(account_watermark["watermark_order_ref"]))
+        ):
+            raise ContractValidationError(
+                "CTP dispatch requires the exact current OrderRef cutover session"
+            )
 
     @staticmethod
     def _validate_sha256(value: str, field_name: str) -> str:
@@ -1889,62 +2584,69 @@ class SqliteExecutionStore:
         *,
         writer_lease: WriterLease,
     ) -> None:
-        """Record explicit MaxOrderRef and legacy-ledger seed evidence.
+        """Record a later session's cutover evidence without allocating a ref.
 
-        The proof is an offline caller observation. This store does not verify
-        a native session, import the legacy ledger, or authorize dispatch.
-        Commands remain unclaimable until this per-account/day seed exists.
+        The initial cutover must remain atomic with the first new reservation.
+        All evidence is caller supplied and non-authorizing.
         """
 
         account_key, trading_day, _ = self._validate_ctp_order_identity_scope(scope)
-        if type(proof) is not CtpOrderRefSeedProof or proof.trading_day != trading_day:
-            raise ContractValidationError("invalid CTP OrderRef seed proof")
-        self._validate_ctp_order_ref(proof.native_max_order_ref, "native MaxOrderRef")
-        self._validate_ctp_order_ref(proof.legacy_ledger_max_order_ref, "legacy ledger MaxOrderRef")
-        self._validate_sha256(proof.legacy_ledger_sha256, "legacy ledger digest")
+        mappings_sha256, evidence_sha256, _ = self._validate_ctp_order_ref_seed_proof(
+            scope, proof
+        )
         now_ns = time.time_ns()
         with self._transaction() as cursor:
             self._assert_active_writer_lease(cursor, scope, writer_lease)
             existing = cursor.execute(
                 """
-                SELECT native_max_order_ref, legacy_ledger_max_order_ref,
-                       legacy_ledger_sha256
-                FROM ctp_order_ref_watermarks
+                SELECT 1 FROM ctp_order_ref_watermarks
                 WHERE account_key = ? AND trading_day = ?
                 """,
                 (account_key, trading_day),
             ).fetchone()
-            if existing is not None:
-                if int(proof.native_max_order_ref) < int(existing["native_max_order_ref"]) or int(
-                    proof.legacy_ledger_max_order_ref
-                ) < int(existing["legacy_ledger_max_order_ref"]):
-                    raise IntentConflictError("CTP OrderRef seed watermark cannot move backward")
-                if (
-                    proof.native_max_order_ref == str(existing["native_max_order_ref"])
-                    and proof.legacy_ledger_max_order_ref
-                    == str(existing["legacy_ledger_max_order_ref"])
-                    and proof.legacy_ledger_sha256 == str(existing["legacy_ledger_sha256"])
-                ):
-                    return
-                cursor.execute(
-                    """
-                    UPDATE ctp_order_ref_watermarks
-                    SET native_max_order_ref = ?, legacy_ledger_max_order_ref = ?,
-                        legacy_ledger_sha256 = ?, updated_at_ns = ?
-                    WHERE account_key = ? AND trading_day = ?
-                    """,
-                    (
-                        proof.native_max_order_ref,
-                        proof.legacy_ledger_max_order_ref,
-                        proof.legacy_ledger_sha256,
-                        now_ns,
-                        account_key,
-                        trading_day,
-                    ),
+            account_watermark = cursor.execute(
+                """
+                SELECT watermark_order_ref, cutover_established
+                FROM ctp_order_ref_account_watermarks WHERE account_key = ?
+                """,
+                (account_key,),
+            ).fetchone()
+            if existing is None or account_watermark is None or not bool(
+                account_watermark["cutover_established"]
+            ):
+                raise ContractValidationError(
+                    "initial CTP OrderRef seed must commit atomically with a new reservation"
                 )
-                return
-            raise ContractValidationError(
-                "initial CTP OrderRef seed must commit atomically with a new reservation"
+            self._import_ctp_legacy_order_ref_mappings(cursor, proof, now_ns=now_ns)
+            self._store_ctp_order_ref_cutover_evidence(
+                cursor,
+                proof,
+                mappings_sha256=mappings_sha256,
+                evidence_sha256=evidence_sha256,
+                now_ns=now_ns,
+            )
+            local_latest = cursor.execute(
+                """
+                SELECT order_ref FROM ctp_order_identity_reservations
+                WHERE account_key = ? ORDER BY order_ref DESC LIMIT 1
+                """,
+                (account_key,),
+            ).fetchone()
+            floor = max(
+                int(str(account_watermark["watermark_order_ref"])),
+                int(proof.native_max_order_ref),
+                int(proof.legacy_ledger_max_order_ref),
+                max(map(int, proof.existing_native_order_refs), default=0),
+                0 if local_latest is None else int(str(local_latest["order_ref"])),
+            )
+            self._advance_ctp_account_order_ref_watermark(
+                cursor,
+                account_key,
+                f"{floor:012d}",
+                now_ns=now_ns,
+                trading_day=trading_day,
+                evidence_sha256=evidence_sha256,
+                cutover_established=True,
             )
 
     def seed_ctp_order_ref_and_reserve_identity(
@@ -1965,11 +2667,9 @@ class SqliteExecutionStore:
         """
 
         account_key, trading_day, scope_key = self._validate_ctp_order_identity_scope(scope)
-        if type(proof) is not CtpOrderRefSeedProof or proof.trading_day != trading_day:
-            raise ContractValidationError("invalid CTP OrderRef seed proof")
-        self._validate_ctp_order_ref(proof.native_max_order_ref, "native MaxOrderRef")
-        self._validate_ctp_order_ref(proof.legacy_ledger_max_order_ref, "legacy ledger MaxOrderRef")
-        self._validate_sha256(proof.legacy_ledger_sha256, "legacy ledger digest")
+        mappings_sha256, evidence_sha256, _ = self._validate_ctp_order_ref_seed_proof(
+            scope, proof
+        )
         if (
             not isinstance(managed_intent_id, str)
             or managed_intent_id != managed_intent_id.strip()
@@ -2011,27 +2711,34 @@ class SqliteExecutionStore:
                 """,
                 (account_key, trading_day),
             ).fetchone()
+            account_watermark = cursor.execute(
+                """
+                SELECT watermark_order_ref, cutover_established
+                FROM ctp_order_ref_account_watermarks WHERE account_key = ?
+                """,
+                (account_key,),
+            ).fetchone()
             if existing_identity is not None:
-                proof_matches = watermark is not None and (
-                    str(watermark["native_max_order_ref"]) == proof.native_max_order_ref
+                session_evidence = cursor.execute(
+                    """
+                    SELECT evidence_sha256 FROM ctp_order_ref_cutover_sessions
+                    WHERE account_key = ? AND trading_day = ? AND scope_key = ?
+                      AND session_generation_id = ?
+                    """,
+                    (account_key, trading_day, scope_key, proof.session_generation_id),
+                ).fetchone()
+                if (
+                    watermark is not None
+                    and account_watermark is not None
+                    and bool(account_watermark["cutover_established"])
+                    and str(watermark["native_max_order_ref"]) == proof.native_max_order_ref
                     and str(watermark["legacy_ledger_max_order_ref"])
                     == proof.legacy_ledger_max_order_ref
                     and str(watermark["legacy_ledger_sha256"]) == proof.legacy_ledger_sha256
-                )
-                if (
-                    proof_matches
+                    and session_evidence is not None
+                    and str(session_evidence["evidence_sha256"]) == evidence_sha256
                     and str(existing_identity["trading_day"]) == trading_day
                     and str(existing_identity["runtime_order_id"]) == runtime_order_id
-                    and int(existing_identity["created_at_ns"])
-                    >= int(
-                        cursor.execute(
-                            """
-                            SELECT updated_at_ns FROM ctp_order_ref_watermarks
-                            WHERE account_key = ? AND trading_day = ?
-                            """,
-                            (account_key, trading_day),
-                        ).fetchone()["updated_at_ns"]
-                    )
                 ):
                     return self._ctp_order_identity_from_row(existing_identity)
                 raise IntentConflictError(
@@ -2044,6 +2751,21 @@ class SqliteExecutionStore:
                 < int(watermark["legacy_ledger_max_order_ref"])
             ):
                 raise IntentConflictError("CTP OrderRef seed watermark cannot move backward")
+            self._import_ctp_legacy_order_ref_mappings(cursor, proof, now_ns=now_ns)
+            self._store_ctp_order_ref_cutover_evidence(
+                cursor,
+                proof,
+                mappings_sha256=mappings_sha256,
+                evidence_sha256=evidence_sha256,
+                now_ns=now_ns,
+            )
+            account_watermark = cursor.execute(
+                """
+                SELECT watermark_order_ref, cutover_established
+                FROM ctp_order_ref_account_watermarks WHERE account_key = ?
+                """,
+                (account_key,),
+            ).fetchone()
             runtime_owner = cursor.execute(
                 """
                 SELECT 1 FROM ctp_order_identity_reservations
@@ -2061,69 +2783,44 @@ class SqliteExecutionStore:
             floor = max(
                 int(proof.native_max_order_ref),
                 int(proof.legacy_ledger_max_order_ref),
+                max(map(int, proof.existing_native_order_refs), default=0),
                 0 if latest is None else int(str(latest["order_ref"])),
+                0
+                if account_watermark is None
+                else int(str(account_watermark["watermark_order_ref"])),
             )
             next_value = floor + 1
             if next_value > 999_999_999_999:
                 raise DurableStoreError("CTP OrderRef sequence is exhausted")
             order_ref = f"{next_value:012d}"
-            watermark_matches = watermark is not None and (
-                str(watermark["native_max_order_ref"]) == proof.native_max_order_ref
-                and str(watermark["legacy_ledger_max_order_ref"])
-                == proof.legacy_ledger_max_order_ref
-                and str(watermark["legacy_ledger_sha256"]) == proof.legacy_ledger_sha256
-            )
-            if watermark is None:
+            try:
                 cursor.execute(
                     """
-                    INSERT INTO ctp_order_ref_watermarks(
-                        account_key, trading_day, native_max_order_ref,
-                        legacy_ledger_max_order_ref, legacy_ledger_sha256, updated_at_ns
-                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT INTO ctp_order_identity_reservations(
+                        account_key, trading_day, scope_key, managed_intent_id,
+                        runtime_order_id, order_ref, created_at_ns
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         account_key,
                         trading_day,
-                        proof.native_max_order_ref,
-                        proof.legacy_ledger_max_order_ref,
-                        proof.legacy_ledger_sha256,
+                        scope_key,
+                        managed_intent_id,
+                        runtime_order_id,
+                        order_ref,
                         now_ns,
                     ),
                 )
-            elif not watermark_matches:
-                cursor.execute(
-                    """
-                    UPDATE ctp_order_ref_watermarks
-                    SET native_max_order_ref = ?, legacy_ledger_max_order_ref = ?,
-                        legacy_ledger_sha256 = ?, updated_at_ns = ?
-                    WHERE account_key = ? AND trading_day = ?
-                    """,
-                    (
-                        proof.native_max_order_ref,
-                        proof.legacy_ledger_max_order_ref,
-                        proof.legacy_ledger_sha256,
-                        now_ns,
-                        account_key,
-                        trading_day,
-                    ),
-                )
-            cursor.execute(
-                """
-                INSERT INTO ctp_order_identity_reservations(
-                    account_key, trading_day, scope_key, managed_intent_id,
-                    runtime_order_id, order_ref, created_at_ns
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    account_key,
-                    trading_day,
-                    scope_key,
-                    managed_intent_id,
-                    runtime_order_id,
-                    order_ref,
-                    now_ns,
-                ),
-            )
+            except sqlite3.IntegrityError as error:
+                error_name = getattr(error, "sqlite_errorname", "")
+                if error_name in {
+                    "SQLITE_CONSTRAINT_PRIMARYKEY",
+                    "SQLITE_CONSTRAINT_UNIQUE",
+                }:
+                    raise IntentConflictError(
+                        "managed CTP order identity is already reserved"
+                    ) from error
+                raise DurableStoreError("unable to persist CTP order identity") from error
             result = cursor.execute(
                 """
                 SELECT account_key, trading_day, scope_key, managed_intent_id,
@@ -2134,6 +2831,15 @@ class SqliteExecutionStore:
                 (account_key, scope_key, managed_intent_id),
             ).fetchone()
             assert result is not None
+            self._advance_ctp_account_order_ref_watermark(
+                cursor,
+                account_key,
+                order_ref,
+                now_ns=now_ns,
+                trading_day=trading_day,
+                evidence_sha256=evidence_sha256,
+                cutover_established=True,
+            )
             return self._ctp_order_identity_from_row(result)
 
     @staticmethod
@@ -3035,6 +3741,22 @@ class SqliteExecutionStore:
                 str(row["order_ref"])
                 if row["order_ref"] is not None
                 else str(row["cancel_target_order_ref"])
+            )
+            if (
+                type(row["dispatch_front_id"]) is not int
+                or type(row["dispatch_session_id"]) is not int
+                or not isinstance(row["session_generation_id"], str)
+            ):
+                raise ContractValidationError("CTP command lacks exact session generation keys")
+            self._require_ctp_order_ref_cutover_session(
+                cursor,
+                account_key=account_key,
+                trading_day=trading_day,
+                scope_key=scope_key,
+                session_generation_id=str(row["session_generation_id"]),
+                native_front_id=int(row["dispatch_front_id"]),
+                native_session_id=int(row["dispatch_session_id"]),
+                order_ref=command_ref,
             )
             reservation = cursor.execute(
                 """
