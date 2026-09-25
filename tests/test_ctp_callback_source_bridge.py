@@ -596,6 +596,62 @@ def test_bridge_poisons_and_releases_a_lost_consumer_lease(tmp_path):
 
 
 @pytest.mark.unit
+def test_close_wins_after_fake_sdk_dequeue_and_discards_callback(tmp_path, monkeypatch):
+    bound = _stage_dispatched_command(tmp_path)
+    bridge = CtpNativeCallbackSourceBridge.bind_after_login(
+        store=bound.store,
+        scope=bound.scope,
+        command_id=bound.command_id,
+        native_trader_client=bound.client,
+    )
+    bound.client._events.put(_source_event(bound.client))
+    original_wait = bound.client._wait_native_callback_event_for_consumer
+    dequeue_finished = threading.Event()
+    resume_poll = threading.Event()
+    poll_finished = threading.Event()
+    poll_errors: list[BaseException] = []
+
+    def pause_after_dequeue(token: object, timeout: float = 5.0) -> object | None:
+        event = original_wait(token, timeout=timeout)
+        dequeue_finished.set()
+        if not resume_poll.wait(timeout=1):
+            raise RuntimeError("test did not release the post-dequeue wait")
+        return event
+
+    monkeypatch.setattr(bound.client, "_wait_native_callback_event_for_consumer", pause_after_dequeue)
+
+    def poll() -> None:
+        try:
+            bridge.next_envelope(timeout=0.6)
+        except BaseException as exc:  # retain the background failure for assertions
+            poll_errors.append(exc)
+        finally:
+            poll_finished.set()
+
+    poll_thread = threading.Thread(target=poll, daemon=True)
+    poll_thread.start()
+    try:
+        assert dequeue_finished.wait(timeout=1)
+        bridge.close()
+        assert bound.client._callback_consumer_token is None
+        resume_poll.set()
+        assert poll_finished.wait(timeout=1)
+        poll_thread.join(timeout=1)
+        assert not poll_thread.is_alive()
+        assert len(poll_errors) == 1
+        assert isinstance(poll_errors[0], ContractValidationError)
+        assert "callback may have been consumed and discarded" in str(poll_errors[0])
+        assert bound.client._events.empty()
+        with pytest.raises(ContractValidationError, match="bridge is closed"):
+            bridge.next_envelope(timeout=0)
+    finally:
+        resume_poll.set()
+        bridge.close()
+        poll_thread.join(timeout=1)
+        bound.store.close()
+
+
+@pytest.mark.unit
 def test_close_wakes_real_trader_client_poll_and_discards_its_result(tmp_path):
     client_module = pytest.importorskip("bt_api_ctp.ctp.client")
     client, _spi = _logged_in_sdk_client_with_fake_api(client_module)
