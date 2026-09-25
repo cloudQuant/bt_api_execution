@@ -154,3 +154,20 @@ carry the command RequestID required by the current callback-key contract.
 `OnRspOrderInsert` and `OnErrRtnOrderInsert` are also unsupported; this mapper
 does not turn local insert-response/error callbacks into provider order-state
 evidence.
+
+The opt-in `CtpNativeCallbackSourceBridge` is a local mapping candidate for the
+immutable `CtpTraderCallbackSourceEvent` API in `bt_api_ctp` commit
+`69098921025ceaba57ca4c7cdb660e97bdf94217`. It reads the durable dispatched
+command while it is `CLAIMED` and before its native call, snapshots the current
+logged-in TraderClient under its lifecycle lock, and polls callback events from
+that exact client's queue. Binding requires an
+exact `native_callback_source` echo in the command's persisted session binding,
+including the opaque API/SPI and client IDs, source generations, login facts,
+and callback sequence baseline. The bridge derives `CtpNativeSessionContext`
+internally; it accepts neither a caller-built context nor a caller-supplied
+event, and it has no fallback to the structural mapper when source binding is
+missing or stale. Its versioned envelope carries the lifecycle facts and the
+mapped callback for a future injected verifier. This is not source attestation,
+a provider acknowledgement, an external writer fence, or a write grant. The
+default store verifier still rejects, and no runtime registers the bridge.
+Trade callbacks and insert-response/error callbacks remain unsupported.

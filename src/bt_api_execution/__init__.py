@@ -35,6 +35,11 @@ from .contracts import (
     order_intent_from_payload,
     payload_sha256,
 )
+from .ctp_callback_source_bridge import (
+    CtpLifecycleBoundNativeCallbackEnvelope,
+    CtpNativeCallbackSourceBridge,
+    ctp_native_callback_source_facts,
+)
 from .ctp_native_callbacks import (
     CtpNativeCallbackEnvelope,
     CtpNativeSessionContext,
@@ -110,6 +115,8 @@ __all__ = [
     "CtpDispatchReceipt",
     "CtpDispatchUnknownResolutionResult",
     "CtpNativeCallbackEnvelope",
+    "CtpLifecycleBoundNativeCallbackEnvelope",
+    "CtpNativeCallbackSourceBridge",
     "CtpNativeSessionContext",
     "CtpCancelActionProjection",
     "CtpProjectedOrderState",
@@ -158,6 +165,7 @@ __all__ = [
     "canonical_json",
     "ctp_native_session_epoch",
     "ctp_native_session_generation_id",
+    "ctp_native_callback_source_facts",
     "map_ctp_native_order_action_callback",
     "map_ctp_native_order_return",
     "order_intent_from_payload",
