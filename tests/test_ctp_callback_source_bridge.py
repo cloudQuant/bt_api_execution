@@ -16,11 +16,13 @@ from bt_api_execution import (
     CtpCancelTarget,
     CtpDispatchAuthority,
     CtpNativeCallbackSourceBridge,
+    CtpOrderRefLegacyMapping,
     CtpOrderRefSeedProof,
     ExecutionScope,
     SqliteExecutionStore,
     ctp_native_callback_source_facts,
     ctp_native_session_generation_id,
+    payload_sha256,
 )
 
 
@@ -249,13 +251,37 @@ def _stage_dispatched_command(
     )
     store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
     lease = store.acquire_or_renew_lease(scope, "source-bridge-test", ttl_ns=30_000_000_000)
+    source_digests = (
+        ("backtrader_prototype", _sha(b"source bridge legacy prototype fixture")),
+        ("sdk_jsonl", _sha(b"source bridge empty SDK ledger fixture")),
+    )
+    legacy_scope = ExecutionScope(
+        "CTP", "simulation", scope.account_ref, "source-bridge-legacy", "20260924"
+    )
+    legacy_mapping = CtpOrderRefLegacyMapping(
+        source_name="backtrader_prototype",
+        account_key=scope.account_key,
+        trading_day="20260924",
+        scope_key=legacy_scope.key,
+        managed_intent_id="source-bridge-legacy-intent",
+        runtime_order_id="bt-managed-v1:" + _sha(b"source-bridge-legacy-intent"),
+        order_ref="000000000012",
+    )
     reservation = store.seed_ctp_order_ref_and_reserve_identity(
         scope,
         CtpOrderRefSeedProof(
             trading_day=scope.trading_day,
             native_max_order_ref="000000000010",
             legacy_ledger_max_order_ref="000000000012",
-            legacy_ledger_sha256=_sha(b"fake legacy seed"),
+            legacy_ledger_sha256=payload_sha256(dict(source_digests)),
+            account_key=scope.account_key,
+            scope_key=scope.key,
+            session_generation_id=generation,
+            native_front_id=source_facts["login_front_id"],
+            native_session_id=source_facts["login_session_id"],
+            existing_native_order_refs=("000000000009", "000000000010"),
+            legacy_source_sha256=source_digests,
+            legacy_mappings=(legacy_mapping,),
         ),
         "source-bridge-intent",
         "bt-managed-v1:" + _sha(b"source-bridge-intent"),

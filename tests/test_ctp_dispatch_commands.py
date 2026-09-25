@@ -644,6 +644,70 @@ def test_v7_typed_command_migrates_to_callback_ledger_without_reopening_dispatch
 
 
 @pytest.mark.unit
+def test_v8_store_migrates_orderref_cutover_state_fail_closed(tmp_path):
+    path = tmp_path / "execution.sqlite3"
+    store = SqliteExecutionStore(path)
+    scope = _scope()
+    lease = _lease(store, scope)
+    reservation = _reserve_seeded(store, scope, lease)
+    staged = _stage_submit(store, scope, lease, reservation)
+    store.close()
+
+    # Remove only v9 cutover structures to model an existing v8 database.
+    connection = sqlite3.connect(path)
+    try:
+        connection.executescript(
+            """
+            DROP TABLE ctp_order_ref_legacy_imports;
+            DROP TABLE ctp_order_ref_cutover_sessions;
+            DROP TABLE ctp_order_ref_account_watermarks;
+            UPDATE execution_meta SET value = '8' WHERE key = 'schema_version';
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    migrated = SqliteExecutionStore(path)
+    try:
+        version = migrated._connection.execute(
+            "SELECT value FROM execution_meta WHERE key = 'schema_version'"
+        ).fetchone()["value"]
+        assert version == "9"
+        command = migrated.read_ctp_dispatch_command(scope, staged.command_id)
+        assert command is not None
+        assert command.status == "UNKNOWN"
+        assert command.unknown_reason == "schema_upgrade_requires_ctp_orderref_cutover"
+        watermark = migrated._connection.execute(
+            """
+            SELECT watermark_order_ref, cutover_established, last_trading_day,
+                   last_cutover_evidence_sha256
+            FROM ctp_order_ref_account_watermarks WHERE account_key = ?
+            """,
+            (scope.account_key,),
+        ).fetchone()
+        assert tuple(watermark) == (reservation.order_ref, 0, None, None)
+        assert (
+            migrated._connection.execute(
+                "SELECT COUNT(*) FROM ctp_order_ref_cutover_sessions"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            migrated.claim_ctp_dispatch_command(
+                scope,
+                staged.command_id,
+                writer_lease=_lease(migrated, scope),
+                authority_verifier=_authority_verifier(),
+            )
+            is None
+        )
+        assert migrated.read_ctp_dispatch_command(scope, staged.command_id).status == "UNKNOWN"
+    finally:
+        migrated.close()
+
+
+@pytest.mark.unit
 def test_v7_schema_migration_rolls_back_ddl_version_and_trigger_on_failure(tmp_path):
     store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
     connection = store._connection
