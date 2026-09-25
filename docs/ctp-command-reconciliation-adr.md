@@ -17,6 +17,11 @@ On restart, `recover_claimed_ctp_dispatch_commands()` changes an interrupted
 `CLAIMED` or `UNKNOWN` command remains fenced. There is no API that resolves or
 clears CTP command `UNKNOWN`, and this ADR does not add one.
 
+This account fence is local to participants that use the same SQLite database
+and lease contract. It cannot exclude another database, an uncoordinated
+process, a manual trading client, or another native/provider writer. A real
+account-wide writer exclusion mechanism remains an external blocker.
+
 ## Correlation keys required before a durable projection
 
 Every normalized callback envelope must bind the immutable local action:

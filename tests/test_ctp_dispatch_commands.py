@@ -11,6 +11,7 @@ from hashlib import sha256
 
 import pytest
 
+import bt_api_execution.store as execution_store_module
 from bt_api_execution import (
     ContractValidationError,
     CtpCancelTarget,
@@ -119,10 +120,11 @@ def _receipt(command, *, outcome="QUEUED", native=None):
 class _FakeCtpDispatchAuthorityVerifier:
     """Test-only fresh verifier; it never calls a provider or external source."""
 
-    def __init__(self, *, overrides=None, error=None, connection=None):
+    def __init__(self, *, overrides=None, error=None, connection=None, after_verify=None):
         self.overrides = dict(overrides or {})
         self.error = error
         self.connection = connection
+        self.after_verify = after_verify
         self.calls = []
         self.in_transaction = None
 
@@ -143,11 +145,22 @@ class _FakeCtpDispatchAuthorityVerifier:
             "expires_at_ns": now_ns + 5_000_000_000,
         }
         values.update(self.overrides)
-        return CtpDispatchAuthority(**values)
+        authority = CtpDispatchAuthority(**values)
+        if self.after_verify is not None:
+            self.after_verify(command, now_ns, authority)
+        return authority
 
 
 def _authority_verifier(**overrides):
     return _FakeCtpDispatchAuthorityVerifier(overrides=overrides)
+
+
+class _ControlledClock:
+    def __init__(self, now_ns):
+        self.now_ns = now_ns
+
+    def time_ns(self):
+        return self.now_ns
 
 
 @pytest.mark.unit
@@ -455,6 +468,62 @@ def test_claim_rejects_stale_or_mismatched_action_authority(tmp_path, override, 
                 authority_verifier=_authority_verifier(**override),
             )
         assert store.read_ctp_dispatch_command(scope, staged.command_id).status == "READY"
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_authority_uses"
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("expiry_target", "expected_error", "message"),
+    [
+        ("authority", ContractValidationError, "authority is expired"),
+        ("writer_lease", WriterLeaseUnavailable, None),
+    ],
+)
+def test_slow_verifier_crossing_expiry_rolls_back_claim(
+    tmp_path, monkeypatch, expiry_target, expected_error, message
+):
+    store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
+    scope = _scope()
+    lease = _lease(store, scope)
+    try:
+        reservation = _reserve_seeded(store, scope, lease)
+        staged = _stage_submit(store, scope, lease, reservation)
+        if expiry_target == "authority":
+            verification_started_ns = lease.expires_at_ns - 20_000_000_000
+            verifier_returned_ns = verification_started_ns + 5_000_000_001
+        else:
+            verification_started_ns = lease.expires_at_ns - 1_000_000_000
+            verifier_returned_ns = lease.expires_at_ns + 1
+        clock = _ControlledClock(verification_started_ns)
+        monkeypatch.setattr(execution_store_module, "time", clock)
+
+        def cross_expiry(_command, now_ns, _authority):
+            assert now_ns == verification_started_ns
+            clock.now_ns = verifier_returned_ns
+
+        verifier = _FakeCtpDispatchAuthorityVerifier(after_verify=cross_expiry)
+        with pytest.raises(expected_error, match=message):
+            store.claim_ctp_dispatch_command(
+                scope,
+                staged.command_id,
+                writer_lease=lease,
+                authority_verifier=verifier,
+            )
+
+        assert len(verifier.calls) == 1
+        assert store.read_ctp_dispatch_command(scope, staged.command_id).status == "READY"
+        row = store._connection.execute(
+            "SELECT claimed_at_ns FROM ctp_dispatch_commands WHERE command_id = ?",
+            (staged.command_id,),
+        ).fetchone()
+        assert row["claimed_at_ns"] is None
         assert (
             store._connection.execute(
                 "SELECT COUNT(*) FROM ctp_dispatch_authority_uses"

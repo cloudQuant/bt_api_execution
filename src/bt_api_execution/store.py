@@ -1621,8 +1621,10 @@ class SqliteExecutionStore:
         account_key, trading_day, scope_key = self._validate_ctp_order_identity_scope(scope)
         self._validate_command_identifier(command_id, "command_id")
         with self._transaction() as cursor:
-            now_ns = time.time_ns()
-            self._assert_active_writer_lease(cursor, scope, writer_lease)
+            verification_started_ns = time.time_ns()
+            self._assert_active_writer_lease(
+                cursor, scope, writer_lease, now_ns=verification_started_ns
+            )
             row = cursor.execute(
                 """
                 SELECT * FROM ctp_dispatch_commands
@@ -1687,8 +1689,14 @@ class SqliteExecutionStore:
                 )
             command = self._ctp_dispatch_command_from_row(row)
             authority = self._verify_ctp_dispatch_authority(
-                authority_verifier, command, now_ns=now_ns
+                authority_verifier, command, now_ns=verification_started_ns
             )
+            claim_now_ns = time.time_ns()
+            self._assert_active_writer_lease(cursor, scope, writer_lease, now_ns=claim_now_ns)
+            if authority.expires_at_ns <= claim_now_ns:
+                raise ContractValidationError("CTP dispatch authority is expired")
+            if claim_now_ns < authority.verified_at_ns:
+                raise ContractValidationError("CTP dispatch authority clock moved backwards")
             cursor.execute(
                 """
                 UPDATE ctp_dispatch_commands
@@ -1697,8 +1705,8 @@ class SqliteExecutionStore:
                 WHERE account_key = ? AND scope_key = ? AND command_id = ? AND status = 'READY'
                 """,
                 (
-                    now_ns,
-                    now_ns,
+                    claim_now_ns,
+                    claim_now_ns,
                     writer_lease.owner_id,
                     writer_lease.fencing_token,
                     account_key,
@@ -2119,12 +2127,16 @@ class SqliteExecutionStore:
         cursor: sqlite3.Cursor,
         scope: ExecutionScope,
         writer_lease: WriterLease | None,
+        *,
+        now_ns: int | None = None,
     ) -> None:
         """Fence a facade mutation inside its SQLite transaction.
 
         Every execution/cancellation state mutation must carry the exact lease
         generation acquired by its facade.  This keeps a direct low-level
         caller from silently bypassing the writer fence after a lease expiry.
+        ``now_ns`` lets a caller recheck expiry against the transaction
+        timestamp it will persist for the mutation.
         """
 
         if writer_lease is None:
@@ -2141,11 +2153,12 @@ class SqliteExecutionStore:
             "WHERE scope_key = ?",
             (scope.account_key,),
         ).fetchone()
+        lease_check_ns = time.time_ns() if now_ns is None else now_ns
         if (
             row is None
             or str(row["owner_id"]) != writer_lease.owner_id
             or int(row["fencing_token"]) != writer_lease.fencing_token
-            or int(row["expires_at_ns"]) <= time.time_ns()
+            or int(row["expires_at_ns"]) <= lease_check_ns
         ):
             raise WriterLeaseUnavailable()
 
