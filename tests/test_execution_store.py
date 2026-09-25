@@ -74,7 +74,7 @@ def test_v2_execution_store_adds_nullable_cumulative_commission_column(tmp_path)
             "SELECT value FROM execution_meta WHERE key = 'schema_version'"
         ).fetchone()["value"]
         assert "cumulative_commission" in columns
-        assert version == "5"
+        assert version == "6"
     finally:
         store.close()
 
@@ -105,9 +105,10 @@ def test_v3_execution_store_adds_ctp_order_identity_reservations(tmp_path) -> No
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-        assert version == "5"
+        assert version == "6"
         assert "ctp_order_identity_reservations" in tables
         assert "ctp_dispatch_commands" in tables
+        assert "ctp_dispatch_authority_uses" in tables
     finally:
         store.close()
 

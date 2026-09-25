@@ -51,6 +51,8 @@ from .ports import AdmissionGate, DispatchPort, ReconciliationPort
 from .store import (
     CancelRecord,
     CtpCancelTarget,
+    CtpDispatchAuthority,
+    CtpDispatchAuthorityVerifier,
     CtpDispatchCommand,
     CtpDispatchReceipt,
     CtpOrderIdentityReservation,
@@ -73,6 +75,8 @@ __all__ = [
     "CancelObservation",
     "CancelRecord",
     "CtpCancelTarget",
+    "CtpDispatchAuthority",
+    "CtpDispatchAuthorityVerifier",
     "CtpDispatchCommand",
     "CtpDispatchReceipt",
     "CtpOrderIdentityReservation",

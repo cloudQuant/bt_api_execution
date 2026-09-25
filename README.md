@@ -113,3 +113,13 @@ restart, and never reuses a committed reference across strategies or trading
 days for the same account. This primitive does not migrate the existing SDK or
 Backtrader journals, dispatch an order, or authorize provider I/O; a managed
 route must complete the separately reviewed single-authority cutover first.
+
+The v6 CTP command outbox keeps that boundary closed while making its local
+claim contract explicit. `claim_ctp_dispatch_command()` requires an injected
+fresh action/source verifier, binds its result to the complete immutable
+submit or cancel request, and records the one-use approval consumption in the
+same SQLite transaction as `READY -> CLAIMED`. The command's approval digest
+and any later receipt digest are evidence echoes only. This package supplies
+the verifier interface and fake-only tests, not a deployed verifier, external
+account-wide writer fence, native callback reconciliation, native SDK import,
+or provider write route.

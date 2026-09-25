@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from decimal import Decimal
 from hashlib import sha256
 
@@ -11,6 +12,7 @@ import pytest
 from bt_api_execution import (
     ContractValidationError,
     CtpCancelTarget,
+    CtpDispatchAuthority,
     CtpDispatchReceipt,
     CtpOrderRefSeedProof,
     DurableStoreError,
@@ -112,8 +114,42 @@ def _receipt(command, *, outcome="QUEUED", native=None):
     )
 
 
+class _FakeCtpDispatchAuthorityVerifier:
+    """Test-only fresh verifier; it never calls a provider or external source."""
+
+    def __init__(self, *, overrides=None, error=None, connection=None):
+        self.overrides = dict(overrides or {})
+        self.error = error
+        self.connection = connection
+        self.calls = []
+        self.in_transaction = None
+
+    def verify_action(self, command, *, now_ns):
+        self.calls.append((command, now_ns))
+        if self.connection is not None:
+            self.in_transaction = self.connection.in_transaction
+        if self.error is not None:
+            raise self.error
+        values = {
+            "authority_type": "ctp_dispatch_authority.v1",
+            "command_binding_sha256": command.authority_binding_sha256,
+            "approval_use_id": command.approval_use_id,
+            "approval_digest": command.approval_digest,
+            "source_digest_sha256": sha256(b"fake current source snapshot").hexdigest(),
+            "verifier_id": "test-verifier.v1",
+            "verified_at_ns": now_ns,
+            "expires_at_ns": now_ns + 5_000_000_000,
+        }
+        values.update(self.overrides)
+        return CtpDispatchAuthority(**values)
+
+
+def _authority_verifier(**overrides):
+    return _FakeCtpDispatchAuthorityVerifier(overrides=overrides)
+
+
 @pytest.mark.unit
-def test_v4_execution_store_migrates_to_command_outbox_v5(tmp_path):
+def test_v4_execution_store_migrates_to_command_outbox_v6(tmp_path):
     path = tmp_path / "execution.sqlite3"
     scope = _scope()
     legacy_intent = OrderIntent.limit(
@@ -140,14 +176,13 @@ def test_v4_execution_store_migrates_to_command_outbox_v5(tmp_path):
 
     # A v4 database has the execution journal, event outbox, lease, and CTP
     # identity tables. The command and OrderRef watermark tables were added in
-    # v5, so both must be absent from this fixture before migration.
+    # v5, then one-use authority consumption was added in v6.
     connection = sqlite3.connect(path)
     try:
+        connection.execute("DROP TABLE ctp_dispatch_authority_uses")
         connection.execute("DROP TABLE ctp_dispatch_commands")
         connection.execute("DROP TABLE ctp_order_ref_watermarks")
-        connection.execute(
-            "UPDATE execution_meta SET value = '4' WHERE key = 'schema_version'"
-        )
+        connection.execute("UPDATE execution_meta SET value = '4' WHERE key = 'schema_version'")
         connection.commit()
     finally:
         connection.close()
@@ -163,24 +198,54 @@ def test_v4_execution_store_migrates_to_command_outbox_v5(tmp_path):
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-        assert version == "5"
+        assert version == "6"
         assert "ctp_dispatch_commands" in tables
         assert "ctp_order_ref_watermarks" in tables
+        assert "ctp_dispatch_authority_uses" in tables
         assert "execution_outbox" in tables
         assert migrated.get_intent(legacy_intent.intent_id, scope=scope) == legacy_intent
         migrated_record = migrated.get(legacy_intent.intent_id, scope=scope)
         assert migrated_record is not None
         assert migrated_record.state is ExecutionState.PENDING_ADMISSION
         assert migrated.read_outbox(scope=scope) == legacy_outbox
-        migrated_reservation = migrated.read_ctp_order_identity(
-            scope, "legacy-managed-intent"
-        )
+        migrated_reservation = migrated.read_ctp_order_identity(scope, "legacy-managed-intent")
         assert migrated_reservation == legacy_reservation
         assert (
-            migrated._connection.execute("SELECT COUNT(*) FROM ctp_order_ref_watermarks")
-            .fetchone()[0]
+            migrated._connection.execute(
+                "SELECT COUNT(*) FROM ctp_order_ref_watermarks"
+            ).fetchone()[0]
             == 0
         )
+    finally:
+        migrated.close()
+
+
+@pytest.mark.unit
+def test_v5_execution_store_migrates_one_use_authority_table(tmp_path):
+    path = tmp_path / "execution.sqlite3"
+    initial = SqliteExecutionStore(path)
+    initial.close()
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("DROP TABLE ctp_dispatch_authority_uses")
+        connection.execute("UPDATE execution_meta SET value = '5' WHERE key = 'schema_version'")
+        connection.commit()
+    finally:
+        connection.close()
+
+    migrated = SqliteExecutionStore(path)
+    try:
+        version = migrated._connection.execute(
+            "SELECT value FROM execution_meta WHERE key = 'schema_version'"
+        ).fetchone()["value"]
+        tables = {
+            row["name"]
+            for row in migrated._connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        assert version == "6"
+        assert "ctp_dispatch_authority_uses" in tables
     finally:
         migrated.close()
 
@@ -317,12 +382,183 @@ def test_claim_requires_seed_and_never_claims_a_preseed_reservation(tmp_path):
         old = store.reserve_ctp_order_identity(scope, "old-intent", _runtime_id("old-intent"))
         old_command = _stage_submit(store, scope, lease, old, command_id="old-command")
         with pytest.raises(ContractValidationError, match="staged-only"):
-            store.claim_ctp_dispatch_command(scope, old_command.command_id, writer_lease=lease)
+            store.claim_ctp_dispatch_command(
+                scope,
+                old_command.command_id,
+                writer_lease=lease,
+                authority_verifier=_authority_verifier(),
+            )
 
         _reserve_seeded(store, scope, lease, "new-intent")
         with pytest.raises(ContractValidationError, match="predates or conflicts"):
-            store.claim_ctp_dispatch_command(scope, old_command.command_id, writer_lease=lease)
+            store.claim_ctp_dispatch_command(
+                scope,
+                old_command.command_id,
+                writer_lease=lease,
+                authority_verifier=_authority_verifier(),
+            )
         assert store.read_ctp_dispatch_command(scope, old_command.command_id).status == "READY"
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+def test_stored_approval_digest_alone_cannot_claim_a_command(tmp_path):
+    store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
+    scope = _scope()
+    lease = _lease(store, scope)
+    try:
+        reservation = _reserve_seeded(store, scope, lease)
+        staged = _stage_submit(store, scope, lease, reservation)
+        with pytest.raises(TypeError, match="authority_verifier"):
+            store.claim_ctp_dispatch_command(
+                scope,
+                staged.command_id,
+                writer_lease=lease,
+            )
+        assert store.read_ctp_dispatch_command(scope, staged.command_id).status == "READY"
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_authority_uses"
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"command_binding_sha256": "0" * 64}, "binding does not match command"),
+        ({"approval_use_id": "another-action"}, "binding does not match command"),
+        ({"verified_at_ns": 0}, "not freshly verified"),
+        ({"expires_at_ns": 0}, "is expired"),
+        ({"source_digest_sha256": "g" * 64}, "invalid authority source digest"),
+    ],
+)
+def test_claim_rejects_stale_or_mismatched_action_authority(tmp_path, override, message):
+    store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
+    scope = _scope()
+    lease = _lease(store, scope)
+    try:
+        reservation = _reserve_seeded(store, scope, lease)
+        staged = _stage_submit(store, scope, lease, reservation)
+        with pytest.raises(ContractValidationError, match=message):
+            store.claim_ctp_dispatch_command(
+                scope,
+                staged.command_id,
+                writer_lease=lease,
+                authority_verifier=_authority_verifier(**override),
+            )
+        assert store.read_ctp_dispatch_command(scope, staged.command_id).status == "READY"
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_authority_uses"
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+def test_authority_verifier_failure_leaves_command_and_use_ledger_untouched(tmp_path):
+    store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
+    scope = _scope()
+    lease = _lease(store, scope)
+    try:
+        reservation = _reserve_seeded(store, scope, lease)
+        staged = _stage_submit(store, scope, lease, reservation)
+        verifier = _FakeCtpDispatchAuthorityVerifier(error=RuntimeError("source check failed"))
+        with pytest.raises(ContractValidationError, match="verification failed"):
+            store.claim_ctp_dispatch_command(
+                scope,
+                staged.command_id,
+                writer_lease=lease,
+                authority_verifier=verifier,
+            )
+        assert len(verifier.calls) == 1
+        assert store.read_ctp_dispatch_command(scope, staged.command_id).status == "READY"
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_authority_uses"
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+def test_fresh_verification_one_use_and_claim_share_one_durable_transaction(tmp_path):
+    store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
+    scope = _scope()
+    lease = _lease(store, scope)
+    try:
+        reservation = _reserve_seeded(store, scope, lease)
+        staged = _stage_submit(store, scope, lease, reservation)
+        store._connection.execute(
+            """
+            CREATE TRIGGER reject_authority_use
+            BEFORE INSERT ON ctp_dispatch_authority_uses
+            BEGIN
+                SELECT RAISE(ABORT, 'injected authority-use failure');
+            END;
+            """
+        )
+        failed_verifier = _FakeCtpDispatchAuthorityVerifier(connection=store._connection)
+        with pytest.raises(DurableStoreError):
+            store.claim_ctp_dispatch_command(
+                scope,
+                staged.command_id,
+                writer_lease=lease,
+                authority_verifier=failed_verifier,
+            )
+        assert len(failed_verifier.calls) == 1
+        assert failed_verifier.in_transaction is True
+        assert store.read_ctp_dispatch_command(scope, staged.command_id).status == "READY"
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_authority_uses"
+            ).fetchone()[0]
+            == 0
+        )
+
+        store._connection.execute("DROP TRIGGER reject_authority_use")
+        verifier = _FakeCtpDispatchAuthorityVerifier(connection=store._connection)
+        claimed = store.claim_ctp_dispatch_command(
+            scope,
+            staged.command_id,
+            writer_lease=lease,
+            authority_verifier=verifier,
+        )
+        assert claimed is not None and claimed.status == "CLAIMED"
+        assert verifier.in_transaction is True
+        use = store._connection.execute(
+            "SELECT * FROM ctp_dispatch_authority_uses WHERE account_key = ?",
+            (staged.account_key,),
+        ).fetchone()
+        assert use is not None
+        assert use["approval_use_id"] == staged.approval_use_id
+        assert use["command_id"] == staged.command_id
+        assert use["command_binding_sha256"] == staged.authority_binding_sha256
+        assert use["approval_digest"] == staged.approval_digest
+        assert use["source_digest_sha256"] == sha256(b"fake current source snapshot").hexdigest()
+        assert use["writer_owner_id"] == lease.owner_id
+        assert use["fencing_token"] == lease.fencing_token
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            store._connection.execute(
+                "DELETE FROM ctp_dispatch_authority_uses WHERE approval_use_id = ?",
+                (staged.approval_use_id,),
+            )
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_authority_uses"
+            ).fetchone()[0]
+            == 1
+        )
     finally:
         store.close()
 
@@ -335,7 +571,12 @@ def test_receipt_requires_exact_typed_echo_and_is_idempotently_stored(tmp_path):
     try:
         reservation = _reserve_seeded(store, scope, lease)
         staged = _stage_submit(store, scope, lease, reservation)
-        claimed = store.claim_ctp_dispatch_command(scope, staged.command_id, writer_lease=lease)
+        claimed = store.claim_ctp_dispatch_command(
+            scope,
+            staged.command_id,
+            writer_lease=lease,
+            authority_verifier=_authority_verifier(),
+        )
         assert claimed is not None and claimed.status == "CLAIMED"
 
         wrong = _receipt(claimed)
@@ -353,7 +594,19 @@ def test_receipt_requires_exact_typed_echo_and_is_idempotently_stored(tmp_path):
         )
         assert store.complete_ctp_dispatch_command(scope, receipt, writer_lease=lease) == completed
         assert (
-            store.claim_ctp_dispatch_command(scope, staged.command_id, writer_lease=lease) is None
+            store.claim_ctp_dispatch_command(
+                scope,
+                staged.command_id,
+                writer_lease=lease,
+                authority_verifier=_authority_verifier(),
+            )
+            is None
+        )
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_authority_uses"
+            ).fetchone()[0]
+            == 1
         )
     finally:
         store.close()
@@ -371,12 +624,23 @@ def test_two_store_claim_race_has_one_local_claimant(tmp_path):
         staged = _stage_submit(first, scope, lease, reservation)
 
         def claim(store):
-            return store.claim_ctp_dispatch_command(scope, staged.command_id, writer_lease=lease)
+            return store.claim_ctp_dispatch_command(
+                scope,
+                staged.command_id,
+                writer_lease=lease,
+                authority_verifier=_authority_verifier(),
+            )
 
         with ThreadPoolExecutor(max_workers=2) as pool:
             results = tuple(pool.map(claim, (first, second)))
         assert sum(result is not None for result in results) == 1
         assert first.read_ctp_dispatch_command(scope, staged.command_id).status == "CLAIMED"
+        assert (
+            first._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_authority_uses"
+            ).fetchone()[0]
+            == 1
+        )
     finally:
         first.close()
         second.close()
@@ -390,7 +654,12 @@ def test_restart_recovery_marks_prior_claim_unknown_without_replay(tmp_path):
     old_lease = store.acquire_or_renew_lease(scope, "outbox-before-crash")
     reservation = _reserve_seeded(store, scope, old_lease)
     staged = _stage_submit(store, scope, old_lease, reservation)
-    assert store.claim_ctp_dispatch_command(scope, staged.command_id, writer_lease=old_lease)
+    assert store.claim_ctp_dispatch_command(
+        scope,
+        staged.command_id,
+        writer_lease=old_lease,
+        authority_verifier=_authority_verifier(),
+    )
     store._connection.execute(
         "UPDATE execution_writer_leases SET expires_at_ns = ? WHERE scope_key = ?",
         (time.time_ns() - 1, scope.account_key),
@@ -412,7 +681,12 @@ def test_restart_recovery_marks_prior_claim_unknown_without_replay(tmp_path):
         assert recovered[0].native_receipt_payload is None
         assert recovered[0].unknown_reason == "claimed_without_receipt_after_writer_change"
         assert (
-            reopened.claim_ctp_dispatch_command(scope, staged.command_id, writer_lease=new_lease)
+            reopened.claim_ctp_dispatch_command(
+                scope,
+                staged.command_id,
+                writer_lease=new_lease,
+                authority_verifier=_authority_verifier(),
+            )
             is None
         )
         assert reopened.recover_claimed_ctp_dispatch_commands(scope, writer_lease=new_lease) == ()
@@ -437,7 +711,10 @@ def test_unresolved_command_fences_other_scopes_account_wide(tmp_path):
             approval_use_id="approval-first",
         )
         assert store.claim_ctp_dispatch_command(
-            first_scope, first_command.command_id, writer_lease=lease
+            first_scope,
+            first_command.command_id,
+            writer_lease=lease,
+            authority_verifier=_authority_verifier(),
         )
 
         second_reservation = _reserve_seeded(store, second_scope, lease, "intent-second")
@@ -457,7 +734,10 @@ def test_unresolved_command_fences_other_scopes_account_wide(tmp_path):
 
         with pytest.raises(InvalidStateTransition, match="account has unresolved"):
             store.claim_ctp_dispatch_command(
-                second_scope, second_command.command_id, writer_lease=new_lease
+                second_scope,
+                second_command.command_id,
+                writer_lease=new_lease,
+                authority_verifier=_authority_verifier(),
             )
         recovered = store.recover_claimed_ctp_dispatch_commands(
             second_scope, writer_lease=new_lease
@@ -467,7 +747,10 @@ def test_unresolved_command_fences_other_scopes_account_wide(tmp_path):
         assert recovered[0].status == "UNKNOWN"
         with pytest.raises(InvalidStateTransition, match="account has unresolved"):
             store.claim_ctp_dispatch_command(
-                second_scope, second_command.command_id, writer_lease=new_lease
+                second_scope,
+                second_command.command_id,
+                writer_lease=new_lease,
+                authority_verifier=_authority_verifier(),
             )
     finally:
         store.close()
@@ -527,6 +810,68 @@ def test_cancel_command_binds_orderref_exchange_system_order_and_session_ids(tmp
                 writer_lease=lease,
                 cancel_target=target,
             )
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+def test_cancel_claim_authority_binds_exact_native_target(tmp_path):
+    store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
+    scope = _scope()
+    lease = _lease(store, scope)
+    try:
+        reservation = _reserve_seeded(store, scope, lease)
+        target = CtpCancelTarget(
+            order_ref=reservation.order_ref,
+            exchange_id="SHFE",
+            order_sys_id="sys-order-17",
+            front_id=4,
+            session_id=91,
+        )
+        request = {
+            "OrderRef": target.order_ref,
+            "ExchangeID": target.exchange_id,
+            "OrderSysID": target.order_sys_id,
+            "FrontID": target.front_id,
+            "SessionID": target.session_id,
+            "ActionFlag": "0",
+        }
+        staged = store.stage_ctp_dispatch_command(
+            scope,
+            "cancel-authority-1",
+            "CANCEL",
+            request,
+            approval_use_id="approval-use-cancel-authority",
+            approval_digest=sha256(b"cancel action receipt digest").hexdigest(),
+            session_binding={"session_identity": "opaque-session-v1"},
+            writer_lease=lease,
+            cancel_target=target,
+        )
+        changed_target = replace(
+            staged, cancel_target_session_id=staged.cancel_target_session_id + 1
+        )
+        assert changed_target.authority_binding_sha256 != staged.authority_binding_sha256
+        with pytest.raises(ContractValidationError, match="binding does not match command"):
+            store.claim_ctp_dispatch_command(
+                scope,
+                staged.command_id,
+                writer_lease=lease,
+                authority_verifier=_authority_verifier(
+                    command_binding_sha256=changed_target.authority_binding_sha256
+                ),
+            )
+        assert store.read_ctp_dispatch_command(scope, staged.command_id).status == "READY"
+        assert store.claim_ctp_dispatch_command(
+            scope,
+            staged.command_id,
+            writer_lease=lease,
+            authority_verifier=_authority_verifier(),
+        )
+        use = store._connection.execute(
+            "SELECT command_binding_sha256 FROM ctp_dispatch_authority_uses WHERE command_id = ?",
+            (staged.command_id,),
+        ).fetchone()
+        assert use["command_binding_sha256"] == staged.authority_binding_sha256
     finally:
         store.close()
 

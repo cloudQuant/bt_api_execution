@@ -18,7 +18,7 @@ from datetime import date
 from decimal import Decimal
 from pathlib import Path
 from threading import RLock
-from typing import TYPE_CHECKING, Any, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Optional, Protocol, Tuple
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -181,6 +181,70 @@ class CtpDispatchCommand:
     native_receipt_sha256: Optional[str]
     completion_echo_sha256: Optional[str]
 
+    @property
+    def authority_binding_sha256(self) -> str:
+        """Return the canonical digest of every immutable dispatch binding.
+
+        This is an input to a trusted action verifier, not authorization by
+        itself. In particular, the stored approval digest is only an echo.
+        """
+
+        return payload_sha256(
+            {
+                "binding_type": "ctp_dispatch_action_binding.v1",
+                "account_key": self.account_key,
+                "scope_key": self.scope_key,
+                "trading_day": self.trading_day,
+                "operation": self.operation,
+                "command_id": self.command_id,
+                "request_payload_sha256": self.request_payload_sha256,
+                "reservation_managed_intent_id": self.reservation_managed_intent_id,
+                "order_ref": self.order_ref,
+                "cancel_target_order_ref": self.cancel_target_order_ref,
+                "cancel_target_exchange_id": self.cancel_target_exchange_id,
+                "cancel_target_order_sys_id": self.cancel_target_order_sys_id,
+                "cancel_target_front_id": self.cancel_target_front_id,
+                "cancel_target_session_id": self.cancel_target_session_id,
+                "approval_use_id": self.approval_use_id,
+                "approval_digest": self.approval_digest,
+                "session_binding_sha256": self.session_binding_sha256,
+            }
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CtpDispatchAuthority:
+    """Fresh verifier output bound to exactly one staged CTP action.
+
+    Constructing this record does not grant authority. The store accepts it
+    only as the result of the mandatory verifier callback and consumes its
+    approval use in the same transaction that claims the command.
+    """
+
+    authority_type: str
+    command_binding_sha256: str
+    approval_use_id: str
+    approval_digest: str
+    source_digest_sha256: str
+    verifier_id: str
+    verified_at_ns: int
+    expires_at_ns: int
+
+
+class CtpDispatchAuthorityVerifier(Protocol):
+    """Trusted local verifier for one fresh approval and source snapshot.
+
+    Implementations must re-verify current per-action approval and its exact
+    source bindings on every invocation. They must be bounded and read-only;
+    network access and native provider calls are outside this package's
+    contract. The callback runs inside the SQLite claim transaction so its
+    result cannot be separated from durable one-use consumption.
+    """
+
+    def verify_action(
+        self, command: CtpDispatchCommand, *, now_ns: int
+    ) -> CtpDispatchAuthority: ...
+
 
 @dataclass(frozen=True)
 class CtpDispatchReceipt:
@@ -268,7 +332,8 @@ class SqliteExecutionStore:
     # cumulative commission. Version 4 adds CTP order identity reservations.
     # Version 5 adds an offline-only command queue in this same authority; the
     # generic event outbox remains an event log, not a command source.
-    _SCHEMA_VERSION = 5
+    # Version 6 records one-use action authority atomically with each claim.
+    _SCHEMA_VERSION = 6
 
     def __init__(self, path: str | Path, *, busy_timeout_ms: int = 5_000) -> None:
         if type(busy_timeout_ms) is not int or busy_timeout_ms <= 0:
@@ -463,6 +528,35 @@ class SqliteExecutionStore:
                     ON ctp_dispatch_commands(account_key, scope_key, status, created_at_ns);
                 CREATE INDEX IF NOT EXISTS ctp_dispatch_commands_account_status
                     ON ctp_dispatch_commands(account_key, status, created_at_ns);
+                CREATE TABLE IF NOT EXISTS ctp_dispatch_authority_uses (
+                    account_key TEXT NOT NULL,
+                    approval_use_id TEXT NOT NULL,
+                    command_id TEXT NOT NULL,
+                    command_binding_sha256 TEXT NOT NULL
+                        CHECK(length(command_binding_sha256) = 64),
+                    approval_digest TEXT NOT NULL CHECK(length(approval_digest) = 64),
+                    source_digest_sha256 TEXT NOT NULL
+                        CHECK(length(source_digest_sha256) = 64),
+                    verifier_id TEXT NOT NULL,
+                    verified_at_ns INTEGER NOT NULL,
+                    expires_at_ns INTEGER NOT NULL CHECK(expires_at_ns > verified_at_ns),
+                    writer_owner_id TEXT NOT NULL,
+                    fencing_token INTEGER NOT NULL,
+                    PRIMARY KEY(account_key, approval_use_id),
+                    UNIQUE(account_key, command_id),
+                    FOREIGN KEY(account_key, command_id)
+                        REFERENCES ctp_dispatch_commands(account_key, command_id)
+                );
+                CREATE TRIGGER IF NOT EXISTS ctp_dispatch_authority_uses_immutable_update
+                BEFORE UPDATE ON ctp_dispatch_authority_uses
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP dispatch authority use is immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS ctp_dispatch_authority_uses_immutable_delete
+                BEFORE DELETE ON ctp_dispatch_authority_uses
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP dispatch authority use is immutable');
+                END;
                 CREATE TRIGGER IF NOT EXISTS ctp_dispatch_commands_immutable
                 BEFORE UPDATE OF account_key, scope_key, trading_day, operation,
                     command_id, request_payload_json, request_payload_sha256,
@@ -508,6 +602,12 @@ class SqliteExecutionStore:
                 )
                 return
             if version == "4":
+                cursor.execute(
+                    "UPDATE execution_meta SET value = ? WHERE key = ?",
+                    (str(self._SCHEMA_VERSION), "schema_version"),
+                )
+                return
+            if version == "5":
                 cursor.execute(
                     "UPDATE execution_meta SET value = ? WHERE key = ?",
                     (str(self._SCHEMA_VERSION), "schema_version"),
@@ -747,6 +847,45 @@ class SqliteExecutionStore:
         ):
             raise ContractValidationError("invalid " + field_name)
         return value
+
+    def _verify_ctp_dispatch_authority(
+        self,
+        verifier: CtpDispatchAuthorityVerifier,
+        command: CtpDispatchCommand,
+        *,
+        now_ns: int,
+    ) -> CtpDispatchAuthority:
+        """Invoke and structurally validate the required fresh action verifier."""
+
+        verify_action = getattr(verifier, "verify_action", None)
+        if not callable(verify_action):
+            raise ContractValidationError("fresh CTP dispatch authority verifier is required")
+        try:
+            authority = verify_action(command, now_ns=now_ns)
+        except Exception as error:
+            raise ContractValidationError(
+                "fresh CTP dispatch authority verification failed"
+            ) from error
+        if type(authority) is not CtpDispatchAuthority:
+            raise ContractValidationError("invalid typed CTP dispatch authority")
+        if authority.authority_type != "ctp_dispatch_authority.v1":
+            raise ContractValidationError("invalid CTP dispatch authority type")
+        self._validate_sha256(authority.command_binding_sha256, "authority command binding")
+        self._validate_sha256(authority.approval_digest, "authority approval digest")
+        self._validate_sha256(authority.source_digest_sha256, "authority source digest")
+        self._validate_command_identifier(authority.approval_use_id, "authority approval use id")
+        self._validate_command_identifier(authority.verifier_id, "authority verifier id")
+        if (
+            authority.command_binding_sha256 != command.authority_binding_sha256
+            or authority.approval_use_id != command.approval_use_id
+            or authority.approval_digest != command.approval_digest
+        ):
+            raise ContractValidationError("CTP dispatch authority binding does not match command")
+        if type(authority.verified_at_ns) is not int or authority.verified_at_ns != now_ns:
+            raise ContractValidationError("CTP dispatch authority was not freshly verified")
+        if type(authority.expires_at_ns) is not int or authority.expires_at_ns <= now_ns:
+            raise ContractValidationError("CTP dispatch authority is expired")
+        return authority
 
     @staticmethod
     def _reject_sensitive_command_fields(value: Any) -> None:
@@ -1459,18 +1598,25 @@ class SqliteExecutionStore:
         command_id: str,
         *,
         writer_lease: WriterLease,
+        authority_verifier: CtpDispatchAuthorityVerifier,
     ) -> Optional[CtpDispatchCommand]:
-        """Condition-claim one READY command after the OrderRef seed gate.
+        """Verify and condition-claim one READY command after the seed gate.
 
-        This is a durable local claim only. The caller-supplied watermark is a
-        local collision floor, not external account-writer fencing, native
-        login evidence, or dispatch authorization. No provider/SDK is called.
+        The verifier must freshly bind the exact staged action and its current
+        approval/source evidence. Its callback, one-use consumption row, and
+        READY-to-CLAIMED transition share one durable transaction. Approval
+        digests stored on commands or echoed by receipts are not authority.
+
+        This remains a local admission contract only: the verifier is injected,
+        and no provider/SDK is called here. The caller-supplied watermark is a
+        local collision floor, not external account-writer fencing or native
+        login evidence.
         """
 
         account_key, trading_day, scope_key = self._validate_ctp_order_identity_scope(scope)
         self._validate_command_identifier(command_id, "command_id")
-        now_ns = time.time_ns()
         with self._transaction() as cursor:
+            now_ns = time.time_ns()
             self._assert_active_writer_lease(cursor, scope, writer_lease)
             row = cursor.execute(
                 """
@@ -1534,6 +1680,10 @@ class SqliteExecutionStore:
                 raise ContractValidationError(
                     "CTP OrderRef predates or conflicts with the seeded watermark"
                 )
+            command = self._ctp_dispatch_command_from_row(row)
+            authority = self._verify_ctp_dispatch_authority(
+                authority_verifier, command, now_ns=now_ns
+            )
             cursor.execute(
                 """
                 UPDATE ctp_dispatch_commands
@@ -1553,6 +1703,28 @@ class SqliteExecutionStore:
             )
             if cursor.rowcount != 1:
                 return None
+            cursor.execute(
+                """
+                INSERT INTO ctp_dispatch_authority_uses (
+                    account_key, approval_use_id, command_id, command_binding_sha256,
+                    approval_digest, source_digest_sha256, verifier_id, verified_at_ns,
+                    expires_at_ns, writer_owner_id, fencing_token
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    account_key,
+                    authority.approval_use_id,
+                    command.command_id,
+                    authority.command_binding_sha256,
+                    authority.approval_digest,
+                    authority.source_digest_sha256,
+                    authority.verifier_id,
+                    authority.verified_at_ns,
+                    authority.expires_at_ns,
+                    writer_lease.owner_id,
+                    writer_lease.fencing_token,
+                ),
+            )
             claimed = cursor.execute(
                 "SELECT * FROM ctp_dispatch_commands WHERE account_key = ? AND command_id = ?",
                 (account_key, command_id),
