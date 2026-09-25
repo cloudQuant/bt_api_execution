@@ -18,7 +18,7 @@ from datetime import date
 from decimal import Decimal
 from pathlib import Path
 from threading import RLock
-from typing import TYPE_CHECKING, Any, Optional, Protocol, Tuple
+from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -885,12 +885,12 @@ class CtpDispatchCommand:
     request_payload: Mapping[str, Any]
     request_payload_sha256: str
     reservation_managed_intent_id: str
-    order_ref: Optional[str]
-    cancel_target_order_ref: Optional[str]
-    cancel_target_exchange_id: Optional[str]
-    cancel_target_order_sys_id: Optional[str]
-    cancel_target_front_id: Optional[int]
-    cancel_target_session_id: Optional[int]
+    order_ref: str | None
+    cancel_target_order_ref: str | None
+    cancel_target_exchange_id: str | None
+    cancel_target_order_sys_id: str | None
+    cancel_target_front_id: int | None
+    cancel_target_session_id: int | None
     approval_use_id: str
     approval_digest: str
     session_binding: Mapping[str, Any]
@@ -898,15 +898,15 @@ class CtpDispatchCommand:
     status: str
     created_at_ns: int
     updated_at_ns: int
-    claimed_at_ns: Optional[int]
-    claimed_owner_id: Optional[str]
-    claimed_fencing_token: Optional[int]
-    completed_at_ns: Optional[int]
-    unknown_at_ns: Optional[int]
-    unknown_reason: Optional[str]
-    native_receipt_payload: Optional[Mapping[str, Any]]
-    native_receipt_sha256: Optional[str]
-    completion_echo_sha256: Optional[str]
+    claimed_at_ns: int | None
+    claimed_owner_id: str | None
+    claimed_fencing_token: int | None
+    completed_at_ns: int | None
+    unknown_at_ns: int | None
+    unknown_reason: str | None
+    native_receipt_payload: Mapping[str, Any] | None
+    native_receipt_sha256: str | None
+    completion_echo_sha256: str | None
     correlation_key: CtpDispatchCorrelationKey | None = None
     local_queue_receipt_id: str | None = None
     local_queue_receipt_queued: bool | None = None
@@ -997,12 +997,12 @@ class CtpDispatchReceipt:
     operation: str
     request_payload_sha256: str
     reservation_managed_intent_id: str
-    order_ref: Optional[str]
-    cancel_target_order_ref: Optional[str]
-    cancel_target_exchange_id: Optional[str]
-    cancel_target_order_sys_id: Optional[str]
-    cancel_target_front_id: Optional[int]
-    cancel_target_session_id: Optional[int]
+    order_ref: str | None
+    cancel_target_order_ref: str | None
+    cancel_target_exchange_id: str | None
+    cancel_target_order_sys_id: str | None
+    cancel_target_front_id: int | None
+    cancel_target_session_id: int | None
     approval_use_id: str
     approval_digest: str
     session_binding_sha256: str
@@ -3413,9 +3413,9 @@ class SqliteExecutionStore:
         approval_digest: str,
         session_binding: Mapping[str, Any],
         writer_lease: WriterLease,
-        managed_intent_id: Optional[str] = None,
-        order_ref: Optional[str] = None,
-        cancel_target: Optional[CtpCancelTarget] = None,
+        managed_intent_id: str | None = None,
+        order_ref: str | None = None,
+        cancel_target: CtpCancelTarget | None = None,
         managed_action_id: str | None = None,
         session_generation_id: str | None = None,
         dispatch_front_id: int | None = None,
@@ -3486,12 +3486,12 @@ class SqliteExecutionStore:
         session_digest = payload_sha256(session_value)
 
         reservation_managed_intent_id: str
-        persisted_order_ref: Optional[str]
-        persisted_cancel_target: Optional[str]
-        cancel_exchange_id: Optional[str] = None
-        cancel_order_sys_id: Optional[str] = None
-        cancel_front_id: Optional[int] = None
-        cancel_session_id: Optional[int] = None
+        persisted_order_ref: str | None
+        persisted_cancel_target: str | None
+        cancel_exchange_id: str | None = None
+        cancel_order_sys_id: str | None = None
+        cancel_front_id: int | None = None
+        cancel_session_id: int | None = None
         if operation == "SUBMIT":
             if managed_intent_id is None or order_ref is None or cancel_target is not None:
                 raise ContractValidationError("SUBMIT requires its reserved intent and OrderRef")
@@ -3785,7 +3785,7 @@ class SqliteExecutionStore:
 
     def read_ctp_dispatch_command(
         self, scope: ExecutionScope, command_id: str
-    ) -> Optional[CtpDispatchCommand]:
+    ) -> CtpDispatchCommand | None:
         """Read a canonical CTP command without changing its dispatch state."""
 
         account_key, _, scope_key = self._validate_ctp_order_identity_scope(scope)
@@ -4181,7 +4181,7 @@ class SqliteExecutionStore:
         writer_lease: WriterLease,
         authority_verifier: CtpDispatchAuthorityVerifier,
         required_local_queue_receipt_id: str | None = None,
-    ) -> Optional[CtpDispatchCommand]:
+    ) -> CtpDispatchCommand | None:
         """Verify and condition-claim one READY command after the seed gate.
 
         The verifier must freshly bind the exact staged action and its current
@@ -4375,7 +4375,7 @@ class SqliteExecutionStore:
             return self._ctp_dispatch_command_from_row(claimed)
 
     @staticmethod
-    def _ctp_dispatch_receipt_payload(receipt: CtpDispatchReceipt) -> Tuple[str, str, str]:
+    def _ctp_dispatch_receipt_payload(receipt: CtpDispatchReceipt) -> tuple[str, str, str]:
         if (
             type(receipt) is not CtpDispatchReceipt
             or receipt.receipt_type != "ctp_dispatch_receipt.v2"
@@ -5280,7 +5280,7 @@ class SqliteExecutionStore:
         scope: ExecutionScope,
         *,
         writer_lease: WriterLease,
-    ) -> Tuple[CtpDispatchCommand, ...]:
+    ) -> tuple[CtpDispatchCommand, ...]:
         """Recover prior-generation CLAIMED commands account-wide; never replay.
 
         One account writer lease covers every strategy scope and trading day,

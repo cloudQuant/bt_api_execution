@@ -14,7 +14,12 @@ from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any, Protocol
 
 from .contracts import CancelIntent, CancelObservation, ExecutionScope, ExecutionState
-from .errors import AdmissionDenied, AdmissionRequired, ContractValidationError, WriterLeaseUnavailable
+from .errors import (
+    AdmissionDenied,
+    AdmissionRequired,
+    ContractValidationError,
+    WriterLeaseUnavailable,
+)
 from .store import WriterLease
 
 if TYPE_CHECKING:

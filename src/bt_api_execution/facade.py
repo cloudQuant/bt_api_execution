@@ -6,7 +6,12 @@ from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
 from .contracts import ExecutionScope, ExecutionState, OrderIntent, ProviderObservation
-from .errors import AdmissionDenied, AdmissionRequired, ContractValidationError, WriterLeaseUnavailable
+from .errors import (
+    AdmissionDenied,
+    AdmissionRequired,
+    ContractValidationError,
+    WriterLeaseUnavailable,
+)
 
 if TYPE_CHECKING:
     from .ports import AdmissionGate, DispatchPort, ReconciliationPort
