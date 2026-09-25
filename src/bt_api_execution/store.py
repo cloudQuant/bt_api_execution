@@ -148,7 +148,11 @@ class CtpOrderRefSeedProof:
 
 @dataclass(frozen=True)
 class CtpDispatchCommand:
-    """Immutable staged CTP request plus its durable local dispatch state."""
+    """Immutable staged request plus local dispatch state, not provider order state.
+
+    ``COMPLETED`` means a typed local native-call receipt was persisted. It does
+    not mean the provider accepted, filled, or cancelled the order.
+    """
 
     account_key: str
     scope_key: str
@@ -251,7 +255,8 @@ class CtpDispatchReceipt:
     """Typed local queue receipt echoing every immutable command binding.
 
     ``native_receipt_payload`` is retained as evidence only. Outcomes describe
-    local queue disposition and are not provider acknowledgements.
+    local dispatch disposition and are not provider order or cancellation
+    acknowledgements.
     """
 
     receipt_type: str
@@ -1786,7 +1791,11 @@ class SqliteExecutionStore:
         *,
         writer_lease: WriterLease,
     ) -> CtpDispatchCommand:
-        """Persist a typed receipt only when every command binding echoes."""
+        """Persist a local receipt only when every command binding echoes.
+
+        A ``QUEUED`` receipt completes the local dispatch receipt step only. It
+        never advances a provider order or cancel-action state projection.
+        """
 
         account_key, _, scope_key = self._validate_ctp_order_identity_scope(scope)
         native_json, native_digest, echo_json = self._ctp_dispatch_receipt_payload(receipt)

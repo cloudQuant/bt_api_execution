@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 import traceback
@@ -622,6 +623,49 @@ def test_receipt_requires_exact_typed_echo_and_is_idempotently_stored(tmp_path):
 
 
 @pytest.mark.unit
+def test_queued_receipt_is_local_dispatch_fact_not_provider_ack(tmp_path):
+    store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
+    scope = _scope()
+    lease = _lease(store, scope)
+    try:
+        reservation = _reserve_seeded(store, scope, lease)
+        staged = _stage_submit(store, scope, lease, reservation)
+        claimed = store.claim_ctp_dispatch_command(
+            scope,
+            staged.command_id,
+            writer_lease=lease,
+            authority_verifier=_authority_verifier(),
+        )
+        assert claimed is not None
+        completed = store.complete_ctp_dispatch_command(
+            scope,
+            _receipt(claimed, outcome="QUEUED", native={"request_id": 17, "queue_code": 0}),
+            writer_lease=lease,
+        )
+        assert completed.status == "COMPLETED"
+        assert completed.native_receipt_payload == {"request_id": 17, "queue_code": 0}
+        persisted_echo = store._connection.execute(
+            """
+            SELECT completion_echo_json FROM ctp_dispatch_commands
+            WHERE account_key = ? AND command_id = ?
+            """,
+            (completed.account_key, completed.command_id),
+        ).fetchone()
+        assert persisted_echo is not None
+        assert json.loads(persisted_echo["completion_echo_json"])["outcome"] == "QUEUED"
+        # The v6 local outbox has no provider order/cancel projection to advance.
+        assert (
+            store._connection.execute("SELECT COUNT(*) FROM execution_records").fetchone()[0] == 0
+        )
+        assert (
+            store._connection.execute("SELECT COUNT(*) FROM cancellation_records").fetchone()[0]
+            == 0
+        )
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
 def test_two_store_claim_race_has_one_local_claimant(tmp_path):
     path = tmp_path / "execution.sqlite3"
     first = SqliteExecutionStore(path)
@@ -689,6 +733,14 @@ def test_restart_recovery_marks_prior_claim_unknown_without_replay(tmp_path):
         assert recovered[0].status == "UNKNOWN"
         assert recovered[0].native_receipt_payload is None
         assert recovered[0].unknown_reason == "claimed_without_receipt_after_writer_change"
+        # No callback/query evidence was supplied after restart; UNKNOWN remains durable.
+        assert reopened.read_ctp_dispatch_command(scope, staged.command_id).status == "UNKNOWN"
+        with pytest.raises(InvalidStateTransition, match="not CLAIMED"):
+            reopened.complete_ctp_dispatch_command(
+                scope,
+                _receipt(recovered[0], outcome="QUEUED"),
+                writer_lease=new_lease,
+            )
         assert (
             reopened.claim_ctp_dispatch_command(
                 scope,

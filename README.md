@@ -123,3 +123,8 @@ and any later receipt digest are evidence echoes only. This package supplies
 the verifier interface and fake-only tests, not a deployed verifier, external
 account-wide writer fence, native callback reconciliation, native SDK import,
 or provider write route.
+
+The callback-correlation and UNKNOWN-recovery contract is design-only in
+[`docs/ctp-command-reconciliation-adr.md`](docs/ctp-command-reconciliation-adr.md):
+until exact native action IDs and complete verified recovery evidence exist,
+the outbox keeps UNKNOWN fenced and creates no provider order-state projection.
