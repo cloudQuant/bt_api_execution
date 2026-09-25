@@ -76,7 +76,7 @@ def test_v2_execution_store_adds_nullable_cumulative_commission_column(tmp_path)
             "SELECT value FROM execution_meta WHERE key = 'schema_version'"
         ).fetchone()["value"]
         assert "cumulative_commission" in columns
-        assert version == "12"
+        assert version == "13"
     finally:
         store.close()
 
@@ -107,16 +107,18 @@ def test_v3_execution_store_adds_ctp_order_identity_reservations(tmp_path) -> No
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-        assert version == "12"
+        assert version == "13"
         assert "ctp_order_identity_reservations" in tables
         assert "ctp_dispatch_commands" in tables
         assert "ctp_dispatch_authority_uses" in tables
+        assert "ctp_order_target_projections" in tables
+        assert "ctp_order_target_projection_consumptions" in tables
     finally:
         store.close()
 
 
 @pytest.mark.unit
-def test_v10_execution_store_adds_callback_ingestion_guard_schema(tmp_path) -> None:
+def test_v10_execution_store_adds_callback_lifecycle_fence_schema(tmp_path) -> None:
     path = tmp_path / "execution.sqlite3"
     connection = sqlite3.connect(path)
     try:
@@ -141,11 +143,83 @@ def test_v10_execution_store_adds_callback_ingestion_guard_schema(tmp_path) -> N
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-        assert version == "12"
+        assert version == "13"
         assert "ctp_dispatch_callback_source_lifecycle_fences" in tables
         assert "ctp_dispatch_callback_ingestion_resolutions" not in tables
+        assert "ctp_order_target_projections" in tables
+        assert "ctp_order_target_projection_consumptions" in tables
     finally:
         store.close()
+
+
+@pytest.mark.unit
+def test_v10_execution_store_migrates_immutable_cancel_target_projection_tables(tmp_path) -> None:
+    path = tmp_path / "execution.sqlite3"
+    store = SqliteExecutionStore(path)
+    store.close()
+
+    # Model a schema-10 file by removing only the schema-11 target tables,
+    # their indexes/triggers, and restoring the prior version marker.
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("DROP TABLE ctp_order_target_projection_consumptions")
+        connection.execute("DROP TABLE ctp_order_target_projections")
+        connection.execute("UPDATE execution_meta SET value = '10' WHERE key = 'schema_version'")
+        connection.commit()
+    finally:
+        connection.close()
+
+    migrated = SqliteExecutionStore(path)
+    try:
+        version = migrated._connection.execute(
+            "SELECT value FROM execution_meta WHERE key = 'schema_version'"
+        ).fetchone()["value"]
+        tables = {
+            str(row["name"])
+            for row in migrated._connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        projection_columns = {
+            str(row["name"])
+            for row in migrated._connection.execute(
+                "PRAGMA table_info(ctp_order_target_projections)"
+            ).fetchall()
+        }
+        indexes = {
+            str(row["name"])
+            for row in migrated._connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            ).fetchall()
+        }
+        triggers = {
+            str(row["name"])
+            for row in migrated._connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+            ).fetchall()
+        }
+        assert version == "13"
+        assert {
+            "ctp_order_target_projections",
+            "ctp_order_target_projection_consumptions",
+            "ctp_dispatch_callback_source_lifecycle_fences",
+        }.issubset(tables)
+        assert {
+            "session_generation_id",
+            "connection_generation",
+            "query_front_id",
+            "query_session_id",
+            "query_request_id",
+            "projection_payload_json",
+            "projection_sha256",
+        }.issubset(projection_columns)
+        assert "ctp_order_target_query_request_once" in indexes
+        assert "ctp_order_target_projections_immutable_update" in triggers
+        assert "ctp_order_target_projections_immutable_delete" in triggers
+        assert "ctp_order_target_consumptions_immutable_update" in triggers
+        assert "ctp_order_target_consumptions_immutable_delete" in triggers
+    finally:
+        migrated.close()
 
 
 def _ctp_scope(*, day: str = "20260925", strategy: str = "strategy.demo") -> ExecutionScope:
