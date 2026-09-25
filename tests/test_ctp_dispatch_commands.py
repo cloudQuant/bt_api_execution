@@ -16,6 +16,8 @@ from bt_api_execution import (
     ContractValidationError,
     CtpCancelTarget,
     CtpDispatchAuthority,
+    CtpDispatchCallbackKey,
+    CtpDispatchCorrelationKey,
     CtpDispatchReceipt,
     CtpOrderRefSeedProof,
     DurableStoreError,
@@ -27,6 +29,7 @@ from bt_api_execution import (
     Side,
     SqliteExecutionStore,
     WriterLeaseUnavailable,
+    require_ctp_dispatch_callback_match,
 )
 
 
@@ -36,6 +39,19 @@ def _scope() -> ExecutionScope:
 
 def _runtime_id(value: str) -> str:
     return "bt-managed-v1:" + sha256(value.encode("ascii")).hexdigest()
+
+
+def _native_request_id(value: str) -> int:
+    return int.from_bytes(sha256(value.encode("ascii")).digest()[:4], "big") % 2_147_483_646 + 1
+
+
+def _session_binding(generation="test-session-generation", front_id=4, session_id=91):
+    return {
+        "session_identity": "opaque-session-v1",
+        "session_generation_id": generation,
+        "dispatch_front_id": front_id,
+        "dispatch_session_id": session_id,
+    }
 
 
 def _proof(day: str = "20260925") -> CtpOrderRefSeedProof:
@@ -74,6 +90,10 @@ def _stage_submit(
     command_id="command-1",
     payload=None,
     approval_use_id="approval-use-1",
+    session_generation_id="test-session-generation",
+    dispatch_front_id=4,
+    dispatch_session_id=91,
+    native_request_id=None,
 ):
     request = dict(
         payload or {"InstrumentID": "rb2710", "LimitPrice": "3510.5", "VolumeTotalOriginal": 1}
@@ -86,16 +106,25 @@ def _stage_submit(
         request,
         approval_use_id=approval_use_id,
         approval_digest=sha256(b"approval receipt digest").hexdigest(),
-        session_binding={"session_identity": "opaque-session-v1"},
+        session_binding=_session_binding(
+            session_generation_id, dispatch_front_id, dispatch_session_id
+        ),
         writer_lease=lease,
         managed_intent_id=reservation.managed_intent_id,
         order_ref=reservation.order_ref,
+        managed_action_id=reservation.managed_intent_id,
+        session_generation_id=session_generation_id,
+        dispatch_front_id=dispatch_front_id,
+        dispatch_session_id=dispatch_session_id,
+        native_request_id=(
+            _native_request_id(command_id) if native_request_id is None else native_request_id
+        ),
     )
 
 
 def _receipt(command, *, outcome="QUEUED", native=None):
     return CtpDispatchReceipt(
-        receipt_type="ctp_dispatch_receipt.v1",
+        receipt_type="ctp_dispatch_receipt.v2",
         command_id=command.command_id,
         account_key=command.account_key,
         scope_key=command.scope_key,
@@ -114,7 +143,32 @@ def _receipt(command, *, outcome="QUEUED", native=None):
         session_binding_sha256=command.session_binding_sha256,
         outcome=outcome,
         native_receipt_payload=native or {"queue_code": 0},
+        correlation_key=command.correlation_key,
     )
+
+
+def _callback(command, *, event_id="event-1", **overrides):
+    key = command.correlation_key
+    assert key is not None
+    values = {
+        "version": 1,
+        "correlation_key": key,
+        "callback_family": "ORDER" if command.operation == "SUBMIT" else "CANCEL_ACTION",
+        "stream_id": "fake-td-callback-stream",
+        "event_id": event_id,
+        "native_request_id": key.native_request_id,
+        "native_action_ref": key.native_action_ref,
+        "order_ref": key.order_ref,
+    }
+    if command.operation == "CANCEL":
+        values.update(
+            exchange_id=key.cancel_target_exchange_id,
+            order_sys_id=key.cancel_target_order_sys_id,
+            target_front_id=key.cancel_target_front_id,
+            target_session_id=key.cancel_target_session_id,
+        )
+    values.update(overrides)
+    return CtpDispatchCallbackKey(**values)
 
 
 class _FakeCtpDispatchAuthorityVerifier:
@@ -164,7 +218,7 @@ class _ControlledClock:
 
 
 @pytest.mark.unit
-def test_v4_execution_store_migrates_to_command_outbox_v6(tmp_path):
+def test_v4_execution_store_migrates_to_typed_ctp_correlation_v7(tmp_path):
     path = tmp_path / "execution.sqlite3"
     scope = _scope()
     legacy_intent = OrderIntent.limit(
@@ -191,7 +245,8 @@ def test_v4_execution_store_migrates_to_command_outbox_v6(tmp_path):
 
     # A v4 database has the execution journal, event outbox, lease, and CTP
     # identity tables. The command and OrderRef watermark tables were added in
-    # v5, then one-use authority consumption was added in v6.
+    # v5 added commands, v6 added one-use authority, and v7 adds typed
+    # per-action/session correlation keys.
     connection = sqlite3.connect(path)
     try:
         connection.execute("DROP TABLE ctp_dispatch_authority_uses")
@@ -213,7 +268,7 @@ def test_v4_execution_store_migrates_to_command_outbox_v6(tmp_path):
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-        assert version == "6"
+        assert version == "7"
         assert "ctp_dispatch_commands" in tables
         assert "ctp_order_ref_watermarks" in tables
         assert "ctp_dispatch_authority_uses" in tables
@@ -259,8 +314,60 @@ def test_v5_execution_store_migrates_one_use_authority_table(tmp_path):
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-        assert version == "6"
+        assert version == "7"
         assert "ctp_dispatch_authority_uses" in tables
+    finally:
+        migrated.close()
+
+
+@pytest.mark.unit
+def test_v6_staged_command_without_typed_keys_migrates_to_unknown(tmp_path):
+    path = tmp_path / "execution.sqlite3"
+    store = SqliteExecutionStore(path)
+    scope = _scope()
+    lease = _lease(store, scope)
+    reservation = _reserve_seeded(store, scope, lease)
+    staged = _stage_submit(store, scope, lease, reservation)
+    store.close()
+
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("DROP INDEX ctp_dispatch_session_request_unique")
+        connection.execute("DROP INDEX ctp_dispatch_managed_action_unique")
+        connection.execute("DROP TRIGGER ctp_dispatch_commands_immutable")
+        for column in (
+            "native_action_ref",
+            "native_request_id",
+            "dispatch_session_id",
+            "dispatch_front_id",
+            "session_generation_id",
+            "managed_action_id",
+            "runtime_order_id",
+            "correlation_version",
+        ):
+            connection.execute(f"ALTER TABLE ctp_dispatch_commands DROP COLUMN {column}")
+        connection.execute("UPDATE execution_meta SET value = '6' WHERE key = 'schema_version'")
+        connection.commit()
+    finally:
+        connection.close()
+
+    migrated = SqliteExecutionStore(path)
+    try:
+        row = migrated.read_ctp_dispatch_command(scope, staged.command_id)
+        assert row is not None
+        assert row.status == "UNKNOWN"
+        assert row.correlation_key is None
+        assert row.unknown_reason == "legacy_command_missing_correlation_keys"
+        assert (
+            migrated.claim_ctp_dispatch_command(
+                scope,
+                staged.command_id,
+                writer_lease=_lease(migrated, scope),
+                authority_verifier=_authority_verifier(),
+            )
+            is None
+        )
+        assert migrated.read_ctp_dispatch_command(scope, staged.command_id).status == "UNKNOWN"
     finally:
         migrated.close()
 
@@ -331,6 +438,191 @@ def test_stage_is_idempotent_and_rejects_conflicting_command_identity(tmp_path):
 
 
 @pytest.mark.unit
+def test_submit_correlation_binds_runtime_action_and_session_keys(tmp_path):
+    store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
+    scope = _scope()
+    lease = _lease(store, scope)
+    try:
+        reservation = _reserve_seeded(store, scope, lease)
+        command = _stage_submit(store, scope, lease, reservation)
+        key = command.correlation_key
+        assert isinstance(key, CtpDispatchCorrelationKey)
+        assert key.runtime_order_id == reservation.runtime_order_id
+        assert key.managed_action_id == reservation.managed_intent_id
+        assert key.order_ref == reservation.order_ref
+        assert key.session_generation_id == "test-session-generation"
+        assert (key.dispatch_front_id, key.dispatch_session_id) == (4, 91)
+        assert key.native_request_id == _native_request_id(command.command_id)
+        assert command.status == "READY"
+        assert require_ctp_dispatch_callback_match(command, _callback(command))
+        assert store.read_ctp_dispatch_command(scope, command.command_id).correlation_key == key
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+def test_callback_key_rejects_cross_scope_session_and_native_id_mismatches(tmp_path):
+    store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
+    first_scope = _scope()
+    lease = _lease(store, first_scope)
+    try:
+        first_reservation = _reserve_seeded(store, first_scope, lease, "intent-first")
+        first = _stage_submit(store, first_scope, lease, first_reservation, "command-first")
+        callback = _callback(first)
+        assert require_ctp_dispatch_callback_match(first, callback) == callback
+
+        other_scope = ExecutionScope(
+            "CTP", "simulation", "acct-outbox", "strategy.other", "20260925"
+        )
+        other_reservation = _reserve_seeded(store, other_scope, lease, "intent-other")
+        other = _stage_submit(
+            store,
+            other_scope,
+            lease,
+            other_reservation,
+            "command-other",
+            approval_use_id="approval-use-other-scope",
+        )
+        with pytest.raises(ContractValidationError, match="correlation does not match"):
+            require_ctp_dispatch_callback_match(first, _callback(other))
+
+        wrong_generation = replace(
+            callback,
+            correlation_key=replace(
+                first.correlation_key, session_generation_id="stale-session-generation"
+            ),
+        )
+        with pytest.raises(ContractValidationError, match="correlation does not match"):
+            require_ctp_dispatch_callback_match(first, wrong_generation)
+        with pytest.raises(ContractValidationError, match="RequestID"):
+            require_ctp_dispatch_callback_match(
+                first, replace(callback, native_request_id=callback.native_request_id + 1)
+            )
+        with pytest.raises(ContractValidationError, match="OrderRef"):
+            require_ctp_dispatch_callback_match(first, replace(callback, order_ref="000000000999"))
+        # Matching is structural only and never changes local or provider state.
+        assert store.read_ctp_dispatch_command(first_scope, first.command_id).status == "READY"
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+def test_session_generation_and_request_id_cannot_be_rebound_or_reused(tmp_path):
+    store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
+    scope = _scope()
+    lease = _lease(store, scope)
+    try:
+        first_reservation = _reserve_seeded(store, scope, lease, "intent-first")
+        first = _stage_submit(store, scope, lease, first_reservation, "command-first")
+        second_reservation = _reserve_seeded(store, scope, lease, "intent-second")
+
+        with pytest.raises(ContractValidationError, match="session generation was reused"):
+            _stage_submit(
+                store,
+                scope,
+                lease,
+                second_reservation,
+                "command-other-session-binding",
+                dispatch_front_id=5,
+            )
+        with pytest.raises(IntentConflictError, match="RequestID is already bound"):
+            _stage_submit(
+                store,
+                scope,
+                lease,
+                second_reservation,
+                "command-reused-request-id",
+                native_request_id=first.correlation_key.native_request_id,
+            )
+        mismatched_binding = _session_binding()
+        with pytest.raises(ContractValidationError, match="typed CTP session keys"):
+            store.stage_ctp_dispatch_command(
+                scope,
+                "command-mismatch-session-echo",
+                "SUBMIT",
+                {"InstrumentID": "rb2710", "OrderRef": second_reservation.order_ref},
+                approval_use_id="approval-use-mismatch-session-echo",
+                approval_digest=sha256(b"mismatch session echo").hexdigest(),
+                session_binding=mismatched_binding,
+                writer_lease=lease,
+                managed_intent_id=second_reservation.managed_intent_id,
+                order_ref=second_reservation.order_ref,
+                managed_action_id=second_reservation.managed_intent_id,
+                session_generation_id="other-session-generation",
+                dispatch_front_id=4,
+                dispatch_session_id=91,
+                native_request_id=_native_request_id("command-mismatch-session-echo"),
+            )
+        assert store.read_ctp_dispatch_command(scope, "command-first") == first
+        assert store.read_ctp_dispatch_command(scope, "command-reused-request-id") is None
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+def test_cancel_correlation_keeps_action_separate_from_exact_order_target(tmp_path):
+    store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
+    scope = _scope()
+    lease = _lease(store, scope)
+    try:
+        reservation = _reserve_seeded(store, scope, lease)
+        target = CtpCancelTarget(
+            order_ref=reservation.order_ref,
+            exchange_id="SHFE",
+            order_sys_id="sys-order-17",
+            front_id=4,
+            session_id=91,
+        )
+        command_id = "cancel-correlation-1"
+        request = {
+            "OrderRef": target.order_ref,
+            "ExchangeID": target.exchange_id,
+            "OrderSysID": target.order_sys_id,
+            "FrontID": target.front_id,
+            "SessionID": target.session_id,
+            "ActionFlag": "0",
+        }
+        command = store.stage_ctp_dispatch_command(
+            scope,
+            command_id,
+            "CANCEL",
+            request,
+            approval_use_id="approval-use-cancel-correlation",
+            approval_digest=sha256(b"cancel correlation approval").hexdigest(),
+            session_binding=_session_binding(),
+            writer_lease=lease,
+            cancel_target=target,
+            managed_action_id="managed-cancel-action-1",
+            session_generation_id="test-session-generation",
+            dispatch_front_id=4,
+            dispatch_session_id=91,
+            native_request_id=_native_request_id(command_id),
+            native_action_ref="native-action-ref-1",
+        )
+        key = command.correlation_key
+        assert key is not None
+        assert key.managed_action_id == "managed-cancel-action-1"
+        assert key.managed_action_id != key.reservation_managed_intent_id
+        assert key.runtime_order_id == reservation.runtime_order_id
+        assert (key.order_ref, key.cancel_target_exchange_id, key.cancel_target_order_sys_id) == (
+            target.order_ref,
+            target.exchange_id,
+            target.order_sys_id,
+        )
+        callback = _callback(command)
+        assert require_ctp_dispatch_callback_match(command, callback) == callback
+        with pytest.raises(ContractValidationError, match="target does not match"):
+            _callback(command, target_session_id=callback.target_session_id + 1)
+        with pytest.raises(ContractValidationError, match="ActionRef"):
+            require_ctp_dispatch_callback_match(
+                command, replace(callback, native_action_ref="different-action-ref")
+            )
+        assert store.read_ctp_dispatch_command(scope, command_id).status == "READY"
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
 def test_approval_use_id_cannot_bind_two_account_commands(tmp_path):
     store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
     scope = _scope()
@@ -379,10 +671,18 @@ def test_command_payload_rejects_nested_credential_shaped_fields(tmp_path, paylo
                 {"InstrumentID": "rb2710"},
                 approval_use_id="approval-use-1",
                 approval_digest=sha256(b"approval receipt digest").hexdigest(),
-                session_binding={"nested": {"access_token": "never-store-this"}},
+                session_binding={
+                    **_session_binding(),
+                    "nested": {"access_token": "never-store-this"},
+                },
                 writer_lease=lease,
                 managed_intent_id=reservation.managed_intent_id,
                 order_ref=reservation.order_ref,
+                managed_action_id=reservation.managed_intent_id,
+                session_generation_id="test-session-generation",
+                dispatch_front_id=4,
+                dispatch_session_id=91,
+                native_request_id=_native_request_id("command-session-secret"),
             )
     finally:
         store.close()
@@ -660,7 +960,7 @@ def test_receipt_requires_exact_typed_echo_and_is_idempotently_stored(tmp_path):
 
         wrong = _receipt(claimed)
         wrong = CtpDispatchReceipt(**{**wrong.__dict__, "session_binding_sha256": "0" * 64})
-        with pytest.raises(ContractValidationError, match="echo does not match"):
+        with pytest.raises(ContractValidationError, match="correlation echo is inconsistent"):
             store.complete_ctp_dispatch_command(scope, wrong, writer_lease=lease)
 
         receipt = _receipt(claimed, native={"request_id": 0, "queue_code": 0})
@@ -722,7 +1022,7 @@ def test_queued_receipt_is_local_dispatch_fact_not_provider_ack(tmp_path):
         ).fetchone()
         assert persisted_echo is not None
         assert json.loads(persisted_echo["completion_echo_json"])["outcome"] == "QUEUED"
-        # The v6 local outbox has no provider order/cancel projection to advance.
+        # The v7 local outbox has no provider order/cancel projection to advance.
         assert (
             store._connection.execute("SELECT COUNT(*) FROM execution_records").fetchone()[0] == 0
         )
@@ -800,8 +1100,13 @@ def test_restart_recovery_marks_prior_claim_unknown_without_replay(tmp_path):
         recovered = reopened.recover_claimed_ctp_dispatch_commands(scope, writer_lease=new_lease)
         assert len(recovered) == 1
         assert recovered[0].status == "UNKNOWN"
+        assert recovered[0].correlation_key == staged.correlation_key
         assert recovered[0].native_receipt_payload is None
         assert recovered[0].unknown_reason == "claimed_without_receipt_after_writer_change"
+        # The fake key matcher proves structure only; it neither resolves UNKNOWN
+        # nor changes the outbox state after restart.
+        assert require_ctp_dispatch_callback_match(recovered[0], _callback(recovered[0]))
+        assert reopened.read_ctp_dispatch_command(scope, staged.command_id).status == "UNKNOWN"
         # No callback/query evidence was supplied after restart; UNKNOWN remains durable.
         assert reopened.read_ctp_dispatch_command(scope, staged.command_id).status == "UNKNOWN"
         with pytest.raises(InvalidStateTransition, match="not CLAIMED"):
@@ -917,9 +1222,15 @@ def test_cancel_command_binds_orderref_exchange_system_order_and_session_ids(tmp
             request,
             approval_use_id="approval-use-cancel",
             approval_digest=sha256(b"cancel approval").hexdigest(),
-            session_binding={"session_identity": "opaque-session-v1"},
+            session_binding=_session_binding(),
             writer_lease=lease,
             cancel_target=target,
+            managed_action_id="cancel-action-1",
+            session_generation_id="test-session-generation",
+            dispatch_front_id=4,
+            dispatch_session_id=91,
+            native_request_id=_native_request_id("cancel-1"),
+            native_action_ref="native-action-1",
         )
         assert cancel.cancel_target_order_ref == target.order_ref
         assert cancel.cancel_target_exchange_id == "SHFE"
@@ -936,9 +1247,15 @@ def test_cancel_command_binds_orderref_exchange_system_order_and_session_ids(tmp
                 mismatched,
                 approval_use_id="approval-use-cancel",
                 approval_digest=sha256(b"cancel approval").hexdigest(),
-                session_binding={"session_identity": "opaque-session-v1"},
+                session_binding=_session_binding(),
                 writer_lease=lease,
                 cancel_target=target,
+                managed_action_id="cancel-action-2",
+                session_generation_id="test-session-generation",
+                dispatch_front_id=4,
+                dispatch_session_id=91,
+                native_request_id=_native_request_id("cancel-2"),
+                native_action_ref="native-action-2",
             )
     finally:
         store.close()
@@ -973,9 +1290,15 @@ def test_cancel_claim_authority_binds_exact_native_target(tmp_path):
             request,
             approval_use_id="approval-use-cancel-authority",
             approval_digest=sha256(b"cancel action receipt digest").hexdigest(),
-            session_binding={"session_identity": "opaque-session-v1"},
+            session_binding=_session_binding(),
             writer_lease=lease,
             cancel_target=target,
+            managed_action_id="cancel-action-authority-1",
+            session_generation_id="test-session-generation",
+            dispatch_front_id=4,
+            dispatch_session_id=91,
+            native_request_id=_native_request_id("cancel-authority-1"),
+            native_action_ref="native-action-authority-1",
         )
         changed_target = replace(
             staged, cancel_target_session_id=staged.cancel_target_session_id + 1
@@ -1045,9 +1368,15 @@ def test_cancel_command_rejects_modify_action_or_fields(tmp_path, field, value, 
                 request,
                 approval_use_id="approval-use-cancel-" + field,
                 approval_digest=sha256(b"cancel approval").hexdigest(),
-                session_binding={"session_identity": "opaque-session-v1"},
+                session_binding=_session_binding(),
                 writer_lease=lease,
                 cancel_target=target,
+                managed_action_id="cancel-action-invalid-" + field,
+                session_generation_id="test-session-generation",
+                dispatch_front_id=4,
+                dispatch_session_id=91,
+                native_request_id=_native_request_id("cancel-invalid-" + field),
+                native_action_ref="native-action-invalid-" + field,
             )
     finally:
         store.close()

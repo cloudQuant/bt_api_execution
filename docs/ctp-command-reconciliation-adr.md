@@ -209,15 +209,29 @@ are echo fields only. Fresh action approval must still be checked by the
 trusted verifier during `claim_ctp_dispatch_command`; the one-use
 authorization and claim stay in that same SQLite transaction.
 
-The current outbox command does not expose a typed `runtime_order_id` or a
-typed per-action identity, and a generic `command_id` is not automatically the
-Backtrader runtime order ID or cancel action ID. A future schema must persist
-these separately and bind `runtime_order_id` to the exact durable OrderRef
-reservation. For submit, the handoff's `managed_intent_id` identifies the
-reservation. For cancel, `managed_intent_id` identifies the original order
-while `runtime_action_id` equals the distinct `managed_cancel_intent_id`; the
-SDK command currently has no typed field for that cancel action identity.
-Do not overload `reservation_managed_intent_id` with the cancel ID.
+The offline schema-v7 candidate now persists and returns a version-1 typed
+`CtpDispatchCorrelationKey` for newly staged commands. It binds the exact
+account, scope, trading day, operation, command ID, canonical request digest,
+reservation intent, managed action ID, reserved runtime order ID and OrderRef,
+approval-use/digest echoes, session-binding digest, non-reused session
+generation ID, dispatch FrontID/SessionID, native RequestID, and optional
+cancel ActionRef. The store obtains `runtime_order_id` from the exact durable
+OrderRef reservation rather than caller input. Submit's action ID must equal
+the reservation intent; cancel's action ID is explicit and distinct from the
+target reservation intent. These key fields are persisted in immutable command
+columns and echoed by the local receipt. Legacy READY/CLAIMED rows without
+these keys migrate to `UNKNOWN`, preserving the fail-closed fence.
+
+`CtpDispatchCallbackKey` and `require_ctp_dispatch_callback_match` are also
+offline, pure DTO/matching seams. The callback key carries the full command
+correlation key plus callback family, stream/event ID, native RequestID and
+ActionRef, callback OrderRef, optional ExchangeID/OrderSysID, and exact cancel
+target FrontID/SessionID. Matching rejects structural mismatches only. These
+types do not verify native callback provenance, are not durably appended, and
+cannot update order/cancel projections or clear `UNKNOWN`; caller-supplied IDs
+or digests are not evidence. The ActionRef and RequestID fields are opaque
+correlation values here, not a claim that a specific native callback family
+echoes them.
 
 Cancel matching also needs an explicit versioned target tuple:
 `OrderRef`, `ExchangeID`, `OrderSysID`, `FrontID`, and `SessionID`. The SDK
@@ -229,13 +243,13 @@ must reject until the handoff version types and validates the same target
 tuple. It must also keep the cancel action's own native `ActionRef` and/or
 `RequestID` distinct from the target order identifiers.
 
-The session binding must include a durable, non-reused native session
-generation in addition to exact TD `FrontID`/`SessionID`, selected MD/TD pair,
-and session-binding digest. `FrontID`/`SessionID` alone can be reused, the
-current submit handoff lacks typed session identity, and the outbox's
-`session_binding` is an unconstrained mapping whose digest does not reveal or
-validate its contents. No generation or login readiness may be inferred from
-a queue receipt. MD and TD readiness must be independently typed and fresh
+The new outbox key requires a caller-supplied session generation and exact TD
+`FrontID`/`SessionID`, but does not establish that the generation is durable,
+non-reused, or sourced from a verified native login. The `session_binding`
+mapping remains an unconstrained input; its digest does not reveal or validate
+its contents. The Backtrader handoff still lacks matching typed session
+identity. No generation or login readiness may be inferred from a queue
+receipt. MD and TD readiness must be independently typed, sourced, and fresh
 before a future writer claim can reach native dispatch.
 
 ### Status and callback mapping
@@ -255,11 +269,11 @@ In particular, SDK `COMPLETED` means that its local receipt was persisted; it
 does not mean `ACKED`, `FILLED`, `CANCELLED`, or provider-terminal. The
 Backtrader `CtpManagedLocalQueuedReceipt` and
 `CtpManagedNativeSubmissionReceipt` also remain non-acknowledgement types.
-The SDK receipt currently has no typed queue-receipt ID/depth contract that
-can be safely translated into the Backtrader local queued receipt, and its
-untyped `native_receipt_payload` must not be mined for a request ID or callback
-identity. A new local bridge-dispatch DTO should preserve the exact command
-binding and local outcome without implementing `ProviderObservation`.
+The SDK receipt still has no typed queue-receipt ID/depth contract that can be
+safely translated into the Backtrader local queued receipt, and its untyped
+`native_receipt_payload` must not be mined for a request ID or callback
+identity. The typed correlation echo preserves the command binding and local
+outcome without implementing `ProviderObservation`.
 
 The existing synchronous `ManagedExecutionFacade` cannot safely consume that
 DTO as a provider observation. A future CTP-specific asynchronous port must
@@ -296,14 +310,16 @@ External risk-permit settlement must be idempotently keyed to that committed
 event and cannot be presented as part of a SQLite transaction unless it truly
 shares it.
 
-The minimal implementation sequence is therefore: (1) version and persist the
-typed action/runtime-order/native-session keys, including cancel
-`ExchangeID`/`ActionRef`/`RequestID`; (2) add a CTP asynchronous managed port
-that records local dispatch without fabricating a `ProviderObservation`; (3)
-add a verified callback ledger and one transaction boundary for callback
-deduplication plus provider projections; then (4) prove with fake crash/restart
-tests that `UNKNOWN` remains fenced without exact evidence and that duplicate,
-stale-generation, mismatched-submit, and mismatched-cancel callbacks cannot
-advance state. Until those seams and the separately reviewed SDK artifact and
-external account-wide writer fence exist, this bridge stays design-only and
-unregistered.
+The first offline step now supplies typed action/runtime-order/native-session
+keys, typed callback correlation DTOs, exact structural matching, fake submit
+and cancel coverage, and fail-closed migration/restart behavior. The remaining
+minimum sequence is: (1) bridge matching typed handoff IDs and validate the
+exact cancel `ExchangeID`/ActionRef/RequestID contract; (2) add a CTP
+asynchronous managed port that records local dispatch without fabricating a
+`ProviderObservation`; (3) add a verified callback ledger and one transaction
+boundary for callback deduplication plus provider projections; then (4) prove
+with fake crash/restart tests that only exact verified evidence can resolve
+`UNKNOWN`, and duplicate, stale-generation, mismatched-submit, and
+mismatched-cancel callbacks cannot advance state. Until those seams and the
+separately reviewed SDK artifact and external account-wide writer fence exist,
+this bridge stays design-only and unregistered.

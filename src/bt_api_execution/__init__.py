@@ -53,13 +53,16 @@ from .store import (
     CtpCancelTarget,
     CtpDispatchAuthority,
     CtpDispatchAuthorityVerifier,
+    CtpDispatchCallbackKey,
     CtpDispatchCommand,
+    CtpDispatchCorrelationKey,
     CtpDispatchReceipt,
     CtpOrderIdentityReservation,
     CtpOrderRefSeedProof,
     ExecutionRecord,
     SqliteExecutionStore,
     WriterLease,
+    require_ctp_dispatch_callback_match,
 )
 
 __all__ = [
@@ -77,7 +80,9 @@ __all__ = [
     "CtpCancelTarget",
     "CtpDispatchAuthority",
     "CtpDispatchAuthorityVerifier",
+    "CtpDispatchCallbackKey",
     "CtpDispatchCommand",
+    "CtpDispatchCorrelationKey",
     "CtpDispatchReceipt",
     "CtpOrderIdentityReservation",
     "CtpOrderRefSeedProof",
@@ -119,4 +124,5 @@ __all__ = [
     "canonical_json",
     "order_intent_from_payload",
     "payload_sha256",
+    "require_ctp_dispatch_callback_match",
 ]

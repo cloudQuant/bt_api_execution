@@ -48,6 +48,30 @@ from .errors import (
 )
 
 
+def _is_sha256(value: Any) -> bool:
+    return (
+        type(value) is str
+        and len(value) == 64
+        and all(char in "0123456789abcdef" for char in value)
+    )
+
+
+def _is_prefixed_digest(value: Any, prefix: str) -> bool:
+    return type(value) is str and value.startswith(prefix) and _is_sha256(value[len(prefix) :])
+
+
+def _validate_correlation_text(value: Any, field_name: str) -> None:
+    if (
+        type(value) is not str
+        or not value
+        or value != value.strip()
+        or len(value) > 128
+        or not value.isascii()
+        or any(not (char.isalnum() or char in "._:-") for char in value)
+    ):
+        raise ContractValidationError("invalid CTP dispatch " + field_name)
+
+
 @dataclass(frozen=True, slots=True)
 class WriterLease:
     """A scope-local writer lease with a monotonically increasing fence."""
@@ -146,6 +170,238 @@ class CtpOrderRefSeedProof:
     legacy_ledger_sha256: str
 
 
+@dataclass(frozen=True, slots=True)
+class CtpDispatchCorrelationKey:
+    """Versioned exact action/session identity carried by one CTP outbox row.
+
+    This is a local correlation contract, not callback authenticity or provider
+    state evidence. ``native_request_id`` and ``native_action_ref`` must be
+    supplied to the eventual native adapter unchanged; no adapter is provided
+    by this package.
+    """
+
+    version: int
+    account_key: str
+    scope_key: str
+    trading_day: str
+    operation: str
+    command_id: str
+    request_payload_sha256: str
+    reservation_managed_intent_id: str
+    managed_action_id: str
+    runtime_order_id: str
+    order_ref: str
+    cancel_target_exchange_id: str | None
+    cancel_target_order_sys_id: str | None
+    cancel_target_front_id: int | None
+    cancel_target_session_id: int | None
+    approval_use_id: str
+    approval_digest: str
+    session_binding_sha256: str
+    session_generation_id: str
+    dispatch_front_id: int
+    dispatch_session_id: int
+    native_request_id: int
+    native_action_ref: str | None
+
+    def __post_init__(self) -> None:
+        if type(self.version) is not int or self.version != 1:
+            raise ContractValidationError("unsupported CTP dispatch correlation version")
+        if type(self.operation) is not str or self.operation not in {"SUBMIT", "CANCEL"}:
+            raise ContractValidationError("invalid CTP dispatch correlation operation")
+        for value, name in (
+            (self.command_id, "command_id"),
+            (self.reservation_managed_intent_id, "managed intent id"),
+            (self.managed_action_id, "managed action id"),
+            (self.approval_use_id, "approval use id"),
+            (self.session_generation_id, "session generation id"),
+        ):
+            _validate_correlation_text(value, name)
+        if not _is_prefixed_digest(self.account_key, "account:"):
+            raise ContractValidationError("invalid CTP dispatch correlation account key")
+        if not _is_prefixed_digest(self.scope_key, "scope:"):
+            raise ContractValidationError("invalid CTP dispatch correlation scope key")
+        if (
+            type(self.trading_day) is not str
+            or len(self.trading_day) != 8
+            or not self.trading_day.isascii()
+            or not self.trading_day.isdigit()
+        ):
+            raise ContractValidationError("invalid CTP dispatch correlation trading day")
+        for value, name in (
+            (self.request_payload_sha256, "request payload digest"),
+            (self.approval_digest, "approval digest"),
+            (self.session_binding_sha256, "session binding digest"),
+        ):
+            if not _is_sha256(value):
+                raise ContractValidationError("invalid CTP dispatch correlation " + name)
+        if not self.runtime_order_id.startswith("bt-managed-v1:") or not _is_sha256(
+            self.runtime_order_id.removeprefix("bt-managed-v1:")
+        ):
+            raise ContractValidationError("invalid CTP dispatch correlation runtime order id")
+        if (
+            type(self.order_ref) is not str
+            or len(self.order_ref) != 12
+            or not self.order_ref.isascii()
+            or not self.order_ref.isdigit()
+        ):
+            raise ContractValidationError("invalid CTP dispatch correlation OrderRef")
+        if type(self.dispatch_front_id) is not int or self.dispatch_front_id <= 0:
+            raise ContractValidationError("invalid CTP dispatch correlation front id")
+        if type(self.dispatch_session_id) is not int or self.dispatch_session_id <= 0:
+            raise ContractValidationError("invalid CTP dispatch correlation session id")
+        if (
+            type(self.native_request_id) is not int
+            or self.native_request_id <= 0
+            or self.native_request_id > 2_147_483_647
+        ):
+            raise ContractValidationError("invalid CTP dispatch native request id")
+        if self.native_action_ref is not None:
+            _validate_correlation_text(self.native_action_ref, "native action reference")
+        if self.operation == "SUBMIT":
+            if self.managed_action_id != self.reservation_managed_intent_id:
+                raise ContractValidationError("submit action id must equal its managed intent id")
+            if self.native_action_ref is not None:
+                raise ContractValidationError("submit correlation cannot carry a cancel ActionRef")
+            if any(
+                value is not None
+                for value in (
+                    self.cancel_target_exchange_id,
+                    self.cancel_target_order_sys_id,
+                    self.cancel_target_front_id,
+                    self.cancel_target_session_id,
+                )
+            ):
+                raise ContractValidationError("submit correlation cannot carry a cancel target")
+        else:
+            if self.managed_action_id == self.reservation_managed_intent_id:
+                raise ContractValidationError(
+                    "cancel action id must be distinct from target intent"
+                )
+            if (
+                not isinstance(self.cancel_target_exchange_id, str)
+                or not self.cancel_target_exchange_id
+                or not isinstance(self.cancel_target_order_sys_id, str)
+                or not self.cancel_target_order_sys_id
+                or type(self.cancel_target_front_id) is not int
+                or self.cancel_target_front_id <= 0
+                or type(self.cancel_target_session_id) is not int
+                or self.cancel_target_session_id <= 0
+            ):
+                raise ContractValidationError("cancel correlation requires its exact native target")
+            _validate_correlation_text(self.cancel_target_exchange_id, "cancel target ExchangeID")
+            _validate_correlation_text(self.cancel_target_order_sys_id, "cancel target OrderSysID")
+
+    def to_payload(self) -> dict[str, Any]:
+        """Return the exact, JSON-safe action/session binding."""
+
+        return {
+            "version": self.version,
+            "account_key": self.account_key,
+            "scope_key": self.scope_key,
+            "trading_day": self.trading_day,
+            "operation": self.operation,
+            "command_id": self.command_id,
+            "request_payload_sha256": self.request_payload_sha256,
+            "reservation_managed_intent_id": self.reservation_managed_intent_id,
+            "managed_action_id": self.managed_action_id,
+            "runtime_order_id": self.runtime_order_id,
+            "order_ref": self.order_ref,
+            "cancel_target_exchange_id": self.cancel_target_exchange_id,
+            "cancel_target_order_sys_id": self.cancel_target_order_sys_id,
+            "cancel_target_front_id": self.cancel_target_front_id,
+            "cancel_target_session_id": self.cancel_target_session_id,
+            "approval_use_id": self.approval_use_id,
+            "approval_digest": self.approval_digest,
+            "session_binding_sha256": self.session_binding_sha256,
+            "session_generation_id": self.session_generation_id,
+            "dispatch_front_id": self.dispatch_front_id,
+            "dispatch_session_id": self.dispatch_session_id,
+            "native_request_id": self.native_request_id,
+            "native_action_ref": self.native_action_ref,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class CtpDispatchCallbackKey:
+    """Unverified, provider-neutral callback correlation keys for fake adapters.
+
+    This value can be compared with a command, but this package does not accept
+    it as callback evidence, persist it, or use it to resolve UNKNOWN.
+    """
+
+    version: int
+    correlation_key: CtpDispatchCorrelationKey
+    callback_family: str
+    stream_id: str
+    event_id: str
+    native_request_id: int
+    native_action_ref: str | None
+    order_ref: str
+    exchange_id: str | None = None
+    order_sys_id: str | None = None
+    target_front_id: int | None = None
+    target_session_id: int | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.version) is not int or self.version != 1:
+            raise ContractValidationError("unsupported CTP callback key version")
+        if type(self.correlation_key) is not CtpDispatchCorrelationKey:
+            raise ContractValidationError("typed CTP dispatch correlation key is required")
+        _validate_correlation_text(self.stream_id, "callback stream id")
+        _validate_correlation_text(self.event_id, "callback event id")
+        if type(self.callback_family) is not str or self.callback_family not in {
+            "ORDER",
+            "TRADE",
+            "CANCEL_ACTION",
+        }:
+            raise ContractValidationError("invalid CTP callback family")
+        if (
+            self.correlation_key.operation == "SUBMIT"
+            and self.callback_family not in {"ORDER", "TRADE"}
+        ) or (
+            self.correlation_key.operation == "CANCEL" and self.callback_family != "CANCEL_ACTION"
+        ):
+            raise ContractValidationError("CTP callback family does not match action")
+        if (
+            type(self.native_request_id) is not int
+            or self.native_request_id <= 0
+            or self.native_request_id > 2_147_483_647
+        ):
+            raise ContractValidationError("invalid CTP callback request id")
+        if self.native_action_ref is not None:
+            _validate_correlation_text(self.native_action_ref, "callback action reference")
+        if (
+            type(self.order_ref) is not str
+            or len(self.order_ref) != 12
+            or not self.order_ref.isascii()
+            or not self.order_ref.isdigit()
+        ):
+            raise ContractValidationError("invalid CTP callback OrderRef")
+        for value, name in (
+            (self.exchange_id, "exchange id"),
+            (self.order_sys_id, "system order id"),
+        ):
+            if value is not None:
+                _validate_correlation_text(value, name)
+        if (self.exchange_id is None) != (self.order_sys_id is None):
+            raise ContractValidationError(
+                "callback exchange and system order ids must appear together"
+            )
+        if self.correlation_key.operation == "CANCEL":
+            if (
+                self.exchange_id != self.correlation_key.cancel_target_exchange_id
+                or self.order_sys_id != self.correlation_key.cancel_target_order_sys_id
+                or type(self.target_front_id) is not int
+                or type(self.target_session_id) is not int
+                or self.target_front_id != self.correlation_key.cancel_target_front_id
+                or self.target_session_id != self.correlation_key.cancel_target_session_id
+            ):
+                raise ContractValidationError("CTP cancel callback target does not match action")
+        elif self.target_front_id is not None or self.target_session_id is not None:
+            raise ContractValidationError("submit callback cannot carry a cancel target session")
+
+
 @dataclass(frozen=True)
 class CtpDispatchCommand:
     """Immutable staged request plus local dispatch state, not provider order state.
@@ -184,6 +440,7 @@ class CtpDispatchCommand:
     native_receipt_payload: Optional[Mapping[str, Any]]
     native_receipt_sha256: Optional[str]
     completion_echo_sha256: Optional[str]
+    correlation_key: CtpDispatchCorrelationKey | None = None
 
     @property
     def authority_binding_sha256(self) -> str:
@@ -195,7 +452,7 @@ class CtpDispatchCommand:
 
         return payload_sha256(
             {
-                "binding_type": "ctp_dispatch_action_binding.v1",
+                "binding_type": "ctp_dispatch_action_binding.v2",
                 "account_key": self.account_key,
                 "scope_key": self.scope_key,
                 "trading_day": self.trading_day,
@@ -212,6 +469,9 @@ class CtpDispatchCommand:
                 "approval_use_id": self.approval_use_id,
                 "approval_digest": self.approval_digest,
                 "session_binding_sha256": self.session_binding_sha256,
+                "correlation_key": (
+                    None if self.correlation_key is None else self.correlation_key.to_payload()
+                ),
             }
         )
 
@@ -278,6 +538,39 @@ class CtpDispatchReceipt:
     session_binding_sha256: str
     outcome: str
     native_receipt_payload: Mapping[str, Any]
+    correlation_key: CtpDispatchCorrelationKey | None = None
+
+
+def require_ctp_dispatch_callback_match(
+    command: CtpDispatchCommand, callback: CtpDispatchCallbackKey
+) -> CtpDispatchCallbackKey:
+    """Require exact structural correlation without asserting callback trust.
+
+    This helper is deliberately pure. It cannot authorize, persist, project, or
+    resolve an outbox command, including a command already in ``UNKNOWN``.
+    """
+
+    if type(command) is not CtpDispatchCommand or command.correlation_key is None:
+        raise ContractValidationError("versioned CTP dispatch correlation is required")
+    if type(callback) is not CtpDispatchCallbackKey:
+        raise ContractValidationError("typed CTP callback correlation key is required")
+    if callback.correlation_key != command.correlation_key:
+        raise ContractValidationError("CTP callback correlation does not match command")
+    expected_order_ref = command.order_ref or command.cancel_target_order_ref
+    if callback.order_ref != expected_order_ref:
+        raise ContractValidationError("CTP callback OrderRef does not match command")
+    if callback.native_request_id != command.correlation_key.native_request_id:
+        raise ContractValidationError("CTP callback RequestID does not match command")
+    if callback.native_action_ref != command.correlation_key.native_action_ref:
+        raise ContractValidationError("CTP callback ActionRef does not match command")
+    if command.operation == "CANCEL" and (
+        callback.exchange_id != command.cancel_target_exchange_id
+        or callback.order_sys_id != command.cancel_target_order_sys_id
+        or callback.target_front_id != command.cancel_target_front_id
+        or callback.target_session_id != command.cancel_target_session_id
+    ):
+        raise ContractValidationError("CTP cancel callback target does not match command")
+    return callback
 
 
 @dataclass(frozen=True)
@@ -338,7 +631,8 @@ class SqliteExecutionStore:
     # Version 5 adds an offline-only command queue in this same authority; the
     # generic event outbox remains an event log, not a command source.
     # Version 6 records one-use action authority atomically with each claim.
-    _SCHEMA_VERSION = 6
+    # Version 7 binds typed runtime/action/session/request identities to commands.
+    _SCHEMA_VERSION = 7
 
     def __init__(self, path: str | Path, *, busy_timeout_ms: int = 5_000) -> None:
         if type(busy_timeout_ms) is not int or busy_timeout_ms <= 0:
@@ -497,6 +791,14 @@ class SqliteExecutionStore:
                     approval_digest TEXT NOT NULL CHECK(length(approval_digest) = 64),
                     session_binding_json TEXT NOT NULL,
                     session_binding_sha256 TEXT NOT NULL CHECK(length(session_binding_sha256) = 64),
+                    correlation_version INTEGER NOT NULL DEFAULT 0,
+                    runtime_order_id TEXT,
+                    managed_action_id TEXT,
+                    session_generation_id TEXT,
+                    dispatch_front_id INTEGER,
+                    dispatch_session_id INTEGER,
+                    native_request_id INTEGER,
+                    native_action_ref TEXT,
                     status TEXT NOT NULL CHECK(status IN ('READY', 'CLAIMED', 'COMPLETED', 'UNKNOWN')),
                     created_at_ns INTEGER NOT NULL,
                     updated_at_ns INTEGER NOT NULL,
@@ -562,18 +864,6 @@ class SqliteExecutionStore:
                 BEGIN
                     SELECT RAISE(ABORT, 'CTP dispatch authority use is immutable');
                 END;
-                CREATE TRIGGER IF NOT EXISTS ctp_dispatch_commands_immutable
-                BEFORE UPDATE OF account_key, scope_key, trading_day, operation,
-                    command_id, request_payload_json, request_payload_sha256,
-                    reservation_managed_intent_id, order_ref, cancel_target_order_ref,
-                    cancel_target_exchange_id, cancel_target_order_sys_id,
-                    cancel_target_front_id, cancel_target_session_id,
-                    approval_use_id, approval_digest, session_binding_json,
-                    session_binding_sha256
-                ON ctp_dispatch_commands
-                BEGIN
-                    SELECT RAISE(ABORT, 'CTP dispatch command identity is immutable');
-                END;
                 """
             )
             row = cursor.execute(
@@ -584,8 +874,9 @@ class SqliteExecutionStore:
                     "INSERT INTO execution_meta(key, value) VALUES (?, ?)",
                     ("schema_version", str(self._SCHEMA_VERSION)),
                 )
-                return
-            version = str(row["value"])
+                version = str(self._SCHEMA_VERSION)
+            else:
+                version = str(row["value"])
             if version == "2":
                 columns = {
                     str(item["name"])
@@ -595,31 +886,76 @@ class SqliteExecutionStore:
                     cursor.execute(
                         "ALTER TABLE execution_records ADD COLUMN cumulative_commission TEXT"
                     )
-                cursor.execute(
-                    "UPDATE execution_meta SET value = ? WHERE key = ?",
-                    (str(self._SCHEMA_VERSION), "schema_version"),
-                )
-                return
-            if version == "3":
-                cursor.execute(
-                    "UPDATE execution_meta SET value = ? WHERE key = ?",
-                    (str(self._SCHEMA_VERSION), "schema_version"),
-                )
-                return
-            if version == "4":
-                cursor.execute(
-                    "UPDATE execution_meta SET value = ? WHERE key = ?",
-                    (str(self._SCHEMA_VERSION), "schema_version"),
-                )
-                return
-            if version == "5":
-                cursor.execute(
-                    "UPDATE execution_meta SET value = ? WHERE key = ?",
-                    (str(self._SCHEMA_VERSION), "schema_version"),
-                )
-                return
-            if version != str(self._SCHEMA_VERSION):
+            elif version not in {"3", "4", "5", "6", str(self._SCHEMA_VERSION)}:
                 raise DurableStoreError("unsupported execution store schema")
+
+            columns = {
+                str(item["name"])
+                for item in cursor.execute("PRAGMA table_info(ctp_dispatch_commands)").fetchall()
+            }
+            correlation_columns = {
+                "correlation_version": "INTEGER NOT NULL DEFAULT 0",
+                "runtime_order_id": "TEXT",
+                "managed_action_id": "TEXT",
+                "session_generation_id": "TEXT",
+                "dispatch_front_id": "INTEGER",
+                "dispatch_session_id": "INTEGER",
+                "native_request_id": "INTEGER",
+                "native_action_ref": "TEXT",
+            }
+            for name, declaration in correlation_columns.items():
+                if name not in columns:
+                    cursor.execute(
+                        f"ALTER TABLE ctp_dispatch_commands ADD COLUMN {name} {declaration}"
+                    )
+            if version != str(self._SCHEMA_VERSION):
+                # Old staged/claimed rows lack session and action correlation.
+                # Never let an automatic migration make them dispatchable.
+                cursor.execute(
+                    """
+                    UPDATE ctp_dispatch_commands
+                    SET status = 'UNKNOWN', unknown_at_ns = COALESCE(unknown_at_ns, updated_at_ns),
+                        unknown_reason = 'legacy_command_missing_correlation_keys'
+                    WHERE correlation_version = 0 AND status IN ('READY', 'CLAIMED')
+                    """
+                )
+                cursor.execute(
+                    "UPDATE execution_meta SET value = ? WHERE key = ?",
+                    (str(self._SCHEMA_VERSION), "schema_version"),
+                )
+            cursor.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS ctp_dispatch_session_request_unique
+                ON ctp_dispatch_commands(account_key, session_generation_id, native_request_id)
+                WHERE correlation_version = 1
+                """
+            )
+            cursor.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS ctp_dispatch_managed_action_unique
+                ON ctp_dispatch_commands(account_key, scope_key, managed_action_id)
+                WHERE correlation_version = 1
+                """
+            )
+            cursor.execute("DROP TRIGGER IF EXISTS ctp_dispatch_commands_immutable")
+            cursor.execute(
+                """
+                CREATE TRIGGER ctp_dispatch_commands_immutable
+                BEFORE UPDATE OF account_key, scope_key, trading_day, operation,
+                    command_id, request_payload_json, request_payload_sha256,
+                    reservation_managed_intent_id, order_ref, cancel_target_order_ref,
+                    cancel_target_exchange_id, cancel_target_order_sys_id,
+                    cancel_target_front_id, cancel_target_session_id,
+                    approval_use_id, approval_digest, session_binding_json,
+                    session_binding_sha256, correlation_version, runtime_order_id,
+                    managed_action_id, session_generation_id, dispatch_front_id,
+                    dispatch_session_id, native_request_id, native_action_ref
+                ON ctp_dispatch_commands
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP dispatch command identity is immutable');
+                END;
+                """
+            )
 
     @staticmethod
     def _validate_ctp_order_identity_scope(scope: ExecutionScope) -> tuple[str, str, str]:
@@ -1245,6 +1581,81 @@ class SqliteExecutionStore:
                 if row["completion_echo_json"] is None
                 else json.loads(str(row["completion_echo_json"]))
             )
+            correlation_version = int(row["correlation_version"])
+            correlation_key = None
+            if correlation_version == 1:
+                action_order_ref = (
+                    str(row["order_ref"])
+                    if row["order_ref"] is not None
+                    else str(row["cancel_target_order_ref"])
+                )
+                correlation_key = CtpDispatchCorrelationKey(
+                    version=1,
+                    account_key=str(row["account_key"]),
+                    scope_key=str(row["scope_key"]),
+                    trading_day=str(row["trading_day"]),
+                    operation=str(row["operation"]),
+                    command_id=str(row["command_id"]),
+                    request_payload_sha256=str(row["request_payload_sha256"]),
+                    reservation_managed_intent_id=str(row["reservation_managed_intent_id"]),
+                    managed_action_id=str(row["managed_action_id"]),
+                    runtime_order_id=str(row["runtime_order_id"]),
+                    order_ref=action_order_ref,
+                    cancel_target_exchange_id=(
+                        None
+                        if row["cancel_target_exchange_id"] is None
+                        else str(row["cancel_target_exchange_id"])
+                    ),
+                    cancel_target_order_sys_id=(
+                        None
+                        if row["cancel_target_order_sys_id"] is None
+                        else str(row["cancel_target_order_sys_id"])
+                    ),
+                    cancel_target_front_id=(
+                        None
+                        if row["cancel_target_front_id"] is None
+                        else int(row["cancel_target_front_id"])
+                    ),
+                    cancel_target_session_id=(
+                        None
+                        if row["cancel_target_session_id"] is None
+                        else int(row["cancel_target_session_id"])
+                    ),
+                    approval_use_id=str(row["approval_use_id"]),
+                    approval_digest=str(row["approval_digest"]),
+                    session_binding_sha256=str(row["session_binding_sha256"]),
+                    session_generation_id=str(row["session_generation_id"]),
+                    dispatch_front_id=int(row["dispatch_front_id"]),
+                    dispatch_session_id=int(row["dispatch_session_id"]),
+                    native_request_id=int(row["native_request_id"]),
+                    native_action_ref=(
+                        None if row["native_action_ref"] is None else str(row["native_action_ref"])
+                    ),
+                )
+                if (
+                    session_binding.get("session_generation_id")
+                    != correlation_key.session_generation_id
+                    or session_binding.get("dispatch_front_id") != correlation_key.dispatch_front_id
+                    or session_binding.get("dispatch_session_id")
+                    != correlation_key.dispatch_session_id
+                ):
+                    raise ValueError("stored CTP session binding differs from correlation")
+            elif correlation_version == 0:
+                if any(
+                    row[name] is not None
+                    for name in (
+                        "runtime_order_id",
+                        "managed_action_id",
+                        "session_generation_id",
+                        "dispatch_front_id",
+                        "dispatch_session_id",
+                        "native_request_id",
+                        "native_action_ref",
+                    )
+                ):
+                    raise ValueError("legacy CTP command has partial correlation keys")
+            else:
+                raise ValueError("unsupported stored CTP correlation version")
             if (
                 not isinstance(request_payload, dict)
                 or not isinstance(session_binding, dict)
@@ -1358,6 +1769,7 @@ class SqliteExecutionStore:
                     if row["completion_echo_sha256"] is None
                     else str(row["completion_echo_sha256"])
                 ),
+                correlation_key=correlation_key,
             )
         except (TypeError, ValueError, json.JSONDecodeError) as error:
             raise DurableStoreError("stored CTP command is unreadable") from error
@@ -1376,6 +1788,12 @@ class SqliteExecutionStore:
         managed_intent_id: Optional[str] = None,
         order_ref: Optional[str] = None,
         cancel_target: Optional[CtpCancelTarget] = None,
+        managed_action_id: str | None = None,
+        session_generation_id: str | None = None,
+        dispatch_front_id: int | None = None,
+        dispatch_session_id: int | None = None,
+        native_request_id: int | None = None,
+        native_action_ref: str | None = None,
     ) -> CtpDispatchCommand:
         """Persist one immutable CTP command; this does not enable dispatch.
 
@@ -1391,6 +1809,21 @@ class SqliteExecutionStore:
         self._validate_sha256(approval_digest, "approval digest")
         if not isinstance(operation, str) or operation not in {"SUBMIT", "CANCEL"}:
             raise ContractValidationError("invalid CTP dispatch operation")
+        if session_generation_id is None:
+            raise ContractValidationError("typed CTP session generation is required")
+        _validate_correlation_text(session_generation_id, "session generation id")
+        if type(dispatch_front_id) is not int or dispatch_front_id <= 0:
+            raise ContractValidationError("typed CTP dispatch FrontID is required")
+        if type(dispatch_session_id) is not int or dispatch_session_id <= 0:
+            raise ContractValidationError("typed CTP dispatch SessionID is required")
+        if (
+            type(native_request_id) is not int
+            or native_request_id <= 0
+            or native_request_id > 2_147_483_647
+        ):
+            raise ContractValidationError("typed CTP native RequestID is required")
+        if native_action_ref is not None:
+            _validate_correlation_text(native_action_ref, "native ActionRef")
         if not isinstance(request_payload, Mapping) or not isinstance(session_binding, Mapping):
             raise ContractValidationError(
                 "CTP command payload and session binding must be mappings"
@@ -1406,6 +1839,14 @@ class SqliteExecutionStore:
             raise ContractValidationError("CTP command request payload must be a non-empty object")
         if not session_value or not isinstance(session_value, dict):
             raise ContractValidationError("CTP session binding must be a non-empty object")
+        if (
+            session_value.get("session_generation_id") != session_generation_id
+            or type(session_value.get("dispatch_front_id")) is not int
+            or session_value.get("dispatch_front_id") != dispatch_front_id
+            or type(session_value.get("dispatch_session_id")) is not int
+            or session_value.get("dispatch_session_id") != dispatch_session_id
+        ):
+            raise ContractValidationError("typed CTP session keys do not match session binding")
         self._reject_sensitive_command_fields(request_value)
         self._reject_sensitive_command_fields(session_value)
         request_digest = payload_sha256(request_value)
@@ -1422,6 +1863,11 @@ class SqliteExecutionStore:
             if managed_intent_id is None or order_ref is None or cancel_target is not None:
                 raise ContractValidationError("SUBMIT requires its reserved intent and OrderRef")
             self._validate_command_identifier(managed_intent_id, "managed_intent_id")
+            if managed_action_id not in (None, managed_intent_id):
+                raise ContractValidationError("submit action id must equal its managed intent id")
+            managed_action_id = managed_intent_id
+            if native_action_ref is not None:
+                raise ContractValidationError("SUBMIT cannot carry a native cancel ActionRef")
             self._validate_ctp_order_ref(order_ref, "OrderRef")
             if (
                 type(request_value.get("OrderRef")) is not str
@@ -1436,6 +1882,9 @@ class SqliteExecutionStore:
         else:
             if managed_intent_id is not None or order_ref is not None or cancel_target is None:
                 raise ContractValidationError("CANCEL requires an exact typed cancel target")
+            if managed_action_id is None:
+                raise ContractValidationError("CANCEL requires a distinct managed action id")
+            self._validate_command_identifier(managed_action_id, "managed_action_id")
             self._validate_ctp_cancel_target(cancel_target, request_value)
             persisted_order_ref = None
             persisted_cancel_target = cancel_target.order_ref
@@ -1451,7 +1900,8 @@ class SqliteExecutionStore:
             if operation == "SUBMIT":
                 reservation = cursor.execute(
                     """
-                    SELECT managed_intent_id FROM ctp_order_identity_reservations
+                    SELECT managed_intent_id, runtime_order_id
+                    FROM ctp_order_identity_reservations
                     WHERE account_key = ? AND trading_day = ? AND scope_key = ?
                       AND managed_intent_id = ? AND order_ref = ?
                     """,
@@ -1460,7 +1910,8 @@ class SqliteExecutionStore:
             else:
                 reservation = cursor.execute(
                     """
-                    SELECT managed_intent_id FROM ctp_order_identity_reservations
+                    SELECT managed_intent_id, runtime_order_id
+                    FROM ctp_order_identity_reservations
                     WHERE account_key = ? AND trading_day = ? AND scope_key = ?
                       AND order_ref = ?
                     """,
@@ -1469,6 +1920,38 @@ class SqliteExecutionStore:
             if reservation is None:
                 raise ContractValidationError("CTP command has no exact OrderRef reservation")
             reservation_managed_intent_id = str(reservation["managed_intent_id"])
+            runtime_order_id = str(reservation["runtime_order_id"])
+            if operation == "CANCEL" and managed_action_id == reservation_managed_intent_id:
+                raise ContractValidationError(
+                    "cancel action id must be distinct from target intent"
+                )
+            action_order_ref = persisted_order_ref or persisted_cancel_target
+            assert action_order_ref is not None
+            CtpDispatchCorrelationKey(
+                version=1,
+                account_key=account_key,
+                scope_key=scope_key,
+                trading_day=trading_day,
+                operation=operation,
+                command_id=command_id,
+                request_payload_sha256=request_digest,
+                reservation_managed_intent_id=reservation_managed_intent_id,
+                managed_action_id=str(managed_action_id),
+                runtime_order_id=runtime_order_id,
+                order_ref=action_order_ref,
+                cancel_target_exchange_id=cancel_exchange_id,
+                cancel_target_order_sys_id=cancel_order_sys_id,
+                cancel_target_front_id=cancel_front_id,
+                cancel_target_session_id=cancel_session_id,
+                approval_use_id=approval_use_id,
+                approval_digest=approval_digest,
+                session_binding_sha256=session_digest,
+                session_generation_id=str(session_generation_id),
+                dispatch_front_id=dispatch_front_id,
+                dispatch_session_id=dispatch_session_id,
+                native_request_id=native_request_id,
+                native_action_ref=native_action_ref,
+            )
 
             existing = cursor.execute(
                 "SELECT * FROM ctp_dispatch_commands WHERE account_key = ? AND command_id = ?",
@@ -1491,6 +1974,14 @@ class SqliteExecutionStore:
                 approval_digest,
                 session_json,
                 session_digest,
+                1,
+                runtime_order_id,
+                str(managed_action_id),
+                str(session_generation_id),
+                dispatch_front_id,
+                dispatch_session_id,
+                native_request_id,
+                native_action_ref,
             )
             if existing is not None:
                 stored = (
@@ -1520,10 +2011,75 @@ class SqliteExecutionStore:
                     str(existing["approval_digest"]),
                     str(existing["session_binding_json"]),
                     str(existing["session_binding_sha256"]),
+                    int(existing["correlation_version"]),
+                    None
+                    if existing["runtime_order_id"] is None
+                    else str(existing["runtime_order_id"]),
+                    None
+                    if existing["managed_action_id"] is None
+                    else str(existing["managed_action_id"]),
+                    None
+                    if existing["session_generation_id"] is None
+                    else str(existing["session_generation_id"]),
+                    None
+                    if existing["dispatch_front_id"] is None
+                    else int(existing["dispatch_front_id"]),
+                    None
+                    if existing["dispatch_session_id"] is None
+                    else int(existing["dispatch_session_id"]),
+                    None
+                    if existing["native_request_id"] is None
+                    else int(existing["native_request_id"]),
+                    None
+                    if existing["native_action_ref"] is None
+                    else str(existing["native_action_ref"]),
                 )
                 if stored != immutable:
                     raise IntentConflictError("CTP command_id conflicts with staged command")
                 return self._ctp_dispatch_command_from_row(existing)
+
+            generation_owner = cursor.execute(
+                """
+                SELECT command_id, session_binding_sha256, dispatch_front_id, dispatch_session_id
+                FROM ctp_dispatch_commands
+                WHERE account_key = ? AND session_generation_id = ?
+                  AND correlation_version = 1
+                ORDER BY created_at_ns, command_id LIMIT 1
+                """,
+                (account_key, session_generation_id),
+            ).fetchone()
+            if generation_owner is not None and (
+                str(generation_owner["session_binding_sha256"]) != session_digest
+                or int(generation_owner["dispatch_front_id"]) != dispatch_front_id
+                or int(generation_owner["dispatch_session_id"]) != dispatch_session_id
+            ):
+                raise ContractValidationError(
+                    "CTP session generation was reused with another binding"
+                )
+            action_owner = cursor.execute(
+                """
+                SELECT command_id FROM ctp_dispatch_commands
+                WHERE account_key = ? AND scope_key = ? AND managed_action_id = ?
+                  AND correlation_version = 1
+                """,
+                (account_key, scope_key, managed_action_id),
+            ).fetchone()
+            if action_owner is not None:
+                raise IntentConflictError(
+                    "CTP managed action id is already bound to another command"
+                )
+            request_owner = cursor.execute(
+                """
+                SELECT command_id FROM ctp_dispatch_commands
+                WHERE account_key = ? AND session_generation_id = ? AND native_request_id = ?
+                  AND correlation_version = 1
+                """,
+                (account_key, session_generation_id, native_request_id),
+            ).fetchone()
+            if request_owner is not None:
+                raise IntentConflictError(
+                    "CTP RequestID is already bound in this session generation"
+                )
 
             approval_owner = cursor.execute(
                 """
@@ -1544,8 +2100,11 @@ class SqliteExecutionStore:
                     cancel_target_exchange_id, cancel_target_order_sys_id,
                     cancel_target_front_id, cancel_target_session_id,
                     approval_use_id, approval_digest, session_binding_json,
-                    session_binding_sha256, status, created_at_ns, updated_at_ns
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'READY', ?, ?)
+                    session_binding_sha256, correlation_version, runtime_order_id,
+                    managed_action_id, session_generation_id, dispatch_front_id,
+                    dispatch_session_id, native_request_id, native_action_ref,
+                    status, created_at_ns, updated_at_ns
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'READY', ?, ?)
                 """,
                 (
                     account_key,
@@ -1566,6 +2125,14 @@ class SqliteExecutionStore:
                     approval_digest,
                     session_json,
                     session_digest,
+                    1,
+                    runtime_order_id,
+                    str(managed_action_id),
+                    str(session_generation_id),
+                    dispatch_front_id,
+                    dispatch_session_id,
+                    native_request_id,
+                    native_action_ref,
                     now_ns,
                     now_ns,
                 ),
@@ -1688,6 +2255,8 @@ class SqliteExecutionStore:
                     "CTP OrderRef predates or conflicts with the seeded watermark"
                 )
             command = self._ctp_dispatch_command_from_row(row)
+            if command.correlation_key is None:
+                raise ContractValidationError("CTP command lacks versioned correlation keys")
             authority = self._verify_ctp_dispatch_authority(
                 authority_verifier, command, now_ns=verification_started_ns
             )
@@ -1749,7 +2318,7 @@ class SqliteExecutionStore:
     def _ctp_dispatch_receipt_payload(receipt: CtpDispatchReceipt) -> Tuple[str, str, str]:
         if (
             type(receipt) is not CtpDispatchReceipt
-            or receipt.receipt_type != "ctp_dispatch_receipt.v1"
+            or receipt.receipt_type != "ctp_dispatch_receipt.v2"
         ):
             raise ContractValidationError("invalid typed CTP dispatch receipt")
         if not isinstance(receipt.outcome, str) or receipt.outcome not in {
@@ -1760,6 +2329,29 @@ class SqliteExecutionStore:
             raise ContractValidationError("invalid CTP dispatch receipt outcome")
         if not isinstance(receipt.native_receipt_payload, Mapping):
             raise ContractValidationError("native CTP receipt payload must be a mapping")
+        key = receipt.correlation_key
+        if type(key) is not CtpDispatchCorrelationKey:
+            raise ContractValidationError("typed CTP dispatch correlation echo is required")
+        if (
+            receipt.command_id != key.command_id
+            or receipt.account_key != key.account_key
+            or receipt.scope_key != key.scope_key
+            or receipt.trading_day != key.trading_day
+            or receipt.operation != key.operation
+            or receipt.request_payload_sha256 != key.request_payload_sha256
+            or receipt.reservation_managed_intent_id != key.reservation_managed_intent_id
+            or receipt.order_ref != (key.order_ref if key.operation == "SUBMIT" else None)
+            or receipt.cancel_target_order_ref
+            != (key.order_ref if key.operation == "CANCEL" else None)
+            or receipt.cancel_target_exchange_id != key.cancel_target_exchange_id
+            or receipt.cancel_target_order_sys_id != key.cancel_target_order_sys_id
+            or receipt.cancel_target_front_id != key.cancel_target_front_id
+            or receipt.cancel_target_session_id != key.cancel_target_session_id
+            or receipt.approval_use_id != key.approval_use_id
+            or receipt.approval_digest != key.approval_digest
+            or receipt.session_binding_sha256 != key.session_binding_sha256
+        ):
+            raise ContractValidationError("CTP dispatch receipt correlation echo is inconsistent")
         try:
             native_json = canonical_json(dict(receipt.native_receipt_payload))
             native_value = json.loads(native_json)
@@ -1784,6 +2376,7 @@ class SqliteExecutionStore:
                 "approval_use_id": receipt.approval_use_id,
                 "approval_digest": receipt.approval_digest,
                 "session_binding_sha256": receipt.session_binding_sha256,
+                "correlation_key": key.to_payload(),
                 "outcome": receipt.outcome,
                 "native_receipt_payload": native_value,
             }
@@ -1838,6 +2431,7 @@ class SqliteExecutionStore:
                 command.approval_use_id,
                 command.approval_digest,
                 command.session_binding_sha256,
+                command.correlation_key,
             )
             actual = (
                 receipt.command_id,
@@ -1856,6 +2450,7 @@ class SqliteExecutionStore:
                 receipt.approval_use_id,
                 receipt.approval_digest,
                 receipt.session_binding_sha256,
+                receipt.correlation_key,
             )
             if actual != expected:
                 raise ContractValidationError("CTP dispatch receipt echo does not match command")
