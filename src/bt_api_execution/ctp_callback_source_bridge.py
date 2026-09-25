@@ -628,13 +628,16 @@ class CtpNativeCallbackSourceBridge:
         if event_type == "OnRspOrderAction":
             if "nRequestID" not in fields or "bIsLast" not in fields:
                 raise _contract_error("terminal action response arguments are missing")
+            request_id = fields["nRequestID"]
+            if type(request_id) is not int:
+                raise _contract_error("terminal action response request ID is invalid")
             return map_ctp_native_order_action_callback(
                 self._correlation,
                 self._binding.session,
                 event_type,
                 fields,
                 response_info,
-                request_id=fields["nRequestID"],
+                request_id=request_id,
                 is_last=fields["bIsLast"],
             )
         if "nRequestID" in fields or "bIsLast" in fields:

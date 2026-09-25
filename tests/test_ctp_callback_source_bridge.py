@@ -370,6 +370,30 @@ def test_bridge_maps_terminal_order_action_source_event(tmp_path):
 
 
 @pytest.mark.unit
+def test_bridge_rejects_non_integer_terminal_action_request_id(tmp_path):
+    bound = _stage_dispatched_command(tmp_path, operation="CANCEL")
+    try:
+        bound.client._events.put(
+            _source_event(
+                bound.client,
+                event_type="OnRspOrderAction",
+                overrides={"nRequestID": "17"},
+            )
+        )
+        bridge = CtpNativeCallbackSourceBridge.bind_after_login(
+            store=bound.store,
+            scope=bound.scope,
+            command_id=bound.command_id,
+            native_trader_client=bound.client,
+        )
+
+        with pytest.raises(ContractValidationError, match="request ID is invalid"):
+            bridge.next_envelope(timeout=0)
+    finally:
+        bound.store.close()
+
+
+@pytest.mark.unit
 def test_bridge_denies_missing_persisted_source_binding_without_legacy_fallback(tmp_path):
     bound = _stage_dispatched_command(tmp_path, include_source_facts=False)
     try:
