@@ -51,6 +51,9 @@ second settlement when an acknowledged order later partially or fully fills.
 python -m pip install ./bt_api_execution
 ```
 
+Source compatibility changes and the `CtpOrderRefSeedProof` constructor
+migration are documented in [MIGRATIONS.md](MIGRATIONS.md).
+
 ## Minimal local example
 
 ```python

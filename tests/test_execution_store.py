@@ -123,6 +123,17 @@ def _runtime_order_id(token: str) -> str:
     return "bt-managed-v1:" + sha256(token.encode("ascii")).hexdigest()
 
 
+@pytest.mark.unit
+def test_ctp_order_ref_seed_proof_rejects_legacy_four_field_constructor() -> None:
+    with pytest.raises(TypeError):
+        CtpOrderRefSeedProof(
+            trading_day="20260925",
+            native_max_order_ref="000000000000",
+            legacy_ledger_max_order_ref="000000000000",
+            legacy_ledger_sha256="0" * 64,
+        )
+
+
 def _seed_proof(scope: ExecutionScope, session: str = "test-seed-session") -> CtpOrderRefSeedProof:
     sources = (
         ("backtrader_prototype", sha256(b"empty backtrader prototype").hexdigest()),
