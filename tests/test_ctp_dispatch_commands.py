@@ -19,6 +19,7 @@ from bt_api_execution import (
     CtpDispatchCallbackKey,
     CtpDispatchCorrelationKey,
     CtpDispatchReceipt,
+    CtpNativeSessionContext,
     CtpOrderRefSeedProof,
     CtpUnknownResolutionAttestation,
     CtpVerifiedCallbackEvidence,
@@ -31,6 +32,9 @@ from bt_api_execution import (
     Side,
     SqliteExecutionStore,
     WriterLeaseUnavailable,
+    ctp_native_session_epoch,
+    ctp_native_session_generation_id,
+    map_ctp_native_order_return,
     payload_sha256,
     require_ctp_dispatch_callback_match,
 )
@@ -724,6 +728,75 @@ def test_submit_correlation_binds_runtime_action_and_session_keys(tmp_path):
         assert command.status == "READY"
         assert require_ctp_dispatch_callback_match(command, _callback(command))
         assert store.read_ctp_dispatch_command(scope, command.command_id).correlation_key == key
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+def test_native_callback_envelope_keeps_default_store_verifier_fail_closed(tmp_path):
+    store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
+    scope = _scope()
+    lease = _lease(store, scope)
+    try:
+        reservation = _reserve_seeded(store, scope, lease)
+        session_epoch = ctp_native_session_epoch()
+        generation = ctp_native_session_generation_id(3, 7, session_epoch, 4, 91)
+        command = _stage_submit(
+            store,
+            scope,
+            lease,
+            reservation,
+            session_generation_id=generation,
+        )
+        _dispatch_fake(store, scope, lease, command)
+        correlation = command.correlation_key
+        assert correlation is not None
+        session = CtpNativeSessionContext(
+            account_key=correlation.account_key,
+            scope_key=correlation.scope_key,
+            trading_day=correlation.trading_day,
+            session_epoch=session_epoch,
+            session_generation_id=correlation.session_generation_id,
+            account_fingerprint="acct_" + sha256(b"9999:investor").hexdigest()[:16],
+            native_api_generation=3,
+            connection_generation=7,
+            dispatch_front_id=correlation.dispatch_front_id,
+            dispatch_session_id=correlation.dispatch_session_id,
+        )
+        callback = map_ctp_native_order_return(
+            correlation,
+            session,
+            {
+                "BrokerID": "9999",
+                "InvestorID": "investor",
+                "UserID": "investor",
+                "InstrumentID": "rb2710",
+                "RequestID": correlation.native_request_id,
+                "OrderRef": correlation.order_ref,
+                "ExchangeID": "SHFE",
+                "OrderSysID": "sys-order-17",
+                "FrontID": correlation.dispatch_front_id,
+                "SessionID": correlation.dispatch_session_id,
+                "TradingDay": correlation.trading_day,
+                "NotifySequence": 7,
+            },
+        )
+
+        with pytest.raises(ContractValidationError, match="trusted CTP callback verification failed"):
+            store.apply_ctp_verified_dispatch_callback(
+                scope,
+                command.command_id,
+                callback.callback_key,
+                callback.to_payload(),
+                writer_lease=lease,
+            )
+        assert store.read_ctp_dispatch_command(scope, command.command_id).status == "COMPLETED"
+        assert store._connection.execute(
+            "SELECT COUNT(*) FROM ctp_dispatch_callback_ledger"
+        ).fetchone()[0] == 0
+        assert store._connection.execute(
+            "SELECT COUNT(*) FROM ctp_dispatch_order_projection"
+        ).fetchone()[0] == 0
     finally:
         store.close()
 

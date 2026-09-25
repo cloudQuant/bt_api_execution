@@ -128,3 +128,29 @@ The callback-correlation and UNKNOWN-recovery contract is design-only in
 [`docs/ctp-command-reconciliation-adr.md`](docs/ctp-command-reconciliation-adr.md):
 until exact native action IDs and complete verified recovery evidence exist,
 the outbox keeps UNKNOWN fenced and creates no provider order-state projection.
+
+`CtpNativeCallbackEnvelope` and its mapping functions preserve exact native
+`OnRtnOrder` RequestID/OrderRef and `OnRspOrderAction` or `OnErrRtnOrderAction`
+RequestID, OrderActionRef, and target fields for a future injected verifier.
+`OnRspOrderAction` mappings require its terminal response flag. Order-return
+events require a positive native `NotifySequence` or `SequenceNo`; the mapper
+does not add a local timestamp or counter. `CtpNativeSessionContext` carries
+the native API and connection generations, trading day, front/session IDs,
+execution account/scope keys, native account fingerprint, and a fresh opaque
+session epoch. Generate the epoch once in code for each new native client and
+retain it for that client's lifetime; the generation identifier includes the
+epoch, native API/connection generations, and bound front/session IDs so
+reconstructing a client with reset local counters can use a distinct stream
+identity when it gets a fresh epoch. The
+envelope copies native fields into immutable tuples and permits only
+callback-specific whitelisted primitive fields. The mapper checks context
+claims against command and callback fields. The context is caller-constructible
+and does not prove source provenance; the default callback verifier still
+rejects, and an injected verifier must authenticate callback origin and bind
+the native account fingerprint to the execution account before any projection
+can be written.
+CTP trade callbacks are not mapped here because `CThostFtdcTradeField` does not
+carry the command RequestID required by the current callback-key contract.
+`OnRspOrderInsert` and `OnErrRtnOrderInsert` are also unsupported; this mapper
+does not turn local insert-response/error callbacks into provider order-state
+evidence.

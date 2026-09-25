@@ -35,6 +35,14 @@ from .contracts import (
     order_intent_from_payload,
     payload_sha256,
 )
+from .ctp_native_callbacks import (
+    CtpNativeCallbackEnvelope,
+    CtpNativeSessionContext,
+    ctp_native_session_epoch,
+    ctp_native_session_generation_id,
+    map_ctp_native_order_action_callback,
+    map_ctp_native_order_return,
+)
 from .errors import (
     AdmissionDenied,
     AdmissionRequired,
@@ -94,6 +102,8 @@ __all__ = [
     "CtpDispatchReconciliationVerifier",
     "CtpDispatchReceipt",
     "CtpDispatchUnknownResolutionResult",
+    "CtpNativeCallbackEnvelope",
+    "CtpNativeSessionContext",
     "CtpOrderIdentityReservation",
     "CtpOrderRefSeedProof",
     "CtpUnknownResolutionAttestation",
@@ -134,6 +144,10 @@ __all__ = [
     "can_transition",
     "cancel_intent_from_payload",
     "canonical_json",
+    "ctp_native_session_epoch",
+    "ctp_native_session_generation_id",
+    "map_ctp_native_order_action_callback",
+    "map_ctp_native_order_return",
     "order_intent_from_payload",
     "payload_sha256",
     "require_ctp_dispatch_callback_match",
