@@ -56,6 +56,14 @@ def _is_sha256(value: Any) -> bool:
     )
 
 
+def _is_local_queue_receipt_id(value: Any) -> bool:
+    return (
+        type(value) is str
+        and len(value) == 32
+        and all(char in "0123456789abcdef" for char in value)
+    )
+
+
 def _is_prefixed_digest(value: Any, prefix: str) -> bool:
     return type(value) is str and value.startswith(prefix) and _is_sha256(value[len(prefix) :])
 
@@ -758,6 +766,8 @@ class CtpDispatchProjection:
     submit_action: CtpSubmitActionProjection | None
     cancel_action: CtpCancelActionProjection | None
     unknown_resolution: CtpUnknownResolutionProjection | None
+    local_queue_receipt_id: str | None = None
+    local_queue_receipt_queued: bool | None = None
 
     def __post_init__(self) -> None:
         _validate_correlation_text(self.command_id, "command id")
@@ -808,6 +818,33 @@ class CtpDispatchProjection:
                 and self.unknown_resolution.cancel_action_terminal_state is None)
         ):
             raise ContractValidationError("CTP UNKNOWN resolution does not match operation")
+        if self.local_queue_receipt_id is not None and not _is_local_queue_receipt_id(
+            self.local_queue_receipt_id
+        ):
+            raise ContractValidationError("invalid projected CTP local queue receipt id")
+        if self.local_queue_receipt_queued is not None and type(
+            self.local_queue_receipt_queued
+        ) is not bool:
+            raise ContractValidationError("invalid projected CTP queue disposition")
+        if self.local_queue_receipt_id is None and self.local_queue_receipt_queued is not None:
+            raise ContractValidationError("projected CTP queue disposition has no receipt id")
+        if self.command_status in {"CLAIMED", "UNKNOWN"} and (
+            self.local_queue_receipt_id is not None
+            and self.local_queue_receipt_queued is not True
+        ):
+            raise ContractValidationError("claimed CTP projection lacks a committed queue receipt")
+        if self.command_status == "COMPLETED" and self.local_queue_receipt_id is not None:
+            if self.local_queue_receipt_queued is None:
+                raise ContractValidationError("completed CTP projection lacks queue disposition")
+            if self.local_queue_receipt_queued is True and self.local_dispatch_outcome not in {
+                "QUEUED",
+                "REJECTED",
+            }:
+                raise ContractValidationError("completed CTP queue projection has invalid outcome")
+        if self.local_queue_receipt_queued is False and (
+            self.command_status != "COMPLETED" or self.local_dispatch_outcome != "REJECTED"
+        ):
+            raise ContractValidationError("rejected CTP queue projection is not terminal")
 
 
 class _RejectCtpDispatchVerifier:
@@ -871,6 +908,8 @@ class CtpDispatchCommand:
     native_receipt_sha256: Optional[str]
     completion_echo_sha256: Optional[str]
     correlation_key: CtpDispatchCorrelationKey | None = None
+    local_queue_receipt_id: str | None = None
+    local_queue_receipt_queued: bool | None = None
 
     @property
     def authority_binding_sha256(self) -> str:
@@ -899,6 +938,7 @@ class CtpDispatchCommand:
                 "approval_use_id": self.approval_use_id,
                 "approval_digest": self.approval_digest,
                 "session_binding_sha256": self.session_binding_sha256,
+                "local_queue_receipt_id": self.local_queue_receipt_id,
                 "correlation_key": (
                     None if self.correlation_key is None else self.correlation_key.to_payload()
                 ),
@@ -969,6 +1009,7 @@ class CtpDispatchReceipt:
     outcome: str
     native_receipt_payload: Mapping[str, Any]
     correlation_key: CtpDispatchCorrelationKey | None = None
+    local_queue_receipt_id: str | None = None
 
 
 def require_ctp_dispatch_callback_match(
@@ -1066,7 +1107,9 @@ class SqliteExecutionStore:
     # and an external-reconciliation-only UNKNOWN fence resolution record.
     # Version 9 adds an account-wide allocated OrderRef watermark and exact,
     # session-bound cutover evidence with imported legacy identity mappings.
-    _SCHEMA_VERSION = 9
+    # Version 10 binds a prepublished local queue receipt to the same command
+    # row and gates its unique worker claim on that receipt being queued.
+    _SCHEMA_VERSION = 10
 
     def __init__(self, path: str | Path, *, busy_timeout_ms: int = 5_000) -> None:
         if type(busy_timeout_ms) is not int or busy_timeout_ms <= 0:
@@ -1306,6 +1349,13 @@ class SqliteExecutionStore:
                     dispatch_session_id INTEGER,
                     native_request_id INTEGER,
                     native_action_ref TEXT,
+                    local_queue_receipt_id TEXT
+                        CHECK(local_queue_receipt_id IS NULL OR
+                              (length(local_queue_receipt_id) = 32 AND
+                               local_queue_receipt_id NOT GLOB '*[^0-9a-f]*')),
+                    local_queue_receipt_queued INTEGER
+                        CHECK(local_queue_receipt_queued IS NULL
+                              OR local_queue_receipt_queued IN (0, 1)),
                     status TEXT NOT NULL CHECK(status IN ('READY', 'CLAIMED', 'COMPLETED', 'UNKNOWN')),
                     created_at_ns INTEGER NOT NULL,
                     updated_at_ns INTEGER NOT NULL,
@@ -1532,7 +1582,9 @@ class SqliteExecutionStore:
                     cursor.execute(
                         "ALTER TABLE execution_records ADD COLUMN cumulative_commission TEXT"
                     )
-            elif version not in {"3", "4", "5", "6", "7", "8", str(self._SCHEMA_VERSION)}:
+            elif version not in {
+                "3", "4", "5", "6", "7", "8", "9", str(self._SCHEMA_VERSION)
+            }:
                 raise DurableStoreError("unsupported execution store schema")
 
             columns = {
@@ -1548,6 +1600,15 @@ class SqliteExecutionStore:
                 "dispatch_session_id": "INTEGER",
                 "native_request_id": "INTEGER",
                 "native_action_ref": "TEXT",
+                "local_queue_receipt_id": (
+                    "TEXT CHECK(local_queue_receipt_id IS NULL OR "
+                    "(length(local_queue_receipt_id) = 32 AND "
+                    "local_queue_receipt_id NOT GLOB '*[^0-9a-f]*'))"
+                ),
+                "local_queue_receipt_queued": (
+                    "INTEGER CHECK(local_queue_receipt_queued IS NULL OR "
+                    "local_queue_receipt_queued IN (0, 1))"
+                ),
             }
             for name, declaration in correlation_columns.items():
                 if name not in columns:
@@ -1604,6 +1665,13 @@ class SqliteExecutionStore:
                 WHERE correlation_version = 1
                 """
             )
+            cursor.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS ctp_dispatch_local_queue_receipt_unique
+                ON ctp_dispatch_commands(account_key, local_queue_receipt_id)
+                WHERE local_queue_receipt_id IS NOT NULL
+                """
+            )
             cursor.execute("DROP TRIGGER IF EXISTS ctp_dispatch_commands_immutable")
             cursor.execute(
                 """
@@ -1616,10 +1684,25 @@ class SqliteExecutionStore:
                     approval_use_id, approval_digest, session_binding_json,
                     session_binding_sha256, correlation_version, runtime_order_id,
                     managed_action_id, session_generation_id, dispatch_front_id,
-                    dispatch_session_id, native_request_id, native_action_ref
+                    dispatch_session_id, native_request_id, native_action_ref,
+                    local_queue_receipt_id
                 ON ctp_dispatch_commands
                 BEGIN
                     SELECT RAISE(ABORT, 'CTP dispatch command identity is immutable');
+                END;
+                """
+            )
+            cursor.execute("DROP TRIGGER IF EXISTS ctp_dispatch_queue_receipt_once")
+            cursor.execute(
+                """
+                CREATE TRIGGER ctp_dispatch_queue_receipt_once
+                BEFORE UPDATE OF local_queue_receipt_queued ON ctp_dispatch_commands
+                WHEN OLD.local_queue_receipt_queued IS NOT NULL
+                  OR NEW.local_queue_receipt_queued IS NULL
+                  OR OLD.local_queue_receipt_id IS NULL
+                  OR OLD.status != 'READY'
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP queue receipt disposition is immutable');
                 END;
                 """
             )
@@ -2914,6 +2997,21 @@ class SqliteExecutionStore:
                 if row["completion_echo_json"] is None
                 else json.loads(str(row["completion_echo_json"]))
             )
+            local_queue_receipt_id = (
+                None
+                if row["local_queue_receipt_id"] is None
+                else str(row["local_queue_receipt_id"])
+            )
+            queued_value = row["local_queue_receipt_queued"]
+            if queued_value not in (None, 0, 1):
+                raise ValueError("stored CTP queue disposition is invalid")
+            local_queue_receipt_queued = None if queued_value is None else bool(queued_value)
+            if local_queue_receipt_id is not None and not _is_local_queue_receipt_id(
+                local_queue_receipt_id
+            ):
+                raise ValueError("stored CTP local queue receipt id is invalid")
+            if local_queue_receipt_id is None and local_queue_receipt_queued is not None:
+                raise ValueError("stored CTP queue state has no receipt id")
             correlation_version = int(row["correlation_version"])
             correlation_key = None
             if correlation_version == 1:
@@ -3012,6 +3110,8 @@ class SqliteExecutionStore:
                         canonical_json(completion_echo) != str(row["completion_echo_json"])
                         or payload_sha256(completion_echo) != str(row["completion_echo_sha256"])
                         or completion_echo.get("native_receipt_payload") != native_receipt_payload
+                        or completion_echo.get("local_queue_receipt_id")
+                        != local_queue_receipt_id
                     )
                 )
                 or (completion_echo is None and row["completion_echo_sha256"] is not None)
@@ -3033,6 +3133,18 @@ class SqliteExecutionStore:
                 )
             ):
                 raise ValueError("stored CTP command digest mismatch")
+            if local_queue_receipt_id is not None:
+                status = str(row["status"])
+                if status in {"CLAIMED", "UNKNOWN"} and local_queue_receipt_queued is not True:
+                    raise ValueError("claimed CTP command lacks a committed queue receipt")
+                if local_queue_receipt_queued is False and status != "COMPLETED":
+                    raise ValueError("rejected CTP queue receipt is not terminal")
+                if status == "COMPLETED":
+                    outcome = completion_echo.get("outcome") if completion_echo else None
+                    if local_queue_receipt_queued is False and outcome != "REJECTED":
+                        raise ValueError("rejected queue receipt has a non-rejected outcome")
+                    if local_queue_receipt_queued is True and outcome not in {"QUEUED", "REJECTED"}:
+                        raise ValueError("queued CTP command has an invalid completion outcome")
             return CtpDispatchCommand(
                 account_key=str(row["account_key"]),
                 scope_key=str(row["scope_key"]),
@@ -3103,6 +3215,8 @@ class SqliteExecutionStore:
                     else str(row["completion_echo_sha256"])
                 ),
                 correlation_key=correlation_key,
+                local_queue_receipt_id=local_queue_receipt_id,
+                local_queue_receipt_queued=local_queue_receipt_queued,
             )
         except (TypeError, ValueError, json.JSONDecodeError) as error:
             raise DurableStoreError("stored CTP command is unreadable") from error
@@ -3127,6 +3241,7 @@ class SqliteExecutionStore:
         dispatch_session_id: int | None = None,
         native_request_id: int | None = None,
         native_action_ref: str | None = None,
+        local_queue_receipt_id: str | None = None,
     ) -> CtpDispatchCommand:
         """Persist one immutable CTP command; this does not enable dispatch.
 
@@ -3157,6 +3272,10 @@ class SqliteExecutionStore:
             raise ContractValidationError("typed CTP native RequestID is required")
         if native_action_ref is not None:
             _validate_correlation_text(native_action_ref, "native ActionRef")
+        if local_queue_receipt_id is not None and not _is_local_queue_receipt_id(
+            local_queue_receipt_id
+        ):
+            raise ContractValidationError("invalid CTP local queue receipt id")
         if not isinstance(request_payload, Mapping) or not isinstance(session_binding, Mapping):
             raise ContractValidationError(
                 "CTP command payload and session binding must be mappings"
@@ -3315,6 +3434,7 @@ class SqliteExecutionStore:
                 dispatch_session_id,
                 native_request_id,
                 native_action_ref,
+                local_queue_receipt_id,
             )
             if existing is not None:
                 stored = (
@@ -3366,6 +3486,9 @@ class SqliteExecutionStore:
                     None
                     if existing["native_action_ref"] is None
                     else str(existing["native_action_ref"]),
+                    None
+                    if existing["local_queue_receipt_id"] is None
+                    else str(existing["local_queue_receipt_id"]),
                 )
                 if stored != immutable:
                     raise IntentConflictError("CTP command_id conflicts with staged command")
@@ -3436,8 +3559,9 @@ class SqliteExecutionStore:
                     session_binding_sha256, correlation_version, runtime_order_id,
                     managed_action_id, session_generation_id, dispatch_front_id,
                     dispatch_session_id, native_request_id, native_action_ref,
+                    local_queue_receipt_id,
                     status, created_at_ns, updated_at_ns
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'READY', ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'READY', ?, ?)
                 """,
                 (
                     account_key,
@@ -3466,6 +3590,7 @@ class SqliteExecutionStore:
                     dispatch_session_id,
                     native_request_id,
                     native_action_ref,
+                    local_queue_receipt_id,
                     now_ns,
                     now_ns,
                 ),
@@ -3600,6 +3725,8 @@ class SqliteExecutionStore:
                 submit_action=None,
                 cancel_action=None,
                 unknown_resolution=None,
+                local_queue_receipt_id=command.local_queue_receipt_id,
+                local_queue_receipt_queued=command.local_queue_receipt_queued,
             )
 
         try:
@@ -3724,9 +3851,146 @@ class SqliteExecutionStore:
                 submit_action=submit_action,
                 cancel_action=cancel_action,
                 unknown_resolution=resolution,
+                local_queue_receipt_id=command.local_queue_receipt_id,
+                local_queue_receipt_queued=command.local_queue_receipt_queued,
             )
         except (ContractValidationError, KeyError, TypeError, ValueError) as error:
             raise DurableStoreError("stored CTP dispatch projection is unreadable") from error
+
+    def record_ctp_dispatch_queue_receipt(
+        self,
+        scope: ExecutionScope,
+        command_id: str,
+        queue_receipt: Mapping[str, Any],
+        *,
+        writer_lease: WriterLease,
+    ) -> CtpDispatchCommand:
+        """Persist the exact local queue ID before a worker can claim the row.
+
+        The caller must invoke this before publishing an accepted command to
+        its worker queue. A rejected queue receipt is completed locally without
+        a sender call; a queued receipt makes the same command row eligible for
+        the single sender claim. The receipt ID is supplied by the queue owner
+        and is never derived from ``command_id``.
+        """
+
+        account_key, _, scope_key = self._validate_ctp_order_identity_scope(scope)
+        self._validate_command_identifier(command_id, "command_id")
+        if not isinstance(queue_receipt, Mapping):
+            raise ContractValidationError("CTP local queue receipt must be a mapping")
+        receipt_id = queue_receipt.get("receipt_id")
+        queued = queue_receipt.get("queued")
+        if (
+            queue_receipt.get("kind") != "command_receipt"
+            or type(receipt_id) is not str
+            or not _is_local_queue_receipt_id(receipt_id)
+            or type(queued) is not bool
+        ):
+            raise ContractValidationError("CTP local queue receipt is malformed")
+        now_ns = time.time_ns()
+        with self._transaction() as cursor:
+            self._assert_active_writer_lease(cursor, scope, writer_lease)
+            row = cursor.execute(
+                """
+                SELECT * FROM ctp_dispatch_commands
+                WHERE account_key = ? AND scope_key = ? AND command_id = ?
+                """,
+                (account_key, scope_key, command_id),
+            ).fetchone()
+            if row is None:
+                raise ContractValidationError("unknown CTP dispatch command")
+            command = self._ctp_dispatch_command_from_row(row)
+            expected_queue_command = "submit" if command.operation == "SUBMIT" else "cancel"
+            if (
+                command.local_queue_receipt_id is None
+                or receipt_id != command.local_queue_receipt_id
+                or queue_receipt.get("command") != expected_queue_command
+                or command.correlation_key is None
+            ):
+                raise ContractValidationError("CTP queue receipt does not match staged command")
+            if command.local_queue_receipt_queued is not None:
+                if command.local_queue_receipt_queued is queued:
+                    return command
+                raise IntentConflictError("CTP command already has another queue disposition")
+            if command.status != "READY":
+                raise InvalidStateTransition("CTP queue receipt requires a READY command")
+
+            if queued:
+                cursor.execute(
+                    """
+                    UPDATE ctp_dispatch_commands
+                    SET local_queue_receipt_queued = 1, updated_at_ns = ?
+                    WHERE account_key = ? AND scope_key = ? AND command_id = ?
+                      AND status = 'READY' AND local_queue_receipt_queued IS NULL
+                    """,
+                    (now_ns, account_key, scope_key, command_id),
+                )
+                if cursor.rowcount != 1:
+                    raise InvalidStateTransition("CTP queue-ready transition changed")
+            else:
+                # Retain only the four public queue fields. Queue diagnostics
+                # may contain operator/provider data and are not command facts.
+                safe_queue_receipt = {
+                    "kind": "command_receipt",
+                    "command": expected_queue_command,
+                    "receipt_id": receipt_id,
+                    "queued": False,
+                }
+                receipt = CtpDispatchReceipt(
+                    receipt_type="ctp_dispatch_receipt.v2",
+                    command_id=command.command_id,
+                    account_key=command.account_key,
+                    scope_key=command.scope_key,
+                    trading_day=command.trading_day,
+                    operation=command.operation,
+                    request_payload_sha256=command.request_payload_sha256,
+                    reservation_managed_intent_id=command.reservation_managed_intent_id,
+                    order_ref=command.order_ref,
+                    cancel_target_order_ref=command.cancel_target_order_ref,
+                    cancel_target_exchange_id=command.cancel_target_exchange_id,
+                    cancel_target_order_sys_id=command.cancel_target_order_sys_id,
+                    cancel_target_front_id=command.cancel_target_front_id,
+                    cancel_target_session_id=command.cancel_target_session_id,
+                    approval_use_id=command.approval_use_id,
+                    approval_digest=command.approval_digest,
+                    session_binding_sha256=command.session_binding_sha256,
+                    outcome="REJECTED",
+                    native_receipt_payload=safe_queue_receipt,
+                    correlation_key=command.correlation_key,
+                    local_queue_receipt_id=receipt_id,
+                )
+                native_json, native_digest, echo_json = self._ctp_dispatch_receipt_payload(receipt)
+                echo_digest = payload_sha256(json.loads(echo_json))
+                cursor.execute(
+                    """
+                    UPDATE ctp_dispatch_commands
+                    SET local_queue_receipt_queued = 0, status = 'COMPLETED',
+                        updated_at_ns = ?, completed_at_ns = ?,
+                        native_receipt_payload_json = ?, native_receipt_sha256 = ?,
+                        completion_echo_json = ?, completion_echo_sha256 = ?
+                    WHERE account_key = ? AND scope_key = ? AND command_id = ?
+                      AND status = 'READY' AND local_queue_receipt_queued IS NULL
+                    """,
+                    (
+                        now_ns,
+                        now_ns,
+                        native_json,
+                        native_digest,
+                        echo_json,
+                        echo_digest,
+                        account_key,
+                        scope_key,
+                        command_id,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise InvalidStateTransition("CTP local rejection transition changed")
+            updated = cursor.execute(
+                "SELECT * FROM ctp_dispatch_commands WHERE account_key = ? AND command_id = ?",
+                (account_key, command_id),
+            ).fetchone()
+            assert updated is not None
+            return self._ctp_dispatch_command_from_row(updated)
 
     def claim_ctp_dispatch_command(
         self,
@@ -3735,6 +3999,7 @@ class SqliteExecutionStore:
         *,
         writer_lease: WriterLease,
         authority_verifier: CtpDispatchAuthorityVerifier,
+        required_local_queue_receipt_id: str | None = None,
     ) -> Optional[CtpDispatchCommand]:
         """Verify and condition-claim one READY command after the seed gate.
 
@@ -3751,6 +4016,10 @@ class SqliteExecutionStore:
 
         account_key, trading_day, scope_key = self._validate_ctp_order_identity_scope(scope)
         self._validate_command_identifier(command_id, "command_id")
+        if required_local_queue_receipt_id is not None and not _is_local_queue_receipt_id(
+            required_local_queue_receipt_id
+        ):
+            raise ContractValidationError("invalid required CTP local queue receipt id")
         with self._transaction() as cursor:
             verification_started_ns = time.time_ns()
             self._assert_active_writer_lease(
@@ -3764,6 +4033,15 @@ class SqliteExecutionStore:
                 (account_key, scope_key, command_id),
             ).fetchone()
             if row is None or str(row["status"]) != "READY":
+                return None
+            if row["local_queue_receipt_id"] is not None and row[
+                "local_queue_receipt_queued"
+            ] != 1:
+                return None
+            if required_local_queue_receipt_id is not None and (
+                row["local_queue_receipt_id"] != required_local_queue_receipt_id
+                or row["local_queue_receipt_queued"] != 1
+            ):
                 return None
             unresolved = cursor.execute(
                 """
@@ -3916,6 +4194,10 @@ class SqliteExecutionStore:
             raise ContractValidationError("invalid CTP dispatch receipt outcome")
         if not isinstance(receipt.native_receipt_payload, Mapping):
             raise ContractValidationError("native CTP receipt payload must be a mapping")
+        if receipt.local_queue_receipt_id is not None and not _is_local_queue_receipt_id(
+            receipt.local_queue_receipt_id
+        ):
+            raise ContractValidationError("invalid CTP local queue receipt echo")
         key = receipt.correlation_key
         if type(key) is not CtpDispatchCorrelationKey:
             raise ContractValidationError("typed CTP dispatch correlation echo is required")
@@ -3963,6 +4245,7 @@ class SqliteExecutionStore:
                 "approval_use_id": receipt.approval_use_id,
                 "approval_digest": receipt.approval_digest,
                 "session_binding_sha256": receipt.session_binding_sha256,
+                "local_queue_receipt_id": receipt.local_queue_receipt_id,
                 "correlation_key": key.to_payload(),
                 "outcome": receipt.outcome,
                 "native_receipt_payload": native_value,
@@ -4019,6 +4302,7 @@ class SqliteExecutionStore:
                 command.approval_digest,
                 command.session_binding_sha256,
                 command.correlation_key,
+                command.local_queue_receipt_id,
             )
             actual = (
                 receipt.command_id,
@@ -4038,9 +4322,14 @@ class SqliteExecutionStore:
                 receipt.approval_digest,
                 receipt.session_binding_sha256,
                 receipt.correlation_key,
+                receipt.local_queue_receipt_id,
             )
             if actual != expected:
                 raise ContractValidationError("CTP dispatch receipt echo does not match command")
+            if command.local_queue_receipt_id is not None and (
+                command.local_queue_receipt_queued is not True
+            ):
+                raise InvalidStateTransition("CTP local queue receipt is not ready for dispatch")
             if command.status in {"COMPLETED", "UNKNOWN"} and command.completion_echo_sha256:
                 if command.completion_echo_sha256 != echo_digest:
                     raise IntentConflictError("CTP dispatch command already has another receipt")

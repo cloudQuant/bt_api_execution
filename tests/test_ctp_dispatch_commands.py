@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 import time
@@ -38,6 +39,12 @@ from bt_api_execution import (
     map_ctp_native_order_return,
     payload_sha256,
     require_ctp_dispatch_callback_match,
+)
+from bt_api_execution.ctp_single_worker_candidate import (
+    CtpManagedPreparedDispatch,
+    CtpManagedSingleWorkerCandidate,
+    CtpNativeDispatchResult,
+    stable_managed_command_id,
 )
 
 
@@ -479,7 +486,7 @@ def test_v4_execution_store_migrates_to_verified_callback_ledger_v8(tmp_path):
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-        assert version == "9"
+        assert version == "10"
         assert "ctp_dispatch_commands" in tables
         assert "ctp_order_ref_watermarks" in tables
         assert "ctp_dispatch_authority_uses" in tables
@@ -533,7 +540,7 @@ def test_v5_execution_store_migrates_one_use_authority_table(tmp_path):
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-        assert version == "9"
+        assert version == "10"
         assert "ctp_dispatch_authority_uses" in tables
     finally:
         migrated.close()
@@ -631,7 +638,7 @@ def test_v7_typed_command_migrates_to_callback_ledger_without_reopening_dispatch
             migrated._connection.execute(
                 "SELECT value FROM execution_meta WHERE key = 'schema_version'"
             ).fetchone()[0]
-            == "9"
+            == "10"
         )
         assert (
             migrated._connection.execute(
@@ -673,7 +680,7 @@ def test_v8_store_migrates_orderref_cutover_state_fail_closed(tmp_path):
         version = migrated._connection.execute(
             "SELECT value FROM execution_meta WHERE key = 'schema_version'"
         ).fetchone()["value"]
-        assert version == "9"
+        assert version == "10"
         command = migrated.read_ctp_dispatch_command(scope, staged.command_id)
         assert command is not None
         assert command.status == "UNKNOWN"
@@ -829,6 +836,332 @@ def test_initial_seed_and_first_reservation_commit_atomically(tmp_path):
             ).fetchone()[0]
             == 1
         )
+    finally:
+        store.close()
+
+
+def _prepared_managed_dispatch(reservation, *, operation="submit", receipt_id="a" * 32):
+    managed_cancel_id = None if operation == "submit" else "cancel." + reservation.managed_intent_id
+    command_id = stable_managed_command_id(
+        operation,
+        reservation.managed_intent_id,
+        reservation.runtime_order_id,
+        managed_cancel_id,
+    )
+    target = {
+        "OrderRef": reservation.order_ref,
+        "InstrumentID": "rb2710",
+    }
+    kwargs = {}
+    if operation == "cancel":
+        target.update(
+            ExchangeID="SHFE",
+            OrderSysID="fake-sys-order",
+            FrontID=4,
+            SessionID=91,
+            ActionFlag="0",
+        )
+        kwargs = {
+            "managed_cancel_intent_id": managed_cancel_id,
+            "native_action_ref": "fake-action-ref",
+            "cancel_target_exchange_id": "SHFE",
+            "cancel_target_order_sys_id": "fake-sys-order",
+            "cancel_target_front_id": 4,
+            "cancel_target_session_id": 91,
+        }
+    return CtpManagedPreparedDispatch(
+        operation=operation,
+        command_id=command_id,
+        managed_intent_id=reservation.managed_intent_id,
+        runtime_order_id=reservation.runtime_order_id,
+        order_ref=reservation.order_ref,
+        request_payload=target,
+        order_ref_reservation=reservation,
+        approval_use_id="approval-use-" + operation,
+        approval_digest=sha256(b"fake approval digest").hexdigest(),
+        session_binding=_session_binding(),
+        session_generation_id="test-session-generation",
+        dispatch_front_id=4,
+        dispatch_session_id=91,
+        native_request_id=_native_request_id(command_id),
+        local_queue_receipt_id=receipt_id,
+        **kwargs,
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["submit", "cancel"])
+async def test_single_worker_requires_persisted_queue_receipt_and_sends_once(
+    tmp_path, operation
+):
+    store = SqliteExecutionStore(tmp_path / (operation + "-single-worker.sqlite3"))
+    scope = _scope()
+    lease = _lease(store, scope)
+    try:
+        reservation = _reserve_seeded(store, scope, lease)
+        prepared = _prepared_managed_dispatch(reservation, operation=operation)
+        worker = CtpManagedSingleWorkerCandidate(
+            store, scope, lease, _authority_verifier()
+        )
+        staged_binding = worker.stage_prepared_dispatch(prepared)
+        sent = []
+
+        async def fake_sender(command):
+            sent.append(command.command_id)
+            return CtpNativeDispatchResult(
+                "QUEUED", {"kind": "fake-native-return", "return_code": 0}
+            )
+
+        with pytest.raises(ContractValidationError, match="queue receipt is not committed"):
+            await worker.dispatch_managed_command(
+                prepared.command_id, staged_binding, fake_sender
+            )
+        assert sent == []
+        with pytest.raises(ContractValidationError, match="does not match staged command"):
+            worker.record_managed_queue_receipt(
+                prepared.command_id,
+                staged_binding,
+                {
+                    "kind": "command_receipt",
+                    "command": operation,
+                    "receipt_id": "f" * 32,
+                    "queued": True,
+                },
+            )
+        assert store.read_ctp_dispatch_command(scope, prepared.command_id).local_queue_receipt_queued is None
+
+        ready_binding = worker.record_managed_queue_receipt(
+            prepared.command_id,
+            staged_binding,
+            {
+                "kind": "command_receipt",
+                "command": operation,
+                "receipt_id": prepared.local_queue_receipt_id,
+                "queued": True,
+            },
+        )
+        assert ready_binding.local_queue_receipt_id == prepared.local_queue_receipt_id
+        assert ready_binding.local_queue_receipt_queued is True
+        payload = ready_binding.to_payload()
+        assert payload["request_payload"]["OrderRef"] == reservation.order_ref
+        assert payload["session_binding"]["session_generation_id"] == prepared.session_generation_id
+        assert payload["approval_use_id"] == prepared.approval_use_id
+        assert payload["managed_action_id"] == (
+            prepared.managed_cancel_intent_id or prepared.managed_intent_id
+        )
+
+        projection = await worker.dispatch_managed_command(
+            prepared.command_id, ready_binding, fake_sender
+        )
+        assert sent == [prepared.command_id]
+        assert projection.command_status == "COMPLETED"
+        assert projection.local_dispatch_outcome == "QUEUED"
+        assert projection.local_queue_receipt_id == prepared.local_queue_receipt_id
+        assert projection.local_queue_receipt_queued is True
+        assert projection.submit_action is None or projection.submit_action.order_state.provider_state is None
+        replay = await worker.dispatch_managed_command(
+            prepared.command_id, ready_binding, fake_sender
+        )
+        assert replay == projection
+        assert sent == [prepared.command_id]
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_single_worker_rejects_orderref_mismatch_before_native_sender(tmp_path):
+    store = SqliteExecutionStore(tmp_path / "mismatch-single-worker.sqlite3")
+    scope = _scope()
+    lease = _lease(store, scope)
+    try:
+        reservation = _reserve_seeded(store, scope, lease)
+        prepared = _prepared_managed_dispatch(reservation)
+        worker = CtpManagedSingleWorkerCandidate(
+            store, scope, lease, _authority_verifier()
+        )
+        wrong_source_reservation = replace(
+            reservation, created_at_ns=reservation.created_at_ns + 1
+        )
+        with pytest.raises(ContractValidationError, match="same-store reservation"):
+            worker.stage_prepared_dispatch(
+                replace(prepared, order_ref_reservation=wrong_source_reservation)
+            )
+        assert store.read_ctp_dispatch_command(scope, prepared.command_id) is None
+        bad_request = replace(
+            prepared,
+            request_payload={**prepared.request_payload, "OrderRef": "999999999999"},
+        )
+        with pytest.raises(ContractValidationError, match="request OrderRef differs"):
+            worker.stage_prepared_dispatch(bad_request)
+        assert store.read_ctp_dispatch_command(scope, prepared.command_id) is None
+        binding = worker.stage_prepared_dispatch(prepared)
+        ready_binding = worker.record_managed_queue_receipt(
+            prepared.command_id,
+            binding,
+            {
+                "kind": "command_receipt",
+                "command": "submit",
+                "receipt_id": prepared.local_queue_receipt_id,
+                "queued": True,
+            },
+        )
+        sent = []
+
+        async def fake_sender(command):
+            sent.append(command.command_id)
+            return CtpNativeDispatchResult("QUEUED", {"return_code": 0})
+
+        mismatched_binding = replace(ready_binding, order_ref="999999999999")
+        with pytest.raises(ContractValidationError, match="differs from durable command"):
+            await worker.dispatch_managed_command(
+                prepared.command_id, mismatched_binding, fake_sender
+            )
+        assert sent == []
+        assert store.read_ctp_dispatch_command(scope, prepared.command_id).status == "READY"
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_single_worker_queue_rejection_never_calls_sender(tmp_path):
+    store = SqliteExecutionStore(tmp_path / "queue-reject-single-worker.sqlite3")
+    scope = _scope()
+    lease = _lease(store, scope)
+    try:
+        reservation = _reserve_seeded(store, scope, lease)
+        prepared = _prepared_managed_dispatch(reservation)
+        worker = CtpManagedSingleWorkerCandidate(
+            store, scope, lease, _authority_verifier()
+        )
+        binding = worker.stage_prepared_dispatch(prepared)
+        binding = worker.record_managed_queue_receipt(
+            prepared.command_id,
+            binding,
+            {
+                "kind": "command_receipt",
+                "command": "submit",
+                "receipt_id": prepared.local_queue_receipt_id,
+                "queued": False,
+            },
+        )
+        sent = []
+
+        async def fake_sender(command):
+            sent.append(command.command_id)
+            return CtpNativeDispatchResult("QUEUED", {"return_code": 0})
+
+        projection = await worker.dispatch_managed_command(
+            prepared.command_id, binding, fake_sender
+        )
+        assert projection.command_status == "COMPLETED"
+        assert projection.local_dispatch_outcome == "REJECTED"
+        assert projection.local_queue_receipt_id == prepared.local_queue_receipt_id
+        assert projection.local_queue_receipt_queued is False
+        assert sent == []
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_single_worker_concurrent_duplicate_has_one_sender_invocation(tmp_path):
+    store = SqliteExecutionStore(tmp_path / "concurrent-single-worker.sqlite3")
+    scope = _scope()
+    lease = _lease(store, scope)
+    try:
+        reservation = _reserve_seeded(store, scope, lease)
+        prepared = _prepared_managed_dispatch(reservation)
+        worker = CtpManagedSingleWorkerCandidate(
+            store, scope, lease, _authority_verifier()
+        )
+        binding = worker.stage_prepared_dispatch(prepared)
+        binding = worker.record_managed_queue_receipt(
+            prepared.command_id,
+            binding,
+            {
+                "kind": "command_receipt",
+                "command": "submit",
+                "receipt_id": prepared.local_queue_receipt_id,
+                "queued": True,
+            },
+        )
+        send_started = asyncio.Event()
+        release_send = asyncio.Event()
+        sent = []
+
+        async def fake_sender(command):
+            sent.append(command.command_id)
+            send_started.set()
+            await release_send.wait()
+            return CtpNativeDispatchResult("QUEUED", {"return_code": 0})
+
+        first_task = asyncio.create_task(
+            worker.dispatch_managed_command(prepared.command_id, binding, fake_sender)
+        )
+        await send_started.wait()
+        duplicate = await worker.dispatch_managed_command(
+            prepared.command_id, binding, fake_sender
+        )
+        assert duplicate.command_status == "CLAIMED"
+        assert sent == [prepared.command_id]
+        release_send.set()
+        final = await first_task
+        assert final.command_status == "COMPLETED"
+        assert sent == [prepared.command_id]
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_single_worker_sender_exception_persists_unknown_and_is_not_replayed(tmp_path):
+    store = SqliteExecutionStore(tmp_path / "unknown-single-worker.sqlite3")
+    scope = _scope()
+    lease = _lease(store, scope)
+    try:
+        reservation = _reserve_seeded(store, scope, lease)
+        prepared = _prepared_managed_dispatch(reservation)
+        worker = CtpManagedSingleWorkerCandidate(
+            store, scope, lease, _authority_verifier()
+        )
+        binding = worker.stage_prepared_dispatch(prepared)
+        ready_binding = worker.record_managed_queue_receipt(
+            prepared.command_id,
+            binding,
+            {
+                "kind": "command_receipt",
+                "command": "submit",
+                "receipt_id": prepared.local_queue_receipt_id,
+                "queued": True,
+            },
+        )
+        secret = "do-not-persist-this-native-exception"
+        sent = []
+
+        async def fake_sender(command):
+            sent.append(command.command_id)
+            raise RuntimeError(secret)
+
+        projection = await worker.dispatch_managed_command(
+            prepared.command_id, ready_binding, fake_sender
+        )
+        assert projection.command_status == "UNKNOWN"
+        assert projection.local_dispatch_outcome == "UNKNOWN"
+        assert projection.local_queue_receipt_id == prepared.local_queue_receipt_id
+        command = store.read_ctp_dispatch_command(scope, prepared.command_id)
+        assert command.native_receipt_payload == {
+            "kind": "native_dispatch",
+            "outcome": "UNKNOWN",
+        }
+        assert secret not in repr(command.native_receipt_payload)
+        replay = await worker.dispatch_managed_command(
+            prepared.command_id, ready_binding, fake_sender
+        )
+        assert replay == projection
+        assert sent == [prepared.command_id]
     finally:
         store.close()
 
