@@ -54,15 +54,95 @@ class _FakeTraderClient:
         self._login_state = "logged_in"
         self._callback_source_sequence = 0
         self._events: queue.Queue[object] = queue.Queue()
+        self._callback_consumer_lock = threading.Lock()
+        self._callback_consumer_token: object | None = None
+        self._callback_consumer_generation: tuple[object, object, object] | None = None
+        self._callback_consumer_waiting: object | None = None
+        self._callback_consumer_last_released: object | None = None
+        self._legacy_callback_waiters = 0
 
     def _bound_identity_is_current(self, *, require_active_front: bool = False) -> bool:
         return require_active_front and self._session_native_front == self._bound_front
 
     def wait_native_callback_event(self, timeout: float = 5.0):
+        with self._callback_consumer_lock:
+            if self._callback_consumer_token is not None:
+                raise RuntimeError("exclusive callback consumer owns the source queue")
+            self._legacy_callback_waiters += 1
         try:
             return self._events.get(timeout=timeout)
         except queue.Empty:
             return None
+        finally:
+            with self._callback_consumer_lock:
+                self._legacy_callback_waiters -= 1
+
+    def _claim_native_callback_event_consumer(self) -> object:
+        with self._callback_consumer_lock:
+            if self._callback_consumer_token is not None or self._legacy_callback_waiters:
+                raise RuntimeError("callback source queue already has a consumer")
+            token = object()
+            self._callback_consumer_token = token
+            self._callback_consumer_generation = (
+                self._callback_source_instance_id,
+                self._native_client_epoch,
+                self._native_api_generation,
+            )
+            return token
+
+    def _wait_native_callback_event_for_consumer(self, token: object, timeout: float = 5.0):
+        with self._callback_consumer_lock:
+            if (
+                self._callback_consumer_token is not token
+                or self._callback_consumer_waiting is not None
+                or self._callback_consumer_generation
+                != (
+                    self._callback_source_instance_id,
+                    self._native_client_epoch,
+                    self._native_api_generation,
+                )
+            ):
+                raise RuntimeError("callback source queue consumer lease is stale")
+            self._callback_consumer_waiting = token
+        try:
+            try:
+                event = self._events.get(timeout=timeout)
+            except queue.Empty:
+                event = None
+        finally:
+            with self._callback_consumer_lock:
+                self._callback_consumer_waiting = None
+                if (
+                    self._callback_consumer_token is not token
+                    or self._callback_consumer_generation
+                    != (
+                        self._callback_source_instance_id,
+                        self._native_client_epoch,
+                        self._native_api_generation,
+                    )
+                ):
+                    raise RuntimeError("callback source queue consumer lease was revoked")
+        return event
+
+    def _release_native_callback_event_consumer(self, token: object) -> None:
+        with self._callback_consumer_lock:
+            if token is self._callback_consumer_last_released:
+                return
+            if self._callback_consumer_token is not token:
+                self._callback_consumer_last_released = token
+                return
+            if self._callback_consumer_waiting is token:
+                raise RuntimeError("callback source queue consumer still has an active waiter")
+            self._callback_consumer_token = None
+            self._callback_consumer_generation = None
+            self._callback_consumer_last_released = token
+
+    def _revoke_native_callback_event_consumer(self) -> None:
+        """Test hook for source-side lease loss while the client login stays current."""
+
+        with self._callback_consumer_lock:
+            self._callback_consumer_token = None
+            self._callback_consumer_generation = None
 
 
 class _FakeActionAuthorityVerifier:
@@ -342,6 +422,91 @@ def test_bridge_derives_context_and_maps_source_queue_event_with_exact_lifecycle
             ).fetchone()[0]
             == 0
         )
+    finally:
+        bound.store.close()
+
+
+@pytest.mark.unit
+def test_bridge_requires_source_queue_exclusive_consumer_capability(tmp_path, monkeypatch):
+    bound = _stage_dispatched_command(tmp_path)
+    try:
+        monkeypatch.setattr(bound.client, "_claim_native_callback_event_consumer", None)
+        with pytest.raises(ContractValidationError, match="no exclusive queue consumer lease"):
+            CtpNativeCallbackSourceBridge.bind_after_login(
+                store=bound.store,
+                scope=bound.scope,
+                command_id=bound.command_id,
+                native_trader_client=bound.client,
+            )
+        assert bound.client._events.empty()
+    finally:
+        bound.store.close()
+
+
+@pytest.mark.unit
+def test_bridge_exclusive_consumer_lease_rejects_competing_bridge_and_releases_on_close(tmp_path):
+    bound = _stage_dispatched_command(tmp_path)
+    try:
+        bridge = CtpNativeCallbackSourceBridge.bind_after_login(
+            store=bound.store,
+            scope=bound.scope,
+            command_id=bound.command_id,
+            native_trader_client=bound.client,
+        )
+
+        with pytest.raises(ContractValidationError, match="lease claim failed"):
+            CtpNativeCallbackSourceBridge.bind_after_login(
+                store=bound.store,
+                scope=bound.scope,
+                command_id=bound.command_id,
+                native_trader_client=bound.client,
+            )
+        assert bound.client._callback_consumer_token is bridge._consumer_token
+        with pytest.raises(RuntimeError, match="exclusive callback consumer"):
+            bound.client.wait_native_callback_event(timeout=0)
+
+        bridge.close()
+        bridge.close()
+        assert bound.client._callback_consumer_token is None
+
+        replacement = CtpNativeCallbackSourceBridge.bind_after_login(
+            store=bound.store,
+            scope=bound.scope,
+            command_id=bound.command_id,
+            native_trader_client=bound.client,
+        )
+        replacement.close()
+        assert bound.client._callback_consumer_token is None
+    finally:
+        bound.store.close()
+
+
+@pytest.mark.unit
+def test_bridge_poisons_and_releases_a_lost_consumer_lease(tmp_path):
+    bound = _stage_dispatched_command(tmp_path)
+    try:
+        bridge = CtpNativeCallbackSourceBridge.bind_after_login(
+            store=bound.store,
+            scope=bound.scope,
+            command_id=bound.command_id,
+            native_trader_client=bound.client,
+        )
+        bound.client._events.put(_source_event(bound.client))
+        bound.client._revoke_native_callback_event_consumer()
+
+        with pytest.raises(ContractValidationError, match="source queue or lifecycle check failed"):
+            bridge.next_envelope(timeout=0)
+        with pytest.raises(ContractValidationError, match="bridge is closed"):
+            bridge.next_envelope(timeout=0)
+        assert bound.client._callback_consumer_token is None
+        assert not bound.client._events.empty()
+        replacement = CtpNativeCallbackSourceBridge.bind_after_login(
+            store=bound.store,
+            scope=bound.scope,
+            command_id=bound.command_id,
+            native_trader_client=bound.client,
+        )
+        replacement.close()
     finally:
         bound.store.close()
 

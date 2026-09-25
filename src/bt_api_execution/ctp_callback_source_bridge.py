@@ -9,6 +9,9 @@ event from that exact client's queue.  The session context is derived inside
 the bridge and is accepted only when the durable command's session-binding
 echo matches the current source facts exactly.
 
+Before returning, the bridge also claims the SDK queue's exclusive consumer lease;
+clients that only expose the legacy bare queue wait are rejected.
+
 The resulting envelope is still evidence for an injected verifier, not a
 provider acknowledgement or write grant.  The store's default callback
 verifier remains rejecting; this module is not registered by a runtime.
@@ -72,7 +75,13 @@ class _TraderClientSource(Protocol):
 
     def _bound_identity_is_current(self, *, require_active_front: bool = False) -> bool: ...
 
-    def wait_native_callback_event(self, timeout: float = 5.0) -> object | None: ...
+    def _claim_native_callback_event_consumer(self) -> object: ...
+
+    def _wait_native_callback_event_for_consumer(
+        self, consumer_token: object, timeout: float = 5.0
+    ) -> object | None: ...
+
+    def _release_native_callback_event_consumer(self, consumer_token: object) -> None: ...
 
 
 def _contract_error(detail: str) -> ContractValidationError:
@@ -280,6 +289,37 @@ def ctp_native_callback_source_facts(native_trader_client: object) -> dict[str, 
     return _capture_logged_in_source(native_trader_client).to_payload()
 
 
+def _claim_native_callback_consumer(native_trader_client: object) -> object:
+    """Require the SDK's queue-level exclusive-consumer capability."""
+
+    claim = getattr(native_trader_client, "_claim_native_callback_event_consumer", None)
+    wait = getattr(native_trader_client, "_wait_native_callback_event_for_consumer", None)
+    release = getattr(native_trader_client, "_release_native_callback_event_consumer", None)
+    if not callable(claim) or not callable(wait) or not callable(release):
+        raise _contract_error("native callback source has no exclusive queue consumer lease")
+    try:
+        token = claim()
+    except ContractValidationError:
+        raise
+    except Exception as exc:
+        raise _contract_error("native callback queue consumer lease claim failed") from exc
+    if token is None:
+        raise _contract_error("native callback queue consumer lease is unavailable")
+    return token
+
+
+def _release_native_callback_consumer(native_trader_client: object, token: object) -> None:
+    """Release a lease acquired before a bridge instance could be returned."""
+
+    release = getattr(native_trader_client, "_release_native_callback_event_consumer", None)
+    if not callable(release):
+        raise _contract_error("native callback queue consumer lease cleanup is unavailable")
+    try:
+        release(token)
+    except Exception as exc:
+        raise _contract_error("native callback queue consumer lease cleanup failed") from exc
+
+
 @dataclass(frozen=True, slots=True)
 class _LifecycleSessionBinding:
     session: CtpNativeSessionContext
@@ -377,7 +417,7 @@ def _read_event_fields(event: object) -> dict[str, object]:
 
 
 class CtpNativeCallbackSourceBridge:
-    """Poll one SDK client's native callback queue under a persisted binding.
+    """Poll one SDK client's native callback queue under a persisted binding and lease.
 
     The bridge binds while the exact command is ``CLAIMED`` and before its
     native call, while the source client reports a successful, current login.
@@ -393,6 +433,7 @@ class CtpNativeCallbackSourceBridge:
         command: CtpDispatchCommand,
         native_trader_client: object,
         binding: _LifecycleSessionBinding,
+        consumer_token: object,
     ) -> None:
         if _token is not _BRIDGE_CONSTRUCTOR_TOKEN:
             raise _contract_error("bridge instances must be issued after login")
@@ -405,6 +446,7 @@ class CtpNativeCallbackSourceBridge:
         self._correlation = correlation
         self._native_trader_client = cast("_TraderClientSource", native_trader_client)
         self._binding = binding
+        self._consumer_token: object | None = consumer_token
         self._last_source_sequence = binding.source_facts.callback_source_sequence_baseline
         self._closed = False
         self._lock = threading.Lock()
@@ -422,8 +464,8 @@ class CtpNativeCallbackSourceBridge:
 
         ``command.session_binding['native_callback_source']`` must equal the
         live SDK source facts returned by :func:`ctp_native_callback_source_facts`.
-        A missing or stale source binding rejects. The caller cannot supply a
-        session context or a callback event.
+        A missing or stale source binding or exclusive queue-consumer capability
+        rejects. The caller cannot supply a session context or a callback event.
         """
 
         if type(store) is not SqliteExecutionStore or type(scope) is not ExecutionScope:
@@ -488,14 +530,23 @@ class CtpNativeCallbackSourceBridge:
             session_binding_sha256=command.session_binding_sha256,
             lifecycle_binding_sha256=lifecycle_digest,
         )
-        return cls(
-            _token=_BRIDGE_CONSTRUCTOR_TOKEN,
-            store=store,
-            scope=scope,
-            command=command,
-            native_trader_client=native_trader_client,
-            binding=binding,
-        )
+        consumer_token = _claim_native_callback_consumer(native_trader_client)
+        try:
+            post_claim_facts = _capture_logged_in_source(native_trader_client)
+            if not facts.same_login_lifecycle(post_claim_facts):
+                raise _contract_error("native source lifecycle changed while claiming queue owner")
+            return cls(
+                _token=_BRIDGE_CONSTRUCTOR_TOKEN,
+                store=store,
+                scope=scope,
+                command=command,
+                native_trader_client=native_trader_client,
+                binding=binding,
+                consumer_token=consumer_token,
+            )
+        except Exception:
+            _release_native_callback_consumer(native_trader_client, consumer_token)
+            raise
 
     def next_envelope(
         self, *, timeout: float = 5.0
@@ -507,7 +558,12 @@ class CtpNativeCallbackSourceBridge:
             try:
                 self._require_command_binding_current()
                 self._require_live_source_current()
-                event = self._native_trader_client.wait_native_callback_event(timeout=timeout)
+                consumer_token = self._consumer_token
+                if consumer_token is None:
+                    raise _contract_error("native callback queue consumer lease is unavailable")
+                event = self._native_trader_client._wait_native_callback_event_for_consumer(
+                    consumer_token, timeout=timeout
+                )
                 self._require_command_binding_current()
                 self._require_live_source_current()
             except Exception as exc:
@@ -654,8 +710,30 @@ class CtpNativeCallbackSourceBridge:
         if self._closed:
             raise _contract_error("bridge is closed after a source mismatch")
 
+    def close(self) -> None:
+        """Release exclusive callback-queue ownership after the final poll."""
+
+        with self._lock:
+            self._closed = True
+            self._release_consumer_token(suppress_errors=False)
+
     def _poison(self) -> None:
         self._closed = True
+        self._release_consumer_token(suppress_errors=True)
+
+    def _release_consumer_token(self, *, suppress_errors: bool) -> None:
+        token = self._consumer_token
+        if token is None:
+            return
+        try:
+            self._native_trader_client._release_native_callback_event_consumer(token)
+        except Exception as exc:
+            if not suppress_errors:
+                raise _contract_error(
+                    "native callback queue consumer lease cleanup failed"
+                ) from exc
+            return
+        self._consumer_token = None
 
 
 _BRIDGE_CONSTRUCTOR_TOKEN = object()
