@@ -20,6 +20,7 @@ from bt_api_execution import (
     CtpDispatchCorrelationKey,
     CtpDispatchReceipt,
     CtpNativeSessionContext,
+    CtpOrderRefLegacyMapping,
     CtpOrderRefSeedProof,
     CtpUnknownResolutionAttestation,
     CtpVerifiedCallbackEvidence,
@@ -61,12 +62,43 @@ def _session_binding(generation="test-session-generation", front_id=4, session_i
     }
 
 
-def _proof(day: str = "20260925") -> CtpOrderRefSeedProof:
+def _proof(
+    scope: ExecutionScope | None = None,
+    *,
+    session_generation_id: str = "test-session-generation",
+) -> CtpOrderRefSeedProof:
+    active_scope = scope or _scope()
+    legacy_scope = ExecutionScope(
+        "CTP", "simulation", "acct-outbox", "strategy.legacy", "20260924"
+    )
+    source_digests = (
+        ("backtrader_prototype", sha256(b"backtrader prototype fixture").hexdigest()),
+        ("sdk_jsonl", sha256(b"empty sdk jsonl fixture").hexdigest()),
+    )
+    mappings = (
+        CtpOrderRefLegacyMapping(
+            source_name="backtrader_prototype",
+            account_key=active_scope.account_key,
+            trading_day="20260924",
+            scope_key=legacy_scope.key,
+            managed_intent_id="legacy-managed-intent",
+            runtime_order_id="legacy-runtime-order-1",
+            order_ref="000000000012",
+        ),
+    )
     return CtpOrderRefSeedProof(
-        trading_day=day,
+        trading_day=active_scope.trading_day,
         native_max_order_ref="000000000010",
         legacy_ledger_max_order_ref="000000000012",
-        legacy_ledger_sha256=sha256(b"offline legacy ledger fixture").hexdigest(),
+        legacy_ledger_sha256=payload_sha256(dict(source_digests)),
+        account_key=active_scope.account_key,
+        scope_key=active_scope.key,
+        session_generation_id=session_generation_id,
+        native_front_id=4,
+        native_session_id=91,
+        existing_native_order_refs=("000000000009", "000000000010"),
+        legacy_source_sha256=source_digests,
+        legacy_mappings=mappings,
     )
 
 
@@ -79,14 +111,35 @@ def _reserve_seeded(
     scope: ExecutionScope,
     lease,
     intent_id: str = "intent-1",
+    *,
+    session_generation_id: str = "test-session-generation",
 ):
     return store.seed_ctp_order_ref_and_reserve_identity(
         scope,
-        _proof(scope.trading_day),
+        _proof(scope, session_generation_id=session_generation_id),
         intent_id,
         _runtime_id(intent_id),
         writer_lease=lease,
     )
+
+
+def _insert_preseed_identity(
+    store: SqliteExecutionStore,
+    scope: ExecutionScope,
+    intent_id: str,
+    runtime_id: str,
+    order_ref: str = "000000000001",
+):
+    store._connection.execute(
+        """
+        INSERT INTO ctp_order_identity_reservations(
+            account_key, trading_day, scope_key, managed_intent_id,
+            runtime_order_id, order_ref, created_at_ns
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (scope.account_key, scope.trading_day, scope.key, intent_id, runtime_id, order_ref, 1),
+    )
+    return store.read_ctp_order_identity(scope, intent_id)
 
 
 def _stage_submit(
@@ -200,11 +253,11 @@ def _stage_cancel(store, scope, lease, reservation, command_id="cancel-command-1
         },
         approval_use_id="approval-use-" + command_id,
         approval_digest=sha256(("approval-" + command_id).encode("ascii")).hexdigest(),
-        session_binding=_session_binding("test-session-generation-cancel"),
+        session_binding=_session_binding("test-session-generation"),
         writer_lease=lease,
         cancel_target=target,
         managed_action_id="managed-action-" + command_id,
-        session_generation_id="test-session-generation-cancel",
+        session_generation_id="test-session-generation",
         dispatch_front_id=4,
         dispatch_session_id=91,
         native_request_id=_native_request_id(command_id),
@@ -392,8 +445,11 @@ def test_v4_execution_store_migrates_to_verified_callback_ledger_v8(tmp_path):
         legacy_record = store.admit_intent(legacy_intent, writer_lease=lease)
         assert legacy_record.state is ExecutionState.PENDING_ADMISSION
         legacy_outbox = store.read_outbox(scope=scope)
-        legacy_reservation = store.reserve_ctp_order_identity(
-            scope, "legacy-managed-intent", _runtime_id("legacy-managed-intent")
+        legacy_reservation = _insert_preseed_identity(
+            store,
+            scope,
+            "legacy-managed-intent",
+            _runtime_id("legacy-managed-intent"),
         )
     finally:
         store.close()
@@ -423,7 +479,7 @@ def test_v4_execution_store_migrates_to_verified_callback_ledger_v8(tmp_path):
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-        assert version == "8"
+        assert version == "9"
         assert "ctp_dispatch_commands" in tables
         assert "ctp_order_ref_watermarks" in tables
         assert "ctp_dispatch_authority_uses" in tables
@@ -441,6 +497,14 @@ def test_v4_execution_store_migrates_to_verified_callback_ledger_v8(tmp_path):
             ).fetchone()[0]
             == 0
         )
+        migrated_account_watermark = migrated._connection.execute(
+            """
+            SELECT watermark_order_ref, cutover_established
+            FROM ctp_order_ref_account_watermarks WHERE account_key = ?
+            """,
+            (scope.account_key,),
+        ).fetchone()
+        assert tuple(migrated_account_watermark) == ("000000000001", 0)
     finally:
         migrated.close()
 
@@ -469,7 +533,7 @@ def test_v5_execution_store_migrates_one_use_authority_table(tmp_path):
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-        assert version == "8"
+        assert version == "9"
         assert "ctp_dispatch_authority_uses" in tables
     finally:
         migrated.close()
@@ -512,7 +576,7 @@ def test_v6_staged_command_without_typed_keys_migrates_to_unknown(tmp_path):
         assert row is not None
         assert row.status == "UNKNOWN"
         assert row.correlation_key is None
-        assert row.unknown_reason == "legacy_command_missing_correlation_keys"
+        assert row.unknown_reason == "schema_upgrade_requires_ctp_orderref_cutover"
         assert (
             migrated.claim_ctp_dispatch_command(
                 scope,
@@ -561,13 +625,13 @@ def test_v7_typed_command_migrates_to_callback_ledger_without_reopening_dispatch
     try:
         current = migrated.read_ctp_dispatch_command(scope, staged.command_id)
         assert current is not None
-        assert current.status == "READY"
+        assert current.status == "UNKNOWN"
         assert current.correlation_key == original_key
         assert (
             migrated._connection.execute(
                 "SELECT value FROM execution_meta WHERE key = 'schema_version'"
             ).fetchone()[0]
-            == "8"
+            == "9"
         )
         assert (
             migrated._connection.execute(
@@ -667,11 +731,364 @@ def test_initial_seed_and_first_reservation_commit_atomically(tmp_path):
             store._connection.execute("SELECT COUNT(*) FROM ctp_order_ref_watermarks").fetchone()[0]
             == 0
         )
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_order_ref_account_watermarks"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            store._connection.execute("SELECT COUNT(*) FROM ctp_order_ref_legacy_imports").fetchone()[0]
+            == 0
+        )
 
         store._connection.execute("DROP TRIGGER reject_seeded_reservation")
         reservation = _reserve_seeded(store, scope, lease)
         assert reservation.order_ref == "000000000013"
         assert _reserve_seeded(store, scope, lease) == reservation
+        imported = store.read_ctp_order_identity(
+            ExecutionScope("CTP", "simulation", "acct-outbox", "strategy.legacy", "20260924"),
+            "legacy-managed-intent",
+        )
+        assert imported is not None and imported.order_ref == "000000000012"
+        account_watermark = store._connection.execute(
+            """
+            SELECT watermark_order_ref, cutover_established, last_trading_day
+            FROM ctp_order_ref_account_watermarks WHERE account_key = ?
+            """,
+            (scope.account_key,),
+        ).fetchone()
+        assert tuple(account_watermark) == ("000000000013", 1, "20260925")
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_order_ref_cutover_sessions"
+            ).fetchone()[0]
+            == 1
+        )
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+def test_cutover_import_and_account_watermark_survive_restart(tmp_path):
+    path = tmp_path / "execution.sqlite3"
+    scope = _scope()
+    store = SqliteExecutionStore(path)
+    try:
+        lease = _lease(store, scope)
+        first = _reserve_seeded(store, scope, lease, "first-cutover-intent")
+        assert first.order_ref == "000000000013"
+    finally:
+        store.close()
+
+    reopened = SqliteExecutionStore(path)
+    try:
+        lease = _lease(reopened, scope)
+        second = _reserve_seeded(reopened, scope, lease, "second-cutover-intent")
+        assert second.order_ref == "000000000014"
+        row = reopened._connection.execute(
+            "SELECT watermark_order_ref, cutover_established "
+            "FROM ctp_order_ref_account_watermarks WHERE account_key = ?",
+            (scope.account_key,),
+        ).fetchone()
+        assert tuple(row) == ("000000000014", 1)
+        assert (
+            reopened._connection.execute(
+                "SELECT COUNT(*) FROM ctp_order_ref_legacy_imports"
+            ).fetchone()[0]
+            == 1
+        )
+    finally:
+        reopened.close()
+
+
+@pytest.mark.unit
+def test_cutover_requires_exact_scope_and_complete_legacy_mapping_manifest(tmp_path):
+    store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
+    scope = _scope()
+    lease = _lease(store, scope)
+    proof = _proof(scope)
+    try:
+        wrong_scope_proof = _proof(
+            ExecutionScope("CTP", "simulation", "acct-outbox", "strategy.other", "20260925")
+        )
+        with pytest.raises(ContractValidationError, match="exact account/scope/day"):
+            store.seed_ctp_order_ref_and_reserve_identity(
+                scope,
+                wrong_scope_proof,
+                "intent-1",
+                _runtime_id("intent-1"),
+                writer_lease=lease,
+            )
+        with pytest.raises(ContractValidationError, match="complete imported mapping set"):
+            store.seed_ctp_order_ref_and_reserve_identity(
+                scope,
+                replace(proof, legacy_mappings=()),
+                "intent-1",
+                _runtime_id("intent-1"),
+                writer_lease=lease,
+            )
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_order_identity_reservations"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_order_ref_cutover_sessions"
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+def test_cutover_rejects_stale_native_floor_and_omitted_imported_mapping(tmp_path):
+    store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
+    scope = _scope()
+    lease = _lease(store, scope)
+    try:
+        proof = _proof(scope)
+        first_mapping = proof.legacy_mappings[0]
+        older_mapping = CtpOrderRefLegacyMapping(
+            source_name="backtrader_prototype",
+            account_key=scope.account_key,
+            trading_day="20260924",
+            scope_key=first_mapping.scope_key,
+            managed_intent_id="legacy-older-intent",
+            runtime_order_id=_runtime_id("legacy-older-intent"),
+            order_ref="000000000011",
+        )
+        complete_proof = replace(
+            proof,
+            legacy_mappings=(older_mapping, first_mapping),
+        )
+        first = store.seed_ctp_order_ref_and_reserve_identity(
+            scope,
+            complete_proof,
+            "first-cutover-intent",
+            _runtime_id("first-cutover-intent"),
+            writer_lease=lease,
+        )
+        assert first.order_ref == "000000000013"
+
+        stale_proof = replace(
+            _proof(scope, session_generation_id="stale-native-session"),
+            native_max_order_ref="000000000009",
+            existing_native_order_refs=("000000000008", "000000000009"),
+        )
+        with pytest.raises(IntentConflictError, match="cannot move backward"):
+            store.seed_ctp_order_ref_and_reserve_identity(
+                scope,
+                stale_proof,
+                "stale-intent",
+                _runtime_id("stale-intent"),
+                writer_lease=lease,
+            )
+
+        incomplete_proof = replace(
+            _proof(scope, session_generation_id="omitted-legacy-session"),
+            legacy_mappings=(first_mapping,),
+        )
+        with pytest.raises(IntentConflictError, match="omits an imported mapping"):
+            store.seed_ctp_order_ref_and_reserve_identity(
+                scope,
+                incomplete_proof,
+                "omitted-intent",
+                _runtime_id("omitted-intent"),
+                writer_lease=lease,
+            )
+
+        assert (
+            store._connection.execute(
+                "SELECT watermark_order_ref FROM ctp_order_ref_account_watermarks "
+                "WHERE account_key = ?",
+                (scope.account_key,),
+            ).fetchone()[0]
+            == "000000000013"
+        )
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_order_ref_cutover_sessions"
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_order_identity_reservations "
+                "WHERE managed_intent_id IN ('stale-intent', 'omitted-intent')"
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+def test_claim_requires_the_cutover_native_session_to_match_command_session(tmp_path):
+    store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
+    scope = _scope()
+    lease = _lease(store, scope)
+    try:
+        reservation = _reserve_seeded(store, scope, lease)
+        staged = _stage_submit(
+            store,
+            scope,
+            lease,
+            reservation,
+            session_generation_id="different-native-session",
+        )
+        with pytest.raises(ContractValidationError, match="exact current OrderRef cutover session"):
+            store.claim_ctp_dispatch_command(
+                scope,
+                staged.command_id,
+                writer_lease=lease,
+                authority_verifier=_authority_verifier(),
+            )
+        assert store.read_ctp_dispatch_command(scope, staged.command_id).status == "READY"
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+def test_superseded_session_proof_cannot_reactivate_or_claim_old_session(tmp_path):
+    store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
+    scope = _scope()
+    lease = _lease(store, scope)
+    original_proof = _proof(scope)
+    try:
+        reservation = store.seed_ctp_order_ref_and_reserve_identity(
+            scope,
+            original_proof,
+            "session-a-intent",
+            _runtime_id("session-a-intent"),
+            writer_lease=lease,
+        )
+        old_session_command = _stage_submit(
+            store,
+            scope,
+            lease,
+            reservation,
+            command_id="session-a-command",
+        )
+        replacement_proof = _proof(
+            scope,
+            session_generation_id="replacement-session-b",
+        )
+        store.record_ctp_order_ref_seed(scope, replacement_proof, writer_lease=lease)
+        # The current proof remains idempotent, while the superseded one does not.
+        store.record_ctp_order_ref_seed(scope, replacement_proof, writer_lease=lease)
+
+        with pytest.raises(IntentConflictError, match="session evidence was superseded"):
+            store.record_ctp_order_ref_seed(scope, original_proof, writer_lease=lease)
+
+        with pytest.raises(IntentConflictError, match="session evidence was superseded"):
+            store.seed_ctp_order_ref_and_reserve_identity(
+                scope,
+                original_proof,
+                "session-a-replay-intent",
+                _runtime_id("session-a-replay-intent"),
+                writer_lease=lease,
+            )
+        with pytest.raises(
+            ContractValidationError,
+            match="exact current OrderRef cutover session",
+        ):
+            store.claim_ctp_dispatch_command(
+                scope,
+                old_session_command.command_id,
+                writer_lease=lease,
+                authority_verifier=_authority_verifier(),
+            )
+
+        assert (
+            store.read_ctp_dispatch_command(scope, old_session_command.command_id).status
+            == "READY"
+        )
+        active = store._connection.execute(
+            """
+            SELECT last_trading_day, last_cutover_evidence_sha256
+            FROM ctp_order_ref_account_watermarks WHERE account_key = ?
+            """,
+            (scope.account_key,),
+        ).fetchone()
+        assert active["last_trading_day"] == scope.trading_day
+        replacement = store._connection.execute(
+            """
+            SELECT evidence_sha256 FROM ctp_order_ref_cutover_sessions
+            WHERE account_key = ? AND trading_day = ? AND scope_key = ?
+              AND session_generation_id = ?
+            """,
+            (
+                scope.account_key,
+                scope.trading_day,
+                scope.key,
+                replacement_proof.session_generation_id,
+            ),
+        ).fetchone()
+        assert active["last_cutover_evidence_sha256"] == replacement["evidence_sha256"]
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_order_identity_reservations "
+                "WHERE managed_intent_id = 'session-a-replay-intent'"
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+def test_account_orderref_active_trading_day_never_moves_backwards(tmp_path):
+    store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
+    first_scope = _scope()
+    first_lease = _lease(store, first_scope)
+    first_proof = _proof(first_scope)
+    second_scope = ExecutionScope(
+        "CTP", "simulation", first_scope.account_ref, "strategy.next-day", "20260926"
+    )
+    try:
+        first = store.seed_ctp_order_ref_and_reserve_identity(
+            first_scope,
+            first_proof,
+            "first-day-intent",
+            _runtime_id("first-day-intent"),
+            writer_lease=first_lease,
+        )
+        second = store.seed_ctp_order_ref_and_reserve_identity(
+            second_scope,
+            _proof(second_scope, session_generation_id="next-trading-day-session"),
+            "second-day-intent",
+            _runtime_id("second-day-intent"),
+            writer_lease=first_lease,
+        )
+        assert first.order_ref == "000000000013"
+        assert second.order_ref == "000000000014"
+
+        with pytest.raises(IntentConflictError, match="active trading day cannot move backward"):
+            store.seed_ctp_order_ref_and_reserve_identity(
+                first_scope,
+                first_proof,
+                "stale-first-day-intent",
+                _runtime_id("stale-first-day-intent"),
+                writer_lease=first_lease,
+            )
+
+        active_day = store._connection.execute(
+            "SELECT last_trading_day FROM ctp_order_ref_account_watermarks "
+            "WHERE account_key = ?",
+            (first_scope.account_key,),
+        ).fetchone()[0]
+        assert active_day == second_scope.trading_day
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_order_identity_reservations "
+                "WHERE managed_intent_id = 'stale-first-day-intent'"
+            ).fetchone()[0]
+            == 0
+        )
     finally:
         store.close()
 
@@ -738,9 +1155,11 @@ def test_native_callback_envelope_keeps_default_store_verifier_fail_closed(tmp_p
     scope = _scope()
     lease = _lease(store, scope)
     try:
-        reservation = _reserve_seeded(store, scope, lease)
         session_epoch = ctp_native_session_epoch()
         generation = ctp_native_session_generation_id(3, 7, session_epoch, 4, 91)
+        reservation = _reserve_seeded(
+            store, scope, lease, session_generation_id=generation
+        )
         command = _stage_submit(
             store,
             scope,
@@ -1414,7 +1833,11 @@ def test_unknown_callback_stays_fenced_until_fresh_terminal_reconciliation(tmp_p
             )
 
         second_reservation = _reserve_seeded(
-            store, other_scope, other_lease, "intent-after-unknown"
+            store,
+            other_scope,
+            other_lease,
+            "intent-after-unknown",
+            session_generation_id="new-session-generation",
         )
         next_command = _stage_submit(
             store,
@@ -1674,7 +2097,8 @@ def test_claim_requires_seed_and_never_claims_a_preseed_reservation(tmp_path):
     scope = _scope()
     lease = _lease(store, scope)
     try:
-        old = store.reserve_ctp_order_identity(scope, "old-intent", _runtime_id("old-intent"))
+        old = _insert_preseed_identity(store, scope, "old-intent", _runtime_id("old-intent"))
+        assert old is not None
         old_command = _stage_submit(store, scope, lease, old, command_id="old-command")
         with pytest.raises(ContractValidationError, match="staged-only"):
             store.claim_ctp_dispatch_command(
