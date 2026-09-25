@@ -953,6 +953,147 @@ def test_claim_requires_the_cutover_native_session_to_match_command_session(tmp_
 
 
 @pytest.mark.unit
+def test_superseded_session_proof_cannot_reactivate_or_claim_old_session(tmp_path):
+    store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
+    scope = _scope()
+    lease = _lease(store, scope)
+    original_proof = _proof(scope)
+    try:
+        reservation = store.seed_ctp_order_ref_and_reserve_identity(
+            scope,
+            original_proof,
+            "session-a-intent",
+            _runtime_id("session-a-intent"),
+            writer_lease=lease,
+        )
+        old_session_command = _stage_submit(
+            store,
+            scope,
+            lease,
+            reservation,
+            command_id="session-a-command",
+        )
+        replacement_proof = _proof(
+            scope,
+            session_generation_id="replacement-session-b",
+        )
+        store.record_ctp_order_ref_seed(scope, replacement_proof, writer_lease=lease)
+        # The current proof remains idempotent, while the superseded one does not.
+        store.record_ctp_order_ref_seed(scope, replacement_proof, writer_lease=lease)
+
+        with pytest.raises(IntentConflictError, match="session evidence was superseded"):
+            store.record_ctp_order_ref_seed(scope, original_proof, writer_lease=lease)
+
+        with pytest.raises(IntentConflictError, match="session evidence was superseded"):
+            store.seed_ctp_order_ref_and_reserve_identity(
+                scope,
+                original_proof,
+                "session-a-replay-intent",
+                _runtime_id("session-a-replay-intent"),
+                writer_lease=lease,
+            )
+        with pytest.raises(
+            ContractValidationError,
+            match="exact current OrderRef cutover session",
+        ):
+            store.claim_ctp_dispatch_command(
+                scope,
+                old_session_command.command_id,
+                writer_lease=lease,
+                authority_verifier=_authority_verifier(),
+            )
+
+        assert (
+            store.read_ctp_dispatch_command(scope, old_session_command.command_id).status
+            == "READY"
+        )
+        active = store._connection.execute(
+            """
+            SELECT last_trading_day, last_cutover_evidence_sha256
+            FROM ctp_order_ref_account_watermarks WHERE account_key = ?
+            """,
+            (scope.account_key,),
+        ).fetchone()
+        assert active["last_trading_day"] == scope.trading_day
+        replacement = store._connection.execute(
+            """
+            SELECT evidence_sha256 FROM ctp_order_ref_cutover_sessions
+            WHERE account_key = ? AND trading_day = ? AND scope_key = ?
+              AND session_generation_id = ?
+            """,
+            (
+                scope.account_key,
+                scope.trading_day,
+                scope.key,
+                replacement_proof.session_generation_id,
+            ),
+        ).fetchone()
+        assert active["last_cutover_evidence_sha256"] == replacement["evidence_sha256"]
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_order_identity_reservations "
+                "WHERE managed_intent_id = 'session-a-replay-intent'"
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+def test_account_orderref_active_trading_day_never_moves_backwards(tmp_path):
+    store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
+    first_scope = _scope()
+    first_lease = _lease(store, first_scope)
+    first_proof = _proof(first_scope)
+    second_scope = ExecutionScope(
+        "CTP", "simulation", first_scope.account_ref, "strategy.next-day", "20260926"
+    )
+    try:
+        first = store.seed_ctp_order_ref_and_reserve_identity(
+            first_scope,
+            first_proof,
+            "first-day-intent",
+            _runtime_id("first-day-intent"),
+            writer_lease=first_lease,
+        )
+        second = store.seed_ctp_order_ref_and_reserve_identity(
+            second_scope,
+            _proof(second_scope, session_generation_id="next-trading-day-session"),
+            "second-day-intent",
+            _runtime_id("second-day-intent"),
+            writer_lease=first_lease,
+        )
+        assert first.order_ref == "000000000013"
+        assert second.order_ref == "000000000014"
+
+        with pytest.raises(IntentConflictError, match="active trading day cannot move backward"):
+            store.seed_ctp_order_ref_and_reserve_identity(
+                first_scope,
+                first_proof,
+                "stale-first-day-intent",
+                _runtime_id("stale-first-day-intent"),
+                writer_lease=first_lease,
+            )
+
+        active_day = store._connection.execute(
+            "SELECT last_trading_day FROM ctp_order_ref_account_watermarks "
+            "WHERE account_key = ?",
+            (first_scope.account_key,),
+        ).fetchone()[0]
+        assert active_day == second_scope.trading_day
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_order_identity_reservations "
+                "WHERE managed_intent_id = 'stale-first-day-intent'"
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
 def test_stage_is_idempotent_and_rejects_conflicting_command_identity(tmp_path):
     store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
     scope = _scope()

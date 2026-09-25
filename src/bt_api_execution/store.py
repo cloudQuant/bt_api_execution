@@ -2337,7 +2337,7 @@ class SqliteExecutionStore:
 
         row = cursor.execute(
             """
-            SELECT watermark_order_ref, cutover_established
+            SELECT watermark_order_ref, cutover_established, last_trading_day
             FROM ctp_order_ref_account_watermarks WHERE account_key = ?
             """,
             (account_key,),
@@ -2360,6 +2360,13 @@ class SqliteExecutionStore:
                 ),
             )
             return
+        active_trading_day = row["last_trading_day"]
+        if (
+            trading_day is not None
+            and active_trading_day is not None
+            and trading_day < str(active_trading_day)
+        ):
+            raise IntentConflictError("CTP OrderRef active trading day cannot move backward")
         current = str(row["watermark_order_ref"])
         advanced = f"{max(int(current), int(order_ref)):012d}"
         established = bool(row["cutover_established"]) or bool(cutover_established)
@@ -2381,6 +2388,50 @@ class SqliteExecutionStore:
                 account_key,
             ),
         )
+
+    @staticmethod
+    def _assert_ctp_order_ref_evidence_is_current_or_new(
+        cursor: sqlite3.Cursor,
+        proof: CtpOrderRefSeedProof,
+        evidence_sha256: str,
+    ) -> None:
+        """Reject superseded session proofs and account-day rollback attempts."""
+
+        account_watermark = cursor.execute(
+            """
+            SELECT last_trading_day, last_cutover_evidence_sha256
+            FROM ctp_order_ref_account_watermarks WHERE account_key = ?
+            """,
+            (proof.account_key,),
+        ).fetchone()
+        if account_watermark is None:
+            return
+        active_day = account_watermark["last_trading_day"]
+        active_evidence = account_watermark["last_cutover_evidence_sha256"]
+        if active_day is not None and proof.trading_day < str(active_day):
+            raise IntentConflictError("CTP OrderRef active trading day cannot move backward")
+
+        prior_session = cursor.execute(
+            """
+            SELECT evidence_sha256 FROM ctp_order_ref_cutover_sessions
+            WHERE account_key = ? AND trading_day = ? AND scope_key = ?
+              AND session_generation_id = ?
+            """,
+            (
+                proof.account_key,
+                proof.trading_day,
+                proof.scope_key,
+                proof.session_generation_id,
+            ),
+        ).fetchone()
+        if prior_session is None:
+            return
+        if str(prior_session["evidence_sha256"]) != evidence_sha256:
+            raise IntentConflictError("CTP OrderRef session proof conflicts with stored evidence")
+        if active_day is None or str(active_day) != proof.trading_day or str(
+            active_evidence
+        ) != evidence_sha256:
+            raise IntentConflictError("CTP OrderRef session evidence was superseded")
 
     @staticmethod
     def _require_ctp_order_ref_cutover_session(
@@ -2597,6 +2648,9 @@ class SqliteExecutionStore:
         now_ns = time.time_ns()
         with self._transaction() as cursor:
             self._assert_active_writer_lease(cursor, scope, writer_lease)
+            self._assert_ctp_order_ref_evidence_is_current_or_new(
+                cursor, proof, evidence_sha256
+            )
             existing = cursor.execute(
                 """
                 SELECT 1 FROM ctp_order_ref_watermarks
@@ -2693,6 +2747,9 @@ class SqliteExecutionStore:
         now_ns = time.time_ns()
         with self._transaction() as cursor:
             self._assert_active_writer_lease(cursor, scope, writer_lease)
+            self._assert_ctp_order_ref_evidence_is_current_or_new(
+                cursor, proof, evidence_sha256
+            )
             existing_identity = cursor.execute(
                 """
                 SELECT account_key, trading_day, scope_key, managed_intent_id,
