@@ -5,7 +5,7 @@ import sqlite3
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
 from decimal import Decimal
 from hashlib import sha256
 
@@ -327,7 +327,7 @@ def _authority_verifier(**overrides):
     return _FakeCtpDispatchAuthorityVerifier(overrides=overrides)
 
 
-def _dispatch_fake(store, scope, lease, command, *, outcome="QUEUED"):
+def _dispatch_fake(store, scope, lease, command, *, outcome="QUEUED", native=None):
     claimed = store.claim_ctp_dispatch_command(
         scope,
         command.command_id,
@@ -336,7 +336,7 @@ def _dispatch_fake(store, scope, lease, command, *, outcome="QUEUED"):
     )
     assert claimed is not None and claimed.status == "CLAIMED"
     return store.complete_ctp_dispatch_command(
-        scope, _receipt(claimed, outcome=outcome), writer_lease=lease
+        scope, _receipt(claimed, outcome=outcome, native=native), writer_lease=lease
     )
 
 
@@ -964,6 +964,74 @@ def test_cancel_correlation_keeps_action_separate_from_exact_order_target(tmp_pa
 
 
 @pytest.mark.unit
+def test_local_rejection_does_not_become_provider_order_rejection(tmp_path):
+    store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
+    scope = _scope()
+    lease = _lease(store, scope)
+    try:
+        reservation = _reserve_seeded(store, scope, lease)
+        command = _stage_submit(store, scope, lease, reservation, "command-local-rejected")
+        completed = _dispatch_fake(
+            store,
+            scope,
+            lease,
+            command,
+            outcome="REJECTED",
+            native={"queue_code": -1},
+        )
+
+        projected = store.read_ctp_dispatch_projection(scope, command.command_id)
+        assert completed.status == "COMPLETED"
+        assert projected is not None
+        assert projected.command_status == "COMPLETED"
+        assert projected.local_dispatch_outcome == "REJECTED"
+        assert projected.submit_action is not None
+        assert projected.submit_action.order_state.provider_state is None
+        assert projected.cancel_action is None
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+def test_local_cancel_rejection_does_not_become_provider_cancel_rejection(tmp_path):
+    store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
+    scope = _scope()
+    lease = _lease(store, scope)
+    try:
+        reservation = _reserve_seeded(store, scope, lease)
+        submit = _stage_submit(store, scope, lease, reservation)
+        _dispatch_fake(store, scope, lease, submit)
+        _apply_callback(
+            store,
+            scope,
+            submit,
+            _callback(submit, event_id="submit-ack-for-local-cancel-reject"),
+            lease,
+            _FakeCtpDispatchCallbackVerifier("ACKNOWLEDGED"),
+        )
+
+        cancel = _stage_cancel(store, scope, lease, reservation, "cancel-local-rejected")
+        completed = _dispatch_fake(
+            store,
+            scope,
+            lease,
+            cancel,
+            outcome="REJECTED",
+            native={"queue_code": -1},
+        )
+        projected = store.read_ctp_dispatch_projection(scope, cancel.command_id)
+
+        assert completed.status == "COMPLETED"
+        assert projected is not None
+        assert projected.local_dispatch_outcome == "REJECTED"
+        assert projected.cancel_action is not None
+        assert projected.cancel_action.action_state is None
+        assert projected.cancel_action.target_order.order_state.provider_state == "ACKNOWLEDGED"
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
 def test_verified_submit_callback_is_durable_idempotent_and_restart_safe(tmp_path):
     path = tmp_path / "execution.sqlite3"
     store = SqliteExecutionStore(path)
@@ -974,6 +1042,11 @@ def test_verified_submit_callback_is_durable_idempotent_and_restart_safe(tmp_pat
         command = _stage_submit(store, scope, lease, reservation)
         completed = _dispatch_fake(store, scope, lease, command)
         callback = _callback(command, event_id="order-event-1")
+        before_verified_callback = store.read_ctp_dispatch_projection(scope, command.command_id)
+        assert before_verified_callback is not None
+        assert before_verified_callback.local_dispatch_outcome == "QUEUED"
+        assert before_verified_callback.submit_action is not None
+        assert before_verified_callback.submit_action.order_state.provider_state is None
         with pytest.raises(ContractValidationError, match="verification failed"):
             _apply_callback(store, scope, command, callback, lease)
         assert (
@@ -982,6 +1055,11 @@ def test_verified_submit_callback_is_durable_idempotent_and_restart_safe(tmp_pat
             ).fetchone()[0]
             == 0
         )
+        after_unverified_callback = store.read_ctp_dispatch_projection(scope, command.command_id)
+        assert after_unverified_callback is not None
+        assert after_unverified_callback.local_dispatch_outcome == "QUEUED"
+        assert after_unverified_callback.submit_action is not None
+        assert after_unverified_callback.submit_action.order_state.provider_state is None
 
         applied = _apply_callback(
             store, scope, command, callback, lease, _FakeCtpDispatchCallbackVerifier()
@@ -999,6 +1077,26 @@ def test_verified_submit_callback_is_durable_idempotent_and_restart_safe(tmp_pat
         ).fetchone()
         assert projection["provider_state"] == "ACKNOWLEDGED"
         assert projection["terminal"] == 0
+        changes_before_read = store._connection.total_changes
+        projected = store.read_ctp_dispatch_projection(scope, command.command_id)
+        assert projected is not None
+        assert projected.operation == "SUBMIT"
+        assert projected.command_status == "COMPLETED"
+        assert projected.local_dispatch_outcome == "QUEUED"
+        assert projected.submit_action is not None
+        assert projected.submit_action.managed_intent_id == reservation.managed_intent_id
+        assert projected.submit_action.runtime_order_id == reservation.runtime_order_id
+        assert projected.submit_action.order_ref == reservation.order_ref
+        assert projected.submit_action.order_state.provider_state == "ACKNOWLEDGED"
+        assert projected.submit_action.order_state.source_kind == "CALLBACK"
+        assert projected.cancel_action is None
+        assert projected.unknown_resolution is None
+        assert store._connection.total_changes == changes_before_read
+        assert not hasattr(projected, "request_payload")
+        assert not hasattr(projected, "session_binding")
+        assert not hasattr(projected, "native_receipt_payload")
+        with pytest.raises(FrozenInstanceError):
+            projected.command_status = "UNKNOWN"
         assert ledger["callback_key_json"] == json.dumps(
             callback.to_payload(), sort_keys=True, separators=(",", ":")
         )
@@ -1033,6 +1131,11 @@ def test_verified_submit_callback_is_durable_idempotent_and_restart_safe(tmp_pat
             ).fetchone()[0]
             == "ACKNOWLEDGED"
         )
+        reopened_projection = reopened.read_ctp_dispatch_projection(scope, command.command_id)
+        assert reopened_projection is not None
+        assert reopened_projection.local_dispatch_outcome == "QUEUED"
+        assert reopened_projection.submit_action is not None
+        assert reopened_projection.submit_action.order_state.provider_state == "ACKNOWLEDGED"
     finally:
         reopened.close()
 
@@ -1211,6 +1314,14 @@ def test_cancel_callback_projects_action_without_cancelling_target_order(tmp_pat
         )
         cancel = _stage_cancel(store, scope, lease, reservation)
         _dispatch_fake(store, scope, lease, cancel)
+        before_cancel_callback = store.read_ctp_dispatch_projection(scope, cancel.command_id)
+        assert before_cancel_callback is not None
+        assert before_cancel_callback.cancel_action is not None
+        assert before_cancel_callback.cancel_action.action_state is None
+        assert (
+            before_cancel_callback.cancel_action.target_order.order_state.provider_state
+            == "ACKNOWLEDGED"
+        )
         applied = _apply_callback(
             store,
             scope,
@@ -1232,6 +1343,27 @@ def test_cancel_callback_projects_action_without_cancelling_target_order(tmp_pat
         assert order_projection["provider_state"] == "ACKNOWLEDGED"
         assert cancel_projection["provider_state"] == "TERMINAL"
         assert cancel_projection["terminal"] == 1
+        projected = store.read_ctp_dispatch_projection(scope, cancel.command_id)
+        assert projected is not None
+        assert projected.operation == "CANCEL"
+        assert projected.command_status == "COMPLETED"
+        assert projected.submit_action is None
+        assert projected.cancel_action is not None
+        assert projected.cancel_action.managed_action_id == cancel.correlation_key.managed_action_id
+        assert projected.cancel_action.action_state == "TERMINAL"
+        assert projected.cancel_action.terminal is True
+        assert projected.cancel_action.target_order.managed_intent_id == reservation.managed_intent_id
+        assert projected.cancel_action.target_order.runtime_order_id == reservation.runtime_order_id
+        assert projected.cancel_action.target_order.order_ref == reservation.order_ref
+        assert projected.cancel_action.target_order.exchange_id == "SHFE"
+        assert projected.cancel_action.target_order.order_sys_id == "sys-order-17"
+        assert projected.cancel_action.target_order.front_id == 4
+        assert projected.cancel_action.target_order.session_id == 91
+        assert projected.cancel_action.target_order.order_state.provider_state == "ACKNOWLEDGED"
+        assert projected.cancel_action.target_order.order_state.source_kind == "CALLBACK"
+        assert projected.cancel_action.managed_action_id != (
+            projected.cancel_action.target_order.managed_intent_id
+        )
     finally:
         store.close()
 
@@ -1266,6 +1398,16 @@ def test_unknown_callback_stays_fenced_until_fresh_terminal_reconciliation(tmp_p
         assert (
             store.read_ctp_dispatch_command(scope, unknown_command.command_id).status == "UNKNOWN"
         )
+        unknown_projection = store.read_ctp_dispatch_projection(scope, unknown_command.command_id)
+        assert unknown_projection is not None
+        assert unknown_projection.command_status == "UNKNOWN"
+        assert unknown_projection.local_dispatch_outcome == "UNKNOWN"
+        assert unknown_projection.unknown_reason is not None
+        assert unknown_projection.submit_action is not None
+        assert unknown_projection.submit_action.order_state.provider_state == "FILLED"
+        assert unknown_projection.submit_action.order_state.source_kind == "CALLBACK"
+        assert unknown_projection.unknown_resolution is None
+        assert store.read_ctp_dispatch_projection(other_scope, unknown_command.command_id) is None
         with pytest.raises(ContractValidationError, match="verification failed"):
             store.resolve_unknown_ctp_dispatch_command(
                 scope, unknown_command.command_id, writer_lease=lease
@@ -1308,6 +1450,19 @@ def test_unknown_callback_stays_fenced_until_fresh_terminal_reconciliation(tmp_p
         assert (
             store.read_ctp_dispatch_command(scope, unknown_command.command_id).status == "UNKNOWN"
         )
+        reconciled_projection = store.read_ctp_dispatch_projection(
+            scope, unknown_command.command_id
+        )
+        assert reconciled_projection is not None
+        assert reconciled_projection.command_status == "UNKNOWN"
+        assert reconciled_projection.local_dispatch_outcome == "UNKNOWN"
+        assert reconciled_projection.unknown_reason == unknown_projection.unknown_reason
+        assert reconciled_projection.submit_action is not None
+        assert reconciled_projection.submit_action.order_state.provider_state == "FILLED"
+        assert reconciled_projection.submit_action.order_state.source_kind == "RECONCILIATION"
+        assert reconciled_projection.unknown_resolution is not None
+        assert reconciled_projection.unknown_resolution.order_terminal_state == "FILLED"
+        assert reconciled_projection.unknown_resolution.cancel_action_terminal_state is None
         assert (
             store._connection.execute(
                 "SELECT provider_state FROM ctp_dispatch_order_projection WHERE account_key = ?",
@@ -1426,6 +1581,23 @@ def test_unknown_cancel_resolution_requires_terminal_action_and_target(tmp_path)
         assert cancel_projection["provider_state"] == "TERMINAL"
         assert cancel_projection["terminal"] == 1
         assert store.read_ctp_dispatch_command(scope, cancel.command_id).status == "UNKNOWN"
+        projected = store.read_ctp_dispatch_projection(scope, cancel.command_id)
+        assert projected is not None
+        assert projected.command_status == "UNKNOWN"
+        assert projected.local_dispatch_outcome == "UNKNOWN"
+        assert projected.cancel_action is not None
+        assert projected.cancel_action.managed_action_id == cancel.correlation_key.managed_action_id
+        assert projected.cancel_action.action_state == "TERMINAL"
+        assert projected.cancel_action.source_kind == "RECONCILIATION"
+        assert projected.cancel_action.target_order.managed_intent_id == reservation.managed_intent_id
+        assert projected.cancel_action.target_order.runtime_order_id == reservation.runtime_order_id
+        assert projected.cancel_action.target_order.exchange_id == "SHFE"
+        assert projected.cancel_action.target_order.order_sys_id == "sys-order-17"
+        assert projected.cancel_action.target_order.order_state.provider_state == "CANCELLED"
+        assert projected.cancel_action.target_order.order_state.source_kind == "RECONCILIATION"
+        assert projected.unknown_resolution is not None
+        assert projected.unknown_resolution.order_terminal_state == "CANCELLED"
+        assert projected.unknown_resolution.cancel_action_terminal_state == "TERMINAL"
     finally:
         store.close()
 

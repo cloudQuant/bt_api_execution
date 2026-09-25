@@ -563,6 +563,230 @@ class CtpDispatchUnknownResolutionResult:
     duplicate: bool
 
 
+@dataclass(frozen=True, slots=True)
+class CtpProjectedOrderState:
+    """One committed provider-order projection, or an explicitly absent one."""
+
+    provider_state: str | None = None
+    terminal: bool | None = None
+    source_kind: str | None = None
+    updated_at_ns: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.provider_state is None:
+            if any(
+                value is not None
+                for value in (self.terminal, self.source_kind, self.updated_at_ns)
+            ):
+                raise ContractValidationError("absent CTP order projection has partial state")
+            return
+        if (
+            type(self.provider_state) is not str
+            or self.provider_state not in _CTP_ORDER_PROJECTION_STATES
+        ):
+            raise ContractValidationError("invalid projected CTP order state")
+        expected_terminal = self.provider_state in _CTP_ORDER_TERMINAL_STATES
+        if type(self.terminal) is not bool or self.terminal is not expected_terminal:
+            raise ContractValidationError("invalid projected CTP order terminal flag")
+        if self.source_kind not in {"CALLBACK", "RECONCILIATION"}:
+            raise ContractValidationError("invalid projected CTP order source")
+        if type(self.updated_at_ns) is not int or self.updated_at_ns <= 0:
+            raise ContractValidationError("invalid projected CTP order timestamp")
+
+
+@dataclass(frozen=True, slots=True)
+class CtpSubmitActionProjection:
+    """A submit command and its separate provider-order projection."""
+
+    managed_intent_id: str
+    runtime_order_id: str
+    order_ref: str
+    order_state: CtpProjectedOrderState
+
+    def __post_init__(self) -> None:
+        _validate_correlation_text(self.managed_intent_id, "managed intent id")
+        if not _is_prefixed_digest(self.runtime_order_id, "bt-managed-v1:"):
+            raise ContractValidationError("invalid projected CTP runtime order id")
+        if (
+            type(self.order_ref) is not str
+            or len(self.order_ref) != 12
+            or not self.order_ref.isascii()
+            or not self.order_ref.isdigit()
+        ):
+            raise ContractValidationError("invalid projected CTP order reference")
+        if type(self.order_state) is not CtpProjectedOrderState:
+            raise ContractValidationError("typed CTP order projection state is required")
+
+
+@dataclass(frozen=True, slots=True)
+class CtpTargetOrderProjection:
+    """The exact existing order targeted by a cancel action."""
+
+    managed_intent_id: str
+    runtime_order_id: str
+    order_ref: str
+    exchange_id: str
+    order_sys_id: str
+    front_id: int
+    session_id: int
+    order_state: CtpProjectedOrderState
+
+    def __post_init__(self) -> None:
+        _validate_correlation_text(self.managed_intent_id, "target managed intent id")
+        if not _is_prefixed_digest(self.runtime_order_id, "bt-managed-v1:"):
+            raise ContractValidationError("invalid projected CTP target runtime order id")
+        if (
+            type(self.order_ref) is not str
+            or len(self.order_ref) != 12
+            or not self.order_ref.isascii()
+            or not self.order_ref.isdigit()
+        ):
+            raise ContractValidationError("invalid projected CTP target order reference")
+        _validate_correlation_text(self.exchange_id, "target exchange id")
+        _validate_correlation_text(self.order_sys_id, "target system order id")
+        for value, name in ((self.front_id, "target front id"), (self.session_id, "target session id")):
+            if type(value) is not int or value <= 0:
+                raise ContractValidationError("invalid projected CTP " + name)
+        if type(self.order_state) is not CtpProjectedOrderState:
+            raise ContractValidationError("typed CTP target order state is required")
+
+
+@dataclass(frozen=True, slots=True)
+class CtpCancelActionProjection:
+    """One cancellation action, kept distinct from its target-order state."""
+
+    managed_action_id: str
+    action_state: str | None
+    terminal: bool | None
+    source_kind: str | None
+    updated_at_ns: int | None
+    target_order: CtpTargetOrderProjection
+
+    def __post_init__(self) -> None:
+        _validate_correlation_text(self.managed_action_id, "managed action id")
+        if self.action_state is None:
+            if any(value is not None for value in (self.terminal, self.source_kind, self.updated_at_ns)):
+                raise ContractValidationError("absent CTP cancel projection has partial state")
+        else:
+            if (
+                type(self.action_state) is not str
+                or self.action_state not in _CTP_CANCEL_ACTION_STATES
+            ):
+                raise ContractValidationError("invalid projected CTP cancel-action state")
+            expected_terminal = self.action_state in _CTP_CANCEL_ACTION_TERMINAL_STATES
+            if type(self.terminal) is not bool or self.terminal is not expected_terminal:
+                raise ContractValidationError("invalid projected CTP cancel-action terminal flag")
+            if self.source_kind not in {"CALLBACK", "RECONCILIATION"}:
+                raise ContractValidationError("invalid projected CTP cancel-action source")
+            if type(self.updated_at_ns) is not int or self.updated_at_ns <= 0:
+                raise ContractValidationError("invalid projected CTP cancel-action timestamp")
+        if type(self.target_order) is not CtpTargetOrderProjection:
+            raise ContractValidationError("typed CTP target-order projection is required")
+        if self.managed_action_id == self.target_order.managed_intent_id:
+            raise ContractValidationError("CTP cancel action must differ from its target intent")
+
+
+@dataclass(frozen=True, slots=True)
+class CtpUnknownResolutionProjection:
+    """Committed reconciliation conclusion for a command that remains UNKNOWN."""
+
+    order_terminal_state: str
+    cancel_action_terminal_state: str | None
+    verified_at_ns: int
+    resolved_at_ns: int
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.order_terminal_state) is not str
+            or self.order_terminal_state not in _CTP_ORDER_TERMINAL_STATES
+        ):
+            raise ContractValidationError("invalid projected CTP UNKNOWN order resolution")
+        if self.cancel_action_terminal_state is not None and (
+            type(self.cancel_action_terminal_state) is not str
+            or self.cancel_action_terminal_state not in _CTP_CANCEL_ACTION_TERMINAL_STATES
+        ):
+            raise ContractValidationError("invalid projected CTP UNKNOWN cancel resolution")
+        for value, name in (
+            (self.verified_at_ns, "verification timestamp"),
+            (self.resolved_at_ns, "resolution timestamp"),
+        ):
+            if type(value) is not int or value <= 0:
+                raise ContractValidationError("invalid CTP UNKNOWN " + name)
+        if self.resolved_at_ns < self.verified_at_ns:
+            raise ContractValidationError("CTP UNKNOWN resolution predates verification")
+
+
+@dataclass(frozen=True, slots=True)
+class CtpDispatchProjection:
+    """Credential-free read model for one exact durable CTP dispatch command.
+
+    ``command_status`` describes only local outbox dispatch. Provider state is
+    exposed separately, and ``local_dispatch_outcome`` never implies a provider
+    acknowledgement. An UNKNOWN command remains UNKNOWN after reconciliation.
+    The optional action variants are absent for legacy commands without typed
+    v8 correlation keys.
+    """
+
+    command_id: str
+    operation: str
+    command_status: str
+    local_dispatch_outcome: str | None
+    unknown_reason: str | None
+    submit_action: CtpSubmitActionProjection | None
+    cancel_action: CtpCancelActionProjection | None
+    unknown_resolution: CtpUnknownResolutionProjection | None
+
+    def __post_init__(self) -> None:
+        _validate_correlation_text(self.command_id, "command id")
+        if type(self.operation) is not str or self.operation not in {"SUBMIT", "CANCEL"}:
+            raise ContractValidationError("invalid projected CTP operation")
+        if type(self.command_status) is not str or self.command_status not in {
+            "READY",
+            "CLAIMED",
+            "COMPLETED",
+            "UNKNOWN",
+        }:
+            raise ContractValidationError("invalid projected CTP command status")
+        if self.local_dispatch_outcome is not None and (
+            type(self.local_dispatch_outcome) is not str
+            or self.local_dispatch_outcome not in {"QUEUED", "REJECTED", "UNKNOWN"}
+        ):
+            raise ContractValidationError("invalid projected CTP local dispatch outcome")
+        if self.command_status == "COMPLETED" and self.local_dispatch_outcome not in {
+            "QUEUED",
+            "REJECTED",
+        }:
+            raise ContractValidationError("completed CTP command lacks a local outcome")
+        if self.command_status == "UNKNOWN" and self.local_dispatch_outcome != "UNKNOWN":
+            raise ContractValidationError("unknown CTP command must retain UNKNOWN outcome")
+        if self.command_status in {"READY", "CLAIMED"} and self.local_dispatch_outcome is not None:
+            raise ContractValidationError("undispatched CTP command has a local outcome")
+        if self.unknown_reason is not None and type(self.unknown_reason) is not str:
+            raise ContractValidationError("invalid projected CTP UNKNOWN reason")
+        if self.submit_action is not None and type(self.submit_action) is not CtpSubmitActionProjection:
+            raise ContractValidationError("typed CTP submit-action projection is required")
+        if self.cancel_action is not None and type(self.cancel_action) is not CtpCancelActionProjection:
+            raise ContractValidationError("typed CTP cancel-action projection is required")
+        if (
+            self.unknown_resolution is not None
+            and type(self.unknown_resolution) is not CtpUnknownResolutionProjection
+        ):
+            raise ContractValidationError("typed CTP UNKNOWN resolution is required")
+        if self.operation == "SUBMIT" and self.cancel_action is not None:
+            raise ContractValidationError("submit projection cannot contain a cancel action")
+        if self.operation == "CANCEL" and self.submit_action is not None:
+            raise ContractValidationError("cancel projection cannot contain a submit action")
+        if self.unknown_resolution is not None and self.command_status != "UNKNOWN":
+            raise ContractValidationError("resolved CTP command must retain UNKNOWN status")
+        if self.unknown_resolution is not None and (
+            (self.operation == "SUBMIT"
+             and self.unknown_resolution.cancel_action_terminal_state is not None)
+            or (self.operation == "CANCEL"
+                and self.unknown_resolution.cancel_action_terminal_state is None)
+        ):
+            raise ContractValidationError("CTP UNKNOWN resolution does not match operation")
+
+
 class _RejectCtpDispatchVerifier:
     """Safe default for callback and reconciliation verification."""
 
@@ -2509,6 +2733,237 @@ class SqliteExecutionStore:
             except sqlite3.Error as error:
                 raise DurableStoreError("unable to read CTP dispatch command") from error
         return None if row is None else self._ctp_dispatch_command_from_row(row)
+
+    def read_ctp_dispatch_projection(
+        self, scope: ExecutionScope, command_id: str
+    ) -> CtpDispatchProjection | None:
+        """Read committed callback/reconciliation projections for one command.
+
+        This query is scoped by the durable execution scope and exact command
+        ID. It exposes neither the staged request nor session/approval data,
+        invokes no verifier, and does not change the outbox. A command resolved
+        through reconciliation retains its historical ``UNKNOWN`` status.
+        """
+
+        account_key, _, scope_key = self._validate_ctp_order_identity_scope(scope)
+        self._validate_command_identifier(command_id, "command_id")
+        with self._lock:
+            try:
+                row = self._connection.execute(
+                    """
+                    SELECT
+                        command.*,
+                        order_projection.runtime_order_id AS op_runtime_order_id,
+                        order_projection.scope_key AS op_scope_key,
+                        order_projection.trading_day AS op_trading_day,
+                        order_projection.managed_intent_id AS op_managed_intent_id,
+                        order_projection.order_ref AS op_order_ref,
+                        order_projection.provider_state AS op_provider_state,
+                        order_projection.terminal AS op_terminal,
+                        order_projection.last_source_kind AS op_source_kind,
+                        order_projection.updated_at_ns AS op_updated_at_ns,
+                        cancel_projection.managed_action_id AS cp_managed_action_id,
+                        cancel_projection.runtime_order_id AS cp_runtime_order_id,
+                        cancel_projection.order_ref AS cp_order_ref,
+                        cancel_projection.target_exchange_id AS cp_target_exchange_id,
+                        cancel_projection.target_order_sys_id AS cp_target_order_sys_id,
+                        cancel_projection.target_front_id AS cp_target_front_id,
+                        cancel_projection.target_session_id AS cp_target_session_id,
+                        cancel_projection.provider_state AS cp_provider_state,
+                        cancel_projection.terminal AS cp_terminal,
+                        cancel_projection.last_source_kind AS cp_source_kind,
+                        cancel_projection.updated_at_ns AS cp_updated_at_ns,
+                        resolution.command_id AS resolution_command_id,
+                        resolution.operation AS resolution_operation,
+                        resolution.correlation_key_sha256 AS resolution_correlation_sha256,
+                        resolution.order_terminal_state AS resolution_order_state,
+                        resolution.cancel_action_terminal_state AS resolution_cancel_state,
+                        resolution.verified_at_ns AS resolution_verified_at_ns,
+                        resolution.resolved_at_ns AS resolution_resolved_at_ns
+                    FROM ctp_dispatch_commands AS command
+                    LEFT JOIN ctp_dispatch_order_projection AS order_projection
+                        ON order_projection.account_key = command.account_key
+                        AND order_projection.runtime_order_id = command.runtime_order_id
+                    LEFT JOIN ctp_dispatch_cancel_projection AS cancel_projection
+                        ON cancel_projection.account_key = command.account_key
+                        AND cancel_projection.scope_key = command.scope_key
+                        AND cancel_projection.managed_action_id = command.managed_action_id
+                    LEFT JOIN ctp_dispatch_unknown_resolutions AS resolution
+                        ON resolution.account_key = command.account_key
+                        AND resolution.scope_key = command.scope_key
+                        AND resolution.command_id = command.command_id
+                    WHERE command.account_key = ?
+                        AND command.scope_key = ?
+                        AND command.command_id = ?
+                    """,
+                    (account_key, scope_key, command_id),
+                ).fetchone()
+            except sqlite3.Error as error:
+                raise DurableStoreError("unable to read CTP dispatch projection") from error
+        if row is None:
+            return None
+
+        command = self._ctp_dispatch_command_from_row(row)
+        correlation = command.correlation_key
+        try:
+            completion_echo_json = row["completion_echo_json"]
+            if completion_echo_json is None:
+                local_dispatch_outcome = "UNKNOWN" if command.status == "UNKNOWN" else None
+            else:
+                # The command loader has already checked canonical JSON, digest,
+                # and agreement with the persisted native receipt payload.
+                completion_echo = json.loads(str(completion_echo_json))
+                outcome = completion_echo.get("outcome") if isinstance(completion_echo, dict) else None
+                if command.status == "COMPLETED":
+                    allowed_outcomes = {"QUEUED", "REJECTED"}
+                elif command.status == "UNKNOWN":
+                    allowed_outcomes = {"UNKNOWN"}
+                else:
+                    allowed_outcomes = set()
+                if type(outcome) is not str or outcome not in allowed_outcomes:
+                    raise ValueError("stored CTP receipt outcome differs from command status")
+                local_dispatch_outcome = outcome
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise DurableStoreError("stored CTP local dispatch outcome is unreadable") from error
+        if correlation is None:
+            if row["resolution_command_id"] is not None:
+                raise DurableStoreError("stored CTP dispatch projection is unreadable")
+            return CtpDispatchProjection(
+                command_id=command.command_id,
+                operation=command.operation,
+                command_status=command.status,
+                local_dispatch_outcome=local_dispatch_outcome,
+                unknown_reason=command.unknown_reason,
+                submit_action=None,
+                cancel_action=None,
+                unknown_resolution=None,
+            )
+
+        try:
+            order_state = CtpProjectedOrderState(
+                provider_state=(
+                    None if row["op_provider_state"] is None else str(row["op_provider_state"])
+                ),
+                terminal=None if row["op_terminal"] is None else bool(row["op_terminal"]),
+                source_kind=(None if row["op_source_kind"] is None else str(row["op_source_kind"])),
+                updated_at_ns=(
+                    None if row["op_updated_at_ns"] is None else int(row["op_updated_at_ns"])
+                ),
+            )
+            if row["op_runtime_order_id"] is not None:
+                stored_order_identity = (
+                    str(row["op_runtime_order_id"]),
+                    str(row["op_scope_key"]),
+                    str(row["op_trading_day"]),
+                    str(row["op_managed_intent_id"]),
+                    str(row["op_order_ref"]),
+                )
+                expected_order_identity = (
+                    correlation.runtime_order_id,
+                    correlation.scope_key,
+                    correlation.trading_day,
+                    correlation.reservation_managed_intent_id,
+                    correlation.order_ref,
+                )
+                if stored_order_identity != expected_order_identity:
+                    raise ValueError("stored CTP order projection identity differs from command")
+
+            resolution = None
+            if row["resolution_command_id"] is not None:
+                if (
+                    command.status != "UNKNOWN"
+                    or str(row["resolution_operation"]) != command.operation
+                    or str(row["resolution_correlation_sha256"])
+                    != payload_sha256(correlation.to_payload())
+                ):
+                    raise ValueError("CTP reconciliation resolution differs from command")
+                resolution = CtpUnknownResolutionProjection(
+                    order_terminal_state=str(row["resolution_order_state"]),
+                    cancel_action_terminal_state=(
+                        None
+                        if row["resolution_cancel_state"] is None
+                        else str(row["resolution_cancel_state"])
+                    ),
+                    verified_at_ns=int(row["resolution_verified_at_ns"]),
+                    resolved_at_ns=int(row["resolution_resolved_at_ns"]),
+                )
+                if order_state.provider_state != resolution.order_terminal_state:
+                    raise ValueError("CTP UNKNOWN order resolution lacks its projection")
+
+            if command.operation == "SUBMIT":
+                submit_action = CtpSubmitActionProjection(
+                    managed_intent_id=correlation.reservation_managed_intent_id,
+                    runtime_order_id=correlation.runtime_order_id,
+                    order_ref=correlation.order_ref,
+                    order_state=order_state,
+                )
+                cancel_action = None
+            else:
+                cancel_action_state = row["cp_provider_state"]
+                cancel_action = CtpCancelActionProjection(
+                    managed_action_id=correlation.managed_action_id,
+                    action_state=(
+                        None if cancel_action_state is None else str(cancel_action_state)
+                    ),
+                    terminal=(
+                        None if row["cp_terminal"] is None else bool(row["cp_terminal"])
+                    ),
+                    source_kind=(
+                        None if row["cp_source_kind"] is None else str(row["cp_source_kind"])
+                    ),
+                    updated_at_ns=(
+                        None if row["cp_updated_at_ns"] is None else int(row["cp_updated_at_ns"])
+                    ),
+                    target_order=CtpTargetOrderProjection(
+                        managed_intent_id=correlation.reservation_managed_intent_id,
+                        runtime_order_id=correlation.runtime_order_id,
+                        order_ref=correlation.order_ref,
+                        exchange_id=correlation.cancel_target_exchange_id,
+                        order_sys_id=correlation.cancel_target_order_sys_id,
+                        front_id=correlation.cancel_target_front_id,
+                        session_id=correlation.cancel_target_session_id,
+                        order_state=order_state,
+                    ),
+                )
+                if row["cp_managed_action_id"] is not None:
+                    stored_cancel_identity = (
+                        str(row["cp_managed_action_id"]),
+                        str(row["cp_runtime_order_id"]),
+                        str(row["cp_order_ref"]),
+                        str(row["cp_target_exchange_id"]),
+                        str(row["cp_target_order_sys_id"]),
+                        int(row["cp_target_front_id"]),
+                        int(row["cp_target_session_id"]),
+                    )
+                    expected_cancel_identity = (
+                        correlation.managed_action_id,
+                        correlation.runtime_order_id,
+                        correlation.order_ref,
+                        correlation.cancel_target_exchange_id,
+                        correlation.cancel_target_order_sys_id,
+                        correlation.cancel_target_front_id,
+                        correlation.cancel_target_session_id,
+                    )
+                    if stored_cancel_identity != expected_cancel_identity:
+                        raise ValueError("stored CTP cancel projection identity differs from action")
+                if resolution is not None and (
+                    cancel_action.action_state != resolution.cancel_action_terminal_state
+                ):
+                    raise ValueError("CTP UNKNOWN cancel resolution lacks its projection")
+                submit_action = None
+
+            return CtpDispatchProjection(
+                command_id=command.command_id,
+                operation=command.operation,
+                command_status=command.status,
+                local_dispatch_outcome=local_dispatch_outcome,
+                unknown_reason=command.unknown_reason,
+                submit_action=submit_action,
+                cancel_action=cancel_action,
+                unknown_resolution=resolution,
+            )
+        except (ContractValidationError, KeyError, TypeError, ValueError) as error:
+            raise DurableStoreError("stored CTP dispatch projection is unreadable") from error
 
     def claim_ctp_dispatch_command(
         self,
