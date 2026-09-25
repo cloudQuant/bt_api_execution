@@ -133,3 +133,177 @@ Implementation blockers are the clean pinned SDK artifact, verified native
 callback field mapping (especially cancel `ActionRef`/`RequestID`), durable
 session-generation/event history across restart, and a trusted source for
 complete mutually consistent order/trade/position/cancel-action evidence.
+
+## Backtrader managed-handoff bridge (design only)
+
+**Status:** unregistered interface design. No converter, provider adapter, or
+default route is implemented by this package.
+
+The Backtrader-side `backtrader_runtime/ctp_managed_handoff.py` and
+`backtrader_runtime/managed_execution.py` contracts cannot currently be
+adapted by returning an SDK outbox receipt from the existing synchronous
+managed facade. `ManagedExecutionBridge` expects its dispatch callback to
+return a provider observation that can be recorded in the generic execution
+ledger. The typed `CtpManagedExecutionAdapterPlaceholder` rejects before
+calling the SDK Store for this reason. By contrast, the SDK's
+`CtpDispatchCommand` and `CtpDispatchReceipt` describe a local staged action
+and local dispatch disposition. There is no SDK method that atomically records
+an outbox transition and a provider order/cancel projection from a callback.
+
+### Proposed immutable bridge envelope
+
+A future adapter should carry a versioned, immutable envelope containing the
+exact typed handoff and the exact outbox command binding. It must retain both
+request digests because they have different domains:
+
+- `handoff_request_digest` is the Backtrader handoff digest over operation,
+  execution/account scope, trading day, managed identities, native target, and
+  request fields;
+- `outbox_request_payload_sha256` is the SDK digest over its canonical request
+  payload only.
+
+These digests must never be compared as if they were interchangeable. The
+bridge must compare the canonical request fields themselves, with no implicit
+field renaming or dropped fields. Any future field translation needs its own
+versioned, reviewed mapping and exact round-trip tests.
+
+The proposed DTO is two immutable records, not a wrapper that looks like a
+provider observation:
+
+```text
+CtpManagedOutboxBindingV1(
+    operation, command_id, managed_action_id,
+    account_key, scope_key, trading_day,
+    managed_intent_id, runtime_order_id, order_ref,
+    canonical_request_fields, handoff_request_digest,
+    outbox_request_payload_sha256,
+    approval_use_id, approval_digest, session_binding_sha256,
+    session_generation, selected_md_td_pair_digest,
+    td_front_id, td_session_id,
+    cancel_target_exchange_id, cancel_target_order_sys_id,
+    cancel_target_front_id, cancel_target_session_id,
+)
+
+CtpManagedOutboxDispatchFact(
+    binding_digest, local_state, local_outcome, local_receipt_digest,
+)
+```
+
+Fields not applicable to submit are explicitly absent; cancel requires the
+complete target tuple. `managed_action_id` is the submit intent ID for submit
+or the distinct cancel-action ID for cancel; it is never inferred from the
+generic `command_id`. Neither DTO implements `ProviderObservation`. A
+separate future `VerifiedCtpCallback` must bind `binding_digest`, native
+session generation, callback stream and stable event ID, event family,
+verifier identity, source digest, and exact callback identifiers before any
+provider projection is considered.
+
+The currently shared identity must echo exactly between the Backtrader handoff
+and staged command: operation, account key, scope key, trading day, reserved
+`OrderRef`, reservation managed intent, and canonical request fields. The
+outbox command and local receipt must additionally echo the approval-use ID,
+approval digest, and session-binding digest exactly. The existing handoff
+does not yet contain those latter fields, so a future envelope must carry them
+alongside—not pretend they are handoff authority. Approval and receipt digests
+are echo fields only. Fresh action approval must still be checked by the
+trusted verifier during `claim_ctp_dispatch_command`; the one-use
+authorization and claim stay in that same SQLite transaction.
+
+The current outbox command does not expose a typed `runtime_order_id` or a
+typed per-action identity, and a generic `command_id` is not automatically the
+Backtrader runtime order ID or cancel action ID. A future schema must persist
+these separately and bind `runtime_order_id` to the exact durable OrderRef
+reservation. For submit, the handoff's `managed_intent_id` identifies the
+reservation. For cancel, `managed_intent_id` identifies the original order
+while `runtime_action_id` equals the distinct `managed_cancel_intent_id`; the
+SDK command currently has no typed field for that cancel action identity.
+Do not overload `reservation_managed_intent_id` with the cancel ID.
+
+Cancel matching also needs an explicit versioned target tuple:
+`OrderRef`, `ExchangeID`, `OrderSysID`, `FrontID`, and `SessionID`. The SDK
+command has typed exchange, system, front, and session target fields, while the
+Backtrader cancel handoff types all of these except `ExchangeID`. Although
+`request_fields` can carry arbitrary scalars, it does not establish that
+`ExchangeID` is present or that the handoff validator checked it. A bridge
+must reject until the handoff version types and validates the same target
+tuple. It must also keep the cancel action's own native `ActionRef` and/or
+`RequestID` distinct from the target order identifiers.
+
+The session binding must include a durable, non-reused native session
+generation in addition to exact TD `FrontID`/`SessionID`, selected MD/TD pair,
+and session-binding digest. `FrontID`/`SessionID` alone can be reused, the
+current submit handoff lacks typed session identity, and the outbox's
+`session_binding` is an unconstrained mapping whose digest does not reveal or
+validate its contents. No generation or login readiness may be inferred from
+a queue receipt. MD and TD readiness must be independently typed and fresh
+before a future writer claim can reach native dispatch.
+
+### Status and callback mapping
+
+Keep the local outbox state, local native-call receipt, provider order state,
+and cancel-action state as separate facts:
+
+| SDK outbox fact | Backtrader bridge fact | Provider projection |
+| --- | --- | --- |
+| `READY` | staged only | none |
+| `CLAIMED` | one-use action claim consumed; native effect may follow | none |
+| receipt outcome `QUEUED` (outbox row becomes `COMPLETED`) | local dispatch/queue fact only | no ACK, fill, or cancel state change |
+| receipt outcome `REJECTED` (outbox row becomes `COMPLETED`) | local refusal fact only, if exact no-native-effect evidence exists | no provider rejection unless a separate provider callback proves it |
+| receipt outcome `UNKNOWN`, or a prior-generation `CLAIMED` recovered as `UNKNOWN` | uncertain action; keep action/account fences | remain `UNKNOWN` absent verified recovery |
+
+In particular, SDK `COMPLETED` means that its local receipt was persisted; it
+does not mean `ACKED`, `FILLED`, `CANCELLED`, or provider-terminal. The
+Backtrader `CtpManagedLocalQueuedReceipt` and
+`CtpManagedNativeSubmissionReceipt` also remain non-acknowledgement types.
+The SDK receipt currently has no typed queue-receipt ID/depth contract that
+can be safely translated into the Backtrader local queued receipt, and its
+untyped `native_receipt_payload` must not be mined for a request ID or callback
+identity. A new local bridge-dispatch DTO should preserve the exact command
+binding and local outcome without implementing `ProviderObservation`.
+
+The existing synchronous `ManagedExecutionFacade` cannot safely consume that
+DTO as a provider observation. A future CTP-specific asynchronous port must
+leave the execution record unresolved after `QUEUED`, and later accept only a
+verified callback envelope. Submit callbacks need exact command/action,
+account, trading day, `OrderRef`, `FrontID`/`SessionID`, session generation,
+native `RequestID` where the callback contract guarantees it, and eventual
+`ExchangeID`/`OrderSysID`. Cancel callbacks additionally need the separate
+cancel action identity (`ActionRef` and/or `RequestID`) and exact target echo.
+Missing, reused, or ambiguous keys leave the action `UNKNOWN`; arrival order or
+target-only matching is insufficient.
+
+Order/trade callbacks advance only the submit's provider order projection.
+Cancel-action callbacks advance only that cancel action. An accepted cancel
+request does not cancel its target; only exact terminal order evidence with
+consistent trade evidence may move the target order to cancelled. Deduplicate
+callbacks by a stable session-generation/stream/event identity. Callback-source
+generation and verified evidence digests must be retained durably.
+
+### Required transaction boundary and blockers
+
+The outbox's `stage`, `claim`, and `complete` methods each persist only their
+own command/receipt fact. The generic `execution_records` and cancellation
+records have separate transitions, and the Backtrader framework projection
+journal is another durable boundary. A callback adapter must not commit one
+projection and then report success while another write fails. Before enabling
+the bridge, a store-owned API must atomically append the verified callback,
+deduplicate its stable event ID, advance the matching submit-order or
+cancel-action projection, and update any same-database command fence. If the
+generic execution ledger and outbox do not share that exact transaction, one
+must be designated the canonical journal and the other made a deterministic,
+rebuildable projection; independent writes are not an acceptable bridge.
+External risk-permit settlement must be idempotently keyed to that committed
+event and cannot be presented as part of a SQLite transaction unless it truly
+shares it.
+
+The minimal implementation sequence is therefore: (1) version and persist the
+typed action/runtime-order/native-session keys, including cancel
+`ExchangeID`/`ActionRef`/`RequestID`; (2) add a CTP asynchronous managed port
+that records local dispatch without fabricating a `ProviderObservation`; (3)
+add a verified callback ledger and one transaction boundary for callback
+deduplication plus provider projections; then (4) prove with fake crash/restart
+tests that `UNKNOWN` remains fenced without exact evidence and that duplicate,
+stale-generation, mismatched-submit, and mismatched-cancel callbacks cannot
+advance state. Until those seams and the separately reviewed SDK artifact and
+external account-wide writer fence exist, this bridge stays design-only and
+unregistered.
