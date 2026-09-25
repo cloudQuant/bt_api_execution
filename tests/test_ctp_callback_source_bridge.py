@@ -596,6 +596,78 @@ def test_bridge_poisons_and_releases_a_lost_consumer_lease(tmp_path):
 
 
 @pytest.mark.unit
+def test_close_wakes_fake_source_poll_and_discards_its_result(tmp_path, monkeypatch):
+    bound = _stage_dispatched_command(tmp_path)
+    client = bound.client
+    bridge = CtpNativeCallbackSourceBridge.bind_after_login(
+        store=bound.store,
+        scope=bound.scope,
+        command_id=bound.command_id,
+        native_trader_client=client,
+    )
+    poll_waiting = threading.Event()
+    release_wakeup = threading.Event()
+    poll_finished = threading.Event()
+    poll_errors: list[BaseException] = []
+
+    def wait_for_lease_release(token: object, timeout: float = 5.0) -> object | None:
+        with client._callback_consumer_lock:
+            if client._callback_consumer_token is not token:
+                raise RuntimeError("callback source queue consumer lease is stale")
+            if client._callback_consumer_waiting is not None:
+                raise RuntimeError("callback source queue already has a waiter")
+            client._callback_consumer_waiting = token
+        poll_waiting.set()
+        release_wakeup.wait(timeout=timeout)
+        with client._callback_consumer_lock:
+            client._callback_consumer_waiting = None
+            if client._callback_consumer_token is not token:
+                raise RuntimeError("callback source queue consumer lease was revoked")
+        return None
+
+    def release_and_wake(token: object) -> None:
+        with client._callback_consumer_lock:
+            if client._callback_consumer_token is not token:
+                raise RuntimeError("callback source queue consumer lease is stale")
+            client._callback_consumer_token = None
+            client._callback_consumer_generation = None
+            client._callback_consumer_last_released = token
+        release_wakeup.set()
+
+    monkeypatch.setattr(client, "_wait_native_callback_event_for_consumer", wait_for_lease_release)
+    monkeypatch.setattr(client, "_release_native_callback_event_consumer", release_and_wake)
+
+    def poll() -> None:
+        try:
+            bridge.next_envelope(timeout=5.0)
+        except BaseException as exc:  # retain the background failure for assertions
+            poll_errors.append(exc)
+        finally:
+            poll_finished.set()
+
+    poll_thread = threading.Thread(target=poll, daemon=True)
+    poll_thread.start()
+    try:
+        assert poll_waiting.wait(timeout=1)
+        close_started = time.monotonic()
+        bridge.close()
+        assert time.monotonic() - close_started < 0.5
+        assert poll_finished.wait(timeout=1)
+        poll_thread.join(timeout=1)
+        assert not poll_thread.is_alive()
+        assert len(poll_errors) == 1
+        assert isinstance(poll_errors[0], ContractValidationError)
+        assert "callback may have been consumed and discarded" in str(poll_errors[0])
+        assert client._callback_consumer_token is None
+        assert client._callback_consumer_waiting is None
+    finally:
+        release_wakeup.set()
+        bridge.close()
+        poll_thread.join(timeout=1)
+        bound.store.close()
+
+
+@pytest.mark.unit
 def test_close_wins_after_fake_sdk_dequeue_and_discards_callback(tmp_path, monkeypatch):
     bound = _stage_dispatched_command(tmp_path)
     bridge = CtpNativeCallbackSourceBridge.bind_after_login(
