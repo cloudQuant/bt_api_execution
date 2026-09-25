@@ -31,6 +31,7 @@ from .store import (
     CtpDispatchProjection,
     CtpDispatchReceipt,
     CtpOrderIdentityReservation,
+    CtpOrderTargetProjectionHandle,
     SqliteExecutionStore,
     WriterLease,
     _is_local_queue_receipt_id,
@@ -380,7 +381,10 @@ class CtpManagedSingleWorkerCandidate:
         self._authority_verifier = authority_verifier
 
     def stage_prepared_dispatch(
-        self, prepared: CtpManagedPreparedDispatch
+        self,
+        prepared: CtpManagedPreparedDispatch,
+        *,
+        cancel_target_projection: CtpOrderTargetProjectionHandle | None = None,
     ) -> CtpManagedDispatchBinding:
         if type(prepared) is not CtpManagedPreparedDispatch:
             raise ContractValidationError("typed managed CTP prepared dispatch is required")
@@ -430,6 +434,7 @@ class CtpManagedSingleWorkerCandidate:
             native_request_id=prepared.native_request_id,
             native_action_ref=prepared.native_action_ref,
             local_queue_receipt_id=prepared.local_queue_receipt_id,
+            cancel_target_projection=cancel_target_projection,
         )
         return CtpManagedDispatchBinding.from_command(command, reservation)
 
@@ -480,6 +485,10 @@ class CtpManagedSingleWorkerCandidate:
             return projection
 
         try:
+            if claimed.operation == "CANCEL":
+                self._store.require_fresh_ctp_cancel_target_for_command(
+                    self._scope, command_id
+                )
             result = sender(claimed)
             if inspect.isawaitable(result):
                 result = await result

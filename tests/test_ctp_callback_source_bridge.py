@@ -23,6 +23,7 @@ from bt_api_execution import (
     CtpOrderRefSeedProof,
     CtpVerifiedCallbackEvidence,
     DurableStoreError,
+    CtpVerifiedOrderTargetProjection,
     ExecutionScope,
     InvalidStateTransition,
     SqliteExecutionStore,
@@ -361,11 +362,59 @@ def _stage_dispatched_command(
             front_id=source_facts["login_front_id"],
             session_id=source_facts["login_session_id"],
         )
+
+        class _FakeTargetVerifier:
+            def verify_order_target(self, exact_scope, exact_reservation, evidence, *, now_ns):
+                return CtpVerifiedOrderTargetProjection(
+                    account_key=exact_reservation.account_key,
+                    scope_key=exact_reservation.scope_key,
+                    trading_day=exact_reservation.trading_day,
+                    managed_intent_id=exact_reservation.managed_intent_id,
+                    runtime_order_id=exact_reservation.runtime_order_id,
+                    order_ref=exact_reservation.order_ref,
+                    account_fingerprint_sha256=_sha(b"fake account"),
+                    registration_digest=_sha(b"fake registration"),
+                    instrument_id="rb2710",
+                    exchange_id=target.exchange_id,
+                    session_generation_id=generation,
+                    connection_generation=7,
+                    query_front_id=source_facts["login_front_id"],
+                    query_session_id=source_facts["login_session_id"],
+                    query_request_id=81,
+                    query_filters_sha256=_sha(b"fake filters"),
+                    query_records_sha256=_sha(b"fake rows"),
+                    source_evidence_sha256=_sha(b"fake native source"),
+                    query_record_count=1,
+                    query_match_count=1,
+                    query_complete=True,
+                    query_terminal=True,
+                    query_timed_out=False,
+                    query_error_id=None,
+                    late_callback_count=0,
+                    order_sys_id=target.order_sys_id,
+                    front_id=target.front_id,
+                    session_id=target.session_id,
+                    provider_state="OPEN",
+                    quantity=1,
+                    traded_quantity=0,
+                    remaining_quantity=1,
+                    verifier_id="fake-source-bridge-target-verifier",
+                    verified_at_ns=now_ns,
+                    expires_at_ns=now_ns + 2_000_000_000,
+                )
+
+        target_projection = store.issue_ctp_order_target_projection(
+            scope,
+            reservation.managed_intent_id,
+            {"fake_only": True},
+            verifier=_FakeTargetVerifier(),
+        )
         command = store.stage_ctp_dispatch_command(
             scope,
             command_id,
             "CANCEL",
             {
+                "InstrumentID": "rb2710",
                 "OrderRef": target.order_ref,
                 "ExchangeID": target.exchange_id,
                 "OrderSysID": target.order_sys_id,
@@ -384,6 +433,7 @@ def _stage_dispatched_command(
             dispatch_session_id=source_facts["login_session_id"],
             native_request_id=17,
             native_action_ref="action-ref-29",
+            cancel_target_projection=target_projection,
         )
     claimed = store.claim_ctp_dispatch_command(
         scope,

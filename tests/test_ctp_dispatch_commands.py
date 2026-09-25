@@ -25,6 +25,7 @@ from bt_api_execution import (
     CtpOrderRefSeedProof,
     CtpUnknownResolutionAttestation,
     CtpVerifiedCallbackEvidence,
+    CtpVerifiedOrderTargetProjection,
     DurableStoreError,
     ExecutionScope,
     ExecutionState,
@@ -251,6 +252,7 @@ def _stage_cancel(store, scope, lease, reservation, command_id="cancel-command-1
         command_id,
         "CANCEL",
         {
+            "InstrumentID": "rb2710",
             "OrderRef": target.order_ref,
             "ExchangeID": target.exchange_id,
             "OrderSysID": target.order_sys_id,
@@ -269,6 +271,69 @@ def _stage_cancel(store, scope, lease, reservation, command_id="cancel-command-1
         dispatch_session_id=91,
         native_request_id=_native_request_id(command_id),
         native_action_ref="native-action-" + command_id,
+        cancel_target_projection=_issue_target_projection(store, scope, reservation),
+    )
+
+
+class _FakeOrderTargetProjectionVerifier:
+    """Fake-only exact-query issuer contract; this is not native evidence."""
+
+    def __init__(self, *, overrides=None):
+        self.overrides = dict(overrides or {})
+        self.calls = []
+
+    def verify_order_target(self, scope, reservation, native_query_evidence, *, now_ns):
+        self.calls.append((scope, reservation, native_query_evidence, now_ns))
+        values = {
+            "account_key": reservation.account_key,
+            "scope_key": reservation.scope_key,
+            "trading_day": reservation.trading_day,
+            "managed_intent_id": reservation.managed_intent_id,
+            "runtime_order_id": reservation.runtime_order_id,
+            "order_ref": reservation.order_ref,
+            "account_fingerprint_sha256": sha256(b"fake account binding").hexdigest(),
+            "registration_digest": sha256(b"fake registration").hexdigest(),
+            "instrument_id": "rb2710",
+            "exchange_id": "SHFE",
+            "session_generation_id": "test-session-generation",
+            "connection_generation": 7,
+            "query_front_id": 4,
+            "query_session_id": 91,
+            "query_request_id": (now_ns % 2_147_483_647) + 1,
+            "query_filters_sha256": sha256(b"fake exact filters").hexdigest(),
+            "query_records_sha256": sha256(b"fake terminal rows").hexdigest(),
+            "source_evidence_sha256": sha256(b"fake source lineage").hexdigest(),
+            "query_record_count": 1,
+            "query_match_count": 1,
+            "query_complete": True,
+            "query_terminal": True,
+            "query_timed_out": False,
+            "query_error_id": None,
+            "late_callback_count": 0,
+            "order_sys_id": "sys-order-17",
+            "front_id": 4,
+            "session_id": 91,
+            "provider_state": "OPEN",
+            "quantity": 1,
+            "traded_quantity": 0,
+            "remaining_quantity": 1,
+            "verifier_id": "fake-target-verifier",
+            "verified_at_ns": now_ns,
+            "expires_at_ns": now_ns + 2_000_000_000,
+        }
+        values.update(self.overrides)
+        return CtpVerifiedOrderTargetProjection(**values)
+
+
+def _issue_target_projection(
+    store, scope, reservation, *, verifier=None, evidence=None
+):
+    authority = verifier or _FakeOrderTargetProjectionVerifier()
+    return store.issue_ctp_order_target_projection(
+        scope,
+        reservation.managed_intent_id,
+        {"fake_only": True} if evidence is None else evidence,
+        verifier=authority,
     )
 
 
@@ -486,7 +551,7 @@ def test_v4_execution_store_migrates_to_verified_callback_ledger_v8(tmp_path):
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-        assert version == "12"
+        assert version == "13"
         assert "ctp_dispatch_commands" in tables
         assert "ctp_order_ref_watermarks" in tables
         assert "ctp_dispatch_authority_uses" in tables
@@ -540,7 +605,7 @@ def test_v5_execution_store_migrates_one_use_authority_table(tmp_path):
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-        assert version == "12"
+        assert version == "13"
         assert "ctp_dispatch_authority_uses" in tables
     finally:
         migrated.close()
@@ -638,7 +703,7 @@ def test_v7_typed_command_migrates_to_callback_ledger_without_reopening_dispatch
             migrated._connection.execute(
                 "SELECT value FROM execution_meta WHERE key = 'schema_version'"
             ).fetchone()[0]
-            == "12"
+            == "13"
         )
         assert (
             migrated._connection.execute(
@@ -680,7 +745,7 @@ def test_v8_store_migrates_orderref_cutover_state_fail_closed(tmp_path):
         version = migrated._connection.execute(
             "SELECT value FROM execution_meta WHERE key = 'schema_version'"
         ).fetchone()["value"]
-        assert version == "12"
+        assert version == "13"
         command = migrated.read_ctp_dispatch_command(scope, staged.command_id)
         assert command is not None
         assert command.status == "UNKNOWN"
@@ -904,7 +969,19 @@ async def test_single_worker_requires_persisted_queue_receipt_and_sends_once(
         worker = CtpManagedSingleWorkerCandidate(
             store, scope, lease, _authority_verifier()
         )
-        staged_binding = worker.stage_prepared_dispatch(prepared)
+        target_projection = None
+        if operation == "cancel":
+            target_projection = _issue_target_projection(
+                store,
+                scope,
+                reservation,
+                verifier=_FakeOrderTargetProjectionVerifier(
+                    overrides={"order_sys_id": "fake-sys-order"}
+                ),
+            )
+        staged_binding = worker.stage_prepared_dispatch(
+            prepared, cancel_target_projection=target_projection
+        )
         sent = []
 
         async def fake_sender(command):
@@ -1789,6 +1866,7 @@ def test_cancel_correlation_keeps_action_separate_from_exact_order_target(tmp_pa
         )
         command_id = "cancel-correlation-1"
         request = {
+            "InstrumentID": "rb2710",
             "OrderRef": target.order_ref,
             "ExchangeID": target.exchange_id,
             "OrderSysID": target.order_sys_id,
@@ -1812,6 +1890,7 @@ def test_cancel_correlation_keeps_action_separate_from_exact_order_target(tmp_pa
             dispatch_session_id=91,
             native_request_id=_native_request_id(command_id),
             native_action_ref="native-action-ref-1",
+            cancel_target_projection=_issue_target_projection(store, scope, reservation),
         )
         key = command.correlation_key
         assert key is not None
@@ -3076,6 +3155,7 @@ def test_cancel_command_binds_orderref_exchange_system_order_and_session_ids(tmp
             session_id=91,
         )
         request = {
+            "InstrumentID": "rb2710",
             "OrderRef": target.order_ref,
             "ExchangeID": target.exchange_id,
             "OrderSysID": target.order_sys_id,
@@ -3101,6 +3181,7 @@ def test_cancel_command_binds_orderref_exchange_system_order_and_session_ids(tmp
             dispatch_session_id=91,
             native_request_id=_native_request_id("cancel-1"),
             native_action_ref="native-action-1",
+            cancel_target_projection=_issue_target_projection(store, scope, reservation),
         )
         assert cancel.cancel_target_order_ref == target.order_ref
         assert cancel.cancel_target_exchange_id == "SHFE"
@@ -3146,6 +3227,7 @@ def test_cancel_claim_authority_binds_exact_native_target(tmp_path):
             session_id=91,
         )
         request = {
+            "InstrumentID": "rb2710",
             "OrderRef": target.order_ref,
             "ExchangeID": target.exchange_id,
             "OrderSysID": target.order_sys_id,
@@ -3169,6 +3251,7 @@ def test_cancel_claim_authority_binds_exact_native_target(tmp_path):
             dispatch_session_id=91,
             native_request_id=_native_request_id("cancel-authority-1"),
             native_action_ref="native-action-authority-1",
+            cancel_target_projection=_issue_target_projection(store, scope, reservation),
         )
         changed_target = replace(
             staged, cancel_target_session_id=staged.cancel_target_session_id + 1
@@ -3222,6 +3305,7 @@ def test_cancel_command_rejects_modify_action_or_fields(tmp_path, field, value, 
             session_id=91,
         )
         request = {
+            "InstrumentID": "rb2710",
             "OrderRef": target.order_ref,
             "ExchangeID": target.exchange_id,
             "OrderSysID": target.order_sys_id,
@@ -3250,3 +3334,247 @@ def test_cancel_command_rejects_modify_action_or_fields(tmp_path, field, value, 
             )
     finally:
         store.close()
+
+
+@pytest.mark.unit
+def test_cancel_target_projection_is_immutable_persisted_and_gates_claim(tmp_path, monkeypatch):
+    store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
+    scope = _scope()
+    lease = _lease(store, scope)
+    try:
+        reservation = _reserve_seeded(store, scope, lease)
+        verifier = _FakeOrderTargetProjectionVerifier()
+        evidence = {"opaque_fake_query": object()}
+        handle = _issue_target_projection(
+            store, scope, reservation, verifier=verifier, evidence=evidence
+        )
+        assert verifier.calls == [(scope, reservation, evidence, handle.projection.verified_at_ns)]
+        assert store.read_ctp_order_target_projection(scope, handle) == handle.projection
+        persisted = store._connection.execute(
+            """
+            SELECT projection_payload_json, projection_sha256
+            FROM ctp_order_target_projections WHERE projection_id = ?
+            """,
+            (handle.projection_id,),
+        ).fetchone()
+        assert payload_sha256(json.loads(persisted["projection_payload_json"])) == persisted[
+            "projection_sha256"
+        ]
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            store._connection.execute(
+                "UPDATE ctp_order_target_projections SET projection_sha256 = ? "
+                "WHERE projection_id = ?",
+                ("0" * 64, handle.projection_id),
+            )
+
+        duplicate_query = _FakeOrderTargetProjectionVerifier(
+            overrides={"query_request_id": 812}
+        )
+        _issue_target_projection(store, scope, reservation, verifier=duplicate_query)
+        with pytest.raises(ContractValidationError, match="query identity is duplicate"):
+            _issue_target_projection(store, scope, reservation, verifier=duplicate_query)
+
+        command = _stage_cancel_with_projection(
+            store, scope, lease, reservation, handle, command_id="cancel-target-projection"
+        )
+        consumption = store._connection.execute(
+            """
+            SELECT projection_id, command_id
+            FROM ctp_order_target_projection_consumptions
+            WHERE account_key = ? AND command_id = ?
+            """,
+            (scope.account_key, command.command_id),
+        ).fetchone()
+        assert tuple(consumption) == (handle.projection_id, command.command_id)
+        claimed = store.claim_ctp_dispatch_command(
+            scope,
+            command.command_id,
+            writer_lease=lease,
+            authority_verifier=_authority_verifier(),
+        )
+        assert claimed is not None and claimed.status == "CLAIMED"
+        assert (
+            store.require_fresh_ctp_cancel_target_for_command(scope, command.command_id)
+            == handle.projection
+        )
+        monkeypatch.setattr(
+            execution_store_module.time, "time_ns", lambda: handle.projection.expires_at_ns
+        )
+        with pytest.raises(ContractValidationError, match="target handle is stale"):
+            store.require_fresh_ctp_cancel_target_for_command(scope, command.command_id)
+    finally:
+        store.close()
+
+
+def _stage_cancel_with_projection(store, scope, lease, reservation, handle, *, command_id):
+    target = CtpCancelTarget(
+        order_ref=reservation.order_ref,
+        exchange_id="SHFE",
+        order_sys_id="sys-order-17",
+        front_id=4,
+        session_id=91,
+    )
+    return store.stage_ctp_dispatch_command(
+        scope,
+        command_id,
+        "CANCEL",
+        {
+            "InstrumentID": "rb2710",
+            "OrderRef": target.order_ref,
+            "ExchangeID": target.exchange_id,
+            "OrderSysID": target.order_sys_id,
+            "FrontID": target.front_id,
+            "SessionID": target.session_id,
+            "ActionFlag": "0",
+        },
+        approval_use_id="approval-use-" + command_id,
+        approval_digest=sha256(("approval-" + command_id).encode("ascii")).hexdigest(),
+        session_binding=_session_binding(),
+        writer_lease=lease,
+        cancel_target=target,
+        managed_action_id="managed-action-" + command_id,
+        session_generation_id="test-session-generation",
+        dispatch_front_id=4,
+        dispatch_session_id=91,
+        native_request_id=_native_request_id(command_id),
+        native_action_ref="native-action-" + command_id,
+        cancel_target_projection=handle,
+    )
+
+
+@pytest.mark.unit
+def test_cancel_target_projection_defaults_to_reject_and_rejects_ambiguous_stale_or_wrong_scope(
+    tmp_path,
+):
+    store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
+    scope = _scope()
+    lease = _lease(store, scope)
+    try:
+        reservation = _reserve_seeded(store, scope, lease)
+        with pytest.raises(ContractValidationError, match="verification failed"):
+            store.issue_ctp_order_target_projection(scope, reservation.managed_intent_id, {})
+
+        target = CtpCancelTarget(
+            order_ref=reservation.order_ref,
+            exchange_id="SHFE",
+            order_sys_id="sys-order-17",
+            front_id=4,
+            session_id=91,
+        )
+        with pytest.raises(ContractValidationError, match="fresh verified CTP order target"):
+            store.stage_ctp_dispatch_command(
+                scope,
+                "cancel-without-query",
+                "CANCEL",
+                {
+                    "OrderRef": target.order_ref,
+                    "ExchangeID": target.exchange_id,
+                    "OrderSysID": target.order_sys_id,
+                    "FrontID": target.front_id,
+                    "SessionID": target.session_id,
+                    "ActionFlag": "0",
+                },
+                approval_use_id="approval-use-cancel-without-query",
+                approval_digest=sha256(b"approval").hexdigest(),
+                session_binding=_session_binding(),
+                writer_lease=lease,
+                cancel_target=target,
+                managed_action_id="managed-action-cancel-without-query",
+                session_generation_id="test-session-generation",
+                dispatch_front_id=4,
+                dispatch_session_id=91,
+                native_request_id=_native_request_id("cancel-without-query"),
+                native_action_ref="native-action-cancel-without-query",
+            )
+
+        wrong_session_projection = _issue_target_projection(
+            store,
+            scope,
+            reservation,
+            verifier=_FakeOrderTargetProjectionVerifier(
+                overrides={"query_session_id": 92}
+            ),
+        )
+        with pytest.raises(
+            ContractValidationError, match="differs from its verified order projection"
+        ):
+            _stage_cancel_with_projection(
+                store,
+                scope,
+                lease,
+                reservation,
+                wrong_session_projection,
+                command_id="cancel-wrong-query-session",
+            )
+
+        for overrides in (
+            {"query_match_count": 2},
+            {"provider_state": "FILLED"},
+        ):
+            with pytest.raises(ContractValidationError, match="verification failed"):
+                _issue_target_projection(
+                    store,
+                    scope,
+                    reservation,
+                    verifier=_FakeOrderTargetProjectionVerifier(overrides=overrides),
+                )
+
+        with pytest.raises(ContractValidationError, match="differs from I9 reservation"):
+            _issue_target_projection(
+                store,
+                scope,
+                reservation,
+                verifier=_FakeOrderTargetProjectionVerifier(
+                    overrides={"trading_day": "20260926"}
+                ),
+            )
+        with pytest.raises(ContractValidationError, match="stale or unbound"):
+            _issue_target_projection(
+                store,
+                scope,
+                reservation,
+                verifier=_FakeOrderTargetProjectionVerifier(
+                    overrides={"verified_at_ns": time.time_ns() - 1}
+                ),
+            )
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+def test_cancel_target_projection_requires_new_query_after_store_restart(tmp_path):
+    path = tmp_path / "execution.sqlite3"
+    scope = _scope()
+    store = SqliteExecutionStore(path)
+    lease = _lease(store, scope)
+    reservation = _reserve_seeded(store, scope, lease)
+    first = _issue_target_projection(store, scope, reservation)
+    command = _stage_cancel_with_projection(
+        store, scope, lease, reservation, first, command_id="restart-cancel"
+    )
+    store.close()
+
+    reopened = SqliteExecutionStore(path)
+    try:
+        new_lease = _lease(reopened, scope)
+        with pytest.raises(ContractValidationError, match="fresh CTP target query"):
+            reopened.claim_ctp_dispatch_command(
+                scope,
+                command.command_id,
+                writer_lease=new_lease,
+                authority_verifier=_authority_verifier(),
+            )
+        with pytest.raises(ContractValidationError, match="same-store CTP target handle"):
+            reopened.read_ctp_order_target_projection(scope, first)
+
+        fresh_command = _stage_cancel(reopened, scope, new_lease, reservation, command.command_id)
+        assert fresh_command.command_id == command.command_id
+        claimed = reopened.claim_ctp_dispatch_command(
+            scope,
+            command.command_id,
+            writer_lease=new_lease,
+            authority_verifier=_authority_verifier(),
+        )
+        assert claimed is not None and claimed.status == "CLAIMED"
+    finally:
+        reopened.close()
