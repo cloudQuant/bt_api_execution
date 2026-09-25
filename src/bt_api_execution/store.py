@@ -862,10 +862,10 @@ class SqliteExecutionStore:
             raise ContractValidationError("fresh CTP dispatch authority verifier is required")
         try:
             authority = verify_action(command, now_ns=now_ns)
-        except Exception as error:
+        except Exception:
             raise ContractValidationError(
                 "fresh CTP dispatch authority verification failed"
-            ) from error
+            ) from None
         if type(authority) is not CtpDispatchAuthority:
             raise ContractValidationError("invalid typed CTP dispatch authority")
         if authority.authority_type != "ctp_dispatch_authority.v1":

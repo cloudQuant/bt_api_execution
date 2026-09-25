@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from decimal import Decimal
@@ -471,14 +472,22 @@ def test_authority_verifier_failure_leaves_command_and_use_ledger_untouched(tmp_
     try:
         reservation = _reserve_seeded(store, scope, lease)
         staged = _stage_submit(store, scope, lease, reservation)
-        verifier = _FakeCtpDispatchAuthorityVerifier(error=RuntimeError("source check failed"))
-        with pytest.raises(ContractValidationError, match="verification failed"):
+        sentinel = "private-source-secret-sentinel"
+        verifier = _FakeCtpDispatchAuthorityVerifier(
+            error=RuntimeError("source check failed: " + sentinel)
+        )
+        with pytest.raises(ContractValidationError, match="verification failed") as caught:
             store.claim_ctp_dispatch_command(
                 scope,
                 staged.command_id,
                 writer_lease=lease,
                 authority_verifier=verifier,
             )
+        formatted_traceback = "".join(traceback.format_exception(caught.value))
+        assert str(caught.value) == "fresh CTP dispatch authority verification failed"
+        assert caught.value.__suppress_context__ is True
+        assert sentinel not in str(caught.value)
+        assert sentinel not in formatted_traceback
         assert len(verifier.calls) == 1
         assert store.read_ctp_dispatch_command(scope, staged.command_id).status == "READY"
         assert (
