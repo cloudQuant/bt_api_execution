@@ -4393,6 +4393,7 @@ class SqliteExecutionStore:
                 )
                 if stored != immutable:
                     raise IntentConflictError("CTP command_id conflicts with staged command")
+                command = self._ctp_dispatch_command_from_row(existing)
                 if operation == "CANCEL":
                     assert cancel_target_projection is not None
                     self._record_ctp_order_target_projection_consumption(
@@ -4402,7 +4403,10 @@ class SqliteExecutionStore:
                         command_id=command_id,
                         consumed_at_ns=now_ns,
                     )
-                return self._ctp_dispatch_command_from_row(existing)
+                    self._require_fresh_ctp_cancel_target_row(
+                        cursor, scope, existing, now_ns=time.monotonic_ns()
+                    )
+                return command
 
             generation_owner = cursor.execute(
                 """
@@ -4519,7 +4523,12 @@ class SqliteExecutionStore:
                 (account_key, command_id),
             ).fetchone()
             assert row is not None
-            return self._ctp_dispatch_command_from_row(row)
+            command = self._ctp_dispatch_command_from_row(row)
+            if operation == "CANCEL":
+                self._require_fresh_ctp_cancel_target_row(
+                    cursor, scope, row, now_ns=time.monotonic_ns()
+                )
+            return command
 
     def read_ctp_dispatch_command(
         self, scope: ExecutionScope, command_id: str

@@ -3462,6 +3462,51 @@ def test_cancel_stage_rechecks_projection_after_transaction_lock_delay(tmp_path,
 
 
 @pytest.mark.unit
+def test_cancel_stage_rolls_back_if_projection_expires_before_commit(tmp_path, monkeypatch):
+    store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
+    scope = _scope()
+    lease = _lease(store, scope)
+    clock = _ControlledMonotonicClock(100_000_000_000)
+    monkeypatch.setattr(execution_store_module.time, "monotonic_ns", clock.monotonic_ns)
+    try:
+        reservation = _reserve_seeded(store, scope, lease)
+        handle = _issue_target_projection(store, scope, reservation)
+        # The transaction's initial freshness check succeeds one nanosecond
+        # before expiry; the final pre-commit check observes expiry.
+        samples = iter(
+            [handle.projection.expires_at_ns - 1, handle.projection.expires_at_ns]
+        )
+        monkeypatch.setattr(
+            execution_store_module.time, "monotonic_ns", lambda: next(samples)
+        )
+
+        with pytest.raises(ContractValidationError, match="target handle is stale"):
+            _stage_cancel_with_projection(
+                store,
+                scope,
+                lease,
+                reservation,
+                handle,
+                command_id="cancel-stage-expiry-before-commit",
+            )
+
+        assert (
+            store.read_ctp_dispatch_command(
+                scope, "cancel-stage-expiry-before-commit"
+            )
+            is None
+        )
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_order_target_projection_consumptions"
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
 def test_cancel_claim_rolls_back_if_authority_verifier_crosses_target_expiry(
     tmp_path, monkeypatch
 ):
