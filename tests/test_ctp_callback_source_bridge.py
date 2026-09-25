@@ -3,9 +3,11 @@ from __future__ import annotations
 import hashlib
 import queue
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
@@ -145,6 +147,59 @@ class _FakeTraderClient:
             self._callback_consumer_generation = None
 
 
+def _logged_in_sdk_client_with_fake_api(client_module: Any) -> tuple[Any, Any]:
+    client = client_module.TraderClient("tcp://fake-front", "9999", "fake-user", "fake-secret")
+
+    class _FakeNativeApi:
+        def __init__(self) -> None:
+            self.authenticate_request_ids: list[int] = []
+            self.login_request_ids: list[int] = []
+
+        def ReqAuthenticate(self, _field, request_id: int) -> int:  # noqa: N802
+            self.authenticate_request_ids.append(request_id)
+            return 0
+
+        def ReqUserLogin(self, _field, request_id: int) -> int:  # noqa: N802
+            self.login_request_ids.append(request_id)
+            return 0
+
+        def RegisterSpi(self, _spi: object) -> None:  # noqa: N802
+            return None
+
+        def Release(self) -> None:  # noqa: N802
+            return None
+
+    api = _FakeNativeApi()
+    client._api = api
+    spi = client_module._TraderSpi(client, api)
+    client._spi = spi
+    spi.OnFrontConnected()
+    spi.OnRspAuthenticate(
+        None,
+        SimpleNamespace(ErrorID=0, ErrorMsg=""),
+        api.authenticate_request_ids[-1],
+        True,
+    )
+    spi.OnRspUserLogin(
+        SimpleNamespace(FrontID=7, SessionID=19, TradingDay="20260925", MaxOrderRef="90"),
+        SimpleNamespace(ErrorID=0, ErrorMsg=""),
+        api.login_request_ids[-1],
+        True,
+    )
+    return client, spi
+
+
+def _supports_source_queue_consumer_lease(client: object) -> bool:
+    return all(
+        callable(getattr(client, name, None))
+        for name in (
+            "_claim_native_callback_event_consumer",
+            "_wait_native_callback_event_for_consumer",
+            "_release_native_callback_event_consumer",
+        )
+    )
+
+
 class _FakeActionAuthorityVerifier:
     def verify_action(self, command, *, now_ns):
         return CtpDispatchAuthority(
@@ -176,8 +231,11 @@ def _stage_dispatched_command(
     operation: str = "SUBMIT",
     include_source_facts: bool = True,
     source_binding_override: dict[str, object] | None = None,
+    source_client: object | None = None,
 ) -> _BoundDispatch:
-    client = _FakeTraderClient()
+    client = (
+        _FakeTraderClient() if source_client is None else cast("_FakeTraderClient", source_client)
+    )
     source_facts = ctp_native_callback_source_facts(client)
     generation = ctp_native_session_generation_id(
         source_facts["native_api_generation"],
@@ -509,6 +567,152 @@ def test_bridge_poisons_and_releases_a_lost_consumer_lease(tmp_path):
         replacement.close()
     finally:
         bound.store.close()
+
+
+@pytest.mark.unit
+def test_close_wakes_real_trader_client_poll_and_discards_its_result(tmp_path):
+    client_module = pytest.importorskip("bt_api_ctp.ctp.client")
+    client, _spi = _logged_in_sdk_client_with_fake_api(client_module)
+    if not _supports_source_queue_consumer_lease(client):
+        pytest.skip("installed bt_api_ctp has no callback queue consumer lease")
+
+    bound = _stage_dispatched_command(tmp_path, source_client=client)
+    bridge = None
+    poll_thread = None
+    poll_errors: list[BaseException] = []
+    poll_finished = threading.Event()
+    try:
+        bridge = CtpNativeCallbackSourceBridge.bind_after_login(
+            store=bound.store,
+            scope=bound.scope,
+            command_id=bound.command_id,
+            native_trader_client=client,
+        )
+
+        def poll() -> None:
+            try:
+                bridge.next_envelope(timeout=0.6)
+            except BaseException as exc:  # retain the background failure for assertions
+                poll_errors.append(exc)
+            finally:
+                poll_finished.set()
+
+        poll_thread = threading.Thread(target=poll, daemon=True)
+        poll_thread.start()
+        with client._query_state_lock:
+            waiting = client._native_callback_event_condition.wait_for(
+                lambda: (
+                    client._native_callback_consumer_lease is not None
+                    and client._native_callback_consumer_lease.waiting
+                ),
+                timeout=1,
+            )
+        assert waiting
+
+        with pytest.raises(ContractValidationError, match="bridge already has a poll in progress"):
+            bridge.next_envelope(timeout=0)
+
+        close_started = time.monotonic()
+        bridge.close()
+        close_elapsed = time.monotonic() - close_started
+        assert close_elapsed < 0.5
+        assert poll_finished.wait(timeout=1)
+        poll_thread.join(timeout=1)
+        assert not poll_thread.is_alive()
+        assert len(poll_errors) == 1
+        assert isinstance(poll_errors[0], ContractValidationError)
+        assert "callback may have been consumed and discarded" in str(poll_errors[0])
+        assert client._native_callback_consumer_lease is None
+        with pytest.raises(ContractValidationError, match="bridge is closed"):
+            bridge.next_envelope(timeout=0)
+    finally:
+        if bridge is not None:
+            bridge.close()
+        if poll_thread is not None:
+            poll_thread.join(timeout=1)
+        bound.store.close()
+        client.stop()
+
+
+@pytest.mark.unit
+def test_close_discards_real_sdk_event_dequeued_before_close_wins(tmp_path, monkeypatch):
+    client_module = pytest.importorskip("bt_api_ctp.ctp.client")
+    client, spi = _logged_in_sdk_client_with_fake_api(client_module)
+    if not _supports_source_queue_consumer_lease(client):
+        pytest.skip("installed bt_api_ctp has no callback queue consumer lease")
+
+    bound = _stage_dispatched_command(tmp_path, source_client=client)
+    bridge = None
+    poll_thread = None
+    poll_errors: list[BaseException] = []
+    poll_finished = threading.Event()
+    dequeue_finished = threading.Event()
+    resume_poll = threading.Event()
+    try:
+        bridge = CtpNativeCallbackSourceBridge.bind_after_login(
+            store=bound.store,
+            scope=bound.scope,
+            command_id=bound.command_id,
+            native_trader_client=client,
+        )
+        source = bound.source_facts
+        spi.OnRtnOrder(
+            SimpleNamespace(
+                BrokerID=source["login_broker_id"],
+                InvestorID=source["login_investor_id"],
+                UserID=source["login_investor_id"],
+                InstrumentID="rb2710",
+                RequestID=17,
+                OrderRef="000000000013",
+                ExchangeID="SHFE",
+                OrderSysID="sys-order-17",
+                FrontID=source["login_front_id"],
+                SessionID=source["login_session_id"],
+                TradingDay=source["login_trading_day"],
+                NotifySequence=381,
+            )
+        )
+        original_wait = client._wait_native_callback_event_for_consumer
+
+        def pause_after_dequeue(token: object, timeout: float = 5.0) -> object | None:
+            event = original_wait(token, timeout=timeout)
+            dequeue_finished.set()
+            if not resume_poll.wait(timeout=1):
+                raise RuntimeError("test did not release the post-dequeue wait")
+            return event
+
+        monkeypatch.setattr(client, "_wait_native_callback_event_for_consumer", pause_after_dequeue)
+
+        def poll() -> None:
+            try:
+                bridge.next_envelope(timeout=0.6)
+            except BaseException as exc:  # retain the background failure for assertions
+                poll_errors.append(exc)
+            finally:
+                poll_finished.set()
+
+        poll_thread = threading.Thread(target=poll, daemon=True)
+        poll_thread.start()
+        assert dequeue_finished.wait(timeout=1)
+        assert client._native_callback_events.empty()
+
+        bridge.close()
+        resume_poll.set()
+        assert poll_finished.wait(timeout=1)
+        poll_thread.join(timeout=1)
+        assert not poll_thread.is_alive()
+        assert len(poll_errors) == 1
+        assert isinstance(poll_errors[0], ContractValidationError)
+        assert "callback may have been consumed and discarded" in str(poll_errors[0])
+        assert client._native_callback_consumer_lease is None
+    finally:
+        resume_poll.set()
+        if bridge is not None:
+            bridge.close()
+        if poll_thread is not None:
+            poll_thread.join(timeout=1)
+        bound.store.close()
+        client.stop()
 
 
 @pytest.mark.unit

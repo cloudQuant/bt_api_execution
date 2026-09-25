@@ -449,6 +449,8 @@ class CtpNativeCallbackSourceBridge:
         self._consumer_token: object | None = consumer_token
         self._last_source_sequence = binding.source_facts.callback_source_sequence_baseline
         self._closed = False
+        self._state_generation = 0
+        self._poll_in_flight = False
         self._lock = threading.Lock()
 
     @classmethod
@@ -555,42 +557,61 @@ class CtpNativeCallbackSourceBridge:
 
         with self._lock:
             self._require_open()
-            try:
+            if self._poll_in_flight:
+                raise _contract_error("native callback bridge already has a poll in progress")
+            consumer_token = self._consumer_token
+            if consumer_token is None:
+                raise _contract_error("native callback queue consumer lease is unavailable")
+            self._poll_in_flight = True
+            poll_generation = self._state_generation
+
+        event: object | None = None
+        try:
+            self._require_command_binding_current()
+            self._require_live_source_current()
+            with self._lock:
+                self._require_poll_current(consumer_token, poll_generation)
+
+            # The SDK wait can block. The bridge state lock stays free so close()
+            # can revoke the queue lease and wake this wait immediately.
+            event = self._native_trader_client._wait_native_callback_event_for_consumer(
+                consumer_token, timeout=timeout
+            )
+
+            with self._lock:
+                self._require_poll_current(consumer_token, poll_generation)
                 self._require_command_binding_current()
                 self._require_live_source_current()
-                consumer_token = self._consumer_token
-                if consumer_token is None:
-                    raise _contract_error("native callback queue consumer lease is unavailable")
-                event = self._native_trader_client._wait_native_callback_event_for_consumer(
-                    consumer_token, timeout=timeout
-                )
-                self._require_command_binding_current()
-                self._require_live_source_current()
-            except Exception as exc:
-                self._poison()
-                if isinstance(exc, ContractValidationError):
-                    raise
-                raise _contract_error(
-                    "native callback source queue or lifecycle check failed"
-                ) from exc
-            if event is None:
-                return None
-            try:
+                if event is None:
+                    self._poll_in_flight = False
+                    return None
                 mapped = self._map_source_event(event)
                 sequence = getattr(event, "source_sequence", None)
                 monotonic_ns = getattr(event, "callback_monotonic_ns", None)
                 if type(sequence) is not int or type(monotonic_ns) is not int:
                     raise _contract_error("source event sequence or time is invalid")
                 self._last_source_sequence = sequence
+                # Finalize while holding the state lock. A close that acquires
+                # the lock after this point is ordered after this completed poll.
+                self._poll_in_flight = False
                 return CtpLifecycleBoundNativeCallbackEnvelope(
                     callback_envelope=mapped,
                     _session_binding=self._binding,
                     event_source_sequence=sequence,
                     callback_monotonic_ns=monotonic_ns,
                 )
-            except Exception:
-                self._poison()
+        except Exception as exc:
+            if not self._poison(expected_generation=poll_generation):
+                raise _contract_error(
+                    "bridge closed during callback poll; callback may have been consumed and "
+                    "discarded, so the outcome may require UNKNOWN reconciliation"
+                ) from exc
+            if isinstance(exc, ContractValidationError):
                 raise
+            raise _contract_error("native callback source queue or lifecycle check failed") from exc
+        finally:
+            with self._lock:
+                self._poll_in_flight = False
 
     def _require_command_binding_current(self) -> None:
         try:
@@ -708,21 +729,40 @@ class CtpNativeCallbackSourceBridge:
 
     def _require_open(self) -> None:
         if self._closed:
-            raise _contract_error("bridge is closed after a source mismatch")
+            raise _contract_error("bridge is closed")
+
+    def _require_poll_current(self, token: object, generation: int) -> None:
+        if (
+            self._closed
+            or self._state_generation != generation
+            or self._consumer_token is not token
+        ):
+            raise _contract_error("bridge closed or queue lease changed during callback poll")
 
     def close(self) -> None:
         """Release exclusive callback-queue ownership after the final poll."""
 
         with self._lock:
-            self._closed = True
-            self._release_consumer_token(suppress_errors=False)
+            if not self._closed:
+                self._closed = True
+                self._state_generation += 1
+            token = self._consumer_token
+        self._release_consumer_token(token, suppress_errors=False)
 
-    def _poison(self) -> None:
-        self._closed = True
-        self._release_consumer_token(suppress_errors=True)
+    def _poison(self, *, expected_generation: int | None = None) -> bool:
+        with self._lock:
+            if expected_generation is not None and (
+                self._closed or self._state_generation != expected_generation
+            ):
+                return False
+            if not self._closed:
+                self._closed = True
+                self._state_generation += 1
+            token = self._consumer_token
+        self._release_consumer_token(token, suppress_errors=True)
+        return True
 
-    def _release_consumer_token(self, *, suppress_errors: bool) -> None:
-        token = self._consumer_token
+    def _release_consumer_token(self, token: object | None, *, suppress_errors: bool) -> None:
         if token is None:
             return
         try:
@@ -733,7 +773,9 @@ class CtpNativeCallbackSourceBridge:
                     "native callback queue consumer lease cleanup failed"
                 ) from exc
             return
-        self._consumer_token = None
+        with self._lock:
+            if self._consumer_token is token:
+                self._consumer_token = None
 
 
 _BRIDGE_CONSTRUCTOR_TOKEN = object()
