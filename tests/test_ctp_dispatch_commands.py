@@ -20,6 +20,8 @@ from bt_api_execution import (
     CtpDispatchCorrelationKey,
     CtpDispatchReceipt,
     CtpOrderRefSeedProof,
+    CtpUnknownResolutionAttestation,
+    CtpVerifiedCallbackEvidence,
     DurableStoreError,
     ExecutionScope,
     ExecutionState,
@@ -29,6 +31,7 @@ from bt_api_execution import (
     Side,
     SqliteExecutionStore,
     WriterLeaseUnavailable,
+    payload_sha256,
     require_ctp_dispatch_callback_match,
 )
 
@@ -171,6 +174,40 @@ def _callback(command, *, event_id="event-1", **overrides):
     return CtpDispatchCallbackKey(**values)
 
 
+def _stage_cancel(store, scope, lease, reservation, command_id="cancel-command-1"):
+    target = CtpCancelTarget(
+        order_ref=reservation.order_ref,
+        exchange_id="SHFE",
+        order_sys_id="sys-order-17",
+        front_id=4,
+        session_id=91,
+    )
+    return store.stage_ctp_dispatch_command(
+        scope,
+        command_id,
+        "CANCEL",
+        {
+            "OrderRef": target.order_ref,
+            "ExchangeID": target.exchange_id,
+            "OrderSysID": target.order_sys_id,
+            "FrontID": target.front_id,
+            "SessionID": target.session_id,
+            "ActionFlag": "0",
+        },
+        approval_use_id="approval-use-" + command_id,
+        approval_digest=sha256(("approval-" + command_id).encode("ascii")).hexdigest(),
+        session_binding=_session_binding("test-session-generation-cancel"),
+        writer_lease=lease,
+        cancel_target=target,
+        managed_action_id="managed-action-" + command_id,
+        session_generation_id="test-session-generation-cancel",
+        dispatch_front_id=4,
+        dispatch_session_id=91,
+        native_request_id=_native_request_id(command_id),
+        native_action_ref="native-action-" + command_id,
+    )
+
+
 class _FakeCtpDispatchAuthorityVerifier:
     """Test-only fresh verifier; it never calls a provider or external source."""
 
@@ -205,8 +242,122 @@ class _FakeCtpDispatchAuthorityVerifier:
         return authority
 
 
+class _FakeCtpDispatchCallbackVerifier:
+    """Test-only evidence source; it creates no provider or network evidence."""
+
+    def __init__(
+        self,
+        state="ACKNOWLEDGED",
+        *,
+        source=b"fake callback",
+        error=None,
+        ttl_ns=5_000_000_000,
+        payload_digest_override=None,
+        verification_delay_s=0,
+    ):
+        self.state = state
+        self.source_digest = sha256(source).hexdigest()
+        self.error = error
+        self.ttl_ns = ttl_ns
+        self.payload_digest_override = payload_digest_override
+        self.verification_delay_s = verification_delay_s
+        self.calls = []
+
+    def verify_callback(self, command, callback, callback_payload, *, now_ns):
+        self.calls.append((command, callback, dict(callback_payload), now_ns))
+        if self.error is not None:
+            raise self.error
+        evidence = CtpVerifiedCallbackEvidence(
+            evidence_type="ctp_verified_callback.v1",
+            callback_key=callback,
+            callback_payload_sha256=(
+                payload_sha256(callback_payload)
+                if self.payload_digest_override is None
+                else self.payload_digest_override
+            ),
+            projection_state=self.state,
+            source_digest_sha256=self.source_digest,
+            verifier_id="test-callback-verifier.v1",
+            verified_at_ns=now_ns,
+            expires_at_ns=now_ns + self.ttl_ns,
+        )
+        if self.verification_delay_s:
+            time.sleep(self.verification_delay_s)
+        return evidence
+
+
+class _FakeCtpDispatchReconciliationVerifier:
+    """Test-only reconciliation attester with no native/query access."""
+
+    def __init__(
+        self,
+        order_state="FILLED",
+        cancel_state=None,
+        *,
+        source=b"fake reconciliation bundle",
+        error=None,
+    ):
+        self.order_state = order_state
+        self.cancel_state = cancel_state
+        self.source_digest = sha256(source).hexdigest()
+        self.error = error
+        self.calls = []
+
+    def verify_unknown(self, command, *, now_ns):
+        self.calls.append((command, now_ns))
+        if self.error is not None:
+            raise self.error
+        return CtpUnknownResolutionAttestation(
+            attestation_type="ctp_unknown_resolution.v1",
+            correlation_key=command.correlation_key,
+            order_terminal_state=self.order_state,
+            cancel_action_terminal_state=self.cancel_state,
+            source_digest_sha256=self.source_digest,
+            verifier_id="test-reconciliation-verifier.v1",
+            verified_at_ns=now_ns,
+            expires_at_ns=now_ns + 5_000_000_000,
+        )
+
+
 def _authority_verifier(**overrides):
     return _FakeCtpDispatchAuthorityVerifier(overrides=overrides)
+
+
+def _dispatch_fake(store, scope, lease, command, *, outcome="QUEUED"):
+    claimed = store.claim_ctp_dispatch_command(
+        scope,
+        command.command_id,
+        writer_lease=lease,
+        authority_verifier=_authority_verifier(),
+    )
+    assert claimed is not None and claimed.status == "CLAIMED"
+    return store.complete_ctp_dispatch_command(
+        scope, _receipt(claimed, outcome=outcome), writer_lease=lease
+    )
+
+
+def _apply_callback(
+    store,
+    scope,
+    command,
+    callback,
+    lease,
+    verifier=None,
+    *,
+    payload=None,
+):
+    callback_payload = payload or {
+        "fake_event_family": callback.callback_family,
+        "fake_event_id": callback.event_id,
+    }
+    return store.apply_ctp_verified_dispatch_callback(
+        scope,
+        command.command_id,
+        callback,
+        callback_payload,
+        writer_lease=lease,
+        callback_verifier=verifier,
+    )
 
 
 class _ControlledClock:
@@ -218,7 +369,7 @@ class _ControlledClock:
 
 
 @pytest.mark.unit
-def test_v4_execution_store_migrates_to_typed_ctp_correlation_v7(tmp_path):
+def test_v4_execution_store_migrates_to_verified_callback_ledger_v8(tmp_path):
     path = tmp_path / "execution.sqlite3"
     scope = _scope()
     legacy_intent = OrderIntent.limit(
@@ -245,8 +396,8 @@ def test_v4_execution_store_migrates_to_typed_ctp_correlation_v7(tmp_path):
 
     # A v4 database has the execution journal, event outbox, lease, and CTP
     # identity tables. The command and OrderRef watermark tables were added in
-    # v5 added commands, v6 added one-use authority, and v7 adds typed
-    # per-action/session correlation keys.
+    # v5 added commands, v6 added one-use authority, v7 adds typed
+    # per-action/session keys, and v8 adds callback ledger/projections.
     connection = sqlite3.connect(path)
     try:
         connection.execute("DROP TABLE ctp_dispatch_authority_uses")
@@ -268,7 +419,7 @@ def test_v4_execution_store_migrates_to_typed_ctp_correlation_v7(tmp_path):
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-        assert version == "7"
+        assert version == "8"
         assert "ctp_dispatch_commands" in tables
         assert "ctp_order_ref_watermarks" in tables
         assert "ctp_dispatch_authority_uses" in tables
@@ -314,7 +465,7 @@ def test_v5_execution_store_migrates_one_use_authority_table(tmp_path):
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-        assert version == "7"
+        assert version == "8"
         assert "ctp_dispatch_authority_uses" in tables
     finally:
         migrated.close()
@@ -368,6 +519,58 @@ def test_v6_staged_command_without_typed_keys_migrates_to_unknown(tmp_path):
             is None
         )
         assert migrated.read_ctp_dispatch_command(scope, staged.command_id).status == "UNKNOWN"
+    finally:
+        migrated.close()
+
+
+@pytest.mark.unit
+def test_v7_typed_command_migrates_to_callback_ledger_without_reopening_dispatch(tmp_path):
+    path = tmp_path / "execution.sqlite3"
+    store = SqliteExecutionStore(path)
+    scope = _scope()
+    lease = _lease(store, scope)
+    reservation = _reserve_seeded(store, scope, lease)
+    staged = _stage_submit(store, scope, lease, reservation)
+    original_key = staged.correlation_key
+    store.close()
+
+    connection = sqlite3.connect(path)
+    try:
+        connection.executescript(
+            """
+            DROP TRIGGER ctp_dispatch_callback_immutable_update;
+            DROP TRIGGER ctp_dispatch_callback_immutable_delete;
+            DROP TRIGGER ctp_dispatch_resolution_immutable_update;
+            DROP TRIGGER ctp_dispatch_resolution_immutable_delete;
+            DROP TABLE ctp_dispatch_unknown_resolutions;
+            DROP TABLE ctp_dispatch_cancel_projection;
+            DROP TABLE ctp_dispatch_order_projection;
+            DROP TABLE ctp_dispatch_callback_ledger;
+            UPDATE execution_meta SET value = '7' WHERE key = 'schema_version';
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    migrated = SqliteExecutionStore(path)
+    try:
+        current = migrated.read_ctp_dispatch_command(scope, staged.command_id)
+        assert current is not None
+        assert current.status == "READY"
+        assert current.correlation_key == original_key
+        assert (
+            migrated._connection.execute(
+                "SELECT value FROM execution_meta WHERE key = 'schema_version'"
+            ).fetchone()[0]
+            == "8"
+        )
+        assert (
+            migrated._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_callback_ledger"
+            ).fetchone()[0]
+            == 0
+        )
     finally:
         migrated.close()
 
@@ -618,6 +821,473 @@ def test_cancel_correlation_keeps_action_separate_from_exact_order_target(tmp_pa
                 command, replace(callback, native_action_ref="different-action-ref")
             )
         assert store.read_ctp_dispatch_command(scope, command_id).status == "READY"
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+def test_verified_submit_callback_is_durable_idempotent_and_restart_safe(tmp_path):
+    path = tmp_path / "execution.sqlite3"
+    store = SqliteExecutionStore(path)
+    scope = _scope()
+    lease = _lease(store, scope)
+    try:
+        reservation = _reserve_seeded(store, scope, lease)
+        command = _stage_submit(store, scope, lease, reservation)
+        completed = _dispatch_fake(store, scope, lease, command)
+        callback = _callback(command, event_id="order-event-1")
+        with pytest.raises(ContractValidationError, match="verification failed"):
+            _apply_callback(store, scope, command, callback, lease)
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_callback_ledger"
+            ).fetchone()[0]
+            == 0
+        )
+
+        applied = _apply_callback(
+            store, scope, command, callback, lease, _FakeCtpDispatchCallbackVerifier()
+        )
+        assert not applied.duplicate
+        assert applied.projection_state == "ACKNOWLEDGED"
+        assert not applied.account_fence_open
+        projection = store._connection.execute(
+            "SELECT * FROM ctp_dispatch_order_projection WHERE account_key = ?",
+            (command.account_key,),
+        ).fetchone()
+        ledger = store._connection.execute(
+            "SELECT * FROM ctp_dispatch_callback_ledger WHERE account_key = ?",
+            (command.account_key,),
+        ).fetchone()
+        assert projection["provider_state"] == "ACKNOWLEDGED"
+        assert projection["terminal"] == 0
+        assert ledger["callback_key_json"] == json.dumps(
+            callback.to_payload(), sort_keys=True, separators=(",", ":")
+        )
+        assert ledger["source_digest_sha256"] == sha256(b"fake callback").hexdigest()
+        assert completed.status == "COMPLETED"
+        assert store.read_ctp_dispatch_command(scope, command.command_id).status == "COMPLETED"
+    finally:
+        store.close()
+
+    reopened = SqliteExecutionStore(path)
+    reopened_lease = _lease(reopened, scope)
+    try:
+        duplicate = _apply_callback(
+            reopened,
+            scope,
+            command,
+            callback,
+            reopened_lease,
+            _FakeCtpDispatchCallbackVerifier(),
+        )
+        assert duplicate.duplicate
+        assert not duplicate.account_fence_open
+        assert (
+            reopened._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_callback_ledger"
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            reopened._connection.execute(
+                "SELECT provider_state FROM ctp_dispatch_order_projection"
+            ).fetchone()[0]
+            == "ACKNOWLEDGED"
+        )
+    finally:
+        reopened.close()
+
+
+@pytest.mark.unit
+def test_callback_verifier_error_payload_is_not_exposed(tmp_path):
+    store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
+    scope = _scope()
+    lease = _lease(store, scope)
+    secret = "SENTINEL-CALLBACK-VERIFIER-SECRET"
+    try:
+        reservation = _reserve_seeded(store, scope, lease)
+        command = _stage_submit(store, scope, lease, reservation)
+        _dispatch_fake(store, scope, lease, command)
+        with pytest.raises(ContractValidationError) as caught:
+            _apply_callback(
+                store,
+                scope,
+                command,
+                _callback(command),
+                lease,
+                _FakeCtpDispatchCallbackVerifier(error=RuntimeError(secret)),
+            )
+        assert secret not in str(caught.value)
+        assert caught.value.__context__ is None
+        assert secret not in "".join(traceback.format_exception(caught.value))
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_callback_ledger"
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+def test_callback_verifier_must_bind_input_digest_and_fresh_expiry(tmp_path):
+    store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
+    scope = _scope()
+    lease = _lease(store, scope)
+    try:
+        reservation = _reserve_seeded(store, scope, lease)
+        command = _stage_submit(store, scope, lease, reservation)
+        _dispatch_fake(store, scope, lease, command)
+        callback = _callback(command, event_id="proof-binding-event")
+        with pytest.raises(ContractValidationError, match="does not match command"):
+            _apply_callback(
+                store,
+                scope,
+                command,
+                callback,
+                lease,
+                _FakeCtpDispatchCallbackVerifier(payload_digest_override="0" * 64),
+            )
+        with pytest.raises(ContractValidationError, match="expired before commit"):
+            _apply_callback(
+                store,
+                scope,
+                command,
+                callback,
+                lease,
+                _FakeCtpDispatchCallbackVerifier(ttl_ns=1, verification_delay_s=0.002),
+            )
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_callback_ledger"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_order_projection"
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+def test_callback_event_id_conflict_is_rejected_without_projection_change(tmp_path):
+    store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
+    scope = _scope()
+    lease = _lease(store, scope)
+    try:
+        reservation = _reserve_seeded(store, scope, lease)
+        command = _stage_submit(store, scope, lease, reservation)
+        _dispatch_fake(store, scope, lease, command)
+        callback = _callback(command, event_id="reused-event-id")
+        _apply_callback(store, scope, command, callback, lease, _FakeCtpDispatchCallbackVerifier())
+        with pytest.raises(IntentConflictError, match="event id conflicts"):
+            _apply_callback(
+                store,
+                scope,
+                command,
+                callback,
+                lease,
+                _FakeCtpDispatchCallbackVerifier("REJECTED", source=b"different fake source"),
+            )
+        assert (
+            store._connection.execute(
+                "SELECT provider_state FROM ctp_dispatch_order_projection"
+            ).fetchone()[0]
+            == "ACKNOWLEDGED"
+        )
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_callback_ledger"
+            ).fetchone()[0]
+            == 1
+        )
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+def test_callback_ledger_and_projection_rollback_together(tmp_path):
+    store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
+    scope = _scope()
+    lease = _lease(store, scope)
+    try:
+        reservation = _reserve_seeded(store, scope, lease)
+        command = _stage_submit(store, scope, lease, reservation)
+        _dispatch_fake(store, scope, lease, command)
+        store._connection.execute(
+            """
+            CREATE TRIGGER fail_ctp_order_projection
+            BEFORE INSERT ON ctp_dispatch_order_projection
+            BEGIN
+                SELECT RAISE(ABORT, 'fake projection failure');
+            END
+            """
+        )
+        callback = _callback(command, event_id="rollback-event")
+        with pytest.raises(DurableStoreError, match="transaction failed"):
+            _apply_callback(
+                store, scope, command, callback, lease, _FakeCtpDispatchCallbackVerifier()
+            )
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_callback_ledger"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_order_projection"
+            ).fetchone()[0]
+            == 0
+        )
+        store._connection.execute("DROP TRIGGER fail_ctp_order_projection")
+        assert not _apply_callback(
+            store, scope, command, callback, lease, _FakeCtpDispatchCallbackVerifier()
+        ).duplicate
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+def test_cancel_callback_projects_action_without_cancelling_target_order(tmp_path):
+    store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
+    scope = _scope()
+    lease = _lease(store, scope)
+    try:
+        reservation = _reserve_seeded(store, scope, lease)
+        submit = _stage_submit(store, scope, lease, reservation)
+        _dispatch_fake(store, scope, lease, submit)
+        _apply_callback(
+            store,
+            scope,
+            submit,
+            _callback(submit, event_id="submit-ack"),
+            lease,
+            _FakeCtpDispatchCallbackVerifier("ACKNOWLEDGED"),
+        )
+        cancel = _stage_cancel(store, scope, lease, reservation)
+        _dispatch_fake(store, scope, lease, cancel)
+        applied = _apply_callback(
+            store,
+            scope,
+            cancel,
+            _callback(cancel, event_id="cancel-terminal"),
+            lease,
+            _FakeCtpDispatchCallbackVerifier("TERMINAL"),
+        )
+        assert applied.projection_state == "TERMINAL"
+        order_projection = store._connection.execute(
+            "SELECT provider_state FROM ctp_dispatch_order_projection WHERE account_key = ?",
+            (cancel.account_key,),
+        ).fetchone()
+        cancel_projection = store._connection.execute(
+            "SELECT provider_state, terminal FROM ctp_dispatch_cancel_projection "
+            "WHERE account_key = ? AND managed_action_id = ?",
+            (cancel.account_key, cancel.correlation_key.managed_action_id),
+        ).fetchone()
+        assert order_projection["provider_state"] == "ACKNOWLEDGED"
+        assert cancel_projection["provider_state"] == "TERMINAL"
+        assert cancel_projection["terminal"] == 1
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+def test_unknown_callback_stays_fenced_until_fresh_terminal_reconciliation(tmp_path):
+    store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
+    scope = _scope()
+    lease = _lease(store, scope)
+    other_scope = ExecutionScope("CTP", "simulation", "acct-outbox", "strategy.other", "20260925")
+    other_lease = _lease(store, other_scope)
+    try:
+        first_reservation = _reserve_seeded(store, scope, lease, "intent-unknown")
+        unknown_command = _stage_submit(
+            store,
+            scope,
+            lease,
+            first_reservation,
+            "command-unknown",
+            approval_use_id="approval-unknown",
+        )
+        _dispatch_fake(store, scope, lease, unknown_command, outcome="UNKNOWN")
+        callback_result = _apply_callback(
+            store,
+            scope,
+            unknown_command,
+            _callback(unknown_command, event_id="late-terminal-order"),
+            lease,
+            _FakeCtpDispatchCallbackVerifier("FILLED"),
+        )
+        assert callback_result.account_fence_open
+        assert (
+            store.read_ctp_dispatch_command(scope, unknown_command.command_id).status == "UNKNOWN"
+        )
+        with pytest.raises(ContractValidationError, match="verification failed"):
+            store.resolve_unknown_ctp_dispatch_command(
+                scope, unknown_command.command_id, writer_lease=lease
+            )
+
+        second_reservation = _reserve_seeded(
+            store, other_scope, other_lease, "intent-after-unknown"
+        )
+        next_command = _stage_submit(
+            store,
+            other_scope,
+            other_lease,
+            second_reservation,
+            "command-after-unknown",
+            approval_use_id="approval-after-unknown",
+            session_generation_id="new-session-generation",
+        )
+        with pytest.raises(InvalidStateTransition, match="command-unknown"):
+            store.claim_ctp_dispatch_command(
+                other_scope,
+                next_command.command_id,
+                writer_lease=other_lease,
+                authority_verifier=_authority_verifier(),
+            )
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_unknown_resolutions"
+            ).fetchone()[0]
+            == 0
+        )
+
+        resolved = store.resolve_unknown_ctp_dispatch_command(
+            scope,
+            unknown_command.command_id,
+            writer_lease=lease,
+            reconciliation_verifier=_FakeCtpDispatchReconciliationVerifier("FILLED"),
+        )
+        assert not resolved.account_fence_open
+        assert not resolved.duplicate
+        assert (
+            store.read_ctp_dispatch_command(scope, unknown_command.command_id).status == "UNKNOWN"
+        )
+        assert (
+            store._connection.execute(
+                "SELECT provider_state FROM ctp_dispatch_order_projection WHERE account_key = ?",
+                (unknown_command.account_key,),
+            ).fetchone()[0]
+            == "FILLED"
+        )
+        duplicate_resolution = store.resolve_unknown_ctp_dispatch_command(
+            scope,
+            unknown_command.command_id,
+            writer_lease=lease,
+            reconciliation_verifier=_FakeCtpDispatchReconciliationVerifier("FILLED"),
+        )
+        assert duplicate_resolution.duplicate
+        assert not duplicate_resolution.account_fence_open
+        with pytest.raises(IntentConflictError, match="resolution conflicts"):
+            store.resolve_unknown_ctp_dispatch_command(
+                scope,
+                unknown_command.command_id,
+                writer_lease=lease,
+                reconciliation_verifier=_FakeCtpDispatchReconciliationVerifier(
+                    "CANCELLED", source=b"different reconciliation bundle"
+                ),
+            )
+        claimed = store.claim_ctp_dispatch_command(
+            other_scope,
+            next_command.command_id,
+            writer_lease=other_lease,
+            authority_verifier=_authority_verifier(),
+        )
+        assert claimed is not None and claimed.status == "CLAIMED"
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+def test_unknown_cancel_resolution_requires_terminal_action_and_target(tmp_path):
+    store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
+    scope = _scope()
+    lease = _lease(store, scope)
+    try:
+        reservation = _reserve_seeded(store, scope, lease)
+        cancel = _stage_cancel(store, scope, lease, reservation, "cancel-unknown")
+        _dispatch_fake(store, scope, lease, cancel, outcome="UNKNOWN")
+        with pytest.raises(ContractValidationError, match="verification failed"):
+            store.resolve_unknown_ctp_dispatch_command(
+                scope,
+                cancel.command_id,
+                writer_lease=lease,
+                reconciliation_verifier=_FakeCtpDispatchReconciliationVerifier(
+                    "ACKNOWLEDGED", "TERMINAL"
+                ),
+            )
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_unknown_resolutions"
+            ).fetchone()[0]
+            == 0
+        )
+
+        store._connection.execute(
+            """
+            CREATE TRIGGER fail_ctp_cancel_projection
+            BEFORE INSERT ON ctp_dispatch_cancel_projection
+            BEGIN
+                SELECT RAISE(ABORT, 'fake cancel projection failure');
+            END
+            """
+        )
+        with pytest.raises(DurableStoreError, match="transaction failed"):
+            store.resolve_unknown_ctp_dispatch_command(
+                scope,
+                cancel.command_id,
+                writer_lease=lease,
+                reconciliation_verifier=_FakeCtpDispatchReconciliationVerifier(
+                    "CANCELLED", "TERMINAL"
+                ),
+            )
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_unknown_resolutions"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_order_projection"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_cancel_projection"
+            ).fetchone()[0]
+            == 0
+        )
+        store._connection.execute("DROP TRIGGER fail_ctp_cancel_projection")
+
+        resolved = store.resolve_unknown_ctp_dispatch_command(
+            scope,
+            cancel.command_id,
+            writer_lease=lease,
+            reconciliation_verifier=_FakeCtpDispatchReconciliationVerifier("CANCELLED", "TERMINAL"),
+        )
+        assert not resolved.account_fence_open
+        assert resolved.order_terminal_state == "CANCELLED"
+        assert resolved.cancel_action_terminal_state == "TERMINAL"
+        order_projection = store._connection.execute(
+            "SELECT provider_state, terminal FROM ctp_dispatch_order_projection"
+        ).fetchone()
+        cancel_projection = store._connection.execute(
+            "SELECT provider_state, terminal FROM ctp_dispatch_cancel_projection"
+        ).fetchone()
+        assert order_projection["provider_state"] == "CANCELLED"
+        assert order_projection["terminal"] == 1
+        assert cancel_projection["provider_state"] == "TERMINAL"
+        assert cancel_projection["terminal"] == 1
+        assert store.read_ctp_dispatch_command(scope, cancel.command_id).status == "UNKNOWN"
     finally:
         store.close()
 
@@ -1022,7 +1692,19 @@ def test_queued_receipt_is_local_dispatch_fact_not_provider_ack(tmp_path):
         ).fetchone()
         assert persisted_echo is not None
         assert json.loads(persisted_echo["completion_echo_json"])["outcome"] == "QUEUED"
-        # The v7 local outbox has no provider order/cancel projection to advance.
+        # A queue receipt alone creates no callback-ledger or provider projection fact.
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_order_projection"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_cancel_projection"
+            ).fetchone()[0]
+            == 0
+        )
         assert (
             store._connection.execute("SELECT COUNT(*) FROM execution_records").fetchone()[0] == 0
         )

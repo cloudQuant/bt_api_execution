@@ -193,10 +193,13 @@ Fields not applicable to submit are explicitly absent; cancel requires the
 complete target tuple. `managed_action_id` is the submit intent ID for submit
 or the distinct cancel-action ID for cancel; it is never inferred from the
 generic `command_id`. Neither DTO implements `ProviderObservation`. A
-separate future `VerifiedCtpCallback` must bind `binding_digest`, native
-session generation, callback stream and stable event ID, event family,
-verifier identity, source digest, and exact callback identifiers before any
-provider projection is considered.
+The SDK's offline schema-v8 candidate now defines the injected
+`CtpDispatchCallbackVerifier` boundary and `CtpVerifiedCallbackEvidence`. Its
+fake-only contract binds the command correlation key, native session
+generation, callback stream and event ID, family, verifier ID, source digest,
+and exact callback identifiers before it appends or projects a callback.
+The default verifier rejects. These contracts do not authenticate real native
+callback provenance until a reviewed source adapter is supplied.
 
 The currently shared identity must echo exactly between the Backtrader handoff
 and staged command: operation, account key, scope key, trading day, reserved
@@ -209,7 +212,7 @@ are echo fields only. Fresh action approval must still be checked by the
 trusted verifier during `claim_ctp_dispatch_command`; the one-use
 authorization and claim stay in that same SQLite transaction.
 
-The offline schema-v7 candidate now persists and returns a version-1 typed
+The offline schema-v8 candidate now persists and returns a version-1 typed
 `CtpDispatchCorrelationKey` for newly staged commands. It binds the exact
 account, scope, trading day, operation, command ID, canonical request digest,
 reservation intent, managed action ID, reserved runtime order ID and OrderRef,
@@ -222,16 +225,31 @@ target reservation intent. These key fields are persisted in immutable command
 columns and echoed by the local receipt. Legacy READY/CLAIMED rows without
 these keys migrate to `UNKNOWN`, preserving the fail-closed fence.
 
-`CtpDispatchCallbackKey` and `require_ctp_dispatch_callback_match` are also
-offline, pure DTO/matching seams. The callback key carries the full command
-correlation key plus callback family, stream/event ID, native RequestID and
-ActionRef, callback OrderRef, optional ExchangeID/OrderSysID, and exact cancel
-target FrontID/SessionID. Matching rejects structural mismatches only. These
-types do not verify native callback provenance, are not durably appended, and
-cannot update order/cancel projections or clear `UNKNOWN`; caller-supplied IDs
-or digests are not evidence. The ActionRef and RequestID fields are opaque
-correlation values here, not a claim that a specific native callback family
-echoes them.
+`CtpDispatchCallbackKey` and `require_ctp_dispatch_callback_match` remain pure
+structural seams. The callback key carries the full command correlation key
+plus family, stream/event ID, native RequestID and ActionRef, callback
+OrderRef, optional ExchangeID/OrderSysID, and exact cancel target
+FrontID/SessionID. Matching rejects structural mismatches only and never
+authenticates a source. The v8 `apply_ctp_verified_dispatch_callback` API calls
+an injected verifier, then atomically appends an immutable callback-ledger row,
+deduplicates by account/session-generation/stream/event, and advances a
+separate submit-order or cancel-action state projection. Duplicate IDs with
+conflicting evidence fail. The cancel-action projection never changes its
+target order. The transaction also reports the account fence; a callback on an
+`UNKNOWN` command does not clear it. The ActionRef and RequestID fields remain
+opaque correlation values here, not a claim that a specific native callback
+family echoes them. No raw native callback payload is persisted.
+
+`resolve_unknown_ctp_dispatch_command` is a separate injected
+`CtpDispatchReconciliationVerifier` boundary. The default verifier rejects;
+an UNKNOWN command stays UNKNOWN and fenced unless a fresh exact attestation
+binds its correlation key and explicit terminal states. Submit requires a
+terminal order state. Cancel requires both terminal cancel-action and target
+order states. The resolution row, corresponding terminal projections, and
+removal of that command from the same SQLite account fence commit atomically;
+the original command remains `UNKNOWN` as historical dispatch fact. The
+offline fake verifier does not query a provider or establish the real
+order/trade/position/cancel consistency that a deployment verifier must prove.
 
 Cancel matching also needs an explicit versioned target tuple:
 `OrderRef`, `ExchangeID`, `OrderSysID`, `FrontID`, and `SessionID`. The SDK
@@ -243,9 +261,9 @@ must reject until the handoff version types and validates the same target
 tuple. It must also keep the cancel action's own native `ActionRef` and/or
 `RequestID` distinct from the target order identifiers.
 
-The new outbox key requires a caller-supplied session generation and exact TD
-`FrontID`/`SessionID`, but does not establish that the generation is durable,
-non-reused, or sourced from a verified native login. The `session_binding`
+The new outbox key requires a caller-supplied session generation identifier
+and exact TD `FrontID`/`SessionID`, but does not establish that the generation
+is durable, non-reused, or sourced from a verified native login. The `session_binding`
 mapping remains an unconstrained input; its digest does not reveal or validate
 its contents. The Backtrader handoff still lacks matching typed session
 identity. No generation or login readiness may be inferred from a queue
@@ -296,30 +314,29 @@ generation and verified evidence digests must be retained durably.
 ### Required transaction boundary and blockers
 
 The outbox's `stage`, `claim`, and `complete` methods each persist only their
-own command/receipt fact. The generic `execution_records` and cancellation
-records have separate transitions, and the Backtrader framework projection
-journal is another durable boundary. A callback adapter must not commit one
-projection and then report success while another write fails. Before enabling
-the bridge, a store-owned API must atomically append the verified callback,
-deduplicate its stable event ID, advance the matching submit-order or
-cancel-action projection, and update any same-database command fence. If the
-generic execution ledger and outbox do not share that exact transaction, one
-must be designated the canonical journal and the other made a deterministic,
-rebuildable projection; independent writes are not an acceptable bridge.
-External risk-permit settlement must be idempotently keyed to that committed
-event and cannot be presented as part of a SQLite transaction unless it truly
-shares it.
-
-The first offline step now supplies typed action/runtime-order/native-session
-keys, typed callback correlation DTOs, exact structural matching, fake submit
-and cancel coverage, and fail-closed migration/restart behavior. The remaining
-minimum sequence is: (1) bridge matching typed handoff IDs and validate the
-exact cancel `ExchangeID`/ActionRef/RequestID contract; (2) add a CTP
-asynchronous managed port that records local dispatch without fabricating a
-`ProviderObservation`; (3) add a verified callback ledger and one transaction
-boundary for callback deduplication plus provider projections; then (4) prove
-with fake crash/restart tests that only exact verified evidence can resolve
-`UNKNOWN`, and duplicate, stale-generation, mismatched-submit, and
-mismatched-cancel callbacks cannot advance state. Until those seams and the
-separately reviewed SDK artifact and external account-wide writer fence exist,
-this bridge stays design-only and unregistered.
+own command/receipt fact. The v8 SDK callback ledger atomically updates its own
+submit-order or cancel-action projection and local UNKNOWN fence decision.
+The generic `execution_records` and cancellation records have separate
+transitions, and the Backtrader framework projection journal is another
+durable boundary; the new transaction does not update those ledgers. A future
+bridge must not commit one projection and report success while another write
+fails. Before enabling it, designate a canonical journal and make every other
+projection deterministic and rebuildable, or provide a transaction that
+actually spans the stores. External risk-permit settlement must be idempotently
+keyed to the committed event and cannot be presented as part of a SQLite
+transaction unless it truly shares it.
+The offline SDK candidate now covers typed action/session keys, fake-only
+callback verification, atomic callback deduplication/projection, separate
+submit/cancel state, and terminal-evidence-only UNKNOWN resolution. The
+remaining minimum work is: (1) bridge exact typed handoff IDs and validate the
+cancel `ExchangeID`/ActionRef/RequestID mapping; (2) add a CTP asynchronous
+managed port that records local dispatch without fabricating a
+`ProviderObservation`; (3) implement and independently review a real callback
+source verifier plus exact order/trade/position/cancel reconciliation adapter;
+and (4) choose a canonical journal across the SDK and Backtrader ledgers, then
+prove crash/restart and duplicate/stale-generation behavior across that
+boundary. Until those seams and the separately reviewed SDK artifact and
+external account-wide writer fence exist, this bridge stays design-only and
+unregistered. The SQLite account fence only coordinates participants using
+this exact database and lease contract; it cannot exclude another database,
+process, manual client, or native writer.

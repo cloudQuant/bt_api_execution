@@ -72,6 +72,14 @@ def _validate_correlation_text(value: Any, field_name: str) -> None:
         raise ContractValidationError("invalid CTP dispatch " + field_name)
 
 
+_CTP_ORDER_PROJECTION_STATES = frozenset(
+    {"ACKNOWLEDGED", "PARTIALLY_FILLED", "FILLED", "CANCELLED", "REJECTED"}
+)
+_CTP_ORDER_TERMINAL_STATES = frozenset({"FILLED", "CANCELLED", "REJECTED"})
+_CTP_CANCEL_ACTION_STATES = frozenset({"ACKNOWLEDGED", "REJECTED", "TERMINAL"})
+_CTP_CANCEL_ACTION_TERMINAL_STATES = frozenset({"REJECTED", "TERMINAL"})
+
+
 @dataclass(frozen=True, slots=True)
 class WriterLease:
     """A scope-local writer lease with a monotonically increasing fence."""
@@ -324,10 +332,11 @@ class CtpDispatchCorrelationKey:
 
 @dataclass(frozen=True, slots=True)
 class CtpDispatchCallbackKey:
-    """Unverified, provider-neutral callback correlation keys for fake adapters.
+    """Provider-neutral callback correlation keys, untrusted without a verifier.
 
-    This value can be compared with a command, but this package does not accept
-    it as callback evidence, persist it, or use it to resolve UNKNOWN.
+    Structural matching can reject mismatches but cannot authenticate source.
+    The store persists this key only after an injected verifier returns an exact,
+    fresh evidence binding; the default verifier rejects.
     """
 
     version: int
@@ -400,6 +409,180 @@ class CtpDispatchCallbackKey:
                 raise ContractValidationError("CTP cancel callback target does not match action")
         elif self.target_front_id is not None or self.target_session_id is not None:
             raise ContractValidationError("submit callback cannot carry a cancel target session")
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "version": self.version,
+            "correlation_key": self.correlation_key.to_payload(),
+            "callback_family": self.callback_family,
+            "stream_id": self.stream_id,
+            "event_id": self.event_id,
+            "native_request_id": self.native_request_id,
+            "native_action_ref": self.native_action_ref,
+            "order_ref": self.order_ref,
+            "exchange_id": self.exchange_id,
+            "order_sys_id": self.order_sys_id,
+            "target_front_id": self.target_front_id,
+            "target_session_id": self.target_session_id,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class CtpVerifiedCallbackEvidence:
+    """Injected verifier output for one exact callback event.
+
+    A digest is only an evidence reference. The store accepts this value only
+    as the return from an injected verifier; constructing it directly does not
+    authenticate callback provenance.
+    """
+
+    evidence_type: str
+    callback_key: CtpDispatchCallbackKey
+    callback_payload_sha256: str
+    projection_state: str
+    source_digest_sha256: str
+    verifier_id: str
+    verified_at_ns: int
+    expires_at_ns: int
+
+    def __post_init__(self) -> None:
+        if self.evidence_type != "ctp_verified_callback.v1":
+            raise ContractValidationError("invalid verified CTP callback evidence type")
+        if type(self.callback_key) is not CtpDispatchCallbackKey:
+            raise ContractValidationError("typed CTP callback key is required")
+        if not _is_sha256(self.callback_payload_sha256):
+            raise ContractValidationError("invalid CTP callback payload digest")
+        if type(self.projection_state) is not str:
+            raise ContractValidationError("invalid CTP callback projection state")
+        if self.callback_key.correlation_key.operation == "SUBMIT":
+            if self.projection_state not in _CTP_ORDER_PROJECTION_STATES:
+                raise ContractValidationError("invalid submit callback projection state")
+        elif self.projection_state not in _CTP_CANCEL_ACTION_STATES:
+            raise ContractValidationError("invalid cancel callback projection state")
+        if not _is_sha256(self.source_digest_sha256):
+            raise ContractValidationError("invalid CTP callback source digest")
+        _validate_correlation_text(self.verifier_id, "callback verifier id")
+        if (
+            type(self.verified_at_ns) is not int
+            or type(self.expires_at_ns) is not int
+            or self.expires_at_ns <= self.verified_at_ns
+        ):
+            raise ContractValidationError("invalid CTP callback verification interval")
+
+
+class CtpDispatchCallbackVerifier(Protocol):
+    """Trusted source adapter; structural callback matching alone is not trust."""
+
+    def verify_callback(
+        self,
+        command: CtpDispatchCommand,
+        callback: CtpDispatchCallbackKey,
+        callback_payload: Mapping[str, Any],
+        *,
+        now_ns: int,
+    ) -> CtpVerifiedCallbackEvidence: ...
+
+
+@dataclass(frozen=True, slots=True)
+class CtpUnknownResolutionAttestation:
+    """Fresh external reconciliation attestation for one UNKNOWN action.
+
+    Submit resolution requires an exact terminal order state. Cancel resolution
+    requires both a terminal cancel-action result and a terminal target-order
+    state. Real adapters must attest their complete exact order/trade/position/
+    cancel evidence set; the SDK stores only its digest and typed conclusion.
+    """
+
+    attestation_type: str
+    correlation_key: CtpDispatchCorrelationKey
+    order_terminal_state: str
+    cancel_action_terminal_state: str | None
+    source_digest_sha256: str
+    verifier_id: str
+    verified_at_ns: int
+    expires_at_ns: int
+
+    def __post_init__(self) -> None:
+        if self.attestation_type != "ctp_unknown_resolution.v1":
+            raise ContractValidationError("invalid CTP UNKNOWN resolution attestation type")
+        if type(self.correlation_key) is not CtpDispatchCorrelationKey:
+            raise ContractValidationError("typed CTP correlation key is required")
+        if (
+            type(self.order_terminal_state) is not str
+            or self.order_terminal_state not in _CTP_ORDER_TERMINAL_STATES
+        ):
+            raise ContractValidationError("UNKNOWN resolution requires a terminal order state")
+        if self.correlation_key.operation == "SUBMIT":
+            if self.cancel_action_terminal_state is not None:
+                raise ContractValidationError("submit resolution cannot contain cancel state")
+        elif (
+            type(self.cancel_action_terminal_state) is not str
+            or self.cancel_action_terminal_state not in _CTP_CANCEL_ACTION_TERMINAL_STATES
+        ):
+            raise ContractValidationError(
+                "cancel resolution requires a terminal cancel-action state"
+            )
+        if not _is_sha256(self.source_digest_sha256):
+            raise ContractValidationError("invalid CTP reconciliation source digest")
+        _validate_correlation_text(self.verifier_id, "reconciliation verifier id")
+        if (
+            type(self.verified_at_ns) is not int
+            or type(self.expires_at_ns) is not int
+            or self.expires_at_ns <= self.verified_at_ns
+        ):
+            raise ContractValidationError("invalid CTP reconciliation verification interval")
+
+
+class CtpDispatchReconciliationVerifier(Protocol):
+    """Trusted external evidence adapter required to resolve an UNKNOWN fence."""
+
+    def verify_unknown(
+        self, command: CtpDispatchCommand, *, now_ns: int
+    ) -> CtpUnknownResolutionAttestation: ...
+
+
+@dataclass(frozen=True, slots=True)
+class CtpDispatchCallbackApplyResult:
+    """Atomic callback-ledger/projection result; not a ProviderObservation."""
+
+    callback_key: CtpDispatchCallbackKey
+    projection_state: str
+    duplicate: bool
+    account_fence_open: bool
+
+
+@dataclass(frozen=True, slots=True)
+class CtpDispatchUnknownResolutionResult:
+    """A durable fence resolution; the original outbox command stays UNKNOWN."""
+
+    command_id: str
+    correlation_key: CtpDispatchCorrelationKey
+    order_terminal_state: str
+    cancel_action_terminal_state: str | None
+    account_fence_open: bool
+    duplicate: bool
+
+
+class _RejectCtpDispatchVerifier:
+    """Safe default for callback and reconciliation verification."""
+
+    def verify_callback(
+        self,
+        command: CtpDispatchCommand,
+        callback: CtpDispatchCallbackKey,
+        callback_payload: Mapping[str, Any],
+        *,
+        now_ns: int,
+    ) -> CtpVerifiedCallbackEvidence:
+        raise ContractValidationError("trusted CTP callback verifier is required")
+
+    def verify_unknown(
+        self, command: CtpDispatchCommand, *, now_ns: int
+    ) -> CtpUnknownResolutionAttestation:
+        raise ContractValidationError("trusted CTP reconciliation verifier is required")
+
+
+_REJECT_CTP_DISPATCH_VERIFIER = _RejectCtpDispatchVerifier()
 
 
 @dataclass(frozen=True)
@@ -632,7 +815,9 @@ class SqliteExecutionStore:
     # generic event outbox remains an event log, not a command source.
     # Version 6 records one-use action authority atomically with each claim.
     # Version 7 binds typed runtime/action/session/request identities to commands.
-    _SCHEMA_VERSION = 7
+    # Version 8 adds an injected-source callback ledger, separate projections,
+    # and an external-reconciliation-only UNKNOWN fence resolution record.
+    _SCHEMA_VERSION = 8
 
     def __init__(self, path: str | Path, *, busy_timeout_ms: int = 5_000) -> None:
         if type(busy_timeout_ms) is not int or busy_timeout_ms <= 0:
@@ -835,6 +1020,145 @@ class SqliteExecutionStore:
                     ON ctp_dispatch_commands(account_key, scope_key, status, created_at_ns);
                 CREATE INDEX IF NOT EXISTS ctp_dispatch_commands_account_status
                     ON ctp_dispatch_commands(account_key, status, created_at_ns);
+                CREATE TABLE IF NOT EXISTS ctp_dispatch_callback_ledger (
+                    account_key TEXT NOT NULL,
+                    scope_key TEXT NOT NULL,
+                    trading_day TEXT NOT NULL,
+                    command_id TEXT NOT NULL,
+                    operation TEXT NOT NULL CHECK(operation IN ('SUBMIT', 'CANCEL')),
+                    managed_action_id TEXT NOT NULL,
+                    runtime_order_id TEXT NOT NULL,
+                    order_ref TEXT NOT NULL,
+                    session_generation_id TEXT NOT NULL,
+                    callback_stream_id TEXT NOT NULL,
+                    callback_event_id TEXT NOT NULL,
+                    callback_family TEXT NOT NULL
+                        CHECK(callback_family IN ('ORDER', 'TRADE', 'CANCEL_ACTION')),
+                    callback_key_json TEXT NOT NULL,
+                    callback_key_sha256 TEXT NOT NULL CHECK(length(callback_key_sha256) = 64),
+                    callback_payload_sha256 TEXT NOT NULL
+                        CHECK(length(callback_payload_sha256) = 64),
+                    correlation_key_sha256 TEXT NOT NULL
+                        CHECK(length(correlation_key_sha256) = 64),
+                    projection_state TEXT NOT NULL,
+                    source_digest_sha256 TEXT NOT NULL
+                        CHECK(length(source_digest_sha256) = 64),
+                    verifier_id TEXT NOT NULL,
+                    verified_at_ns INTEGER NOT NULL,
+                    applied_at_ns INTEGER NOT NULL,
+                    PRIMARY KEY(
+                        account_key, session_generation_id,
+                        callback_stream_id, callback_event_id
+                    ),
+                    FOREIGN KEY(account_key, command_id)
+                        REFERENCES ctp_dispatch_commands(account_key, command_id)
+                );
+                CREATE INDEX IF NOT EXISTS ctp_dispatch_callback_command
+                    ON ctp_dispatch_callback_ledger(account_key, command_id, applied_at_ns);
+                CREATE TABLE IF NOT EXISTS ctp_dispatch_order_projection (
+                    account_key TEXT NOT NULL,
+                    runtime_order_id TEXT NOT NULL,
+                    scope_key TEXT NOT NULL,
+                    trading_day TEXT NOT NULL,
+                    managed_intent_id TEXT NOT NULL,
+                    order_ref TEXT NOT NULL,
+                    provider_state TEXT NOT NULL CHECK(provider_state IN (
+                        'ACKNOWLEDGED', 'PARTIALLY_FILLED', 'FILLED', 'CANCELLED', 'REJECTED'
+                    )),
+                    terminal INTEGER NOT NULL CHECK(terminal IN (0, 1)),
+                    correlation_key_sha256 TEXT NOT NULL
+                        CHECK(length(correlation_key_sha256) = 64),
+                    source_digest_sha256 TEXT NOT NULL
+                        CHECK(length(source_digest_sha256) = 64),
+                    last_source_kind TEXT NOT NULL
+                        CHECK(last_source_kind IN ('CALLBACK', 'RECONCILIATION')),
+                    last_event_generation_id TEXT,
+                    last_event_stream_id TEXT,
+                    last_event_id TEXT,
+                    updated_at_ns INTEGER NOT NULL,
+                    PRIMARY KEY(account_key, runtime_order_id),
+                     CHECK(
+                         (provider_state IN ('FILLED', 'CANCELLED', 'REJECTED') AND terminal = 1)
+                         OR (
+                             provider_state IN ('ACKNOWLEDGED', 'PARTIALLY_FILLED')
+                             AND terminal = 0
+                         )
+                     ),
+                    FOREIGN KEY(account_key, runtime_order_id)
+                        REFERENCES ctp_order_identity_reservations(account_key, runtime_order_id)
+                );
+                CREATE TABLE IF NOT EXISTS ctp_dispatch_cancel_projection (
+                    account_key TEXT NOT NULL,
+                    scope_key TEXT NOT NULL,
+                    managed_action_id TEXT NOT NULL,
+                    runtime_order_id TEXT NOT NULL,
+                    order_ref TEXT NOT NULL,
+                    target_exchange_id TEXT NOT NULL,
+                    target_order_sys_id TEXT NOT NULL,
+                    target_front_id INTEGER NOT NULL,
+                    target_session_id INTEGER NOT NULL,
+                    provider_state TEXT NOT NULL CHECK(provider_state IN (
+                        'ACKNOWLEDGED', 'REJECTED', 'TERMINAL'
+                    )),
+                    terminal INTEGER NOT NULL CHECK(terminal IN (0, 1)),
+                    correlation_key_sha256 TEXT NOT NULL
+                        CHECK(length(correlation_key_sha256) = 64),
+                    source_digest_sha256 TEXT NOT NULL
+                        CHECK(length(source_digest_sha256) = 64),
+                    last_source_kind TEXT NOT NULL
+                        CHECK(last_source_kind IN ('CALLBACK', 'RECONCILIATION')),
+                    last_event_generation_id TEXT,
+                    last_event_stream_id TEXT,
+                    last_event_id TEXT,
+                    updated_at_ns INTEGER NOT NULL,
+                    PRIMARY KEY(account_key, scope_key, managed_action_id),
+                    CHECK((provider_state IN ('REJECTED', 'TERMINAL') AND terminal = 1)
+                       OR (provider_state = 'ACKNOWLEDGED' AND terminal = 0)),
+                    FOREIGN KEY(account_key, runtime_order_id)
+                        REFERENCES ctp_order_identity_reservations(account_key, runtime_order_id)
+                );
+                CREATE TABLE IF NOT EXISTS ctp_dispatch_unknown_resolutions (
+                    account_key TEXT NOT NULL,
+                    scope_key TEXT NOT NULL,
+                    command_id TEXT NOT NULL,
+                    operation TEXT NOT NULL CHECK(operation IN ('SUBMIT', 'CANCEL')),
+                    correlation_key_sha256 TEXT NOT NULL
+                        CHECK(length(correlation_key_sha256) = 64),
+                    order_terminal_state TEXT NOT NULL
+                        CHECK(order_terminal_state IN ('FILLED', 'CANCELLED', 'REJECTED')),
+                    cancel_action_terminal_state TEXT
+                        CHECK(cancel_action_terminal_state IN ('REJECTED', 'TERMINAL')),
+                    source_digest_sha256 TEXT NOT NULL
+                        CHECK(length(source_digest_sha256) = 64),
+                    verifier_id TEXT NOT NULL,
+                    verified_at_ns INTEGER NOT NULL,
+                    resolved_at_ns INTEGER NOT NULL,
+                    PRIMARY KEY(account_key, command_id),
+                    CHECK((operation = 'SUBMIT' AND cancel_action_terminal_state IS NULL)
+                       OR (operation = 'CANCEL' AND cancel_action_terminal_state IS NOT NULL)),
+                    FOREIGN KEY(account_key, command_id)
+                        REFERENCES ctp_dispatch_commands(account_key, command_id)
+                );
+                CREATE TRIGGER IF NOT EXISTS ctp_dispatch_callback_immutable_update
+                BEFORE UPDATE ON ctp_dispatch_callback_ledger
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP callback ledger is immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS ctp_dispatch_callback_immutable_delete
+                BEFORE DELETE ON ctp_dispatch_callback_ledger
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP callback ledger is immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS ctp_dispatch_resolution_immutable_update
+                BEFORE UPDATE ON ctp_dispatch_unknown_resolutions
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP UNKNOWN resolution is immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS ctp_dispatch_resolution_immutable_delete
+                BEFORE DELETE ON ctp_dispatch_unknown_resolutions
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP UNKNOWN resolution is immutable');
+                END;
                 CREATE TABLE IF NOT EXISTS ctp_dispatch_authority_uses (
                     account_key TEXT NOT NULL,
                     approval_use_id TEXT NOT NULL,
@@ -886,7 +1210,7 @@ class SqliteExecutionStore:
                     cursor.execute(
                         "ALTER TABLE execution_records ADD COLUMN cumulative_commission TEXT"
                     )
-            elif version not in {"3", "4", "5", "6", str(self._SCHEMA_VERSION)}:
+            elif version not in {"3", "4", "5", "6", "7", str(self._SCHEMA_VERSION)}:
                 raise DurableStoreError("unsupported execution store schema")
 
             columns = {
@@ -2204,7 +2528,14 @@ class SqliteExecutionStore:
             unresolved = cursor.execute(
                 """
                 SELECT command_id, status FROM ctp_dispatch_commands
-                WHERE account_key = ? AND status IN ('CLAIMED', 'UNKNOWN')
+                WHERE account_key = ? AND (
+                    status = 'CLAIMED'
+                    OR (status = 'UNKNOWN' AND NOT EXISTS (
+                        SELECT 1 FROM ctp_dispatch_unknown_resolutions AS resolution
+                        WHERE resolution.account_key = ctp_dispatch_commands.account_key
+                          AND resolution.command_id = ctp_dispatch_commands.command_id
+                    ))
+                )
                 ORDER BY created_at_ns, command_id LIMIT 1
                 """,
                 (account_key,),
@@ -2517,6 +2848,595 @@ class SqliteExecutionStore:
             ).fetchone()
             assert completed is not None
             return self._ctp_dispatch_command_from_row(completed)
+
+    @staticmethod
+    def _ctp_dispatch_has_open_account_fence(cursor: sqlite3.Cursor, account_key: str) -> bool:
+        row = cursor.execute(
+            """
+            SELECT 1 FROM ctp_dispatch_commands
+            WHERE account_key = ? AND (
+                status = 'CLAIMED'
+                OR (status = 'UNKNOWN' AND NOT EXISTS (
+                    SELECT 1 FROM ctp_dispatch_unknown_resolutions AS resolution
+                    WHERE resolution.account_key = ctp_dispatch_commands.account_key
+                      AND resolution.command_id = ctp_dispatch_commands.command_id
+                ))
+            )
+            LIMIT 1
+            """,
+            (account_key,),
+        ).fetchone()
+        return row is not None
+
+    @staticmethod
+    def _verify_ctp_dispatch_callback(
+        verifier: CtpDispatchCallbackVerifier,
+        command: CtpDispatchCommand,
+        callback: CtpDispatchCallbackKey,
+        callback_payload: Mapping[str, Any],
+        callback_payload_sha256: str,
+        *,
+        now_ns: int,
+    ) -> CtpVerifiedCallbackEvidence:
+        verify_callback = getattr(verifier, "verify_callback", None)
+        if not callable(verify_callback):
+            raise ContractValidationError("trusted CTP callback verifier is required")
+        verification_failed = False
+        evidence: CtpVerifiedCallbackEvidence | None = None
+        try:
+            evidence = verify_callback(command, callback, callback_payload, now_ns=now_ns)
+        except Exception:
+            # Raise outside the except block so verifier exceptions and payloads
+            # are absent from both the public message and implicit context.
+            verification_failed = True
+        if verification_failed:
+            raise ContractValidationError("trusted CTP callback verification failed")
+        if type(evidence) is not CtpVerifiedCallbackEvidence:
+            raise ContractValidationError("invalid typed CTP callback verification result")
+        if (
+            evidence.callback_key != callback
+            or evidence.callback_payload_sha256 != callback_payload_sha256
+            or evidence.callback_key.correlation_key != command.correlation_key
+        ):
+            raise ContractValidationError("verified CTP callback binding does not match command")
+        SqliteExecutionStore._validate_ctp_callback_projection_state(callback, evidence)
+        if evidence.verified_at_ns != now_ns:
+            raise ContractValidationError("CTP callback source was not freshly verified")
+        return evidence
+
+    @staticmethod
+    def _validate_ctp_callback_projection_state(
+        callback: CtpDispatchCallbackKey, evidence: CtpVerifiedCallbackEvidence
+    ) -> None:
+        if callback.correlation_key.operation == "SUBMIT":
+            if evidence.projection_state not in _CTP_ORDER_PROJECTION_STATES:
+                raise ContractValidationError("invalid submit callback projection state")
+            if callback.callback_family == "TRADE" and evidence.projection_state not in {
+                "PARTIALLY_FILLED",
+                "FILLED",
+            }:
+                raise ContractValidationError("trade callback has a non-trade projection state")
+        elif evidence.projection_state not in _CTP_CANCEL_ACTION_STATES:
+            raise ContractValidationError("invalid cancel-action projection state")
+
+    @staticmethod
+    def _upsert_ctp_order_projection(
+        cursor: sqlite3.Cursor,
+        key: CtpDispatchCorrelationKey,
+        state: str,
+        source_digest_sha256: str,
+        *,
+        source_kind: str,
+        updated_at_ns: int,
+        callback_key: CtpDispatchCallbackKey | None = None,
+    ) -> None:
+        if key.operation not in {"SUBMIT", "CANCEL"} or state not in _CTP_ORDER_PROJECTION_STATES:
+            raise ContractValidationError("invalid CTP order projection")
+        current = cursor.execute(
+            """
+            SELECT * FROM ctp_dispatch_order_projection
+            WHERE account_key = ? AND runtime_order_id = ?
+            """,
+            (key.account_key, key.runtime_order_id),
+        ).fetchone()
+        if current is not None:
+            identity = (
+                str(current["scope_key"]),
+                str(current["trading_day"]),
+                str(current["managed_intent_id"]),
+                str(current["order_ref"]),
+            )
+            expected_identity = (
+                key.scope_key,
+                key.trading_day,
+                key.reservation_managed_intent_id,
+                key.order_ref,
+            )
+            if identity != expected_identity:
+                raise IntentConflictError(
+                    "CTP order projection identity conflicts with correlation"
+                )
+            current_state = str(current["provider_state"])
+            allowed = {
+                "ACKNOWLEDGED": _CTP_ORDER_PROJECTION_STATES,
+                "PARTIALLY_FILLED": {"PARTIALLY_FILLED", "FILLED", "CANCELLED"},
+                "FILLED": {"FILLED"},
+                "CANCELLED": {"CANCELLED"},
+                "REJECTED": {"REJECTED"},
+            }
+            if state not in allowed[current_state]:
+                raise InvalidStateTransition(
+                    "CTP order projection cannot regress or replace terminal"
+                )
+        is_terminal = int(state in _CTP_ORDER_TERMINAL_STATES)
+        cursor.execute(
+            """
+            INSERT INTO ctp_dispatch_order_projection(
+                account_key, runtime_order_id, scope_key, trading_day,
+                managed_intent_id, order_ref, provider_state, terminal,
+                correlation_key_sha256, source_digest_sha256, last_source_kind,
+                last_event_generation_id, last_event_stream_id, last_event_id, updated_at_ns
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(account_key, runtime_order_id) DO UPDATE SET
+                provider_state = excluded.provider_state,
+                terminal = excluded.terminal,
+                correlation_key_sha256 = excluded.correlation_key_sha256,
+                source_digest_sha256 = excluded.source_digest_sha256,
+                last_source_kind = excluded.last_source_kind,
+                last_event_generation_id = excluded.last_event_generation_id,
+                last_event_stream_id = excluded.last_event_stream_id,
+                last_event_id = excluded.last_event_id,
+                updated_at_ns = excluded.updated_at_ns
+            """,
+            (
+                key.account_key,
+                key.runtime_order_id,
+                key.scope_key,
+                key.trading_day,
+                key.reservation_managed_intent_id,
+                key.order_ref,
+                state,
+                is_terminal,
+                payload_sha256(key.to_payload()),
+                source_digest_sha256,
+                source_kind,
+                None if callback_key is None else key.session_generation_id,
+                None if callback_key is None else callback_key.stream_id,
+                None if callback_key is None else callback_key.event_id,
+                updated_at_ns,
+            ),
+        )
+
+    @staticmethod
+    def _upsert_ctp_cancel_projection(
+        cursor: sqlite3.Cursor,
+        key: CtpDispatchCorrelationKey,
+        state: str,
+        source_digest_sha256: str,
+        *,
+        source_kind: str,
+        updated_at_ns: int,
+        callback_key: CtpDispatchCallbackKey | None = None,
+    ) -> None:
+        if key.operation != "CANCEL" or state not in _CTP_CANCEL_ACTION_STATES:
+            raise ContractValidationError("invalid CTP cancel-action projection")
+        current = cursor.execute(
+            """
+            SELECT * FROM ctp_dispatch_cancel_projection
+            WHERE account_key = ? AND scope_key = ? AND managed_action_id = ?
+            """,
+            (key.account_key, key.scope_key, key.managed_action_id),
+        ).fetchone()
+        if current is not None:
+            identity = (
+                str(current["runtime_order_id"]),
+                str(current["managed_action_id"]),
+                str(current["order_ref"]),
+                str(current["target_exchange_id"]),
+                str(current["target_order_sys_id"]),
+                int(current["target_front_id"]),
+                int(current["target_session_id"]),
+            )
+            expected = (
+                key.runtime_order_id,
+                key.managed_action_id,
+                key.order_ref,
+                key.cancel_target_exchange_id,
+                key.cancel_target_order_sys_id,
+                key.cancel_target_front_id,
+                key.cancel_target_session_id,
+            )
+            if identity != expected:
+                raise IntentConflictError("CTP cancel projection identity conflicts with action")
+            current_state = str(current["provider_state"])
+            allowed = {
+                "ACKNOWLEDGED": _CTP_CANCEL_ACTION_STATES,
+                "REJECTED": {"REJECTED"},
+                "TERMINAL": {"TERMINAL"},
+            }
+            if state not in allowed[current_state]:
+                raise InvalidStateTransition(
+                    "CTP cancel-action projection cannot regress or replace terminal"
+                )
+        is_terminal = int(state in _CTP_CANCEL_ACTION_TERMINAL_STATES)
+        cursor.execute(
+            """
+            INSERT INTO ctp_dispatch_cancel_projection(
+                account_key, scope_key, managed_action_id, runtime_order_id,
+                order_ref, target_exchange_id, target_order_sys_id,
+                target_front_id, target_session_id, provider_state, terminal,
+                correlation_key_sha256, source_digest_sha256, last_source_kind,
+                last_event_generation_id, last_event_stream_id, last_event_id, updated_at_ns
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(account_key, scope_key, managed_action_id) DO UPDATE SET
+                provider_state = excluded.provider_state,
+                terminal = excluded.terminal,
+                correlation_key_sha256 = excluded.correlation_key_sha256,
+                source_digest_sha256 = excluded.source_digest_sha256,
+                last_source_kind = excluded.last_source_kind,
+                last_event_generation_id = excluded.last_event_generation_id,
+                last_event_stream_id = excluded.last_event_stream_id,
+                last_event_id = excluded.last_event_id,
+                updated_at_ns = excluded.updated_at_ns
+            """,
+            (
+                key.account_key,
+                key.scope_key,
+                key.managed_action_id,
+                key.runtime_order_id,
+                key.order_ref,
+                key.cancel_target_exchange_id,
+                key.cancel_target_order_sys_id,
+                key.cancel_target_front_id,
+                key.cancel_target_session_id,
+                state,
+                is_terminal,
+                payload_sha256(key.to_payload()),
+                source_digest_sha256,
+                source_kind,
+                None if callback_key is None else key.session_generation_id,
+                None if callback_key is None else callback_key.stream_id,
+                None if callback_key is None else callback_key.event_id,
+                updated_at_ns,
+            ),
+        )
+
+    def apply_ctp_verified_dispatch_callback(
+        self,
+        scope: ExecutionScope,
+        command_id: str,
+        callback: CtpDispatchCallbackKey,
+        callback_payload: Mapping[str, Any],
+        *,
+        writer_lease: WriterLease,
+        callback_verifier: CtpDispatchCallbackVerifier | None = None,
+    ) -> CtpDispatchCallbackApplyResult:
+        """Verify one callback, then atomically append, dedupe, and project it.
+
+        The verifier must authenticate the callback's local/native source and
+        return a fresh exact binding. The default verifier always rejects.
+        Structural matching and digest equality alone never confer trust. A
+        callback on an UNKNOWN command updates only its typed projection; the
+        UNKNOWN account fence remains until reconciliation is separately
+        attested by :meth:`resolve_unknown_ctp_dispatch_command`.
+        """
+
+        account_key, _, scope_key = self._validate_ctp_order_identity_scope(scope)
+        self._validate_command_identifier(command_id, "command_id")
+        if type(callback) is not CtpDispatchCallbackKey:
+            raise ContractValidationError("typed CTP callback correlation key is required")
+        if not isinstance(callback_payload, Mapping):
+            raise ContractValidationError("CTP callback payload must be a mapping")
+        callback_payload_invalid = False
+        callback_payload_json = ""
+        callback_payload_value: Any = None
+        try:
+            callback_payload_json = canonical_json(dict(callback_payload))
+            callback_payload_value = json.loads(callback_payload_json)
+        except (TypeError, ValueError):
+            callback_payload_invalid = True
+        if callback_payload_invalid:
+            raise ContractValidationError("CTP callback payload is not canonical JSON")
+        if not isinstance(callback_payload_value, dict) or not callback_payload_value:
+            raise ContractValidationError("CTP callback payload must be a non-empty object")
+        self._reject_sensitive_command_fields(callback_payload_value)
+        callback_payload_digest = payload_sha256(callback_payload_value)
+        staged = self.read_ctp_dispatch_command(scope, command_id)
+        if staged is None:
+            raise ContractValidationError("unknown CTP dispatch command")
+        if staged.status not in {"CLAIMED", "COMPLETED", "UNKNOWN"}:
+            raise InvalidStateTransition("callback cannot apply to an undispatched CTP command")
+        require_ctp_dispatch_callback_match(staged, callback)
+        verification_started_ns = time.time_ns()
+        evidence = self._verify_ctp_dispatch_callback(
+            _REJECT_CTP_DISPATCH_VERIFIER if callback_verifier is None else callback_verifier,
+            staged,
+            callback,
+            callback_payload_value,
+            callback_payload_digest,
+            now_ns=verification_started_ns,
+        )
+        callback_json = canonical_json(callback.to_payload())
+        callback_digest = payload_sha256(json.loads(callback_json))
+        correlation_digest = payload_sha256(staged.correlation_key.to_payload())
+        with self._transaction() as cursor:
+            applied_at_ns = time.time_ns()
+            self._assert_active_writer_lease(cursor, scope, writer_lease, now_ns=applied_at_ns)
+            if evidence.expires_at_ns <= applied_at_ns:
+                raise ContractValidationError(
+                    "verified CTP callback evidence expired before commit"
+                )
+            row = cursor.execute(
+                """
+                SELECT * FROM ctp_dispatch_commands
+                WHERE account_key = ? AND scope_key = ? AND command_id = ?
+                """,
+                (account_key, scope_key, command_id),
+            ).fetchone()
+            if row is None:
+                raise ContractValidationError("unknown CTP dispatch command")
+            current = self._ctp_dispatch_command_from_row(row)
+            if (
+                current.status not in {"CLAIMED", "COMPLETED", "UNKNOWN"}
+                or current.correlation_key != staged.correlation_key
+            ):
+                raise InvalidStateTransition("CTP callback command changed during verification")
+            duplicate = cursor.execute(
+                """
+                SELECT * FROM ctp_dispatch_callback_ledger
+                WHERE account_key = ? AND session_generation_id = ?
+                  AND callback_stream_id = ? AND callback_event_id = ?
+                """,
+                (
+                    account_key,
+                    callback.correlation_key.session_generation_id,
+                    callback.stream_id,
+                    callback.event_id,
+                ),
+            ).fetchone()
+            if duplicate is not None:
+                exact = (
+                    str(duplicate["command_id"]) == command_id
+                    and str(duplicate["callback_key_json"]) == callback_json
+                    and str(duplicate["callback_key_sha256"]) == callback_digest
+                    and str(duplicate["callback_payload_sha256"]) == callback_payload_digest
+                    and str(duplicate["correlation_key_sha256"]) == correlation_digest
+                    and str(duplicate["projection_state"]) == evidence.projection_state
+                    and str(duplicate["source_digest_sha256"]) == evidence.source_digest_sha256
+                    and str(duplicate["verifier_id"]) == evidence.verifier_id
+                )
+                if not exact:
+                    raise IntentConflictError(
+                        "CTP callback event id conflicts with durable evidence"
+                    )
+                fence_open = self._ctp_dispatch_has_open_account_fence(cursor, account_key)
+                return CtpDispatchCallbackApplyResult(
+                    callback_key=callback,
+                    projection_state=evidence.projection_state,
+                    duplicate=True,
+                    account_fence_open=fence_open,
+                )
+
+            cursor.execute(
+                """
+                INSERT INTO ctp_dispatch_callback_ledger(
+                    account_key, scope_key, trading_day, command_id, operation,
+                    managed_action_id, runtime_order_id, order_ref,
+                    session_generation_id, callback_stream_id, callback_event_id,
+                    callback_family, callback_key_json, callback_key_sha256,
+                    callback_payload_sha256, correlation_key_sha256,
+                    projection_state, source_digest_sha256,
+                    verifier_id, verified_at_ns, applied_at_ns
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    account_key,
+                    scope_key,
+                    staged.trading_day,
+                    command_id,
+                    staged.operation,
+                    staged.correlation_key.managed_action_id,
+                    staged.correlation_key.runtime_order_id,
+                    staged.correlation_key.order_ref,
+                    staged.correlation_key.session_generation_id,
+                    callback.stream_id,
+                    callback.event_id,
+                    callback.callback_family,
+                    callback_json,
+                    callback_digest,
+                    callback_payload_digest,
+                    correlation_digest,
+                    evidence.projection_state,
+                    evidence.source_digest_sha256,
+                    evidence.verifier_id,
+                    evidence.verified_at_ns,
+                    applied_at_ns,
+                ),
+            )
+            if staged.operation == "SUBMIT":
+                self._upsert_ctp_order_projection(
+                    cursor,
+                    staged.correlation_key,
+                    evidence.projection_state,
+                    evidence.source_digest_sha256,
+                    source_kind="CALLBACK",
+                    updated_at_ns=applied_at_ns,
+                    callback_key=callback,
+                )
+            else:
+                self._upsert_ctp_cancel_projection(
+                    cursor,
+                    staged.correlation_key,
+                    evidence.projection_state,
+                    evidence.source_digest_sha256,
+                    source_kind="CALLBACK",
+                    updated_at_ns=applied_at_ns,
+                    callback_key=callback,
+                )
+            fence_open = self._ctp_dispatch_has_open_account_fence(cursor, account_key)
+            return CtpDispatchCallbackApplyResult(
+                callback_key=callback,
+                projection_state=evidence.projection_state,
+                duplicate=False,
+                account_fence_open=fence_open,
+            )
+
+    def resolve_unknown_ctp_dispatch_command(
+        self,
+        scope: ExecutionScope,
+        command_id: str,
+        *,
+        writer_lease: WriterLease,
+        reconciliation_verifier: CtpDispatchReconciliationVerifier | None = None,
+    ) -> CtpDispatchUnknownResolutionResult:
+        """Resolve only with a fresh exact external reconciliation attestation.
+
+        The command remains historically ``UNKNOWN``. This atomically records
+        an immutable terminal-evidence decision, updates the separate submit or
+        cancel projection, and removes this command from the local account
+        fence. Submit needs terminal order evidence; cancel needs terminal
+        cancel-action evidence *and* terminal target-order evidence. Real
+        verification must reconcile exact order/trade/position/cancel sources;
+        caller digests or a matching callback are insufficient.
+        """
+
+        account_key, _, scope_key = self._validate_ctp_order_identity_scope(scope)
+        self._validate_command_identifier(command_id, "command_id")
+        staged = self.read_ctp_dispatch_command(scope, command_id)
+        if staged is None or staged.status != "UNKNOWN":
+            raise InvalidStateTransition("only an UNKNOWN CTP dispatch command can be resolved")
+        if staged.correlation_key is None:
+            raise ContractValidationError(
+                "UNKNOWN command lacks typed correlation and cannot resolve"
+            )
+        verifier = (
+            _REJECT_CTP_DISPATCH_VERIFIER
+            if reconciliation_verifier is None
+            else reconciliation_verifier
+        )
+        verify_unknown = getattr(verifier, "verify_unknown", None)
+        if not callable(verify_unknown):
+            raise ContractValidationError("trusted CTP reconciliation verifier is required")
+        verification_started_ns = time.time_ns()
+        verification_failed = False
+        attestation: CtpUnknownResolutionAttestation | None = None
+        try:
+            attestation = verify_unknown(staged, now_ns=verification_started_ns)
+        except Exception:
+            verification_failed = True
+        if verification_failed:
+            raise ContractValidationError("trusted CTP reconciliation verification failed")
+        if type(attestation) is not CtpUnknownResolutionAttestation:
+            raise ContractValidationError("invalid typed CTP reconciliation attestation")
+        if (
+            attestation.correlation_key != staged.correlation_key
+            or attestation.verified_at_ns != verification_started_ns
+        ):
+            raise ContractValidationError("CTP reconciliation evidence does not match UNKNOWN")
+        resolved_at_ns = time.time_ns()
+        if attestation.expires_at_ns <= resolved_at_ns:
+            raise ContractValidationError("CTP reconciliation evidence expired before commit")
+        correlation_digest = payload_sha256(staged.correlation_key.to_payload())
+        with self._transaction() as cursor:
+            resolved_at_ns = time.time_ns()
+            self._assert_active_writer_lease(cursor, scope, writer_lease, now_ns=resolved_at_ns)
+            if attestation.expires_at_ns <= resolved_at_ns:
+                raise ContractValidationError("CTP reconciliation evidence expired before commit")
+            row = cursor.execute(
+                """
+                SELECT * FROM ctp_dispatch_commands
+                WHERE account_key = ? AND scope_key = ? AND command_id = ?
+                """,
+                (account_key, scope_key, command_id),
+            ).fetchone()
+            if row is None:
+                raise ContractValidationError("unknown CTP dispatch command")
+            current = self._ctp_dispatch_command_from_row(row)
+            if current.status != "UNKNOWN" or current.correlation_key != staged.correlation_key:
+                raise InvalidStateTransition("CTP UNKNOWN command changed during reconciliation")
+            existing = cursor.execute(
+                """
+                SELECT * FROM ctp_dispatch_unknown_resolutions
+                WHERE account_key = ? AND command_id = ?
+                """,
+                (account_key, command_id),
+            ).fetchone()
+            if existing is not None:
+                exact = (
+                    str(existing["correlation_key_sha256"]) == correlation_digest
+                    and str(existing["order_terminal_state"]) == attestation.order_terminal_state
+                    and (
+                        None
+                        if existing["cancel_action_terminal_state"] is None
+                        else str(existing["cancel_action_terminal_state"])
+                    )
+                    == attestation.cancel_action_terminal_state
+                    and str(existing["source_digest_sha256"]) == attestation.source_digest_sha256
+                    and str(existing["verifier_id"]) == attestation.verifier_id
+                )
+                if not exact:
+                    raise IntentConflictError(
+                        "CTP UNKNOWN resolution conflicts with durable evidence"
+                    )
+                return CtpDispatchUnknownResolutionResult(
+                    command_id=command_id,
+                    correlation_key=staged.correlation_key,
+                    order_terminal_state=attestation.order_terminal_state,
+                    cancel_action_terminal_state=attestation.cancel_action_terminal_state,
+                    account_fence_open=self._ctp_dispatch_has_open_account_fence(
+                        cursor, account_key
+                    ),
+                    duplicate=True,
+                )
+            cursor.execute(
+                """
+                INSERT INTO ctp_dispatch_unknown_resolutions(
+                    account_key, scope_key, command_id, operation,
+                    correlation_key_sha256, order_terminal_state,
+                    cancel_action_terminal_state, source_digest_sha256,
+                    verifier_id, verified_at_ns, resolved_at_ns
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    account_key,
+                    scope_key,
+                    command_id,
+                    staged.operation,
+                    correlation_digest,
+                    attestation.order_terminal_state,
+                    attestation.cancel_action_terminal_state,
+                    attestation.source_digest_sha256,
+                    attestation.verifier_id,
+                    attestation.verified_at_ns,
+                    resolved_at_ns,
+                ),
+            )
+            self._upsert_ctp_order_projection(
+                cursor,
+                staged.correlation_key,
+                attestation.order_terminal_state,
+                attestation.source_digest_sha256,
+                source_kind="RECONCILIATION",
+                updated_at_ns=resolved_at_ns,
+            )
+            if staged.operation == "CANCEL":
+                assert attestation.cancel_action_terminal_state is not None
+                self._upsert_ctp_cancel_projection(
+                    cursor,
+                    staged.correlation_key,
+                    attestation.cancel_action_terminal_state,
+                    attestation.source_digest_sha256,
+                    source_kind="RECONCILIATION",
+                    updated_at_ns=resolved_at_ns,
+                )
+            return CtpDispatchUnknownResolutionResult(
+                command_id=command_id,
+                correlation_key=staged.correlation_key,
+                order_terminal_state=attestation.order_terminal_state,
+                cancel_action_terminal_state=attestation.cancel_action_terminal_state,
+                account_fence_open=self._ctp_dispatch_has_open_account_fence(cursor, account_key),
+                duplicate=False,
+            )
 
     def recover_claimed_ctp_dispatch_commands(
         self,
