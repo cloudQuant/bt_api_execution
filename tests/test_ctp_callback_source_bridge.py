@@ -26,7 +26,6 @@ from bt_api_execution import (
     CtpVerifiedOrderTargetProjection,
     DurableStoreError,
     ExecutionScope,
-    InvalidStateTransition,
     SqliteExecutionStore,
     ctp_native_callback_source_facts,
     ctp_native_session_generation_id,
@@ -433,7 +432,6 @@ def _stage_dispatched_command(
             dispatch_front_id=source_facts["login_front_id"],
             dispatch_session_id=source_facts["login_session_id"],
             native_request_id=17,
-            native_action_ref="action-ref-29",
             cancel_target_projection=target_projection,
         )
     claimed = store.claim_ctp_dispatch_command(
@@ -604,7 +602,7 @@ def _source_event(
             "UserID": client._bound_user_id,
             "InstrumentID": "rb2710",
             "RequestID": 17,
-            "OrderActionRef": "action-ref-29",
+            "OrderActionRef": 1,
             "OrderRef": "000000000013",
             "ExchangeID": "SHFE",
             "OrderSysID": "sys-order-17",
@@ -706,7 +704,7 @@ def test_bridge_derives_context_and_maps_source_queue_event_with_exact_lifecycle
         )
         payload = result.to_payload()
         assert payload["envelope_type"] == "ctp_lifecycle_bound_native_callback_envelope.v1"
-        assert payload["callback_envelope"]["envelope_type"] == "ctp_native_callback_envelope.v1"
+        assert payload["callback_envelope"]["envelope_type"] == "ctp_native_callback_envelope.v2"
         source = payload["lifecycle_binding"]["source_facts"]
         assert source == bound.source_facts
         assert source["native_api_source_id"] == bound.client._native_api_source_id
@@ -1122,7 +1120,7 @@ def test_bridge_maps_terminal_order_action_source_event(tmp_path):
         assert result is not None
         assert result.callback_envelope.source_callback == "OnRspOrderAction"
         assert result.callback_envelope.response_is_last is True
-        assert result.callback_key.native_action_ref == "action-ref-29"
+        assert result.callback_key.native_action_ref == 1
         assert result.to_payload()["callback_envelope"]["response_error_id"] == 0
     finally:
         bound.store.close()
@@ -1423,21 +1421,10 @@ def test_source_lifecycle_fence_blocks_new_claim_after_queued_receipt_and_restar
         assert reopened.read_ctp_dispatch_command(bound.scope, bound.command_id).status == (
             "COMPLETED"
         )
-        next_command = _stage_followup_ready_command(bound, reopened)
-
-        class _MustNotVerify:
-            def verify_action(self, command, *, now_ns):
-                raise AssertionError("claim reached authority verifier despite callback guard")
-
         with pytest.raises(
-            InvalidStateTransition, match="CTP callback source lifecycle fence"
+            ContractValidationError, match="permanent callback lifecycle fence"
         ):
-            reopened.claim_ctp_dispatch_command(
-                bound.scope,
-                next_command.command_id,
-                writer_lease=bound.lease,
-                authority_verifier=_MustNotVerify(),
-            )
+            _stage_followup_ready_command(bound, reopened)
         assert reopened._connection.execute(
             "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences WHERE account_key = ?",
             (bound.scope.account_key,),
@@ -1521,21 +1508,10 @@ def test_source_lifecycle_fence_covers_event_queued_between_polls_and_restart(tm
         bound.store.close()
 
         reopened = SqliteExecutionStore(tmp_path / "execution.sqlite3")
-        next_command = _stage_followup_ready_command(bound, reopened)
-
-        class _MustNotVerify:
-            def verify_action(self, command, *, now_ns):
-                raise AssertionError("claim reached authority verifier despite lifecycle fence")
-
         with pytest.raises(
-            InvalidStateTransition, match="CTP callback source lifecycle fence"
+            ContractValidationError, match="permanent callback lifecycle fence"
         ):
-            reopened.claim_ctp_dispatch_command(
-                bound.scope,
-                next_command.command_id,
-                writer_lease=bound.lease,
-                authority_verifier=_MustNotVerify(),
-            )
+            _stage_followup_ready_command(bound, reopened)
         assert reopened._connection.execute(
             "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences WHERE account_key = ?",
             (bound.scope.account_key,),
@@ -1569,7 +1545,7 @@ def test_v11_resolved_guard_migrates_to_permanent_fence_and_stays_after_reopen(t
         version = migrated._connection.execute(
             "SELECT value FROM execution_meta WHERE key = 'schema_version'"
         ).fetchone()["value"]
-        assert version == "13"
+        assert version == "17"
         assert migrated.read_ctp_dispatch_command(bound.scope, bound.command_id).status == (
             "COMPLETED"
         )
@@ -1587,25 +1563,14 @@ def test_v11_resolved_guard_migrates_to_permanent_fence_and_stays_after_reopen(t
             command.correlation_key.to_payload()
         )
 
-        next_command = _stage_followup_ready_command(bound, migrated)
-
-        class _MustNotVerify:
-            def verify_action(self, command, *, now_ns):
-                raise AssertionError("claim reached authority verifier despite migrated fence")
-
         with pytest.raises(
-            InvalidStateTransition, match="CTP callback source lifecycle fence"
+            ContractValidationError, match="permanent callback lifecycle fence"
         ):
-            migrated.claim_ctp_dispatch_command(
-                bound.scope,
-                next_command.command_id,
-                writer_lease=bound.lease,
-                authority_verifier=_MustNotVerify(),
-            )
+            _stage_followup_ready_command(bound, migrated)
         migrated.close()
         migrated = None
 
-        # The v13 upgrade is idempotent and the old resolved bit never removes
+        # The combined v17 upgrade is idempotent and the old resolved bit never removes
         # the newly migrated account source-lifecycle fence.
         reopened = SqliteExecutionStore(tmp_path / "execution.sqlite3")
         assert reopened._connection.execute(
@@ -1613,14 +1578,9 @@ def test_v11_resolved_guard_migrates_to_permanent_fence_and_stays_after_reopen(t
             (bound.scope.account_key,),
         ).fetchone()[0] == 1
         with pytest.raises(
-            InvalidStateTransition, match="CTP callback source lifecycle fence"
+            ContractValidationError, match="permanent callback lifecycle fence"
         ):
-            reopened.claim_ctp_dispatch_command(
-                bound.scope,
-                next_command.command_id,
-                writer_lease=bound.lease,
-                authority_verifier=_MustNotVerify(),
-            )
+            _stage_followup_ready_command(bound, reopened)
     finally:
         if migrated is not None:
             migrated.close()
@@ -1644,7 +1604,7 @@ def test_v11_unmappable_resolved_guard_refuses_store_upgrade(tmp_path):
 
 
 @pytest.mark.unit
-def test_v12_permanent_fence_and_projectionless_cancel_migrate_to_v13(tmp_path):
+def test_v12_permanent_fence_and_projectionless_cancel_migrate_to_v17(tmp_path):
     bound = _stage_dispatched_command(tmp_path, operation="CANCEL")
     migrated = None
     reopened = None
@@ -1669,11 +1629,11 @@ def test_v12_permanent_fence_and_projectionless_cancel_migrate_to_v13(tmp_path):
         migrated = SqliteExecutionStore(tmp_path / "execution.sqlite3")
         assert migrated._connection.execute(
             "SELECT value FROM execution_meta WHERE key = 'schema_version'"
-        ).fetchone()[0] == "13"
+        ).fetchone()[0] == "17"
         command = migrated.read_ctp_dispatch_command(bound.scope, bound.command_id)
         assert command is not None
         assert command.status == "UNKNOWN"
-        assert command.unknown_reason == "schema_upgrade_requires_ctp_orderref_cutover"
+        assert command.unknown_reason == "schema_upgrade_requires_ctp_v2_dispatch_cutover"
         assert migrated._connection.execute(
             "SELECT COUNT(*) FROM ctp_order_target_projections"
         ).fetchone()[0] == 0
@@ -1685,21 +1645,10 @@ def test_v12_permanent_fence_and_projectionless_cancel_migrate_to_v13(tmp_path):
         assert persisted_fence is not None
         assert persisted_fence[0] == fence_id
 
-        next_command = _stage_followup_ready_command(bound, migrated)
-
-        class _MustNotVerify:
-            def verify_action(self, command, *, now_ns):
-                raise AssertionError("claim reached authority verifier after v12 fence migration")
-
         with pytest.raises(
-            InvalidStateTransition, match="CTP callback source lifecycle fence"
+            ContractValidationError, match="permanent callback lifecycle fence"
         ):
-            migrated.claim_ctp_dispatch_command(
-                bound.scope,
-                next_command.command_id,
-                writer_lease=bound.lease,
-                authority_verifier=_MustNotVerify(),
-            )
+            _stage_followup_ready_command(bound, migrated)
         migrated.close()
         migrated = None
 
@@ -1814,22 +1763,11 @@ def test_callback_commit_lease_loss_leaves_durable_ingestion_fence(tmp_path):
         replacement_lease = reopened.acquire_or_renew_lease(
             bound.scope, "source-bridge-restarted-owner", ttl_ns=30_000_000_000
         )
-        next_command = _stage_followup_ready_command(
-            bound, reopened, writer_lease=replacement_lease
-        )
-
-        class _MustNotVerify:
-            def verify_action(self, command, *, now_ns):
-                raise AssertionError("claim reached authority verifier despite callback guard")
-
         with pytest.raises(
-            InvalidStateTransition, match="CTP callback source lifecycle fence"
+            ContractValidationError, match="permanent callback lifecycle fence"
         ):
-            reopened.claim_ctp_dispatch_command(
-                bound.scope,
-                next_command.command_id,
-                writer_lease=replacement_lease,
-                authority_verifier=_MustNotVerify(),
+            _stage_followup_ready_command(
+                bound, reopened, writer_lease=replacement_lease
             )
     finally:
         if adapter is not None:

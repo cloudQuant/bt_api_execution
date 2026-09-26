@@ -7,17 +7,19 @@ not contain a risk ledger or provider transport.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import time
 import uuid
 from collections.abc import Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
 from threading import RLock
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
@@ -87,6 +89,32 @@ _CTP_ORDER_TERMINAL_STATES = frozenset({"FILLED", "CANCELLED", "REJECTED"})
 _CTP_CANCEL_ACTION_STATES = frozenset({"ACKNOWLEDGED", "REJECTED", "TERMINAL"})
 _CTP_CANCEL_ACTION_TERMINAL_STATES = frozenset({"REJECTED", "TERMINAL"})
 _CTP_ORDER_TARGET_MAX_TTL_NS = 5_000_000_000
+_CTP_CALLBACK_OWNER_POISON_CODES = frozenset(
+    {
+        "candidate_composition_failure",
+        "dispatch_stage_ambiguous",
+        "dispatch_claim_failure",
+        "owner_stop",
+        "source_replaced",
+        "disconnect",
+        "lifecycle_transition",
+        "source_gap",
+        "queue_overflow",
+        "unknown_source",
+        "unsupported_financial",
+        "capture_incomplete",
+        "callback_handler_error",
+        "append_failure",
+        "append_commit_unknown",
+        "native_call_ambiguous",
+        "native_call_receipt_mismatch",
+        "native_call_lease_failure",
+        "source_identity_mismatch",
+        "owner_binding_mismatch",
+        "callback_route_mismatch",
+        "callback_apply_failure",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -324,6 +352,293 @@ class CtpOrderTargetProjectionHandle:
 
 
 @dataclass(frozen=True, slots=True)
+class CtpCallbackSessionOwnerHandle:
+    """Exact Store-instance handle for one durable CTP callback session owner."""
+
+    owner_intent_id: str
+    account_key: str
+    scope_key: str
+
+    def __post_init__(self) -> None:
+        if not _is_local_queue_receipt_id(self.owner_intent_id):
+            raise ContractValidationError("invalid CTP callback owner intent id")
+        if not _is_prefixed_digest(self.account_key, "account:") or not _is_prefixed_digest(
+            self.scope_key, "scope:"
+        ):
+            raise ContractValidationError("invalid CTP callback owner scope")
+
+
+@dataclass(frozen=True, slots=True)
+class CtpCallbackIngressCommit:
+    """Readback of one synchronously committed SDK callback inbox append."""
+
+    owner_intent_id: str
+    source_sequence: int
+    record_digest_sha256: str
+    committed_high_watermark: int
+    status: str = "COMMITTED"
+
+
+@dataclass(frozen=True, slots=True)
+class CtpCallbackIngressEventV1:
+    """Exact Store-issued readback of one durable but unapplied ingress row."""
+
+    owner_handle: CtpCallbackSessionOwnerHandle
+    source_sequence: int
+    record_digest_sha256: str
+    callback_name: str
+    callback_class: str
+    source_phase: str
+    source_tags: tuple[str, str, str, str, int, int]
+    connection_generation: int
+    record_payload_json: str
+
+    def __post_init__(self) -> None:
+        if type(self.owner_handle) is not CtpCallbackSessionOwnerHandle:
+            raise ContractValidationError("typed CTP callback session owner is required")
+        if (
+            type(self.source_sequence) is not int
+            or self.source_sequence <= 0
+            or not _is_sha256(self.record_digest_sha256)
+            or type(self.callback_name) is not str
+            or not self.callback_name
+            or type(self.callback_class) is not str
+            or not self.callback_class
+            or self.source_phase not in {"PRE_LOGIN", "ACTIVE", "POISONED"}
+            or type(self.source_tags) is not tuple
+            or len(self.source_tags) != 6
+            or any(type(value) is not str or not value for value in self.source_tags[:4])
+            or type(self.source_tags[4]) is not int
+            or self.source_tags[4] <= 0
+            or type(self.source_tags[5]) is not int
+            or self.source_tags[5] < 0
+            or type(self.connection_generation) is not int
+            or self.connection_generation < 0
+            or type(self.record_payload_json) is not str
+        ):
+            raise ContractValidationError("invalid Store-issued CTP callback ingress event")
+
+
+@dataclass(frozen=True, slots=True)
+class CtpCallbackSessionPoisonCommit:
+    """Durable readback after a monotonic session-owner poison transition."""
+
+    owner_intent_id: str
+    durable_state: str
+    last_source_sequence: int
+    poison_code: str
+    committed: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class CtpCallbackSessionBindingV1:
+    """Exact Store readback of the SDK-accepted login/session identity."""
+
+    owner_intent_id: str
+    account_key: str
+    scope_key: str
+    trading_day: str
+    session_generation_id: str
+    dispatch_front_id: int
+    dispatch_session_id: int
+    source_instance_id: str
+    native_client_epoch: str
+    native_api_source_id: str
+    native_spi_source_id: str
+    native_api_generation: int
+    source_connection_generation: int
+    connection_generation: int
+    source_high_watermark: int
+    session_binding_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class CtpTraderCallbackIngressPoisonAckV2:
+    """SDK-shaped acknowledgement for one durable monotonic poison write."""
+
+    owner_intent_id: str
+    durable_state: str
+    last_source_sequence: int
+    poison_code: str
+    committed: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class CtpManagedNativeCallBindingV2:
+    """One-use, Store-issued binding for one claimed native CTP request.
+
+    This is an in-process source bridge contract. Its object identity is
+    registered by one live Store instance and checked by the install-time SDK
+    verifier; the fields alone are not authority or hostile-process isolation.
+    """
+
+    binding_id: str
+    owner_intent_id: str
+    account_key: str
+    scope_key: str
+    command_id: str
+    operation: str
+    trading_day: str
+    request_payload_json: str
+    request_payload_sha256: str
+    reservation_managed_intent_id: str
+    managed_action_id: str
+    runtime_order_id: str
+    order_ref: str
+    native_request_id: int
+    native_action_ref: int | None
+    native_request_payload_json: str
+    native_request_payload_sha256: str
+    cancel_target_order_ref: str | None
+    cancel_target_exchange_id: str | None
+    cancel_target_order_sys_id: str | None
+    cancel_target_front_id: int | None
+    cancel_target_session_id: int | None
+    session_binding_sha256: str
+    session_generation_id: str
+    dispatch_front_id: int
+    dispatch_session_id: int
+    writer_owner_id: str
+    writer_fencing_token: int
+    expires_at_ns: int
+
+    def __post_init__(self) -> None:
+        if not _is_local_queue_receipt_id(self.binding_id):
+            raise ContractValidationError("invalid CTP native-call binding id")
+        for value, name in (
+            (self.owner_intent_id, "owner intent id"),
+            (self.command_id, "command id"),
+            (self.reservation_managed_intent_id, "managed intent id"),
+            (self.managed_action_id, "managed action id"),
+            (self.runtime_order_id, "runtime order id"),
+            (self.order_ref, "OrderRef"),
+            (self.session_generation_id, "session generation"),
+            (self.writer_owner_id, "writer owner id"),
+        ):
+            SqliteExecutionStore._validate_command_identifier(value, name)
+        if self.operation not in {"SUBMIT", "CANCEL"}:
+            raise ContractValidationError("invalid CTP native-call binding operation")
+        if not _is_prefixed_digest(self.account_key, "account:") or not _is_prefixed_digest(
+            self.scope_key, "scope:"
+        ):
+            raise ContractValidationError("invalid CTP native-call binding scope")
+        if (
+            not _is_sha256(self.request_payload_sha256)
+            or not _is_sha256(self.native_request_payload_sha256)
+            or not _is_sha256(self.session_binding_sha256)
+        ):
+            raise ContractValidationError("invalid CTP native-call binding digest")
+        if self.request_payload_json != canonical_json(
+            json.loads(self.request_payload_json)
+        ) or payload_sha256(json.loads(self.request_payload_json)) != self.request_payload_sha256:
+            raise ContractValidationError("invalid CTP native-call binding payload")
+        try:
+            logical_payload = json.loads(self.request_payload_json)
+            native_payload = json.loads(self.native_request_payload_json)
+        except (TypeError, ValueError) as error:
+            raise ContractValidationError("invalid CTP native-call binding native payload") from error
+        expected_native_payload = dict(logical_payload)
+        if "OrderActionRef" in logical_payload:
+            raise ContractValidationError("logical native-call payload contains ActionRef")
+        if self.operation == "CANCEL":
+            expected_native_payload["OrderActionRef"] = self.native_action_ref
+        if (
+            not isinstance(native_payload, dict)
+            or canonical_json(native_payload) != self.native_request_payload_json
+            or payload_sha256(native_payload) != self.native_request_payload_sha256
+            or native_payload != expected_native_payload
+        ):
+            raise ContractValidationError("invalid CTP native-call binding native payload")
+        if (
+            type(self.native_request_id) is not int
+            or self.native_request_id <= 0
+            or self.native_request_id > 2_147_483_647
+            or type(self.dispatch_front_id) is not int
+            or self.dispatch_front_id <= 0
+            or type(self.dispatch_session_id) is not int
+            or self.dispatch_session_id <= 0
+            or type(self.writer_fencing_token) is not int
+            or self.writer_fencing_token <= 0
+            or type(self.expires_at_ns) is not int
+            or self.expires_at_ns <= 0
+        ):
+            raise ContractValidationError("invalid CTP native-call binding numeric identity")
+        if self.operation == "SUBMIT":
+            if any(
+                value is not None
+                for value in (
+                    self.native_action_ref,
+                    self.cancel_target_order_ref,
+                    self.cancel_target_exchange_id,
+                    self.cancel_target_order_sys_id,
+                    self.cancel_target_front_id,
+                    self.cancel_target_session_id,
+                )
+            ):
+                raise ContractValidationError("submit native-call binding has cancel identity")
+        elif (
+            type(self.native_action_ref) is not int
+            or not 1 <= self.native_action_ref <= 2_147_483_647
+            or self.cancel_target_order_ref != self.order_ref
+            or not self.cancel_target_exchange_id
+            or not self.cancel_target_order_sys_id
+            or type(self.cancel_target_front_id) is not int
+            or self.cancel_target_front_id <= 0
+            or type(self.cancel_target_session_id) is not int
+            or self.cancel_target_session_id <= 0
+        ):
+            raise ContractValidationError("cancel native-call binding lacks complete target")
+
+    def to_payload(self) -> dict[str, Any]:
+        """Return the frozen SDK verifier handoff shape."""
+
+        return {
+            "binding_type": "ctp_managed_native_call_binding.v2",
+            "owner_intent_id": self.owner_intent_id,
+            "account_key": self.account_key,
+            "scope_key": self.scope_key,
+            "command_id": self.command_id,
+            "operation": self.operation,
+            "trading_day": self.trading_day,
+            "request_payload_json": self.request_payload_json,
+            "request_payload_sha256": self.request_payload_sha256,
+            "native_request_payload_json": self.native_request_payload_json,
+            "native_request_payload_sha256": self.native_request_payload_sha256,
+            "reservation_managed_intent_id": self.reservation_managed_intent_id,
+            "managed_action_id": self.managed_action_id,
+            "runtime_order_id": self.runtime_order_id,
+            "order_ref": self.order_ref,
+            "native_request_id": self.native_request_id,
+            "native_action_ref": self.native_action_ref,
+            "cancel_target_order_ref": self.cancel_target_order_ref,
+            "cancel_target_exchange_id": self.cancel_target_exchange_id,
+            "cancel_target_order_sys_id": self.cancel_target_order_sys_id,
+            "cancel_target_front_id": self.cancel_target_front_id,
+            "cancel_target_session_id": self.cancel_target_session_id,
+            "session_binding_sha256": self.session_binding_sha256,
+            "session_generation_id": self.session_generation_id,
+            "dispatch_front_id": self.dispatch_front_id,
+            "dispatch_session_id": self.dispatch_session_id,
+            "writer_owner_id": self.writer_owner_id,
+            "writer_fencing_token": self.writer_fencing_token,
+            "expires_at_ns": self.expires_at_ns,
+        }
+
+
+# Kept as an import alias for callers that only need to name the in-process
+# binding protocol. Store claim APIs issue V2 objects exclusively.
+CtpManagedNativeCallBindingV1 = CtpManagedNativeCallBindingV2
+
+
+@dataclass(frozen=True, slots=True)
+class CtpSessionNativeCallClaim:
+    """One claimed command and its exact Store-issued SDK send binding."""
+
+    command: CtpDispatchCommand
+    binding: CtpManagedNativeCallBindingV2
+
+
+@dataclass(frozen=True, slots=True)
 class CtpOrderRefLegacyMapping:
     """One exact mapping imported from a pre-cutover CTP identity source."""
 
@@ -393,11 +708,17 @@ class CtpDispatchCorrelationKey:
     dispatch_front_id: int
     dispatch_session_id: int
     native_request_id: int
-    native_action_ref: str | None
+    native_action_ref: str | int | None
+    native_request_payload_sha256: str | None = None
 
     def __post_init__(self) -> None:
-        if type(self.version) is not int or self.version != 1:
+        if type(self.version) is not int or self.version not in {1, 2}:
             raise ContractValidationError("unsupported CTP dispatch correlation version")
+        if self.version == 1:
+            if self.native_request_payload_sha256 is not None:
+                raise ContractValidationError("legacy CTP correlation cannot bind native payload")
+        elif not _is_sha256(self.native_request_payload_sha256):
+            raise ContractValidationError("CTP correlation requires native payload digest")
         if type(self.operation) is not str or self.operation not in {"SUBMIT", "CANCEL"}:
             raise ContractValidationError("invalid CTP dispatch correlation operation")
         for value, name in (
@@ -448,7 +769,13 @@ class CtpDispatchCorrelationKey:
         ):
             raise ContractValidationError("invalid CTP dispatch native request id")
         if self.native_action_ref is not None:
-            _validate_correlation_text(self.native_action_ref, "native action reference")
+            if self.version == 1:
+                _validate_correlation_text(self.native_action_ref, "native action reference")
+            elif (
+                type(self.native_action_ref) is not int
+                or not 1 <= self.native_action_ref <= 2_147_483_647
+            ):
+                raise ContractValidationError("invalid native ActionRef integer")
         if self.operation == "SUBMIT":
             if self.managed_action_id != self.reservation_managed_intent_id:
                 raise ContractValidationError("submit action id must equal its managed intent id")
@@ -469,6 +796,11 @@ class CtpDispatchCorrelationKey:
                 raise ContractValidationError(
                     "cancel action id must be distinct from target intent"
                 )
+            if self.version == 2 and (
+                type(self.native_action_ref) is not int
+                or not 1 <= self.native_action_ref <= 2_147_483_647
+            ):
+                raise ContractValidationError("cancel correlation requires Store ActionRef integer")
             if (
                 not isinstance(self.cancel_target_exchange_id, str)
                 or not self.cancel_target_exchange_id
@@ -486,7 +818,7 @@ class CtpDispatchCorrelationKey:
     def to_payload(self) -> dict[str, Any]:
         """Return the exact, JSON-safe action/session binding."""
 
-        return {
+        payload = {
             "version": self.version,
             "account_key": self.account_key,
             "scope_key": self.scope_key,
@@ -511,6 +843,9 @@ class CtpDispatchCorrelationKey:
             "native_request_id": self.native_request_id,
             "native_action_ref": self.native_action_ref,
         }
+        if self.version == 2:
+            payload["native_request_payload_sha256"] = self.native_request_payload_sha256
+        return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -528,7 +863,7 @@ class CtpDispatchCallbackKey:
     stream_id: str
     event_id: str
     native_request_id: int
-    native_action_ref: str | None
+    native_action_ref: str | int | None
     order_ref: str
     exchange_id: str | None = None
     order_sys_id: str | None = None
@@ -536,10 +871,12 @@ class CtpDispatchCallbackKey:
     target_session_id: int | None = None
 
     def __post_init__(self) -> None:
-        if type(self.version) is not int or self.version != 1:
+        if type(self.version) is not int or self.version not in {1, 2}:
             raise ContractValidationError("unsupported CTP callback key version")
         if type(self.correlation_key) is not CtpDispatchCorrelationKey:
             raise ContractValidationError("typed CTP dispatch correlation key is required")
+        if self.version != self.correlation_key.version:
+            raise ContractValidationError("CTP callback and correlation versions differ")
         _validate_correlation_text(self.stream_id, "callback stream id")
         _validate_correlation_text(self.event_id, "callback event id")
         if type(self.callback_family) is not str or self.callback_family not in {
@@ -562,7 +899,13 @@ class CtpDispatchCallbackKey:
         ):
             raise ContractValidationError("invalid CTP callback request id")
         if self.native_action_ref is not None:
-            _validate_correlation_text(self.native_action_ref, "callback action reference")
+            if self.version == 1:
+                _validate_correlation_text(self.native_action_ref, "callback action reference")
+            elif (
+                type(self.native_action_ref) is not int
+                or not 1 <= self.native_action_ref <= 2_147_483_647
+            ):
+                raise ContractValidationError("invalid callback ActionRef integer")
         if (
             type(self.order_ref) is not str
             or len(self.order_ref) != 12
@@ -581,6 +924,11 @@ class CtpDispatchCallbackKey:
                 "callback exchange and system order ids must appear together"
             )
         if self.correlation_key.operation == "CANCEL":
+            if self.version == 2 and (
+                type(self.native_action_ref) is not int
+                or self.native_action_ref != self.correlation_key.native_action_ref
+            ):
+                raise ContractValidationError("cancel callback ActionRef does not match action")
             if (
                 self.exchange_id != self.correlation_key.cancel_target_exchange_id
                 or self.order_sys_id != self.correlation_key.cancel_target_order_sys_id
@@ -651,6 +999,69 @@ class CtpVerifiedCallbackEvidence:
             or self.expires_at_ns <= self.verified_at_ns
         ):
             raise ContractValidationError("invalid CTP callback verification interval")
+
+
+@dataclass(frozen=True, slots=True)
+class CtpVerifiedTradeFactEvidence:
+    """Injected verifier result for one native TradeField without fabricated IDs."""
+
+    evidence_type: str
+    owner_intent_id: str
+    source_sequence: int
+    ingress_record_digest_sha256: str
+    event_id: str
+    trade_fact_sha256: str
+    source_digest_sha256: str
+    verifier_id: str
+    verified_at_ns: int
+    expires_at_ns: int
+
+    def __post_init__(self) -> None:
+        if self.evidence_type != "ctp_verified_trade_fact.v2":
+            raise ContractValidationError("invalid verified CTP trade evidence type")
+        if not _is_local_queue_receipt_id(self.owner_intent_id):
+            raise ContractValidationError("invalid verified CTP trade owner")
+        if type(self.source_sequence) is not int or self.source_sequence <= 0:
+            raise ContractValidationError("invalid verified CTP trade sequence")
+        for value in (
+            self.ingress_record_digest_sha256,
+            self.trade_fact_sha256,
+            self.source_digest_sha256,
+        ):
+            if not _is_sha256(value):
+                raise ContractValidationError("invalid verified CTP trade digest")
+        _validate_correlation_text(self.event_id, "trade event id")
+        _validate_correlation_text(self.verifier_id, "trade verifier id")
+        if (
+            type(self.verified_at_ns) is not int
+            or type(self.expires_at_ns) is not int
+            or self.expires_at_ns <= self.verified_at_ns
+        ):
+            raise ContractValidationError("invalid CTP trade verification interval")
+
+
+class CtpDispatchTradeFactVerifier(Protocol):
+    """Trusted adapter for one exact durable SDK ingress TradeField."""
+
+    def verify_trade_fact(
+        self,
+        command: CtpDispatchCommand,
+        trade_fact: Any,
+        source_event: CtpCallbackIngressEventV1,
+        *,
+        now_ns: int,
+    ) -> CtpVerifiedTradeFactEvidence: ...
+
+
+@dataclass(frozen=True, slots=True)
+class CtpDispatchTradeFactApplyResult:
+    command_id: str
+    event_id: str
+    trade_quantity: int
+    cumulative_trade_quantity: int
+    projection_state: str | None
+    duplicate: bool
+    account_fence_open: bool
 
 
 class CtpDispatchCallbackVerifier(Protocol):
@@ -1095,6 +1506,8 @@ class CtpDispatchCommand:
     correlation_key: CtpDispatchCorrelationKey | None = None
     local_queue_receipt_id: str | None = None
     local_queue_receipt_queued: bool | None = None
+    native_request_payload: Mapping[str, Any] | None = None
+    native_request_payload_sha256: str | None = None
 
     @property
     def authority_binding_sha256(self) -> str:
@@ -1113,6 +1526,7 @@ class CtpDispatchCommand:
                 "operation": self.operation,
                 "command_id": self.command_id,
                 "request_payload_sha256": self.request_payload_sha256,
+                "native_request_payload_sha256": self.native_request_payload_sha256,
                 "reservation_managed_intent_id": self.reservation_managed_intent_id,
                 "order_ref": self.order_ref,
                 "cancel_target_order_ref": self.cancel_target_order_ref,
@@ -1298,7 +1712,10 @@ class SqliteExecutionStore:
     # Version 12 introduced a permanent callback source-lifecycle fence in a
     # separate candidate. Version 13 combines that fence with order-target
     # projections while migrating the distinct v11 lineages by old table facts.
-    _SCHEMA_VERSION = 13
+    # Version 14 adds local journal lineage to new outbox rows only.
+    # Version 15 adds a one-shot account callback session owner and durable
+    # all-SPI ingress inbox, plus exact owner-bound native-call state.
+    _SCHEMA_VERSION = 17
 
     def __init__(self, path: str | Path, *, busy_timeout_ms: int = 5_000) -> None:
         if type(busy_timeout_ms) is not int or busy_timeout_ms <= 0:
@@ -1321,6 +1738,22 @@ class SqliteExecutionStore:
             self._issued_ctp_order_target_projections: dict[
                 str, CtpOrderTargetProjectionHandle
             ] = {}
+            self._issued_ctp_callback_session_owners: dict[
+                str, CtpCallbackSessionOwnerHandle
+            ] = {}
+            self._issued_ctp_callback_session_adapters: dict[str, object] = {}
+            self._ctp_callback_ingress_record_types: dict[str, type] = {}
+            self._issued_ctp_staged_commands: dict[tuple[str, str], CtpDispatchCommand] = {}
+            self._active_ctp_callback_sessions: dict[
+                str, CtpCallbackSessionBindingV1
+            ] = {}
+            self._issued_ctp_callback_ingress_events: dict[
+                tuple[str, int], CtpCallbackIngressEventV1
+            ] = {}
+            self._issued_ctp_native_call_bindings: dict[
+                str, CtpManagedNativeCallBindingV2
+            ] = {}
+            self._consumed_ctp_native_call_bindings: set[str] = set()
             self._create_schema()
         except sqlite3.Error as error:
             raise DurableStoreError("unable to initialize execution store") from error
@@ -1330,6 +1763,1563 @@ class SqliteExecutionStore:
 
         with self._lock:
             self._connection.close()
+
+    def journal_source_identity(self) -> dict[str, str | int]:
+        """Return the persisted local journal lineage, not provider authority."""
+
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT value FROM execution_meta WHERE key = ?",
+                ("journal_incarnation_id",),
+            ).fetchone()
+        if row is None:
+            raise DurableStoreError("execution journal identity is unavailable")
+        value = str(row["value"])
+        if len(value) != 32 or any(character not in "0123456789abcdef" for character in value):
+            raise DurableStoreError("execution journal identity is invalid")
+        return {"generation_kind": "EXECUTION_JOURNAL", "generation": value, "epoch": 1}
+
+    def create_ctp_callback_session_owner(
+        self,
+        scope: ExecutionScope,
+        *,
+        writer_lease: WriterLease,
+    ) -> CtpCallbackSessionOwnerHandle:
+        """Persist a one-shot account owner before native API construction.
+
+        This creates no native identity and grants no send authority. A
+        persisted owner is never recreated after Store/process restart. Prior
+        dispatched commands, callback ledgers, and lifecycle fences require a
+        separate recovery design and reject this candidate owner.
+        """
+
+        account_key, _, scope_key = self._validate_ctp_order_identity_scope(scope)
+        owner_intent_id = uuid.uuid4().hex
+        now_ns = time.time_ns()
+        with self._lock:
+            with self._transaction() as cursor:
+                self._assert_active_writer_lease(cursor, scope, writer_lease, now_ns=now_ns)
+                fenced = cursor.execute(
+                    "SELECT 1 FROM ctp_dispatch_callback_source_lifecycle_fences "
+                    "WHERE account_key = ? LIMIT 1",
+                    (account_key,),
+                ).fetchone()
+                if fenced is not None:
+                    raise InvalidStateTransition(
+                        "account has a permanent CTP callback source lifecycle fence"
+                    )
+                previous_owner = cursor.execute(
+                    "SELECT 1 FROM ctp_dispatch_callback_session_owners "
+                    "WHERE account_key = ? LIMIT 1",
+                    (account_key,),
+                ).fetchone()
+                if previous_owner is not None:
+                    raise InvalidStateTransition(
+                        "account already has a durable CTP callback session owner"
+                    )
+                previous_dispatch = cursor.execute(
+                    """
+                    SELECT command_id FROM ctp_dispatch_commands
+                    WHERE account_key = ? AND status != 'READY'
+                    ORDER BY created_at_ns, command_id LIMIT 1
+                    """,
+                    (account_key,),
+                ).fetchone()
+                previous_callback = cursor.execute(
+                    "SELECT 1 FROM ctp_dispatch_callback_ledger "
+                    "WHERE account_key = ? LIMIT 1",
+                    (account_key,),
+                ).fetchone()
+                if previous_dispatch is not None or previous_callback is not None:
+                    raise InvalidStateTransition(
+                        "prior CTP dispatch history prevents a new callback session owner"
+                    )
+                cursor.execute(
+                    """
+                    INSERT INTO ctp_dispatch_callback_session_owners(
+                        owner_intent_id, account_key, scope_key, owner_state,
+                        writer_owner_id, writer_fencing_token,
+                        last_source_sequence, created_at_ns, updated_at_ns
+                    ) VALUES (?, ?, ?, 'PREPARED', ?, ?, 0, ?, ?)
+                    """,
+                    (
+                        owner_intent_id,
+                        account_key,
+                        scope_key,
+                        writer_lease.owner_id,
+                        writer_lease.fencing_token,
+                        now_ns,
+                        now_ns,
+                    ),
+                )
+            handle = CtpCallbackSessionOwnerHandle(
+                owner_intent_id=owner_intent_id,
+                account_key=account_key,
+                scope_key=scope_key,
+            )
+            self._issued_ctp_callback_session_owners[owner_intent_id] = handle
+        return handle
+
+    def _register_ctp_callback_session_adapter(
+        self,
+        owner_handle: CtpCallbackSessionOwnerHandle,
+        adapter: object,
+        record_type: type,
+    ) -> None:
+        """Pin the one in-process adapter and exact SDK wire class per owner.
+
+        This is a trusted-process composition contract, not an isolation
+        boundary against arbitrary Python code in the same process.
+        """
+
+        if (
+            type(owner_handle) is not CtpCallbackSessionOwnerHandle
+            or type(record_type) is not type
+            or adapter is None
+            or self._issued_ctp_callback_session_owners.get(owner_handle.owner_intent_id)
+            is not owner_handle
+        ):
+            raise ContractValidationError("exact Store-owned callback adapter inputs are required")
+        with self._lock:
+            prior = self._issued_ctp_callback_session_adapters.get(owner_handle.owner_intent_id)
+            if prior is not None:
+                raise InvalidStateTransition("CTP callback owner already has its single adapter")
+            self._issued_ctp_callback_session_adapters[owner_handle.owner_intent_id] = adapter
+            self._ctp_callback_ingress_record_types[owner_handle.owner_intent_id] = record_type
+
+    @staticmethod
+    def _ctp_callback_payload_from_record(
+        record: Any, *, expected_record_type: type
+    ) -> tuple[dict[str, Any], str, str]:
+        """Validate the immutable callback snapshot without importing the SDK."""
+
+        if type(expected_record_type) is not type or type(record) is not expected_record_type:
+            raise ContractValidationError("typed CTP callback ingress record is required")
+        to_payload = getattr(record, "to_payload", None)
+        if not callable(to_payload):
+            raise ContractValidationError("typed CTP callback ingress record is malformed")
+        try:
+            payload = to_payload()
+            if type(payload) is not dict:
+                raise ValueError
+            expected = {
+                "schema",
+                "owner_intent_id",
+                "callback_name",
+                "callback_class",
+                "phase",
+                "source_instance_id",
+                "native_client_epoch",
+                "native_api_source_id",
+                "native_spi_source_id",
+                "native_api_generation",
+                "source_connection_generation",
+                "connection_generation",
+                "sequence",
+                "monotonic_ns",
+                "named_args",
+                "flattened_fields",
+                "capture_complete",
+                "missing_getters",
+                "digest",
+            }
+            if set(payload) != expected or payload["schema"] != "ctp_trader_callback_ingress.v2":
+                raise ValueError
+            digest = payload["digest"]
+            if not _is_sha256(digest):
+                raise ValueError
+            unsigned = dict(payload)
+            del unsigned["digest"]
+            digest_bytes = json.dumps(
+                unsigned,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+            if hashlib.sha256(digest_bytes).hexdigest() != digest:
+                raise ValueError
+            canonical_bytes = json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+            if len(canonical_bytes) > 32 * 1024:
+                raise ValueError
+            if (
+                payload["capture_complete"] is not True
+                or payload["missing_getters"] != []
+                or type(payload["sequence"]) is not int
+                or payload["sequence"] <= 0
+                or type(payload["monotonic_ns"]) is not int
+                or payload["monotonic_ns"] <= 0
+                or type(payload["native_api_generation"]) is not int
+                or payload["native_api_generation"] <= 0
+                or type(payload["source_connection_generation"]) is not int
+                or payload["source_connection_generation"] < 0
+                or type(payload["connection_generation"]) is not int
+                or payload["connection_generation"] < 0
+                or type(payload["named_args"]) is not list
+                or type(payload["flattened_fields"]) is not list
+            ):
+                raise ValueError
+            for key in (
+                "owner_intent_id",
+                "callback_name",
+                "callback_class",
+                "phase",
+                "source_instance_id",
+                "native_client_epoch",
+                "native_api_source_id",
+                "native_spi_source_id",
+            ):
+                if type(payload[key]) is not str or not payload[key] or len(payload[key]) > 128:
+                    raise ValueError
+            if payload["callback_class"] not in {
+                "PRE_LOGIN",
+                "ROUTEABLE",
+                "AUDIT_QUERY",
+                "AUDIT_INFORMATIONAL",
+                "LIFECYCLE_POISON",
+                "UNSUPPORTED_FINANCIAL",
+            }:
+                raise ValueError
+            if payload["phase"] not in {"PRE_LOGIN", "ACTIVE", "POISONED"}:
+                raise ValueError
+            # The SDK snapshot format is scalar-only. Recanonicalization also
+            # rejects arbitrary objects, bytes, non-finite floats and NaN.
+            encoded = json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+            self_digest = str(digest)
+            return payload, encoded, self_digest
+        except (AttributeError, TypeError, ValueError, KeyError, UnicodeError):
+            raise ContractValidationError("CTP callback ingress record is invalid") from None
+
+    @staticmethod
+    def _ctp_callback_field(
+        payload: Mapping[str, Any], argument_slot: int, field_name: str
+    ) -> Any:
+        for item in payload["flattened_fields"]:
+            if (
+                type(item) is dict
+                and item.get("argument_slot") == argument_slot
+                and item.get("field_name") == field_name
+            ):
+                if item.get("present") is not True or item.get("scalar_captured") is not True:
+                    return None
+                return item.get("value")
+        return None
+
+    @staticmethod
+    def _ctp_callback_named_arg(payload: Mapping[str, Any], slot: int) -> Any:
+        if slot < 0 or slot >= len(payload["named_args"]):
+            return None
+        item = payload["named_args"][slot]
+        if type(item) is not dict or item.get("present") is not True:
+            return None
+        if item.get("scalar_captured") is not True:
+            return None
+        return item.get("value")
+
+    def append_ctp_callback_ingress(
+        self,
+        owner_handle: CtpCallbackSessionOwnerHandle,
+        record: Any,
+        *,
+        _adapter: object | None = None,
+    ) -> CtpCallbackIngressCommit:
+        """Synchronously append one source-owned SDK callback snapshot.
+
+        The callback source invokes this before it publishes the event to any
+        queue or legacy callback. A gap, replay, changed source tuple, malformed
+        snapshot, or persistence ambiguity poisons the durable owner.
+        """
+
+        payload: dict[str, Any] | None = None
+        try:
+            expected_adapter = self._issued_ctp_callback_session_adapters.get(
+                owner_handle.owner_intent_id
+            )
+            expected_record_type = self._ctp_callback_ingress_record_types.get(
+                owner_handle.owner_intent_id
+            )
+            if expected_adapter is None or (
+                _adapter is not None and _adapter is not expected_adapter
+            ):
+                raise ContractValidationError("fixed CTP callback session adapter is required")
+            if expected_record_type is None:
+                raise ContractValidationError("fixed CTP callback record type is unavailable")
+            payload, payload_json, digest = self._ctp_callback_payload_from_record(
+                record, expected_record_type=expected_record_type
+            )
+            if payload["owner_intent_id"] != owner_handle.owner_intent_id:
+                raise ContractValidationError("CTP callback owner does not match sink")
+            source_tags = {
+                "source_instance_id": payload["source_instance_id"],
+                "native_client_epoch": payload["native_client_epoch"],
+                "native_api_source_id": payload["native_api_source_id"],
+                "native_spi_source_id": payload["native_spi_source_id"],
+                "native_api_generation": payload["native_api_generation"],
+                "connection_generation": payload["source_connection_generation"],
+            }
+            event_generation = payload["connection_generation"]
+            if any(
+                type(value) is not str or not value or len(value) > 128
+                for key, value in source_tags.items()
+                if key.endswith("_id") or key in {"source_instance_id", "native_client_epoch"}
+            ):
+                raise ContractValidationError("CTP callback source identity is invalid")
+            if type(source_tags["native_api_generation"]) is not int or source_tags[
+                "native_api_generation"
+            ] <= 0:
+                raise ContractValidationError("CTP callback source generation is invalid")
+            if type(source_tags["connection_generation"]) is not int:
+                raise ContractValidationError("CTP callback source generation is invalid")
+            if type(event_generation) is not int or event_generation < 0:
+                raise ContractValidationError("CTP callback event generation is invalid")
+
+            now_ns = time.time_ns()
+            with self._lock, self._transaction() as cursor:
+                    owner = cursor.execute(
+                        """
+                        SELECT * FROM ctp_dispatch_callback_session_owners
+                        WHERE owner_intent_id = ? AND account_key = ? AND scope_key = ?
+                        """,
+                        (
+                            owner_handle.owner_intent_id,
+                            owner_handle.account_key,
+                            owner_handle.scope_key,
+                        ),
+                    ).fetchone()
+                    if (
+                        type(owner_handle) is not CtpCallbackSessionOwnerHandle
+                        or self._issued_ctp_callback_session_owners.get(
+                            owner_handle.owner_intent_id
+                        )
+                        is not owner_handle
+                        or owner is None
+                        or str(owner["owner_state"]) not in {"PREPARED", "ACTIVE"}
+                    ):
+                        raise ContractValidationError("CTP callback owner is not live")
+                    seq = payload["sequence"]
+                    expected_seq = int(owner["last_source_sequence"]) + 1
+                    if seq != expected_seq:
+                        raise ContractValidationError("CTP callback source sequence gap or replay")
+                    owner_tags = (
+                        owner["source_instance_id"],
+                        owner["native_client_epoch"],
+                        owner["native_api_source_id"],
+                        owner["native_spi_source_id"],
+                        owner["native_api_generation"],
+                        owner["connection_generation"],
+                    )
+                    incoming_tags = (
+                        source_tags["source_instance_id"],
+                        source_tags["native_client_epoch"],
+                        source_tags["native_api_source_id"],
+                        source_tags["native_spi_source_id"],
+                        source_tags["native_api_generation"],
+                        source_tags["connection_generation"],
+                    )
+                    if all(value is None for value in owner_tags):
+                        if str(owner["owner_state"]) != "PREPARED" or payload["phase"] != "PRE_LOGIN":
+                            raise ContractValidationError("CTP callback source did not start pre-login")
+                        if seq != 1 or payload["callback_name"] != "OnFrontConnected":
+                            raise ContractValidationError("CTP callback source lacks its first front event")
+                    elif owner_tags != incoming_tags:
+                        raise ContractValidationError("CTP callback source identity changed")
+                    owner_state = str(owner["owner_state"])
+                    if (
+                        (owner_state == "PREPARED" and payload["phase"] != "PRE_LOGIN")
+                        or (owner_state == "ACTIVE" and payload["phase"] != "ACTIVE")
+                    ):
+                        raise ContractValidationError("CTP callback phase differs from durable owner")
+
+                    previous = cursor.execute(
+                        """
+                        SELECT callback_name FROM ctp_dispatch_callback_ingress
+                        WHERE owner_intent_id = ? ORDER BY source_sequence DESC LIMIT 1
+                        """,
+                        (owner_handle.owner_intent_id,),
+                    ).fetchone()
+                    callback_name = payload["callback_name"]
+                    class_name = payload["callback_class"]
+                    if owner_state == "PREPARED":
+                        allowed_next = {
+                            None: "OnFrontConnected",
+                            "OnFrontConnected": "OnRspAuthenticate",
+                            "OnRspAuthenticate": "OnRspUserLogin",
+                        }
+                        if allowed_next.get(None if previous is None else str(previous["callback_name"])) != callback_name:
+                            raise ContractValidationError("unexpected CTP pre-login callback order")
+                        if class_name != "PRE_LOGIN":
+                            raise ContractValidationError("pre-login callback has the wrong class")
+                        if callback_name in {"OnRspAuthenticate", "OnRspUserLogin"}:
+                            error_id = self._ctp_callback_field(payload, 1, "ErrorID")
+                            if type(error_id) is not int or error_id != 0:
+                                raise ContractValidationError("CTP pre-login response is not successful")
+                    poison_code = None
+                    if class_name == "LIFECYCLE_POISON":
+                        poison_code = "lifecycle_transition"
+                    elif class_name == "UNSUPPORTED_FINANCIAL":
+                        poison_code = "unsupported_financial"
+                    elif class_name == "PRE_LOGIN" and owner_state == "ACTIVE":
+                        poison_code = "lifecycle_transition"
+                    elif payload["phase"] == "POISONED":
+                        poison_code = "source_gap"
+
+                    # Queries that can reveal account activity are retained as
+                    # audit facts but block future sends until an exact typed
+                    # query evaluator exists. This flag is one-way in v1.
+                    economic_query = callback_name in {
+                        "OnRspQryOrder",
+                        "OnRspQryTrade",
+                        "OnRspQryInvestorPosition",
+                        "OnRspQryTradingAccount",
+                    }
+                    cursor.execute(
+                        """
+                        INSERT INTO ctp_dispatch_callback_ingress(
+                            owner_intent_id, source_sequence, record_digest_sha256,
+                            callback_name, callback_class, source_phase,
+                            source_instance_id, native_client_epoch,
+                            native_api_source_id, native_spi_source_id,
+                            native_api_generation, source_connection_generation,
+                            connection_generation, record_payload_json, captured_at_ns
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            owner_handle.owner_intent_id,
+                            seq,
+                            digest,
+                            callback_name,
+                            class_name,
+                            payload["phase"],
+                            source_tags["source_instance_id"],
+                            source_tags["native_client_epoch"],
+                            source_tags["native_api_source_id"],
+                            source_tags["native_spi_source_id"],
+                            source_tags["native_api_generation"],
+                            source_tags["connection_generation"],
+                            event_generation,
+                            payload_json,
+                            now_ns,
+                        ),
+                    )
+                    new_state = "POISONED" if poison_code else owner_state
+                    cursor.execute(
+                        """
+                        UPDATE ctp_dispatch_callback_session_owners
+                        SET source_instance_id = ?, native_client_epoch = ?,
+                            native_api_source_id = ?, native_spi_source_id = ?,
+                            native_api_generation = ?, connection_generation = ?,
+                            last_source_sequence = ?,
+                            economic_query_observed = CASE WHEN ? = 1 THEN 1
+                                ELSE economic_query_observed END,
+                            owner_state = ?, poison_code = CASE WHEN ? IS NULL
+                                THEN poison_code ELSE ? END,
+                            updated_at_ns = ?
+                        WHERE owner_intent_id = ? AND owner_state IN ('PREPARED', 'ACTIVE')
+                        """,
+                        (
+                            source_tags["source_instance_id"],
+                            source_tags["native_client_epoch"],
+                            source_tags["native_api_source_id"],
+                            source_tags["native_spi_source_id"],
+                            source_tags["native_api_generation"],
+                            source_tags["connection_generation"],
+                            seq,
+                            int(economic_query),
+                            new_state,
+                            poison_code,
+                            poison_code,
+                            now_ns,
+                            owner_handle.owner_intent_id,
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        raise InvalidStateTransition("CTP callback owner changed during append")
+            return CtpCallbackIngressCommit(
+                owner_intent_id=owner_handle.owner_intent_id,
+                source_sequence=payload["sequence"],
+                record_digest_sha256=digest,
+                committed_high_watermark=payload["sequence"],
+            )
+        except Exception as error:
+            with suppress(Exception):
+                self.poison_ctp_callback_session_owner(
+                    owner_handle,
+                    "capture_incomplete" if payload is None else "source_gap",
+                    last_sequence=(
+                        payload.get("sequence") if payload is not None else None
+                    ),
+                )
+            if isinstance(error, ContractValidationError):
+                raise
+            raise ContractValidationError("CTP callback inbox append failed") from None
+
+    @staticmethod
+    def _ctp_callback_applied_sequence(
+        cursor: sqlite3.Cursor, owner_intent_id: str, last_source_sequence: int
+    ) -> int:
+        row = cursor.execute(
+            """
+            SELECT COUNT(*) AS application_count, COALESCE(MAX(source_sequence), 0) AS highwater
+            FROM ctp_dispatch_callback_ingress_applications
+            WHERE owner_intent_id = ?
+            """,
+            (owner_intent_id,),
+        ).fetchone()
+        count = int(row["application_count"])
+        highwater = int(row["highwater"])
+        if count != highwater or highwater > last_source_sequence:
+            raise DurableStoreError("CTP callback inbox application sequence is inconsistent")
+        return highwater
+
+    def _require_current_ctp_callback_ingress_event(
+        self,
+        cursor: sqlite3.Cursor,
+        scope: ExecutionScope,
+        event: CtpCallbackIngressEventV1,
+        writer_lease: WriterLease,
+        *,
+        expected_class: str = "ROUTEABLE",
+    ) -> tuple[sqlite3.Row, sqlite3.Row, Mapping[str, Any], CtpCallbackSessionBindingV1]:
+        if (
+            type(event) is not CtpCallbackIngressEventV1
+            or type(event.owner_handle) is not CtpCallbackSessionOwnerHandle
+            or self._issued_ctp_callback_ingress_events.get(
+                (event.owner_handle.owner_intent_id, event.source_sequence)
+            )
+            is not event
+        ):
+            raise ContractValidationError("Store-issued CTP callback ingress event is required")
+        account_key, trading_day, scope_key = self._validate_ctp_order_identity_scope(scope)
+        if (
+            event.owner_handle.account_key != account_key
+            or event.owner_handle.scope_key != scope_key
+            or self._issued_ctp_callback_session_owners.get(event.owner_handle.owner_intent_id)
+            is not event.owner_handle
+        ):
+            raise ContractValidationError("CTP callback event does not belong to the execution scope")
+        binding = self._active_ctp_callback_sessions.get(event.owner_handle.owner_intent_id)
+        if binding is None:
+            raise InvalidStateTransition("active CTP callback session binding is unavailable")
+        self._assert_active_writer_lease(cursor, scope, writer_lease)
+        owner = cursor.execute(
+            """
+            SELECT * FROM ctp_dispatch_callback_session_owners
+            WHERE owner_intent_id = ? AND account_key = ? AND scope_key = ?
+            """,
+            (event.owner_handle.owner_intent_id, account_key, scope_key),
+        ).fetchone()
+        if (
+            owner is None
+            or str(owner["owner_state"]) != "ACTIVE"
+            or str(owner["trading_day"]) != trading_day
+            or str(owner["trading_day"]) != binding.trading_day
+            or int(owner["front_id"]) != binding.dispatch_front_id
+            or int(owner["session_id"]) != binding.dispatch_session_id
+            or int(owner["active_connection_generation"]) != binding.connection_generation
+            or binding.owner_intent_id != event.owner_handle.owner_intent_id
+        ):
+            raise InvalidStateTransition("CTP callback owner changed before ledger commit")
+        row = cursor.execute(
+            """
+            SELECT * FROM ctp_dispatch_callback_ingress
+            WHERE owner_intent_id = ? AND source_sequence = ?
+            """,
+            (event.owner_handle.owner_intent_id, event.source_sequence),
+        ).fetchone()
+        if (
+            row is None
+            or str(row["record_digest_sha256"]) != event.record_digest_sha256
+            or str(row["record_payload_json"]) != event.record_payload_json
+            or str(row["callback_name"]) != event.callback_name
+            or str(row["callback_class"]) != expected_class
+            or str(row["source_phase"]) != "ACTIVE"
+            or event.callback_class != expected_class
+            or int(row["connection_generation"]) != binding.connection_generation
+            or (
+                str(row["source_instance_id"]),
+                str(row["native_client_epoch"]),
+                str(row["native_api_source_id"]),
+                str(row["native_spi_source_id"]),
+                int(row["native_api_generation"]),
+                int(row["source_connection_generation"]),
+            )
+            != (
+                binding.source_instance_id,
+                binding.native_client_epoch,
+                binding.native_api_source_id,
+                binding.native_spi_source_id,
+                binding.native_api_generation,
+                binding.source_connection_generation,
+            )
+        ):
+            raise ContractValidationError("CTP callback ingress row differs from the source event")
+        payload = json.loads(str(row["record_payload_json"]))
+        if (
+            payload.get("digest") != event.record_digest_sha256
+            or payload.get("sequence") != event.source_sequence
+            or payload.get("capture_complete") is not True
+            or payload.get("phase") != "ACTIVE"
+        ):
+            raise ContractValidationError("CTP callback ingress payload failed readback")
+        applied = self._ctp_callback_applied_sequence(
+            cursor, event.owner_handle.owner_intent_id, int(owner["last_source_sequence"])
+        )
+        if event.source_sequence != applied + 1:
+            raise InvalidStateTransition("CTP callback source event is not the next sequence")
+        return owner, row, payload, binding
+
+    @staticmethod
+    def _insert_ctp_callback_ingress_application(
+        cursor: sqlite3.Cursor,
+        event: CtpCallbackIngressEventV1,
+        command_id: str,
+        outcome: str,
+        evidence_payload: Mapping[str, Any],
+        *,
+        applied_at_ns: int,
+    ) -> None:
+        if outcome != "APPLIED":
+            raise ContractValidationError("invalid routed CTP callback application outcome")
+        digest = payload_sha256(
+            {
+                "application_type": "ctp_callback_ingress_routed.v1",
+                "owner_intent_id": event.owner_handle.owner_intent_id,
+                "source_sequence": event.source_sequence,
+                "record_digest_sha256": event.record_digest_sha256,
+                "command_id": command_id,
+                "outcome": outcome,
+                "evidence": dict(evidence_payload),
+            }
+        )
+        cursor.execute(
+            """
+            INSERT INTO ctp_dispatch_callback_ingress_applications(
+                owner_intent_id, source_sequence, outcome, command_id,
+                application_digest_sha256, applied_at_ns
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event.owner_handle.owner_intent_id,
+                event.source_sequence,
+                outcome,
+                command_id,
+                digest,
+                applied_at_ns,
+            ),
+        )
+
+    @staticmethod
+    def _insert_ctp_order_cumulative_observation(
+        cursor: sqlite3.Cursor,
+        event: CtpCallbackIngressEventV1,
+        command: CtpDispatchCommand,
+        binding: CtpCallbackSessionBindingV1,
+        native_volume_traded: object,
+        callback_key_sha256: str,
+        *,
+        observed_at_ns: int,
+    ) -> tuple[int, str] | None:
+        if native_volume_traded is None:
+            return None
+        if type(native_volume_traded) is not int or native_volume_traded < 0:
+            raise ContractValidationError("native CTP VolumeTraded is invalid")
+        payload = dict(command.request_payload)
+        order_quantity = payload.get("VolumeTotalOriginal")
+        if type(order_quantity) is not int or order_quantity <= 0:
+            raise ContractValidationError("durable CTP submit quantity is invalid")
+        if native_volume_traded > order_quantity:
+            raise ContractValidationError("native CTP cumulative volume exceeds submit quantity")
+        prior_order = cursor.execute(
+            """
+            SELECT native_volume_traded FROM ctp_dispatch_order_cumulative_ledger
+            WHERE owner_intent_id = ? AND command_id = ? AND source_sequence < ?
+            ORDER BY source_sequence DESC LIMIT 1
+            """,
+            (event.owner_handle.owner_intent_id, command.command_id, event.source_sequence),
+        ).fetchone()
+        if prior_order is not None and native_volume_traded < int(
+            prior_order["native_volume_traded"]
+        ):
+            raise InvalidStateTransition("native CTP order cumulative volume moved backwards")
+        prior = cursor.execute(
+            """
+            SELECT COALESCE(SUM(trade_volume), 0) AS total
+            FROM ctp_dispatch_trade_fact_ledger
+            WHERE owner_intent_id = ? AND command_id = ? AND source_sequence < ?
+            """,
+            (event.owner_handle.owner_intent_id, command.command_id, event.source_sequence),
+        ).fetchone()
+        trade_volume = int(prior["total"])
+        if native_volume_traded == trade_volume:
+            consistency = "MATCHED"
+        elif native_volume_traded > trade_volume:
+            consistency = "ORDER_CUMULATIVE_AHEAD"
+        else:
+            consistency = "TRADE_CUMULATIVE_AHEAD"
+        cursor.execute(
+            """
+            INSERT INTO ctp_dispatch_order_cumulative_ledger(
+                owner_intent_id, source_sequence, account_key, scope_key, trading_day,
+                command_id, runtime_order_id, order_ref, native_volume_traded,
+                trade_volume_at_prefix, prefix_consistency,
+                ingress_record_digest_sha256, callback_key_sha256, observed_at_ns
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event.owner_handle.owner_intent_id,
+                event.source_sequence,
+                command.account_key,
+                command.scope_key,
+                command.trading_day,
+                command.command_id,
+                command.correlation_key.runtime_order_id,
+                command.order_ref,
+                native_volume_traded,
+                trade_volume,
+                consistency,
+                event.record_digest_sha256,
+                callback_key_sha256,
+                observed_at_ns,
+            ),
+        )
+        return trade_volume, consistency
+
+    def read_next_ctp_callback_ingress(
+        self, owner_handle: CtpCallbackSessionOwnerHandle
+    ) -> CtpCallbackIngressEventV1 | None:
+        """Read the next exact durable source event not yet routed or audited.
+
+        This read does not consume the event. A routing path must commit its
+        ledger/projection and application marker together; an audit-only path
+        must call :meth:`mark_ctp_callback_ingress_audit`.
+        """
+
+        if type(owner_handle) is not CtpCallbackSessionOwnerHandle:
+            raise ContractValidationError("typed CTP callback owner is required")
+        if self._issued_ctp_callback_session_owners.get(owner_handle.owner_intent_id) is not owner_handle:
+            raise ContractValidationError("exact same-Store CTP callback owner is required")
+        with self._lock:
+            try:
+                owner = self._connection.execute(
+                    """
+                    SELECT * FROM ctp_dispatch_callback_session_owners
+                    WHERE owner_intent_id = ? AND account_key = ? AND scope_key = ?
+                    """,
+                    (
+                        owner_handle.owner_intent_id,
+                        owner_handle.account_key,
+                        owner_handle.scope_key,
+                    ),
+                ).fetchone()
+                if owner is None or str(owner["owner_state"]) != "ACTIVE":
+                    raise InvalidStateTransition("CTP callback session owner is not active")
+                last_source = int(owner["last_source_sequence"])
+                applied = self._ctp_callback_applied_sequence(
+                    self._connection.cursor(), owner_handle.owner_intent_id, last_source
+                )
+                if applied >= last_source:
+                    return None
+                sequence = applied + 1
+                row = self._connection.execute(
+                    """
+                    SELECT * FROM ctp_dispatch_callback_ingress
+                    WHERE owner_intent_id = ? AND source_sequence = ?
+                    """,
+                    (owner_handle.owner_intent_id, sequence),
+                ).fetchone()
+                if row is None:
+                    raise DurableStoreError("CTP callback inbox has a missing source event")
+                event = CtpCallbackIngressEventV1(
+                    owner_handle=owner_handle,
+                    source_sequence=sequence,
+                    record_digest_sha256=str(row["record_digest_sha256"]),
+                    callback_name=str(row["callback_name"]),
+                    callback_class=str(row["callback_class"]),
+                    source_phase=str(row["source_phase"]),
+                    source_tags=(
+                        str(row["source_instance_id"]),
+                        str(row["native_client_epoch"]),
+                        str(row["native_api_source_id"]),
+                        str(row["native_spi_source_id"]),
+                        int(row["native_api_generation"]),
+                        int(row["source_connection_generation"]),
+                    ),
+                    connection_generation=int(row["connection_generation"]),
+                    record_payload_json=str(row["record_payload_json"]),
+                )
+                issued_key = (owner_handle.owner_intent_id, sequence)
+                previous = self._issued_ctp_callback_ingress_events.get(issued_key)
+                if previous is not None:
+                    if previous != event:
+                        raise DurableStoreError("CTP callback inbox readback changed")
+                    return previous
+                self._issued_ctp_callback_ingress_events[issued_key] = event
+                return event
+            except sqlite3.Error as error:
+                raise DurableStoreError("unable to read CTP callback inbox") from error
+
+    def read_ctp_callback_session_context_facts(
+        self, owner_handle: CtpCallbackSessionOwnerHandle
+    ) -> tuple[CtpCallbackSessionBindingV1, str, str]:
+        """Return Store-readback login account scalars for a live in-process owner.
+
+        Broker/User identity is read from the immutable successful login inbox
+        row; it is never accepted from the routing caller.
+        """
+
+        if (
+            type(owner_handle) is not CtpCallbackSessionOwnerHandle
+            or self._issued_ctp_callback_session_owners.get(owner_handle.owner_intent_id)
+            is not owner_handle
+        ):
+            raise ContractValidationError("exact same-Store CTP callback owner is required")
+        with self._lock:
+            binding = self._active_ctp_callback_sessions.get(owner_handle.owner_intent_id)
+            owner = self._connection.execute(
+                """
+                SELECT * FROM ctp_dispatch_callback_session_owners
+                WHERE owner_intent_id = ? AND account_key = ? AND scope_key = ?
+                """,
+                (owner_handle.owner_intent_id, owner_handle.account_key, owner_handle.scope_key),
+            ).fetchone()
+            if (
+                binding is None
+                or owner is None
+                or str(owner["owner_state"]) != "ACTIVE"
+                or binding.owner_intent_id != owner_handle.owner_intent_id
+                or binding.account_key != owner_handle.account_key
+                or binding.scope_key != owner_handle.scope_key
+                or binding.trading_day != str(owner["trading_day"])
+                or binding.dispatch_front_id != int(owner["front_id"])
+                or binding.dispatch_session_id != int(owner["session_id"])
+                or binding.connection_generation != int(owner["active_connection_generation"])
+            ):
+                raise InvalidStateTransition("active CTP callback session binding is unavailable")
+            login = self._connection.execute(
+                """
+                SELECT * FROM ctp_dispatch_callback_ingress
+                WHERE owner_intent_id = ? AND callback_name = 'OnRspUserLogin'
+                ORDER BY source_sequence DESC LIMIT 1
+                """,
+                (owner_handle.owner_intent_id,),
+            ).fetchone()
+            if (
+                login is None
+                or int(login["source_sequence"]) != binding.source_high_watermark
+                or str(login["callback_name"]) != "OnRspUserLogin"
+                or str(login["callback_class"]) != "PRE_LOGIN"
+            ):
+                raise DurableStoreError("durable CTP login identity row is unavailable")
+            payload = json.loads(str(login["record_payload_json"]))
+            broker_id = self._ctp_callback_field(payload, 0, "BrokerID")
+            user_id = self._ctp_callback_field(payload, 0, "UserID")
+            if (
+                type(broker_id) is not str
+                or not broker_id
+                or type(user_id) is not str
+                or not user_id
+                or self._ctp_callback_field(payload, 0, "TradingDay") != binding.trading_day
+            ):
+                raise DurableStoreError("durable CTP login identity is invalid")
+            return binding, broker_id, user_id
+
+    def find_ctp_dispatch_command_for_ingress(
+        self, event: CtpCallbackIngressEventV1
+    ) -> CtpDispatchCommand | None:
+        """Correlate a routeable event from its native fields, never caller IDs.
+
+        ``None`` means that the uniquely correlated command is still inside
+        its native Req call; the event must stay in the inbox until its receipt
+        transaction completes. Unmatched, ambiguous, or wrong-session events
+        raise and must poison the source owner.
+        """
+
+        if (
+            type(event) is not CtpCallbackIngressEventV1
+            or self._issued_ctp_callback_ingress_events.get(
+                (event.owner_handle.owner_intent_id, event.source_sequence)
+            )
+            is not event
+        ):
+            raise ContractValidationError("Store-issued CTP callback ingress event is required")
+        payload = json.loads(event.record_payload_json)
+        if (
+            payload.get("digest") != event.record_digest_sha256
+            or payload.get("sequence") != event.source_sequence
+            or payload.get("callback_name") != event.callback_name
+            or payload.get("callback_class") != "ROUTEABLE"
+            or payload.get("phase") != "ACTIVE"
+            or payload.get("capture_complete") is not True
+        ):
+            raise ContractValidationError("CTP routeable callback record is not exact")
+        name = event.callback_name
+        field = {
+            item["field_name"]: item["value"]
+            for item in payload["flattened_fields"]
+            if item.get("argument_slot") == 0
+            and item.get("present") is True
+            and item.get("scalar_captured") is True
+        }
+        if name not in {
+            "OnRtnOrder",
+            "OnRtnTrade",
+            "OnRspOrderInsert",
+            "OnErrRtnOrderInsert",
+            "OnRspOrderAction",
+            "OnErrRtnOrderAction",
+        }:
+            raise ContractValidationError("CTP routeable callback has no code-owned router")
+        with self._lock:
+            owner = self._connection.execute(
+                """
+                SELECT * FROM ctp_dispatch_callback_session_owners
+                WHERE owner_intent_id = ? AND account_key = ? AND scope_key = ?
+                """,
+                (
+                    event.owner_handle.owner_intent_id,
+                    event.owner_handle.account_key,
+                    event.owner_handle.scope_key,
+                ),
+            ).fetchone()
+            binding = self._active_ctp_callback_sessions.get(
+                event.owner_handle.owner_intent_id
+            )
+            if (
+                owner is None
+                or str(owner["owner_state"]) != "ACTIVE"
+                or binding is None
+                or event.source_tags
+                != (
+                    str(owner["source_instance_id"]),
+                    str(owner["native_client_epoch"]),
+                    str(owner["native_api_source_id"]),
+                    str(owner["native_spi_source_id"]),
+                    int(owner["native_api_generation"]),
+                    int(owner["connection_generation"]),
+                )
+                or event.connection_generation != int(owner["active_connection_generation"])
+                or event.connection_generation != binding.connection_generation
+                or binding.source_high_watermark >= event.source_sequence
+            ):
+                raise ContractValidationError("CTP routeable callback source differs from owner")
+
+            applied = self._ctp_callback_applied_sequence(
+                self._connection.cursor(),
+                event.owner_handle.owner_intent_id,
+                int(owner["last_source_sequence"]),
+            )
+            if event.source_sequence != applied + 1:
+                raise InvalidStateTransition("CTP routeable callback is out of sequence")
+
+            submit_names = {"OnRtnOrder", "OnRtnTrade", "OnRspOrderInsert", "OnErrRtnOrderInsert"}
+            operation = "SUBMIT" if name in submit_names else "CANCEL"
+            # A staged CANCEL deliberately has no `order_ref` column value;
+            # its target OrderRef is persisted separately. Keep the remaining
+            # RequestID, ActionRef, target tuple, and session checks below so
+            # two cancel actions on one order cannot be confused.
+            rows = self._connection.execute(
+                """
+                SELECT * FROM ctp_dispatch_commands
+                WHERE account_key = ? AND scope_key = ? AND trading_day = ?
+                  AND operation = ?
+                  AND CASE WHEN operation = 'SUBMIT'
+                      THEN order_ref ELSE cancel_target_order_ref END = ?
+                ORDER BY created_at_ns, command_id
+                """,
+                (
+                    event.owner_handle.account_key,
+                    event.owner_handle.scope_key,
+                    binding.trading_day,
+                    operation,
+                    field.get("OrderRef"),
+                ),
+            ).fetchall()
+            matches = []
+            for row in rows:
+                correlation = self._ctp_dispatch_command_from_row(row).correlation_key
+                if correlation is None:
+                    continue
+                if (
+                    correlation.session_generation_id != binding.session_generation_id
+                    or correlation.dispatch_front_id != binding.dispatch_front_id
+                    or correlation.dispatch_session_id != binding.dispatch_session_id
+                ):
+                    continue
+                if name == "OnRtnTrade":
+                    matches.append(row)
+                    continue
+                if field.get("RequestID") != correlation.native_request_id:
+                    continue
+                if name in {"OnRspOrderAction", "OnErrRtnOrderAction"} and (
+                    field.get("OrderActionRef") != correlation.native_action_ref
+                    or field.get("ExchangeID") != correlation.cancel_target_exchange_id
+                    or field.get("OrderSysID") != correlation.cancel_target_order_sys_id
+                    or field.get("FrontID") != correlation.cancel_target_front_id
+                    or field.get("SessionID") != correlation.cancel_target_session_id
+                ):
+                    continue
+                matches.append(row)
+            if len(matches) != 1:
+                raise ContractValidationError("CTP callback command correlation is not unique")
+            row = matches[0]
+            if row["callback_owner_intent_id"] != event.owner_handle.owner_intent_id:
+                raise ContractValidationError("CTP callback command is not bound to this owner")
+            if str(row["status"]) == "CLAIMED" and int(row["native_call_inflight"]) == 1:
+                return None
+            if (
+                str(row["status"]) not in {"COMPLETED", "UNKNOWN"}
+                or int(row["native_call_inflight"]) != 0
+                or row["local_queue_receipt_id"] is None
+                or row["local_queue_receipt_queued"] != 1
+            ):
+                raise InvalidStateTransition("CTP callback arrived outside completed native send")
+            return self._ctp_dispatch_command_from_row(row)
+
+    def mark_ctp_callback_ingress_audit(
+        self,
+        scope: ExecutionScope,
+        event: CtpCallbackIngressEventV1,
+        *,
+        writer_lease: WriterLease,
+    ) -> None:
+        """Atomically mark one informational/query event as audit-only.
+
+        Routeable and unsupported/lifecycle events cannot be consumed through
+        this path. Economic query callbacks remain a permanent send fence even
+        after this audit marker is written.
+        """
+
+        if (
+            type(event) is not CtpCallbackIngressEventV1
+            or self._issued_ctp_callback_ingress_events.get(
+                (event.owner_handle.owner_intent_id, event.source_sequence)
+            )
+            is not event
+        ):
+            raise ContractValidationError("Store-issued CTP callback ingress event is required")
+        if event.callback_class not in {"AUDIT_QUERY", "AUDIT_INFORMATIONAL"}:
+            raise ContractValidationError("CTP callback event is not audit-only")
+        account_key, _, scope_key = self._validate_ctp_order_identity_scope(scope)
+        if (
+            account_key != event.owner_handle.account_key
+            or scope_key != event.owner_handle.scope_key
+        ):
+            raise ContractValidationError("CTP callback audit scope differs from owner")
+        now_ns = time.time_ns()
+        application_digest = payload_sha256(
+            {
+                "application_type": "ctp_callback_ingress_audit.v1",
+                "owner_intent_id": event.owner_handle.owner_intent_id,
+                "source_sequence": event.source_sequence,
+                "record_digest_sha256": event.record_digest_sha256,
+                "callback_class": event.callback_class,
+            }
+        )
+        with self._transaction() as cursor:
+            owner = cursor.execute(
+                """
+                SELECT * FROM ctp_dispatch_callback_session_owners
+                WHERE owner_intent_id = ? AND account_key = ? AND scope_key = ?
+                """,
+                (event.owner_handle.owner_intent_id, account_key, scope_key),
+            ).fetchone()
+            if owner is None or str(owner["owner_state"]) != "ACTIVE":
+                raise InvalidStateTransition("CTP callback session owner is not active")
+            self._assert_active_writer_lease(
+                cursor,
+                scope,
+                writer_lease,
+                now_ns=now_ns,
+            )
+            if (
+                str(owner["writer_owner_id"]) != writer_lease.owner_id
+                or int(owner["writer_fencing_token"]) != writer_lease.fencing_token
+            ):
+                raise WriterLeaseUnavailable()
+            applied = self._ctp_callback_applied_sequence(
+                cursor, event.owner_handle.owner_intent_id, int(owner["last_source_sequence"])
+            )
+            if event.source_sequence != applied + 1:
+                raise InvalidStateTransition("CTP callback audit event is out of sequence")
+            row = cursor.execute(
+                """
+                SELECT * FROM ctp_dispatch_callback_ingress
+                WHERE owner_intent_id = ? AND source_sequence = ?
+                """,
+                (event.owner_handle.owner_intent_id, event.source_sequence),
+            ).fetchone()
+            if (
+                row is None
+                or str(row["record_digest_sha256"]) != event.record_digest_sha256
+                or str(row["record_payload_json"]) != event.record_payload_json
+                or str(row["callback_name"]) != event.callback_name
+                or str(row["callback_class"]) != event.callback_class
+            ):
+                raise ContractValidationError("CTP callback audit row differs from source event")
+            cursor.execute(
+                """
+                INSERT INTO ctp_dispatch_callback_ingress_applications(
+                    owner_intent_id, source_sequence, outcome, command_id,
+                    application_digest_sha256, applied_at_ns
+                ) VALUES (?, ?, 'AUDIT_ONLY', NULL, ?, ?)
+                """,
+                (
+                    event.owner_handle.owner_intent_id,
+                    event.source_sequence,
+                    application_digest,
+                    now_ns,
+                ),
+            )
+
+    @staticmethod
+    def _ctp_callback_session_binding_payload(
+        binding: CtpCallbackSessionBindingV1,
+    ) -> dict[str, Any]:
+        if type(binding) is not CtpCallbackSessionBindingV1:
+            raise ContractValidationError("typed active CTP callback binding is required")
+        return {
+            "binding_type": "ctp_callback_session_binding.v1",
+            "owner_intent_id": binding.owner_intent_id,
+            "account_key": binding.account_key,
+            "scope_key": binding.scope_key,
+            "trading_day": binding.trading_day,
+            "session_generation_id": binding.session_generation_id,
+            "dispatch_front_id": binding.dispatch_front_id,
+            "dispatch_session_id": binding.dispatch_session_id,
+            "source_tags": {
+                "source_instance_id": binding.source_instance_id,
+                "native_client_epoch": binding.native_client_epoch,
+                "native_api_source_id": binding.native_api_source_id,
+                "native_spi_source_id": binding.native_spi_source_id,
+                "native_api_generation": binding.native_api_generation,
+                "connection_generation": binding.source_connection_generation,
+            },
+            "source_high_watermark": binding.source_high_watermark,
+        }
+
+    @classmethod
+    def _require_command_session_binding(
+        cls,
+        row: Mapping[str, Any],
+        binding: CtpCallbackSessionBindingV1,
+    ) -> None:
+        expected_payload = cls._ctp_callback_session_binding_payload(binding)
+        if (
+            str(row["session_binding_json"]) != canonical_json(expected_payload)
+            or str(row["session_binding_sha256"]) != binding.session_binding_sha256
+            or payload_sha256(expected_payload) != binding.session_binding_sha256
+        ):
+            raise ContractValidationError(
+                "CTP command session binding differs from active Store session"
+            )
+
+    def bind_ctp_callback_session(
+        self,
+        scope: ExecutionScope,
+        owner_handle: CtpCallbackSessionOwnerHandle,
+        observation: Any,
+        source_tags: Any,
+        high_watermark: int,
+        *,
+        writer_lease: WriterLease,
+    ) -> CtpCallbackSessionBindingV1:
+        """Bind one SDK-accepted terminal login to this permanent owner."""
+
+        account_key, trading_day, scope_key = self._validate_ctp_order_identity_scope(scope)
+        if type(high_watermark) is not int or high_watermark <= 0:
+            raise ContractValidationError("invalid CTP login source watermark")
+        try:
+            tag_values = {
+                name: getattr(source_tags, name)
+                for name in (
+                    "source_instance_id",
+                    "native_client_epoch",
+                    "native_api_source_id",
+                    "native_spi_source_id",
+                    "native_api_generation",
+                    "connection_generation",
+                )
+            }
+            observation_values = {
+                "broker_id": observation.broker_id,
+                "user_id": observation.user_id,
+                "trading_day": observation.trading_day,
+                "connection_generation": observation.connection_generation,
+                "request_id": observation.request_id,
+            }
+        except Exception:
+            raise ContractValidationError("typed SDK login observation is required") from None
+        if (
+            any(type(tag_values[name]) is not str or not tag_values[name] for name in (
+                "source_instance_id", "native_client_epoch", "native_api_source_id",
+                "native_spi_source_id"
+            ))
+            or type(tag_values["native_api_generation"]) is not int
+            or tag_values["native_api_generation"] <= 0
+            or type(tag_values["connection_generation"]) is not int
+            or tag_values["connection_generation"] < 0
+            or type(observation_values["broker_id"]) is not str
+            or not observation_values["broker_id"]
+            or type(observation_values["user_id"]) is not str
+            or not observation_values["user_id"]
+            or observation_values["trading_day"] != trading_day
+            or type(observation_values["connection_generation"]) is not int
+            or observation_values["connection_generation"] <= 0
+            or type(observation_values["request_id"]) is not int
+            or observation_values["request_id"] <= 0
+        ):
+            raise ContractValidationError("SDK login identity does not match CTP scope")
+        epoch = tag_values["native_client_epoch"]
+        if len(epoch) != 32 or any(char not in "0123456789abcdef" for char in epoch):
+            raise ContractValidationError("invalid native client epoch")
+        now_ns = time.time_ns()
+        with self._lock, self._transaction() as cursor:
+            self._assert_active_writer_lease(cursor, scope, writer_lease, now_ns=now_ns)
+            owner = self._require_ctp_callback_session_owner_handle(
+                cursor,
+                scope,
+                owner_handle,
+                allowed_states=frozenset({"PREPARED"}),
+                writer_lease=writer_lease,
+                now_ns=now_ns,
+            )
+            if high_watermark != int(owner["last_source_sequence"]):
+                raise ContractValidationError("SDK login watermark changed before binding")
+            login = cursor.execute(
+                """
+                    SELECT * FROM ctp_dispatch_callback_ingress
+                    WHERE owner_intent_id = ? AND source_sequence = ?
+                    """,
+                (owner_handle.owner_intent_id, high_watermark),
+            ).fetchone()
+            if (
+                login is None
+                or str(login["callback_name"]) != "OnRspUserLogin"
+                or str(login["callback_class"]) != "PRE_LOGIN"
+                or str(login["source_phase"]) != "PRE_LOGIN"
+                or str(login["source_instance_id"]) != tag_values["source_instance_id"]
+                or str(login["native_client_epoch"]) != epoch
+                or str(login["native_api_source_id"]) != tag_values["native_api_source_id"]
+                or str(login["native_spi_source_id"]) != tag_values["native_spi_source_id"]
+                or int(login["native_api_generation"]) != tag_values["native_api_generation"]
+                or int(login["source_connection_generation"])
+                != tag_values["connection_generation"]
+                or int(login["connection_generation"])
+                != observation_values["connection_generation"]
+            ):
+                raise ContractValidationError("durable CTP login source does not match SDK")
+            login_payload = json.loads(str(login["record_payload_json"]))
+            if (
+                self._ctp_callback_named_arg(login_payload, 2)
+                != observation_values["request_id"]
+                or self._ctp_callback_field(login_payload, 0, "BrokerID")
+                != observation_values["broker_id"]
+                or self._ctp_callback_field(login_payload, 0, "UserID")
+                != observation_values["user_id"]
+                or self._ctp_callback_field(login_payload, 0, "TradingDay")
+                != observation_values["trading_day"]
+                or type(self._ctp_callback_field(login_payload, 0, "FrontID")) is not int
+                or type(self._ctp_callback_field(login_payload, 0, "SessionID")) is not int
+            ):
+                raise ContractValidationError("durable CTP login identity differs from SDK")
+            front_id = self._ctp_callback_field(login_payload, 0, "FrontID")
+            session_id = self._ctp_callback_field(login_payload, 0, "SessionID")
+            if front_id <= 0 or session_id <= 0:
+                raise ContractValidationError("invalid native CTP login front/session")
+            session_generation_id = (
+                f"ctp-native-v2:{epoch}:{tag_values['native_api_generation']}:"
+                f"{observation_values['connection_generation']}:{front_id}:{session_id}"
+            )
+            session_digest = payload_sha256(
+                {
+                    "binding_type": "ctp_callback_session_binding.v1",
+                    "owner_intent_id": owner_handle.owner_intent_id,
+                    "account_key": account_key,
+                    "scope_key": scope_key,
+                    "trading_day": trading_day,
+                    "session_generation_id": session_generation_id,
+                    "dispatch_front_id": front_id,
+                    "dispatch_session_id": session_id,
+                    "source_tags": tag_values,
+                    "source_high_watermark": high_watermark,
+                }
+            )
+            cursor.execute(
+                """
+                    UPDATE ctp_dispatch_callback_session_owners
+                    SET owner_state = 'ACTIVE', trading_day = ?, front_id = ?,
+                        session_id = ?, active_connection_generation = ?,
+                        updated_at_ns = ?
+                    WHERE owner_intent_id = ? AND owner_state = 'PREPARED'
+                    """,
+                (
+                    trading_day,
+                    front_id,
+                    session_id,
+                    observation_values["connection_generation"],
+                    now_ns,
+                    owner_handle.owner_intent_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise InvalidStateTransition("CTP callback owner activation changed")
+            prior_events = cursor.execute(
+                """
+                    SELECT source_sequence, record_digest_sha256, callback_class
+                    FROM ctp_dispatch_callback_ingress
+                    WHERE owner_intent_id = ? AND source_sequence <= ?
+                    ORDER BY source_sequence
+                    """,
+                (owner_handle.owner_intent_id, high_watermark),
+            ).fetchall()
+            if len(prior_events) != high_watermark:
+                raise DurableStoreError("CTP login inbox sequence is incomplete")
+            if self._ctp_callback_applied_sequence(
+                cursor, owner_handle.owner_intent_id, high_watermark
+            ) != 0:
+                raise DurableStoreError("CTP login inbox was unexpectedly consumed")
+            for prior_event in prior_events:
+                sequence = int(prior_event["source_sequence"])
+                application_digest = payload_sha256(
+                    {
+                        "application_type": "ctp_callback_prelogin_bound.v1",
+                        "owner_intent_id": owner_handle.owner_intent_id,
+                        "source_sequence": sequence,
+                        "record_digest_sha256": str(
+                            prior_event["record_digest_sha256"]
+                        ),
+                        "callback_class": str(prior_event["callback_class"]),
+                    }
+                )
+                cursor.execute(
+                    """
+                        INSERT INTO ctp_dispatch_callback_ingress_applications(
+                            owner_intent_id, source_sequence, outcome, command_id,
+                            application_digest_sha256, applied_at_ns
+                        ) VALUES (?, ?, 'AUDIT_ONLY', NULL, ?, ?)
+                        """,
+                    (
+                        owner_handle.owner_intent_id,
+                        sequence,
+                        application_digest,
+                        now_ns,
+                    ),
+                )
+        binding = CtpCallbackSessionBindingV1(
+            owner_intent_id=owner_handle.owner_intent_id,
+            account_key=account_key,
+            scope_key=scope_key,
+            trading_day=trading_day,
+            session_generation_id=session_generation_id,
+            dispatch_front_id=front_id,
+            dispatch_session_id=session_id,
+            source_instance_id=tag_values["source_instance_id"],
+            native_client_epoch=epoch,
+            native_api_source_id=tag_values["native_api_source_id"],
+            native_spi_source_id=tag_values["native_spi_source_id"],
+            native_api_generation=tag_values["native_api_generation"],
+            source_connection_generation=tag_values["connection_generation"],
+            connection_generation=observation_values["connection_generation"],
+            source_high_watermark=high_watermark,
+            session_binding_sha256=session_digest,
+        )
+        self._active_ctp_callback_sessions[owner_handle.owner_intent_id] = binding
+        return binding
+
+    @staticmethod
+    def _ctp_callback_session_generation_id(owner_row: Mapping[str, Any]) -> str:
+        epoch = owner_row["native_client_epoch"]
+        api_generation = owner_row["native_api_generation"]
+        connection_generation = owner_row["active_connection_generation"]
+        front_id = owner_row["front_id"]
+        session_id = owner_row["session_id"]
+        if (
+            type(epoch) is not str
+            or len(epoch) != 32
+            or any(char not in "0123456789abcdef" for char in epoch)
+            or type(api_generation) is not int
+            or api_generation <= 0
+            or type(connection_generation) is not int
+            or connection_generation <= 0
+            or type(front_id) is not int
+            or front_id <= 0
+            or type(session_id) is not int
+            or session_id <= 0
+        ):
+            raise ContractValidationError("active CTP callback session identity is invalid")
+        return (
+            f"ctp-native-v2:{epoch}:{api_generation}:{connection_generation}:"
+            f"{front_id}:{session_id}"
+        )
+
+    def _require_ctp_callback_session_owner_handle(
+        self,
+        cursor: sqlite3.Cursor,
+        scope: ExecutionScope,
+        owner_handle: CtpCallbackSessionOwnerHandle,
+        *,
+        allowed_states: frozenset[str] | None = None,
+        writer_lease: WriterLease | None = None,
+        now_ns: int | None = None,
+    ) -> sqlite3.Row:
+        account_key, _, scope_key = self._validate_ctp_order_identity_scope(scope)
+        if (
+            type(owner_handle) is not CtpCallbackSessionOwnerHandle
+            or self._issued_ctp_callback_session_owners.get(owner_handle.owner_intent_id)
+            is not owner_handle
+            or owner_handle.account_key != account_key
+            or owner_handle.scope_key != scope_key
+        ):
+            raise ContractValidationError(
+                "exact same-Store CTP callback session owner handle is required"
+            )
+        row = cursor.execute(
+            """
+            SELECT * FROM ctp_dispatch_callback_session_owners
+            WHERE owner_intent_id = ? AND account_key = ? AND scope_key = ?
+            """,
+            (owner_handle.owner_intent_id, account_key, scope_key),
+        ).fetchone()
+        if row is None:
+            raise ContractValidationError("durable CTP callback session owner is missing")
+        if allowed_states is not None and str(row["owner_state"]) not in allowed_states:
+            raise InvalidStateTransition("CTP callback session owner is not active")
+        if writer_lease is not None:
+            self._assert_active_writer_lease(
+                cursor, scope, writer_lease, now_ns=now_ns
+            )
+            if (
+                str(row["writer_owner_id"]) != writer_lease.owner_id
+                or int(row["writer_fencing_token"]) != writer_lease.fencing_token
+            ):
+                raise WriterLeaseUnavailable()
+        return row
+
+    def poison_ctp_callback_session_owner(
+        self,
+        owner_handle: CtpCallbackSessionOwnerHandle,
+        reason_code: str,
+        *,
+        source_tags: Mapping[str, Any] | None = None,
+        last_sequence: int | None = None,
+    ) -> CtpCallbackSessionPoisonCommit:
+        """Permanently poison a one-shot owner after source uncertainty.
+
+        Poisoning is monotonic and fail-safe, so it does not require a currently
+        live writer lease. Callback/source detail is never copied into the
+        durable poison marker. The permanent owner row itself remains an
+        account fence if this best-effort poison transaction cannot commit.
+        """
+
+        if type(owner_handle) is not CtpCallbackSessionOwnerHandle or (
+            self._issued_ctp_callback_session_owners.get(owner_handle.owner_intent_id)
+            is not owner_handle
+        ):
+            raise ContractValidationError(
+                "exact same-Store CTP callback session owner handle is required"
+            )
+        if type(reason_code) is not str or reason_code not in _CTP_CALLBACK_OWNER_POISON_CODES:
+            raise ContractValidationError("invalid CTP callback owner poison code")
+        if last_sequence is not None and (type(last_sequence) is not int or last_sequence < 0):
+            raise ContractValidationError("invalid CTP callback owner sequence")
+        effective_reason = reason_code
+        if source_tags is not None:
+            expected = {
+                "source_instance_id",
+                "native_client_epoch",
+                "native_api_source_id",
+                "native_spi_source_id",
+                "native_api_generation",
+                "connection_generation",
+            }
+            if not isinstance(source_tags, Mapping) or set(source_tags) != expected or any(
+                type(source_tags[name]) not in (str, int)
+                or (type(source_tags[name]) is str and len(source_tags[name]) > 128)
+                for name in expected
+            ):
+                effective_reason = "source_identity_mismatch"
+
+        with self._transaction() as cursor:
+            row = cursor.execute(
+                "SELECT * FROM ctp_dispatch_callback_session_owners "
+                "WHERE owner_intent_id = ? AND account_key = ? AND scope_key = ?",
+                (
+                    owner_handle.owner_intent_id,
+                    owner_handle.account_key,
+                    owner_handle.scope_key,
+                ),
+            ).fetchone()
+            if row is None:
+                raise ContractValidationError("durable CTP callback session owner is missing")
+            if source_tags is not None and set(source_tags) == {
+                "source_instance_id",
+                "native_client_epoch",
+                "native_api_source_id",
+                "native_spi_source_id",
+                "native_api_generation",
+                "connection_generation",
+            }:
+                for incoming, column in (
+                    ("source_instance_id", "source_instance_id"),
+                    ("native_client_epoch", "native_client_epoch"),
+                    ("native_api_source_id", "native_api_source_id"),
+                    ("native_spi_source_id", "native_spi_source_id"),
+                    ("native_api_generation", "native_api_generation"),
+                    ("connection_generation", "connection_generation"),
+                ):
+                    stored = row[column]
+                    if stored is not None and stored != source_tags[incoming]:
+                        effective_reason = "source_identity_mismatch"
+                        break
+            current_state = str(row["owner_state"])
+            if current_state != "POISONED":
+                cursor.execute(
+                    """
+                    UPDATE ctp_dispatch_callback_session_owners
+                    SET owner_state = 'POISONED', poison_code = ?,
+                        poison_observed_sequence = MAX(last_source_sequence, COALESCE(?, 0)),
+                        updated_at_ns = ?
+                    WHERE owner_intent_id = ? AND owner_state IN ('PREPARED', 'ACTIVE')
+                    """,
+                    (
+                        effective_reason,
+                        last_sequence,
+                        time.time_ns(),
+                        owner_handle.owner_intent_id,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise InvalidStateTransition("CTP callback session owner changed")
+                row = cursor.execute(
+                    "SELECT * FROM ctp_dispatch_callback_session_owners "
+                    "WHERE owner_intent_id = ?",
+                    (owner_handle.owner_intent_id,),
+                ).fetchone()
+                assert row is not None
+            persisted_sequence = int(
+                row["poison_observed_sequence"]
+                if row["poison_observed_sequence"] is not None
+                else row["last_source_sequence"]
+            )
+            persisted_code = str(row["poison_code"])
+        return CtpCallbackSessionPoisonCommit(
+            owner_intent_id=owner_handle.owner_intent_id,
+            durable_state="POISONED",
+            last_source_sequence=persisted_sequence,
+            poison_code=persisted_code,
+        )
 
     def _migrate_legacy_ctp_callback_source_lifecycle_fences(
         self, cursor: sqlite3.Cursor, *, previous_tables: set[str]
@@ -1474,6 +3464,98 @@ class SqliteExecutionStore:
             )
             fenced_accounts.add(account_key)
 
+    def _migrate_legacy_ctp_action_ref_accounts(self, cursor: sqlite3.Cursor) -> None:
+        """Validate historical dispatch identity and fence pre-V2 cancel history.
+
+        V1 ActionRef values may have been sent to a native provider and cannot
+        safely seed the independent integer allocator. Preserve their command
+        bytes and audit rows; the account fence prevents a new V2 allocation.
+        Every historical command must also retain a canonical account and
+        scope key. An unidentifiable completed SUBMIT is enough to make the
+        account boundary unknowable, so reject the whole migration rather than
+        treating a malformed key as a separate account.
+        """
+
+        historical_rows = cursor.execute(
+            "SELECT account_key, scope_key FROM ctp_dispatch_commands"
+        ).fetchall()
+        for row in historical_rows:
+            if not _is_prefixed_digest(str(row["account_key"]), "account:"):
+                raise DurableStoreError("historical CTP dispatch account identity is unreadable")
+            if not _is_prefixed_digest(str(row["scope_key"]), "scope:"):
+                raise DurableStoreError("historical CTP dispatch scope identity is unreadable")
+        if cursor.execute("PRAGMA foreign_key_check").fetchone() is not None:
+            raise DurableStoreError("historical CTP foreign key integrity is inconsistent")
+
+        fenced_accounts = {
+            str(row["account_key"])
+            for row in cursor.execute(
+                "SELECT account_key FROM ctp_dispatch_callback_source_lifecycle_fences"
+            ).fetchall()
+        }
+        rows = cursor.execute(
+            """
+            SELECT account_key, scope_key, command_id, request_payload_sha256,
+                   session_binding_sha256, correlation_version, updated_at_ns
+            FROM ctp_dispatch_commands
+            WHERE operation = 'CANCEL' AND correlation_version < 2
+            ORDER BY account_key, created_at_ns, command_id
+            """
+        ).fetchall()
+        for row in rows:
+            account_key = str(row["account_key"])
+            if not _is_prefixed_digest(account_key, "account:"):
+                raise DurableStoreError("legacy CTP cancel account identity is unreadable")
+            if account_key in fenced_accounts:
+                continue
+            if not _is_prefixed_digest(str(row["scope_key"]), "scope:"):
+                raise DurableStoreError("legacy CTP cancel scope identity is unreadable")
+            command_id = str(row["command_id"])
+            if int(row["correlation_version"]) == 1:
+                command_row = cursor.execute(
+                    "SELECT * FROM ctp_dispatch_commands WHERE account_key = ? AND command_id = ?",
+                    (account_key, command_id),
+                ).fetchone()
+                if command_row is None:
+                    raise DurableStoreError("legacy CTP cancel command disappeared during migration")
+                command = self._ctp_dispatch_command_from_row(command_row)
+                if command.correlation_key is None:
+                    raise DurableStoreError("legacy CTP cancel has no exact correlation")
+                correlation_digest = payload_sha256(command.correlation_key.to_payload())
+            else:
+                # Correlation version zero has no typed source identity. Bind
+                # the permanent fence to its immutable command digest instead
+                # of inventing a native ActionRef from an old payload.
+                correlation_digest = payload_sha256(
+                    {
+                        "migration": "ctp_legacy_cancel_fence.v1",
+                        "account_key": account_key,
+                        "command_id": command_id,
+                        "request_payload_sha256": str(row["request_payload_sha256"]),
+                    }
+                )
+            session_digest = str(row["session_binding_sha256"])
+            if not _is_sha256(correlation_digest) or not _is_sha256(session_digest):
+                raise DurableStoreError("legacy CTP cancel fence digest is invalid")
+            cursor.execute(
+                """
+                INSERT INTO ctp_dispatch_callback_source_lifecycle_fences(
+                    account_key, scope_key, command_id, source_lifecycle_fence_id,
+                    correlation_key_sha256, session_binding_sha256, created_at_ns
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    account_key,
+                    str(row["scope_key"]),
+                    command_id,
+                    uuid.uuid4().hex,
+                    correlation_digest,
+                    session_digest,
+                    int(row["updated_at_ns"]),
+                ),
+            )
+            fenced_accounts.add(account_key)
+
     def _create_schema(self) -> None:
         with self._transaction() as cursor:
             # Capture lineage facts before CREATE TABLE IF NOT EXISTS adds the
@@ -1487,6 +3569,24 @@ class SqliteExecutionStore:
                     "SELECT name FROM sqlite_master WHERE type = 'table'"
                 ).fetchall()
             }
+            if "ctp_dispatch_commands" in previous_tables:
+                existing_command_columns = {
+                    str(item["name"])
+                    for item in cursor.execute(
+                        "PRAGMA table_info(ctp_dispatch_commands)"
+                    ).fetchall()
+                }
+                for name, declaration in (
+                    ("callback_owner_intent_id", "TEXT"),
+                    (
+                        "native_call_inflight",
+                        "INTEGER NOT NULL DEFAULT 0 CHECK(native_call_inflight IN (0, 1))",
+                    ),
+                ):
+                    if name not in existing_command_columns:
+                        cursor.execute(
+                            f"ALTER TABLE ctp_dispatch_commands ADD COLUMN {name} {declaration}"
+                        )
             self._execute_schema_statements(
                 cursor,
                 """
@@ -1521,6 +3621,7 @@ class SqliteExecutionStore:
                     state TEXT NOT NULL,
                     payload_json TEXT NOT NULL,
                     created_at_ns INTEGER NOT NULL,
+                    journal_incarnation_id TEXT,
                     FOREIGN KEY(scope_key, intent_id)
                         REFERENCES execution_records(scope_key, intent_id)
                 );
@@ -1744,6 +3845,14 @@ class SqliteExecutionStore:
                     dispatch_session_id INTEGER,
                     native_request_id INTEGER,
                     native_action_ref TEXT,
+                    native_action_ref_int INTEGER
+                        CHECK(native_action_ref_int IS NULL OR
+                              (typeof(native_action_ref_int) = 'integer' AND
+                               native_action_ref_int BETWEEN 1 AND 2147483647)),
+                    native_request_payload_json TEXT,
+                    native_request_payload_sha256 TEXT
+                        CHECK(native_request_payload_sha256 IS NULL OR
+                              length(native_request_payload_sha256) = 64),
                     local_queue_receipt_id TEXT
                         CHECK(local_queue_receipt_id IS NULL OR
                               (length(local_queue_receipt_id) = 32 AND
@@ -1757,6 +3866,9 @@ class SqliteExecutionStore:
                     claimed_at_ns INTEGER,
                     claimed_owner_id TEXT,
                     claimed_fencing_token INTEGER,
+                    callback_owner_intent_id TEXT,
+                    native_call_inflight INTEGER NOT NULL DEFAULT 0
+                        CHECK(native_call_inflight IN (0, 1)),
                     completed_at_ns INTEGER,
                     unknown_at_ns INTEGER,
                     unknown_reason TEXT,
@@ -1787,6 +3899,71 @@ class SqliteExecutionStore:
                     ON ctp_dispatch_commands(account_key, scope_key, status, created_at_ns);
                 CREATE INDEX IF NOT EXISTS ctp_dispatch_commands_account_status
                     ON ctp_dispatch_commands(account_key, status, created_at_ns);
+                CREATE TABLE IF NOT EXISTS ctp_native_action_ref_counters (
+                    account_key TEXT PRIMARY KEY,
+                    last_action_ref INTEGER NOT NULL
+                        CHECK(typeof(last_action_ref) = 'integer' AND
+                              last_action_ref BETWEEN 0 AND 2147483647),
+                    updated_at_ns INTEGER NOT NULL
+                );
+                CREATE TRIGGER IF NOT EXISTS ctp_native_action_ref_counter_monotonic
+                BEFORE UPDATE OF last_action_ref ON ctp_native_action_ref_counters
+                WHEN NEW.last_action_ref != OLD.last_action_ref + 1
+                     OR NEW.last_action_ref > 2147483647
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP native ActionRef counter must increment by one');
+                END;
+                CREATE TRIGGER IF NOT EXISTS ctp_native_action_ref_counter_no_delete
+                BEFORE DELETE ON ctp_native_action_ref_counters
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP native ActionRef counter is durable');
+                END;
+                CREATE TABLE IF NOT EXISTS ctp_native_action_ref_allocations (
+                    account_key TEXT NOT NULL,
+                    native_action_ref INTEGER NOT NULL
+                        CHECK(typeof(native_action_ref) = 'integer' AND
+                              native_action_ref BETWEEN 1 AND 2147483647),
+                    scope_key TEXT NOT NULL,
+                    command_id TEXT NOT NULL,
+                    managed_action_id TEXT NOT NULL,
+                    allocated_at_ns INTEGER NOT NULL,
+                    PRIMARY KEY(account_key, native_action_ref),
+                    UNIQUE(account_key, command_id),
+                    UNIQUE(account_key, scope_key, managed_action_id),
+                    FOREIGN KEY(account_key, command_id)
+                        REFERENCES ctp_dispatch_commands(account_key, command_id)
+                );
+                CREATE TRIGGER IF NOT EXISTS ctp_native_action_ref_allocations_immutable_update
+                BEFORE UPDATE ON ctp_native_action_ref_allocations
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP native ActionRef allocation is immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS ctp_native_action_ref_allocations_immutable_delete
+                BEFORE DELETE ON ctp_native_action_ref_allocations
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP native ActionRef allocation is immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS ctp_dispatch_session_owner_write_once
+                BEFORE UPDATE ON ctp_dispatch_commands
+                WHEN
+                    (OLD.callback_owner_intent_id IS NOT NULL
+                     AND NEW.callback_owner_intent_id != OLD.callback_owner_intent_id)
+                    OR (OLD.callback_owner_intent_id IS NULL
+                        AND NEW.callback_owner_intent_id IS NOT NULL
+                        AND NOT (OLD.status = 'READY' AND NEW.status = 'CLAIMED'
+                                 AND NEW.native_call_inflight = 1))
+                    OR (OLD.native_call_inflight != NEW.native_call_inflight
+                        AND NOT ((OLD.native_call_inflight = 0
+                                  AND NEW.native_call_inflight = 1
+                                  AND OLD.status = 'READY' AND NEW.status = 'CLAIMED'
+                                  AND NEW.callback_owner_intent_id IS NOT NULL)
+                              OR (OLD.native_call_inflight = 1
+                                  AND NEW.native_call_inflight = 0
+                                  AND OLD.status = 'CLAIMED'
+                                  AND NEW.status IN ('COMPLETED', 'UNKNOWN'))))
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP session owner command binding is immutable');
+                END;
                 CREATE TABLE IF NOT EXISTS ctp_dispatch_callback_ledger (
                     account_key TEXT NOT NULL,
                     scope_key TEXT NOT NULL,
@@ -1822,6 +3999,99 @@ class SqliteExecutionStore:
                 );
                 CREATE INDEX IF NOT EXISTS ctp_dispatch_callback_command
                     ON ctp_dispatch_callback_ledger(account_key, command_id, applied_at_ns);
+                CREATE TABLE IF NOT EXISTS ctp_dispatch_trade_fact_ledger (
+                    account_key TEXT NOT NULL,
+                    scope_key TEXT NOT NULL,
+                    trading_day TEXT NOT NULL,
+                    owner_intent_id TEXT NOT NULL,
+                    source_sequence INTEGER NOT NULL CHECK(source_sequence > 0),
+                    ingress_record_digest_sha256 TEXT NOT NULL
+                        CHECK(length(ingress_record_digest_sha256) = 64),
+                    command_id TEXT NOT NULL,
+                    managed_intent_id TEXT NOT NULL,
+                    runtime_order_id TEXT NOT NULL,
+                    order_ref TEXT NOT NULL,
+                    session_generation_id TEXT NOT NULL,
+                    callback_stream_id TEXT NOT NULL,
+                    callback_event_id TEXT NOT NULL,
+                    exchange_id TEXT NOT NULL,
+                    trade_id TEXT NOT NULL,
+                    order_sys_id TEXT NOT NULL,
+                    instrument_id TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    offset_flag TEXT NOT NULL,
+                    hedge_flag TEXT NOT NULL,
+                    trade_price TEXT NOT NULL,
+                    trade_volume INTEGER NOT NULL CHECK(trade_volume > 0),
+                    cumulative_trade_volume INTEGER NOT NULL CHECK(cumulative_trade_volume > 0),
+                    cumulative_order_volume INTEGER,
+                    prefix_consistency TEXT NOT NULL CHECK(prefix_consistency IN (
+                        'NO_ORDER_CUMULATIVE', 'MATCHED',
+                        'ORDER_CUMULATIVE_AHEAD', 'TRADE_CUMULATIVE_AHEAD'
+                    )),
+                    cumulative_commission TEXT CHECK(cumulative_commission IS NULL),
+                    commission_quality TEXT NOT NULL CHECK(commission_quality = 'INCOMPLETE'),
+                    fact_payload_json TEXT NOT NULL,
+                    fact_payload_sha256 TEXT NOT NULL CHECK(length(fact_payload_sha256) = 64),
+                    source_digest_sha256 TEXT NOT NULL CHECK(length(source_digest_sha256) = 64),
+                    verifier_id TEXT NOT NULL,
+                    verified_at_ns INTEGER NOT NULL,
+                    applied_at_ns INTEGER NOT NULL,
+                    PRIMARY KEY(account_key, trading_day, exchange_id, trade_id),
+                    UNIQUE(owner_intent_id, source_sequence),
+                    FOREIGN KEY(account_key, command_id)
+                        REFERENCES ctp_dispatch_commands(account_key, command_id),
+                    FOREIGN KEY(owner_intent_id, source_sequence)
+                        REFERENCES ctp_dispatch_callback_ingress(owner_intent_id, source_sequence)
+                );
+                CREATE INDEX IF NOT EXISTS ctp_dispatch_trade_command
+                    ON ctp_dispatch_trade_fact_ledger(account_key, command_id, source_sequence);
+                CREATE TRIGGER IF NOT EXISTS ctp_dispatch_trade_fact_immutable_update
+                BEFORE UPDATE ON ctp_dispatch_trade_fact_ledger
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP trade fact ledger is immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS ctp_dispatch_trade_fact_immutable_delete
+                BEFORE DELETE ON ctp_dispatch_trade_fact_ledger
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP trade fact ledger is immutable');
+                END;
+                CREATE TABLE IF NOT EXISTS ctp_dispatch_order_cumulative_ledger (
+                    owner_intent_id TEXT NOT NULL,
+                    source_sequence INTEGER NOT NULL CHECK(source_sequence > 0),
+                    account_key TEXT NOT NULL,
+                    scope_key TEXT NOT NULL,
+                    trading_day TEXT NOT NULL,
+                    command_id TEXT NOT NULL,
+                    runtime_order_id TEXT NOT NULL,
+                    order_ref TEXT NOT NULL,
+                    native_volume_traded INTEGER NOT NULL CHECK(native_volume_traded >= 0),
+                    trade_volume_at_prefix INTEGER NOT NULL CHECK(trade_volume_at_prefix >= 0),
+                    prefix_consistency TEXT NOT NULL CHECK(prefix_consistency IN (
+                        'MATCHED', 'ORDER_CUMULATIVE_AHEAD', 'TRADE_CUMULATIVE_AHEAD'
+                    )),
+                    ingress_record_digest_sha256 TEXT NOT NULL
+                        CHECK(length(ingress_record_digest_sha256) = 64),
+                    callback_key_sha256 TEXT NOT NULL CHECK(length(callback_key_sha256) = 64),
+                    observed_at_ns INTEGER NOT NULL,
+                    PRIMARY KEY(owner_intent_id, source_sequence),
+                    FOREIGN KEY(account_key, command_id)
+                        REFERENCES ctp_dispatch_commands(account_key, command_id),
+                    FOREIGN KEY(owner_intent_id, source_sequence)
+                        REFERENCES ctp_dispatch_callback_ingress(owner_intent_id, source_sequence)
+                );
+                CREATE INDEX IF NOT EXISTS ctp_dispatch_order_cumulative_command
+                    ON ctp_dispatch_order_cumulative_ledger(account_key, command_id, source_sequence);
+                CREATE TRIGGER IF NOT EXISTS ctp_dispatch_order_cumulative_immutable_update
+                BEFORE UPDATE ON ctp_dispatch_order_cumulative_ledger
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP order cumulative ledger is immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS ctp_dispatch_order_cumulative_immutable_delete
+                BEFORE DELETE ON ctp_dispatch_order_cumulative_ledger
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP order cumulative ledger is immutable');
+                END;
                 CREATE TABLE IF NOT EXISTS ctp_dispatch_callback_source_lifecycle_fences (
                     account_key TEXT NOT NULL,
                     scope_key TEXT NOT NULL,
@@ -1849,6 +4119,135 @@ class SqliteExecutionStore:
                 BEFORE DELETE ON ctp_dispatch_callback_source_lifecycle_fences
                 BEGIN
                     SELECT RAISE(ABORT, 'CTP callback source lifecycle fence is immutable');
+                END;
+                CREATE TABLE IF NOT EXISTS ctp_dispatch_callback_session_owners (
+                    owner_intent_id TEXT PRIMARY KEY
+                        CHECK(length(owner_intent_id) = 32
+                              AND owner_intent_id NOT GLOB '*[^0-9a-f]*'),
+                    account_key TEXT NOT NULL UNIQUE,
+                    scope_key TEXT NOT NULL,
+                    owner_state TEXT NOT NULL
+                        CHECK(owner_state IN ('PREPARED', 'ACTIVE', 'POISONED')),
+                    writer_owner_id TEXT NOT NULL,
+                    writer_fencing_token INTEGER NOT NULL CHECK(writer_fencing_token > 0),
+                    source_instance_id TEXT,
+                    native_client_epoch TEXT,
+                    native_api_source_id TEXT,
+                    native_spi_source_id TEXT,
+                    native_api_generation INTEGER,
+                    connection_generation INTEGER,
+                    trading_day TEXT,
+                    front_id INTEGER,
+                    session_id INTEGER,
+                    active_connection_generation INTEGER,
+                    last_source_sequence INTEGER NOT NULL DEFAULT 0
+                        CHECK(last_source_sequence >= 0),
+                    economic_query_observed INTEGER NOT NULL DEFAULT 0
+                        CHECK(economic_query_observed IN (0, 1)),
+                    poison_observed_sequence INTEGER CHECK(
+                        poison_observed_sequence IS NULL OR poison_observed_sequence >= 0
+                    ),
+                    poison_code TEXT,
+                    created_at_ns INTEGER NOT NULL,
+                    updated_at_ns INTEGER NOT NULL,
+                    CHECK((owner_state = 'POISONED' AND poison_code IS NOT NULL)
+                       OR (owner_state != 'POISONED' AND poison_code IS NULL)),
+                    CHECK((owner_state = 'PREPARED' AND trading_day IS NULL
+                           AND front_id IS NULL AND session_id IS NULL
+                           AND active_connection_generation IS NULL)
+                       OR (owner_state = 'ACTIVE'
+                           AND trading_day IS NOT NULL AND front_id IS NOT NULL
+                           AND session_id IS NOT NULL AND active_connection_generation > 0)
+                       OR (owner_state = 'POISONED'
+                           AND ((trading_day IS NULL AND front_id IS NULL AND session_id IS NULL)
+                             OR (trading_day IS NOT NULL AND front_id IS NOT NULL
+                                 AND session_id IS NOT NULL
+                                 AND active_connection_generation > 0))))
+                );
+                CREATE TRIGGER IF NOT EXISTS ctp_callback_session_owner_immutable_identity
+                BEFORE UPDATE ON ctp_dispatch_callback_session_owners
+                WHEN NEW.owner_intent_id != OLD.owner_intent_id
+                  OR NEW.account_key != OLD.account_key
+                  OR NEW.scope_key != OLD.scope_key
+                  OR NEW.writer_owner_id != OLD.writer_owner_id
+                  OR NEW.writer_fencing_token != OLD.writer_fencing_token
+                  OR NEW.last_source_sequence < OLD.last_source_sequence
+                  OR (OLD.economic_query_observed = 1 AND NEW.economic_query_observed != 1)
+                  OR (OLD.owner_state = 'POISONED' AND NEW.owner_state != 'POISONED')
+                  OR (OLD.owner_state = 'ACTIVE' AND NEW.owner_state = 'PREPARED')
+                  OR (OLD.owner_state != 'PREPARED' AND (
+                        NEW.source_instance_id != OLD.source_instance_id
+                     OR NEW.native_client_epoch != OLD.native_client_epoch
+                     OR NEW.native_api_source_id != OLD.native_api_source_id
+                     OR NEW.native_spi_source_id != OLD.native_spi_source_id
+                     OR NEW.native_api_generation != OLD.native_api_generation
+                     OR NEW.connection_generation != OLD.connection_generation
+                     OR NEW.trading_day != OLD.trading_day
+                     OR NEW.front_id != OLD.front_id
+                     OR NEW.session_id != OLD.session_id
+                     OR NEW.active_connection_generation != OLD.active_connection_generation
+                  ))
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP callback session owner identity is immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS ctp_callback_session_owner_no_delete
+                BEFORE DELETE ON ctp_dispatch_callback_session_owners
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP callback session owner is permanent');
+                END;
+                CREATE TABLE IF NOT EXISTS ctp_dispatch_callback_ingress (
+                    owner_intent_id TEXT NOT NULL,
+                    source_sequence INTEGER NOT NULL CHECK(source_sequence > 0),
+                    record_digest_sha256 TEXT NOT NULL
+                        CHECK(length(record_digest_sha256) = 64),
+                    callback_name TEXT NOT NULL,
+                    callback_class TEXT NOT NULL,
+                    source_phase TEXT NOT NULL,
+                    source_instance_id TEXT NOT NULL,
+                    native_client_epoch TEXT NOT NULL,
+                    native_api_source_id TEXT NOT NULL,
+                    native_spi_source_id TEXT NOT NULL,
+                    native_api_generation INTEGER NOT NULL CHECK(native_api_generation > 0),
+                    source_connection_generation INTEGER NOT NULL
+                        CHECK(source_connection_generation >= 0),
+                    connection_generation INTEGER NOT NULL CHECK(connection_generation >= 0),
+                    record_payload_json TEXT NOT NULL,
+                    captured_at_ns INTEGER NOT NULL,
+                    PRIMARY KEY(owner_intent_id, source_sequence),
+                    FOREIGN KEY(owner_intent_id)
+                        REFERENCES ctp_dispatch_callback_session_owners(owner_intent_id)
+                );
+                CREATE TRIGGER IF NOT EXISTS ctp_callback_ingress_immutable_update
+                BEFORE UPDATE ON ctp_dispatch_callback_ingress
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP callback ingress record is immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS ctp_callback_ingress_immutable_delete
+                BEFORE DELETE ON ctp_dispatch_callback_ingress
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP callback ingress record is immutable');
+                END;
+                CREATE TABLE IF NOT EXISTS ctp_dispatch_callback_ingress_applications (
+                    owner_intent_id TEXT NOT NULL,
+                    source_sequence INTEGER NOT NULL CHECK(source_sequence > 0),
+                    outcome TEXT NOT NULL CHECK(outcome IN ('AUDIT_ONLY', 'APPLIED', 'POISONED')),
+                    command_id TEXT,
+                    application_digest_sha256 TEXT NOT NULL
+                        CHECK(length(application_digest_sha256) = 64),
+                    applied_at_ns INTEGER NOT NULL,
+                    PRIMARY KEY(owner_intent_id, source_sequence),
+                    FOREIGN KEY(owner_intent_id, source_sequence)
+                        REFERENCES ctp_dispatch_callback_ingress(owner_intent_id, source_sequence)
+                );
+                CREATE TRIGGER IF NOT EXISTS ctp_callback_ingress_applications_immutable_update
+                BEFORE UPDATE ON ctp_dispatch_callback_ingress_applications
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP callback ingress application is immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS ctp_callback_ingress_applications_immutable_delete
+                BEFORE DELETE ON ctp_dispatch_callback_ingress_applications
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP callback ingress application is immutable');
                 END;
                 CREATE TABLE IF NOT EXISTS ctp_dispatch_order_projection (
                     account_key TEXT NOT NULL,
@@ -2016,6 +4415,18 @@ class SqliteExecutionStore:
                 version = str(self._SCHEMA_VERSION)
             else:
                 version = str(row["value"])
+            outbox_columns = {
+                str(item["name"])
+                for item in cursor.execute("PRAGMA table_info(execution_outbox)").fetchall()
+            }
+            if "journal_incarnation_id" not in outbox_columns:
+                cursor.execute(
+                    "ALTER TABLE execution_outbox ADD COLUMN journal_incarnation_id TEXT"
+                )
+            cursor.execute(
+                "INSERT OR IGNORE INTO execution_meta(key, value) VALUES (?, ?)",
+                ("journal_incarnation_id", uuid.uuid4().hex),
+            )
             target_projection_tables = {
                 "ctp_order_target_projections",
                 "ctp_order_target_projection_consumptions",
@@ -2068,6 +4479,32 @@ class SqliteExecutionStore:
                     raise DurableStoreError(
                         "inconsistent schema 12 callback guard lineage"
                     )
+            elif version == "15":
+                required_v15_tables = {
+                    "ctp_dispatch_callback_ledger",
+                    "ctp_dispatch_callback_source_lifecycle_fences",
+                    "ctp_dispatch_callback_session_owners",
+                    "ctp_dispatch_callback_ingress",
+                    "ctp_dispatch_callback_ingress_applications",
+                    "ctp_order_target_projections",
+                    "ctp_order_target_projection_consumptions",
+                }
+                if not required_v15_tables.issubset(previous_tables):
+                    raise DurableStoreError("incomplete schema 15 CTP callback lineage")
+            elif version == "16":
+                required_v16_tables = {
+                    "ctp_dispatch_commands",
+                    "ctp_dispatch_callback_ledger",
+                    "ctp_dispatch_callback_source_lifecycle_fences",
+                    "ctp_dispatch_callback_session_owners",
+                    "ctp_dispatch_callback_ingress",
+                    "ctp_dispatch_callback_ingress_applications",
+                    "ctp_dispatch_trade_fact_ledger",
+                    "ctp_order_target_projections",
+                    "ctp_order_target_projection_consumptions",
+                }
+                if not required_v16_tables.issubset(previous_tables):
+                    raise DurableStoreError("incomplete schema 16 CTP execution lineage")
             if version == "2":
                 columns = {
                     str(item["name"])
@@ -2078,7 +4515,7 @@ class SqliteExecutionStore:
                         "ALTER TABLE execution_records ADD COLUMN cumulative_commission TEXT"
                     )
             elif version not in {
-                "3", "4", "5", "6", "7", "8", "9", "10", "11", "12",
+                "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16",
                 str(self._SCHEMA_VERSION),
             }:
                 raise DurableStoreError("unsupported execution store schema")
@@ -2096,6 +4533,9 @@ class SqliteExecutionStore:
                 "dispatch_session_id": "INTEGER",
                 "native_request_id": "INTEGER",
                 "native_action_ref": "TEXT",
+                "native_action_ref_int": "INTEGER",
+                "native_request_payload_json": "TEXT",
+                "native_request_payload_sha256": "TEXT",
                 "local_queue_receipt_id": (
                     "TEXT CHECK(local_queue_receipt_id IS NULL OR "
                     "(length(local_queue_receipt_id) = 32 AND "
@@ -2111,17 +4551,29 @@ class SqliteExecutionStore:
                     cursor.execute(
                         f"ALTER TABLE ctp_dispatch_commands ADD COLUMN {name} {declaration}"
                     )
+            session_owner_columns = {
+                "callback_owner_intent_id": "TEXT",
+                "native_call_inflight": "INTEGER NOT NULL DEFAULT 0 CHECK(native_call_inflight IN (0, 1))",
+            }
+            for name, declaration in session_owner_columns.items():
+                if name not in columns:
+                    cursor.execute(
+                        f"ALTER TABLE ctp_dispatch_commands ADD COLUMN {name} {declaration}"
+                    )
             if version != str(self._SCHEMA_VERSION):
                 self._migrate_legacy_ctp_callback_source_lifecycle_fences(
                     cursor, previous_tables=previous_tables
                 )
+                self._migrate_legacy_ctp_action_ref_accounts(cursor)
                 # Old rows have no exact OrderRef cutover-session evidence.
                 # Never let migration make those commands dispatchable.
                 cursor.execute(
                     """
                     UPDATE ctp_dispatch_commands
                     SET status = 'UNKNOWN', unknown_at_ns = COALESCE(unknown_at_ns, updated_at_ns),
-                        unknown_reason = 'schema_upgrade_requires_ctp_orderref_cutover'
+                        unknown_reason = COALESCE(
+                            unknown_reason, 'schema_upgrade_requires_ctp_v2_dispatch_cutover'
+                        )
                     WHERE status IN ('READY', 'CLAIMED')
                     """
                 )
@@ -2154,14 +4606,21 @@ class SqliteExecutionStore:
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS ctp_dispatch_session_request_unique
                 ON ctp_dispatch_commands(account_key, session_generation_id, native_request_id)
-                WHERE correlation_version = 1
+                WHERE correlation_version IN (1, 2)
                 """
             )
             cursor.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS ctp_dispatch_managed_action_unique
                 ON ctp_dispatch_commands(account_key, scope_key, managed_action_id)
-                WHERE correlation_version = 1
+                WHERE correlation_version IN (1, 2)
+                """
+            )
+            cursor.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS ctp_dispatch_native_action_ref_unique
+                ON ctp_dispatch_commands(account_key, native_action_ref_int)
+                WHERE correlation_version = 2 AND native_action_ref_int IS NOT NULL
                 """
             )
             cursor.execute(
@@ -2184,6 +4643,8 @@ class SqliteExecutionStore:
                     session_binding_sha256, correlation_version, runtime_order_id,
                     managed_action_id, session_generation_id, dispatch_front_id,
                     dispatch_session_id, native_request_id, native_action_ref,
+                    native_action_ref_int, native_request_payload_json,
+                    native_request_payload_sha256,
                     local_queue_receipt_id
                 ON ctp_dispatch_commands
                 BEGIN
@@ -3899,9 +6360,115 @@ class SqliteExecutionStore:
             return self._ctp_order_identity_from_row(result)
 
     @staticmethod
+    def _allocate_ctp_native_action_ref(
+        cursor: sqlite3.Cursor,
+        *,
+        account_key: str,
+        scope_key: str,
+        command_id: str,
+        managed_action_id: str,
+        allocated_at_ns: int,
+    ) -> int:
+        """Allocate one durable account-lifetime CTP int32 OrderActionRef."""
+
+        existing = cursor.execute(
+            """
+            SELECT native_action_ref FROM ctp_native_action_ref_allocations
+            WHERE account_key = ? AND command_id = ?
+            """,
+            (account_key, command_id),
+        ).fetchone()
+        if existing is not None:
+            raise IntentConflictError("CTP native ActionRef was already allocated to this command")
+        counter = cursor.execute(
+            "SELECT last_action_ref FROM ctp_native_action_ref_counters WHERE account_key = ?",
+            (account_key,),
+        ).fetchone()
+        if counter is None:
+            next_value = 1
+            cursor.execute(
+                """
+                INSERT INTO ctp_native_action_ref_counters(
+                    account_key, last_action_ref, updated_at_ns
+                ) VALUES (?, ?, ?)
+                """,
+                (account_key, next_value, allocated_at_ns),
+            )
+        else:
+            previous = int(counter["last_action_ref"])
+            if previous >= 2_147_483_647:
+                raise DurableStoreError("CTP native ActionRef int32 sequence is exhausted")
+            next_value = previous + 1
+            cursor.execute(
+                """
+                UPDATE ctp_native_action_ref_counters
+                SET last_action_ref = ?, updated_at_ns = ?
+                WHERE account_key = ? AND last_action_ref = ?
+                """,
+                (next_value, allocated_at_ns, account_key, previous),
+            )
+            if cursor.rowcount != 1:
+                raise DurableStoreError("CTP native ActionRef counter changed unexpectedly")
+        if type(next_value) is not int or not 1 <= next_value <= 2_147_483_647:
+            raise DurableStoreError("CTP native ActionRef allocator produced an invalid value")
+        return next_value
+
+    @staticmethod
+    def _require_ctp_native_action_ref_allocation(
+        cursor: sqlite3.Cursor,
+        row: sqlite3.Row,
+        correlation: CtpDispatchCorrelationKey,
+    ) -> None:
+        """Match a V2 cancel command to its immutable allocator row and counter."""
+
+        if correlation.version != 2:
+            raise InvalidStateTransition("legacy CTP command is audit-only")
+        if correlation.operation == "SUBMIT":
+            if correlation.native_action_ref is not None or row["native_action_ref_int"] is not None:
+                raise DurableStoreError("CTP submit unexpectedly carries a native ActionRef")
+            allocated = cursor.execute(
+                "SELECT 1 FROM ctp_native_action_ref_allocations WHERE account_key = ? AND command_id = ?",
+                (str(row["account_key"]), str(row["command_id"])),
+            ).fetchone()
+            if allocated is not None:
+                raise DurableStoreError("CTP submit has a native ActionRef allocation")
+            return
+        action_ref = correlation.native_action_ref
+        if type(action_ref) is not int or not 1 <= action_ref <= 2_147_483_647:
+            raise DurableStoreError("CTP cancel lacks a native ActionRef integer")
+        allocation = cursor.execute(
+            """
+            SELECT native_action_ref, scope_key, managed_action_id
+            FROM ctp_native_action_ref_allocations
+            WHERE account_key = ? AND command_id = ?
+            """,
+            (str(row["account_key"]), str(row["command_id"])),
+        ).fetchone()
+        counter = cursor.execute(
+            "SELECT last_action_ref FROM ctp_native_action_ref_counters WHERE account_key = ?",
+            (str(row["account_key"]),),
+        ).fetchone()
+        if (
+            allocation is None
+            or int(allocation["native_action_ref"]) != action_ref
+            or str(allocation["scope_key"]) != str(row["scope_key"])
+            or str(allocation["managed_action_id"]) != correlation.managed_action_id
+            or row["native_action_ref_int"] is None
+            or int(row["native_action_ref_int"]) != action_ref
+            or counter is None
+            or int(counter["last_action_ref"]) < action_ref
+        ):
+            raise DurableStoreError("CTP cancel ActionRef allocation is missing or mismatched")
+
+    @staticmethod
     def _ctp_dispatch_command_from_row(row: sqlite3.Row) -> CtpDispatchCommand:
         try:
             request_payload = json.loads(str(row["request_payload_json"]))
+            native_request_payload = (
+                None
+                if row["native_request_payload_json"] is None
+                else json.loads(str(row["native_request_payload_json"]))
+            )
             session_binding = json.loads(str(row["session_binding_json"]))
             native_receipt_payload = (
                 None
@@ -3930,14 +6497,32 @@ class SqliteExecutionStore:
                 raise ValueError("stored CTP queue state has no receipt id")
             correlation_version = int(row["correlation_version"])
             correlation_key = None
-            if correlation_version == 1:
+            if correlation_version in {1, 2}:
                 action_order_ref = (
                     str(row["order_ref"])
                     if row["order_ref"] is not None
                     else str(row["cancel_target_order_ref"])
                 )
+                native_action_ref: str | int | None
+                if correlation_version == 1:
+                    native_action_ref = (
+                        None
+                        if row["native_action_ref"] is None
+                        else str(row["native_action_ref"])
+                    )
+                else:
+                    native_action_ref = (
+                        None
+                        if row["native_action_ref_int"] is None
+                        else int(row["native_action_ref_int"])
+                    )
+                native_payload_digest = (
+                    None
+                    if row["native_request_payload_sha256"] is None
+                    else str(row["native_request_payload_sha256"])
+                )
                 correlation_key = CtpDispatchCorrelationKey(
-                    version=1,
+                    version=correlation_version,
                     account_key=str(row["account_key"]),
                     scope_key=str(row["scope_key"]),
                     trading_day=str(row["trading_day"]),
@@ -3975,9 +6560,8 @@ class SqliteExecutionStore:
                     dispatch_front_id=int(row["dispatch_front_id"]),
                     dispatch_session_id=int(row["dispatch_session_id"]),
                     native_request_id=int(row["native_request_id"]),
-                    native_action_ref=(
-                        None if row["native_action_ref"] is None else str(row["native_action_ref"])
-                    ),
+                    native_action_ref=native_action_ref,
+                    native_request_payload_sha256=native_payload_digest,
                 )
                 if (
                     session_binding.get("session_generation_id")
@@ -3987,6 +6571,26 @@ class SqliteExecutionStore:
                     != correlation_key.dispatch_session_id
                 ):
                     raise ValueError("stored CTP session binding differs from correlation")
+                if correlation_version == 1:
+                    if (
+                        row["native_action_ref_int"] is not None
+                        or native_request_payload is not None
+                        or row["native_request_payload_sha256"] is not None
+                    ):
+                        raise ValueError("legacy CTP command has V2 native request fields")
+                else:
+                    expected_native_payload = dict(request_payload)
+                    if correlation_key.operation == "CANCEL":
+                        expected_native_payload["OrderActionRef"] = correlation_key.native_action_ref
+                    if (
+                        row["native_action_ref"] is not None
+                        or not isinstance(native_request_payload, dict)
+                        or canonical_json(native_request_payload)
+                        != str(row["native_request_payload_json"])
+                        or payload_sha256(native_request_payload) != native_payload_digest
+                        or native_request_payload != expected_native_payload
+                    ):
+                        raise ValueError("stored CTP V2 native request payload is inconsistent")
             elif correlation_version == 0:
                 if any(
                     row[name] is not None
@@ -3998,6 +6602,9 @@ class SqliteExecutionStore:
                         "dispatch_session_id",
                         "native_request_id",
                         "native_action_ref",
+                        "native_action_ref_int",
+                        "native_request_payload_json",
+                        "native_request_payload_sha256",
                     )
                 ):
                     raise ValueError("legacy CTP command has partial correlation keys")
@@ -4006,6 +6613,7 @@ class SqliteExecutionStore:
             if (
                 not isinstance(request_payload, dict)
                 or not isinstance(session_binding, dict)
+                or (native_request_payload is not None and not isinstance(native_request_payload, dict))
                 or (
                     native_receipt_payload is not None
                     and not isinstance(native_receipt_payload, dict)
@@ -4013,6 +6621,12 @@ class SqliteExecutionStore:
                 or (completion_echo is not None and not isinstance(completion_echo, dict))
                 or canonical_json(request_payload) != str(row["request_payload_json"])
                 or payload_sha256(request_payload) != str(row["request_payload_sha256"])
+                or (
+                    native_request_payload is not None
+                    and payload_sha256(native_request_payload)
+                    != str(row["native_request_payload_sha256"])
+                )
+                or (native_request_payload is None and row["native_request_payload_sha256"] is not None)
                 or canonical_json(session_binding) != str(row["session_binding_json"])
                 or payload_sha256(session_binding) != str(row["session_binding_sha256"])
                 or (
@@ -4052,7 +6666,18 @@ class SqliteExecutionStore:
             if local_queue_receipt_id is not None:
                 status = str(row["status"])
                 if status in {"CLAIMED", "UNKNOWN"} and local_queue_receipt_queued is not True:
-                    raise ValueError("claimed CTP command lacks a committed queue receipt")
+                    pre_native_unknown = (
+                        status == "UNKNOWN"
+                        and row["unknown_reason"]
+                        in {
+                            "session_pre_native_failure:post_stage_failure",
+                            "session_pre_native_failure:queue_receipt_failure",
+                            "session_pre_native_failure:queue_publish_failure",
+                        }
+                        and local_queue_receipt_queued is None
+                    )
+                    if not pre_native_unknown:
+                        raise ValueError("claimed CTP command lacks a committed queue receipt")
                 if local_queue_receipt_queued is False and status != "COMPLETED":
                     raise ValueError("rejected CTP queue receipt is not terminal")
                 if status == "COMPLETED":
@@ -4133,6 +6758,16 @@ class SqliteExecutionStore:
                 correlation_key=correlation_key,
                 local_queue_receipt_id=local_queue_receipt_id,
                 local_queue_receipt_queued=local_queue_receipt_queued,
+                native_request_payload=(
+                    None
+                    if native_request_payload is None
+                    else MappingProxyType(native_request_payload)
+                ),
+                native_request_payload_sha256=(
+                    None
+                    if row["native_request_payload_sha256"] is None
+                    else str(row["native_request_payload_sha256"])
+                ),
             )
         except (TypeError, ValueError, json.JSONDecodeError) as error:
             raise DurableStoreError("stored CTP command is unreadable") from error
@@ -4156,7 +6791,7 @@ class SqliteExecutionStore:
         dispatch_front_id: int | None = None,
         dispatch_session_id: int | None = None,
         native_request_id: int | None = None,
-        native_action_ref: str | None = None,
+        native_action_ref: Any = None,
         local_queue_receipt_id: str | None = None,
         cancel_target_projection: CtpOrderTargetProjectionHandle | None = None,
     ) -> CtpDispatchCommand:
@@ -4189,7 +6824,7 @@ class SqliteExecutionStore:
         ):
             raise ContractValidationError("typed CTP native RequestID is required")
         if native_action_ref is not None:
-            _validate_correlation_text(native_action_ref, "native ActionRef")
+            raise ContractValidationError("native ActionRef is allocated by the execution Store")
         if local_queue_receipt_id is not None and not _is_local_queue_receipt_id(
             local_queue_receipt_id
         ):
@@ -4207,6 +6842,8 @@ class SqliteExecutionStore:
             raise ContractValidationError("CTP command payload is not canonical JSON") from error
         if not request_value or not isinstance(request_value, dict):
             raise ContractValidationError("CTP command request payload must be a non-empty object")
+        if "OrderActionRef" in request_value:
+            raise ContractValidationError("logical CTP request cannot supply native OrderActionRef")
         if not session_value or not isinstance(session_value, dict):
             raise ContractValidationError("CTP session binding must be a non-empty object")
         if (
@@ -4239,8 +6876,6 @@ class SqliteExecutionStore:
             if managed_action_id not in (None, managed_intent_id):
                 raise ContractValidationError("submit action id must equal its managed intent id")
             managed_action_id = managed_intent_id
-            if native_action_ref is not None:
-                raise ContractValidationError("SUBMIT cannot carry a native cancel ActionRef")
             self._validate_ctp_order_ref(order_ref, "OrderRef")
             if (
                 type(request_value.get("OrderRef")) is not str
@@ -4276,6 +6911,37 @@ class SqliteExecutionStore:
             target_check_now_ns = time.monotonic_ns()
             now_ns = time.time_ns()
             self._assert_active_writer_lease(cursor, scope, writer_lease)
+            if cursor.execute(
+                "SELECT 1 FROM ctp_dispatch_callback_source_lifecycle_fences WHERE account_key = ?",
+                (account_key,),
+            ).fetchone() is not None:
+                raise ContractValidationError("CTP account has a permanent callback lifecycle fence")
+            session_owner = cursor.execute(
+                "SELECT * FROM ctp_dispatch_callback_session_owners WHERE account_key = ?",
+                (account_key,),
+            ).fetchone()
+            if session_owner is not None:
+                owner_intent_id = str(session_owner["owner_intent_id"])
+                active_binding = self._active_ctp_callback_sessions.get(owner_intent_id)
+                if (
+                    active_binding is None
+                    or str(session_owner["owner_state"]) != "ACTIVE"
+                    or session_value.get("binding_type") != "ctp_callback_session_binding.v1"
+                    or session_value.get("owner_intent_id") != owner_intent_id
+                    or active_binding.account_key != account_key
+                    or active_binding.scope_key != scope_key
+                    or active_binding.trading_day != trading_day
+                    or session_digest != active_binding.session_binding_sha256
+                    or session_json
+                    != canonical_json(self._ctp_callback_session_binding_payload(active_binding))
+                    or payload_sha256(
+                        self._ctp_callback_session_binding_payload(active_binding)
+                    )
+                    != active_binding.session_binding_sha256
+                ):
+                    raise ContractValidationError(
+                        "CTP staged session binding differs from active Store session"
+                    )
             if operation == "SUBMIT":
                 reservation = cursor.execute(
                     """
@@ -4339,8 +7005,33 @@ class SqliteExecutionStore:
                 )
             action_order_ref = persisted_order_ref or persisted_cancel_target
             assert action_order_ref is not None
+            existing = cursor.execute(
+                "SELECT * FROM ctp_dispatch_commands WHERE account_key = ? AND command_id = ?",
+                (account_key, command_id),
+            ).fetchone()
+            if existing is not None and int(existing["correlation_version"]) != 2:
+                raise IntentConflictError("legacy CTP command cannot be restaged for native dispatch")
+            if operation == "CANCEL":
+                if existing is None:
+                    native_action_ref = self._allocate_ctp_native_action_ref(
+                        cursor,
+                        account_key=account_key,
+                        scope_key=scope_key,
+                        command_id=command_id,
+                        managed_action_id=str(managed_action_id),
+                        allocated_at_ns=now_ns,
+                    )
+                else:
+                    native_action_ref = int(existing["native_action_ref_int"])
+            else:
+                native_action_ref = None
+            native_request_value = dict(request_value)
+            if operation == "CANCEL":
+                native_request_value["OrderActionRef"] = native_action_ref
+            native_request_json = canonical_json(native_request_value)
+            native_request_digest = payload_sha256(native_request_value)
             CtpDispatchCorrelationKey(
-                version=1,
+                version=2,
                 account_key=account_key,
                 scope_key=scope_key,
                 trading_day=trading_day,
@@ -4363,12 +7054,8 @@ class SqliteExecutionStore:
                 dispatch_session_id=dispatch_session_id,
                 native_request_id=native_request_id,
                 native_action_ref=native_action_ref,
+                native_request_payload_sha256=native_request_digest,
             )
-
-            existing = cursor.execute(
-                "SELECT * FROM ctp_dispatch_commands WHERE account_key = ? AND command_id = ?",
-                (account_key, command_id),
-            ).fetchone()
             immutable = (
                 scope_key,
                 trading_day,
@@ -4386,14 +7073,17 @@ class SqliteExecutionStore:
                 approval_digest,
                 session_json,
                 session_digest,
-                1,
+                2,
                 runtime_order_id,
                 str(managed_action_id),
                 str(session_generation_id),
                 dispatch_front_id,
                 dispatch_session_id,
                 native_request_id,
+                None,
                 native_action_ref,
+                native_request_json,
+                native_request_digest,
                 local_queue_receipt_id,
             )
             if existing is not None:
@@ -4447,12 +7137,25 @@ class SqliteExecutionStore:
                     if existing["native_action_ref"] is None
                     else str(existing["native_action_ref"]),
                     None
+                    if existing["native_action_ref_int"] is None
+                    else int(existing["native_action_ref_int"]),
+                    None
+                    if existing["native_request_payload_json"] is None
+                    else str(existing["native_request_payload_json"]),
+                    None
+                    if existing["native_request_payload_sha256"] is None
+                    else str(existing["native_request_payload_sha256"]),
+                    None
                     if existing["local_queue_receipt_id"] is None
                     else str(existing["local_queue_receipt_id"]),
                 )
                 if stored != immutable:
                     raise IntentConflictError("CTP command_id conflicts with staged command")
                 command = self._ctp_dispatch_command_from_row(existing)
+                assert command.correlation_key is not None
+                self._require_ctp_native_action_ref_allocation(
+                    cursor, existing, command.correlation_key
+                )
                 if operation == "CANCEL":
                     assert cancel_target_projection is not None
                     self._record_ctp_order_target_projection_consumption(
@@ -4465,6 +7168,8 @@ class SqliteExecutionStore:
                     self._require_fresh_ctp_cancel_target_row(
                         cursor, scope, existing, now_ns=time.monotonic_ns()
                     )
+                with self._lock:
+                    self._issued_ctp_staged_commands[(account_key, command_id)] = command
                 return command
 
             generation_owner = cursor.execute(
@@ -4472,7 +7177,7 @@ class SqliteExecutionStore:
                 SELECT command_id, session_binding_sha256, dispatch_front_id, dispatch_session_id
                 FROM ctp_dispatch_commands
                 WHERE account_key = ? AND session_generation_id = ?
-                  AND correlation_version = 1
+                  AND correlation_version IN (1, 2)
                 ORDER BY created_at_ns, command_id LIMIT 1
                 """,
                 (account_key, session_generation_id),
@@ -4489,7 +7194,7 @@ class SqliteExecutionStore:
                 """
                 SELECT command_id FROM ctp_dispatch_commands
                 WHERE account_key = ? AND scope_key = ? AND managed_action_id = ?
-                  AND correlation_version = 1
+                  AND correlation_version IN (1, 2)
                 """,
                 (account_key, scope_key, managed_action_id),
             ).fetchone()
@@ -4501,7 +7206,7 @@ class SqliteExecutionStore:
                 """
                 SELECT command_id FROM ctp_dispatch_commands
                 WHERE account_key = ? AND session_generation_id = ? AND native_request_id = ?
-                  AND correlation_version = 1
+                  AND correlation_version IN (1, 2)
                 """,
                 (account_key, session_generation_id, native_request_id),
             ).fetchone()
@@ -4532,9 +7237,11 @@ class SqliteExecutionStore:
                     session_binding_sha256, correlation_version, runtime_order_id,
                     managed_action_id, session_generation_id, dispatch_front_id,
                     dispatch_session_id, native_request_id, native_action_ref,
+                    native_action_ref_int, native_request_payload_json,
+                    native_request_payload_sha256,
                     local_queue_receipt_id,
                     status, created_at_ns, updated_at_ns
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'READY', ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'READY', ?, ?)
                 """,
                 (
                     account_key,
@@ -4555,19 +7262,39 @@ class SqliteExecutionStore:
                     approval_digest,
                     session_json,
                     session_digest,
-                    1,
+                    2,
                     runtime_order_id,
                     str(managed_action_id),
                     str(session_generation_id),
                     dispatch_front_id,
                     dispatch_session_id,
                     native_request_id,
+                    None,
                     native_action_ref,
+                    native_request_json,
+                    native_request_digest,
                     local_queue_receipt_id,
                     now_ns,
                     now_ns,
                 ),
             )
+            if operation == "CANCEL":
+                cursor.execute(
+                    """
+                    INSERT INTO ctp_native_action_ref_allocations(
+                        account_key, native_action_ref, scope_key, command_id,
+                        managed_action_id, allocated_at_ns
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        account_key,
+                        native_action_ref,
+                        scope_key,
+                        command_id,
+                        str(managed_action_id),
+                        now_ns,
+                    ),
+                )
             if operation == "CANCEL":
                 assert cancel_target_projection is not None
                 self._record_ctp_order_target_projection_consumption(
@@ -4587,7 +7314,210 @@ class SqliteExecutionStore:
                 self._require_fresh_ctp_cancel_target_row(
                     cursor, scope, row, now_ns=time.monotonic_ns()
                 )
+            with self._lock:
+                self._issued_ctp_staged_commands[(account_key, command_id)] = command
             return command
+
+    def read_ctp_staged_command_for_session(
+        self,
+        scope: ExecutionScope,
+        command_id: str,
+        *,
+        owner_handle: CtpCallbackSessionOwnerHandle,
+        writer_lease: WriterLease,
+    ) -> CtpDispatchCommand:
+        """Issue the exact READY command identity for a pre-native failure.
+
+        A caller cannot forge a command from readback JSON and pass it to the
+        fail-before-native transition. This narrow read issues a same-Store
+        object only while the exact active owner and writer lease still hold.
+        Reading it grants no claim or provider authority.
+        """
+
+        account_key, _, scope_key = self._validate_ctp_order_identity_scope(scope)
+        self._validate_command_identifier(command_id, "command_id")
+        with self._transaction() as cursor:
+            now_ns = time.time_ns()
+            self._assert_active_writer_lease(cursor, scope, writer_lease, now_ns=now_ns)
+            owner = self._require_ctp_callback_session_owner_handle(
+                cursor,
+                scope,
+                owner_handle,
+                allowed_states=frozenset({"ACTIVE"}),
+                writer_lease=writer_lease,
+                now_ns=now_ns,
+            )
+            session = self._active_ctp_callback_sessions.get(owner_handle.owner_intent_id)
+            if session is None or bool(owner["economic_query_observed"]):
+                raise InvalidStateTransition("active CTP callback session is unavailable")
+            row = cursor.execute(
+                """
+                SELECT * FROM ctp_dispatch_commands
+                WHERE account_key = ? AND scope_key = ? AND command_id = ?
+                """,
+                (account_key, scope_key, command_id),
+            ).fetchone()
+            if row is None or str(row["status"]) != "READY":
+                raise InvalidStateTransition("CTP command is not staged before native claim")
+            if (
+                row["callback_owner_intent_id"]
+                not in (None, owner_handle.owner_intent_id)
+                or int(row["native_call_inflight"]) != 0
+                or row["local_queue_receipt_queued"] == 0
+            ):
+                raise ContractValidationError("CTP staged command differs from active owner")
+            self._require_command_session_binding(row, session)
+            command = self._ctp_dispatch_command_from_row(row)
+        with self._lock:
+            self._issued_ctp_staged_commands[(account_key, command_id)] = command
+        return command
+
+    def fail_ctp_dispatch_command_before_native(
+        self,
+        scope: ExecutionScope,
+        staged_command: CtpDispatchCommand,
+        *,
+        owner_handle: CtpCallbackSessionOwnerHandle,
+        writer_lease: WriterLease,
+        failure_code: str,
+    ) -> CtpDispatchCommand:
+        """Permanently fence a staged command after local handoff ambiguity.
+
+        This API accepts only a same-Store issued command object, the exact
+        active callback owner, and the active writer lease. It atomically marks
+        a READY command UNKNOWN and poisons its owner. It cannot be used after
+        a native claim, for a known local queue rejection, or to release its
+        reserved OrderRef.
+        """
+
+        allowed_failure_codes = frozenset(
+            {"post_stage_failure", "queue_receipt_failure", "queue_publish_failure"}
+        )
+        if type(staged_command) is not CtpDispatchCommand:
+            raise ContractValidationError("Store-issued staged CTP command is required")
+        if type(owner_handle) is not CtpCallbackSessionOwnerHandle:
+            raise ContractValidationError("exact callback session owner is required")
+        if type(failure_code) is not str or failure_code not in allowed_failure_codes:
+            raise ContractValidationError("invalid pre-native CTP failure code")
+        account_key, _, scope_key = self._validate_ctp_order_identity_scope(scope)
+        key = (account_key, staged_command.command_id)
+        with self._lock:
+            if self._issued_ctp_staged_commands.get(key) is not staged_command:
+                raise ContractValidationError("CTP staged command is not fresh for this Store")
+
+        with self._transaction() as cursor:
+            now_ns = time.time_ns()
+            self._assert_active_writer_lease(cursor, scope, writer_lease, now_ns=now_ns)
+            owner = self._require_ctp_callback_session_owner_handle(
+                cursor,
+                scope,
+                owner_handle,
+                allowed_states=frozenset({"ACTIVE"}),
+                writer_lease=writer_lease,
+                now_ns=now_ns,
+            )
+            session = self._active_ctp_callback_sessions.get(owner_handle.owner_intent_id)
+            row = cursor.execute(
+                """
+                SELECT * FROM ctp_dispatch_commands
+                WHERE account_key = ? AND scope_key = ? AND command_id = ?
+                """,
+                (account_key, scope_key, staged_command.command_id),
+            ).fetchone()
+            if row is None:
+                raise ContractValidationError("staged CTP command is missing")
+            current = self._ctp_dispatch_command_from_row(row)
+            staged_payload_matches = (
+                type(staged_command.request_payload) is dict
+                and canonical_json(staged_command.request_payload)
+                == canonical_json(dict(current.request_payload))
+                and payload_sha256(staged_command.request_payload)
+                == staged_command.request_payload_sha256
+                and type(staged_command.session_binding) is dict
+                and canonical_json(staged_command.session_binding)
+                == canonical_json(dict(current.session_binding))
+                and payload_sha256(staged_command.session_binding)
+                == staged_command.session_binding_sha256
+            )
+            immutable_identity_matches = all(
+                getattr(current, name) == getattr(staged_command, name)
+                for name in (
+                    "account_key",
+                    "scope_key",
+                    "trading_day",
+                    "operation",
+                    "command_id",
+                    "request_payload_sha256",
+                    "reservation_managed_intent_id",
+                    "order_ref",
+                    "cancel_target_order_ref",
+                    "cancel_target_exchange_id",
+                    "cancel_target_order_sys_id",
+                    "cancel_target_front_id",
+                    "cancel_target_session_id",
+                    "approval_use_id",
+                    "approval_digest",
+                    "session_binding_sha256",
+                    "correlation_key",
+                    "local_queue_receipt_id",
+                )
+            )
+            if (
+                session is None
+                or bool(owner["economic_query_observed"])
+                or staged_command.status != "READY"
+                or not staged_payload_matches
+                or not immutable_identity_matches
+                or str(row["status"]) != "READY"
+                or row["callback_owner_intent_id"]
+                not in (None, owner_handle.owner_intent_id)
+                or int(row["native_call_inflight"]) != 0
+                or row["local_queue_receipt_queued"] == 0
+            ):
+                raise InvalidStateTransition("CTP command is no longer pre-native and READY")
+            self._require_command_session_binding(row, session)
+            cursor.execute(
+                """
+                UPDATE ctp_dispatch_commands
+                SET status = 'UNKNOWN', unknown_at_ns = ?, updated_at_ns = ?,
+                    unknown_reason = ?
+                WHERE account_key = ? AND scope_key = ? AND command_id = ?
+                  AND status = 'READY' AND native_call_inflight = 0
+                """,
+                (
+                    now_ns,
+                    now_ns,
+                    "session_pre_native_failure:" + failure_code,
+                    account_key,
+                    scope_key,
+                    staged_command.command_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise InvalidStateTransition("CTP pre-native failure transition changed")
+            cursor.execute(
+                """
+                UPDATE ctp_dispatch_callback_session_owners
+                SET owner_state = 'POISONED', poison_code = 'dispatch_stage_ambiguous',
+                    poison_observed_sequence = last_source_sequence, updated_at_ns = ?
+                WHERE owner_intent_id = ? AND owner_state = 'ACTIVE'
+                """,
+                (now_ns, owner_handle.owner_intent_id),
+            )
+            if cursor.rowcount != 1:
+                raise InvalidStateTransition("CTP owner poison transition changed")
+            updated = cursor.execute(
+                """
+                SELECT * FROM ctp_dispatch_commands
+                WHERE account_key = ? AND scope_key = ? AND command_id = ?
+                """,
+                (account_key, scope_key, staged_command.command_id),
+            ).fetchone()
+            assert updated is not None
+            result = self._ctp_dispatch_command_from_row(updated)
+        with self._lock:
+            self._issued_ctp_staged_commands.pop(key, None)
+        return result
 
     def read_ctp_dispatch_command(
         self, scope: ExecutionScope, command_id: str
@@ -4987,6 +7917,7 @@ class SqliteExecutionStore:
         writer_lease: WriterLease,
         authority_verifier: CtpDispatchAuthorityVerifier,
         required_local_queue_receipt_id: str | None = None,
+        _callback_session_owner: CtpCallbackSessionOwnerHandle | None = None,
     ) -> CtpDispatchCommand | None:
         """Verify and condition-claim one READY command after the seed gate.
 
@@ -5007,12 +7938,121 @@ class SqliteExecutionStore:
             required_local_queue_receipt_id
         ):
             raise ContractValidationError("invalid required CTP local queue receipt id")
+        # Authority providers are injected and may consult SDK-owned state.
+        # Never invoke one while holding the SQLite transaction/Store lock:
+        # callback ingress takes SDK lifecycle lock before synchronously
+        # appending to this Store. The final transaction below re-reads and
+        # compares the exact command and all mutable admission facts.
+        verification_command = self.read_ctp_dispatch_command(scope, command_id)
+        if verification_command is None or verification_command.status != "READY":
+            if _callback_session_owner is not None:
+                with self._lock:
+                    owner_row = self._connection.execute(
+                        "SELECT last_source_sequence FROM "
+                        "ctp_dispatch_callback_session_owners WHERE account_key = ?",
+                        (account_key,),
+                    ).fetchone()
+                    if owner_row is not None:
+                        cursor = self._connection.cursor()
+                        try:
+                            applied = self._ctp_callback_applied_sequence(
+                                cursor,
+                                _callback_session_owner.owner_intent_id,
+                                int(owner_row["last_source_sequence"]),
+                            )
+                        finally:
+                            cursor.close()
+                        if applied != int(owner_row["last_source_sequence"]):
+                            raise InvalidStateTransition(
+                                "CTP callback inbox has unapplied source events"
+                            )
+            return None
+        if (
+            verification_command.correlation_key is None
+            or verification_command.correlation_key.version != 2
+            or verification_command.native_request_payload is None
+            or verification_command.native_request_payload_sha256 is None
+        ):
+            raise InvalidStateTransition("legacy CTP command is audit-only")
+        # Avoid invoking an injected verifier for an account that already has
+        # a permanent source-lifecycle fence. This is only a read-only early
+        # rejection; the claim transaction repeats the fence check after the
+        # verifier to close the race without holding Store locks across it.
+        with self._lock:
+            existing_source_fence = self._connection.execute(
+                """
+                SELECT command_id FROM ctp_dispatch_callback_source_lifecycle_fences
+                WHERE account_key = ? ORDER BY created_at_ns, command_id LIMIT 1
+                """,
+                (account_key,),
+            ).fetchone()
+        if existing_source_fence is not None:
+            raise InvalidStateTransition(
+                "account has CTP callback source lifecycle fence: "
+                + str(existing_source_fence["command_id"])
+            )
+        verification_started_ns = time.time_ns()
+        authority = self._verify_ctp_dispatch_authority(
+            authority_verifier,
+            verification_command,
+            now_ns=verification_started_ns,
+        )
         with self._transaction() as cursor:
-            verification_started_ns = time.time_ns()
             target_check_started_ns = time.monotonic_ns()
             self._assert_active_writer_lease(
                 cursor, scope, writer_lease, now_ns=verification_started_ns
             )
+            session_owner = cursor.execute(
+                """
+                SELECT * FROM ctp_dispatch_callback_session_owners
+                WHERE account_key = ?
+                """,
+                (account_key,),
+            ).fetchone()
+            if session_owner is None:
+                if _callback_session_owner is not None:
+                    raise ContractValidationError(
+                        "CTP callback session owner is not persisted for this account"
+                    )
+            else:
+                if _callback_session_owner is None:
+                    raise InvalidStateTransition(
+                        "ordinary CTP claim is blocked by the callback session owner"
+                    )
+                self._require_ctp_callback_session_owner_handle(
+                    cursor,
+                    scope,
+                    _callback_session_owner,
+                    allowed_states=frozenset({"ACTIVE"}),
+                    writer_lease=writer_lease,
+                    now_ns=verification_started_ns,
+                )
+                active_binding = self._active_ctp_callback_sessions.get(
+                    _callback_session_owner.owner_intent_id
+                )
+                if (
+                    active_binding is None
+                    or active_binding.account_key != account_key
+                    or active_binding.scope_key != scope_key
+                    or active_binding.trading_day != trading_day
+                    or active_binding.session_generation_id
+                    != self._ctp_callback_session_generation_id(session_owner)
+                ):
+                    raise InvalidStateTransition(
+                        "active CTP callback session binding is not live in this Store"
+                    )
+                if bool(session_owner["economic_query_observed"]):
+                    raise InvalidStateTransition(
+                        "CTP economic query results require a typed evaluator before send"
+                    )
+                if self._ctp_callback_applied_sequence(
+                    cursor,
+                    _callback_session_owner.owner_intent_id,
+                    int(session_owner["last_source_sequence"]),
+                ) != int(session_owner["last_source_sequence"]):
+                    raise InvalidStateTransition(
+                        "CTP callback inbox has unapplied source events"
+                    )
             row = cursor.execute(
                 """
                 SELECT * FROM ctp_dispatch_commands
@@ -5022,6 +8062,28 @@ class SqliteExecutionStore:
             ).fetchone()
             if row is None or str(row["status"]) != "READY":
                 return None
+            if int(row["correlation_version"]) != 2:
+                raise InvalidStateTransition("legacy CTP command version is audit-only")
+            if session_owner is not None:
+                if (
+                    str(session_owner["scope_key"]) != scope_key
+                    or str(row["trading_day"]) != str(session_owner["trading_day"])
+                    or str(row["session_generation_id"])
+                    != self._ctp_callback_session_generation_id(session_owner)
+                    or int(row["dispatch_front_id"]) != int(session_owner["front_id"])
+                    or int(row["dispatch_session_id"]) != int(session_owner["session_id"])
+                ):
+                    raise ContractValidationError(
+                        "CTP command session differs from active callback owner"
+                    )
+                assert active_binding is not None
+                self._require_command_session_binding(row, active_binding)
+                if row["local_queue_receipt_id"] is None or row[
+                    "local_queue_receipt_queued"
+                ] != 1:
+                    raise InvalidStateTransition(
+                        "callback-owner claim requires a committed queued receipt"
+                    )
             if row["local_queue_receipt_id"] is not None and row[
                 "local_queue_receipt_queued"
             ] != 1:
@@ -5126,11 +8188,11 @@ class SqliteExecutionStore:
                     "CTP OrderRef predates or conflicts with the seeded watermark"
                 )
             command = self._ctp_dispatch_command_from_row(row)
-            if command.correlation_key is None:
-                raise ContractValidationError("CTP command lacks versioned correlation keys")
-            authority = self._verify_ctp_dispatch_authority(
-                authority_verifier, command, now_ns=verification_started_ns
-            )
+            if command.correlation_key is None or command != verification_command:
+                raise ContractValidationError(
+                    "CTP command changed while authority was verified"
+                )
+            self._require_ctp_native_action_ref_allocation(cursor, row, command.correlation_key)
             claim_now_ns = time.time_ns()
             self._assert_active_writer_lease(cursor, scope, writer_lease, now_ns=claim_now_ns)
             if authority.expires_at_ns <= claim_now_ns:
@@ -5146,6 +8208,27 @@ class SqliteExecutionStore:
             ).fetchone()
             if row_after_verification is None or str(row_after_verification["status"]) != "READY":
                 return None
+            if session_owner is not None:
+                fresh_owner = cursor.execute(
+                    "SELECT * FROM ctp_dispatch_callback_session_owners WHERE account_key = ?",
+                    (account_key,),
+                ).fetchone()
+                fresh_binding = self._active_ctp_callback_sessions.get(
+                    _callback_session_owner.owner_intent_id
+                )
+                if (
+                    fresh_owner is None
+                    or str(fresh_owner["owner_state"]) != "ACTIVE"
+                    or bool(fresh_owner["economic_query_observed"])
+                    or fresh_binding is None
+                    or fresh_binding != active_binding
+                    or str(fresh_owner["owner_intent_id"])
+                    != _callback_session_owner.owner_intent_id
+                ):
+                    raise InvalidStateTransition(
+                        "active CTP callback session changed during claim verification"
+                    )
+                self._require_command_session_binding(row_after_verification, fresh_binding)
             if str(row_after_verification["operation"]) == "CANCEL":
                 self._require_fresh_ctp_cancel_target_row(
                     cursor,
@@ -5157,7 +8240,8 @@ class SqliteExecutionStore:
                 """
                 UPDATE ctp_dispatch_commands
                 SET status = 'CLAIMED', updated_at_ns = ?, claimed_at_ns = ?,
-                    claimed_owner_id = ?, claimed_fencing_token = ?
+                    claimed_owner_id = ?, claimed_fencing_token = ?,
+                    callback_owner_intent_id = ?, native_call_inflight = ?
                 WHERE account_key = ? AND scope_key = ? AND command_id = ? AND status = 'READY'
                 """,
                 (
@@ -5165,6 +8249,10 @@ class SqliteExecutionStore:
                     claim_now_ns,
                     writer_lease.owner_id,
                     writer_lease.fencing_token,
+                    None
+                    if session_owner is None
+                    else _callback_session_owner.owner_intent_id,
+                    0 if session_owner is None else 1,
                     account_key,
                     scope_key,
                     command_id,
@@ -5207,6 +8295,247 @@ class SqliteExecutionStore:
                     now_ns=time.monotonic_ns(),
                 )
             return self._ctp_dispatch_command_from_row(claimed)
+
+    def claim_ctp_dispatch_command_for_session(
+        self,
+        scope: ExecutionScope,
+        command_id: str,
+        *,
+        owner_handle: CtpCallbackSessionOwnerHandle,
+        writer_lease: WriterLease,
+        authority_verifier: CtpDispatchAuthorityVerifier,
+        required_local_queue_receipt_id: str,
+        binding_ttl_ns: int = 5_000_000_000,
+    ) -> CtpSessionNativeCallClaim | None:
+        """Claim one queued command under the exact active inbox owner.
+
+        The READY-to-CLAIMED transition and ``native_call_inflight`` marker are
+        committed by the ordinary claim transaction before this method issues
+        its ephemeral binding. If binding creation or verifier handoff is
+        interrupted, the durable command remains non-retryable.
+        """
+
+        if type(binding_ttl_ns) is not int or not 0 < binding_ttl_ns <= 30_000_000_000:
+            raise ContractValidationError("invalid CTP native-call binding lifetime")
+        account_key, _, scope_key = self._validate_ctp_order_identity_scope(scope)
+        if type(owner_handle) is not CtpCallbackSessionOwnerHandle:
+            raise ContractValidationError("typed CTP callback owner is required")
+        if self._active_ctp_callback_sessions.get(owner_handle.owner_intent_id) is None:
+            raise InvalidStateTransition("active CTP callback session binding is unavailable")
+        command = self.claim_ctp_dispatch_command(
+            scope,
+            command_id,
+            writer_lease=writer_lease,
+            authority_verifier=authority_verifier,
+            required_local_queue_receipt_id=required_local_queue_receipt_id,
+            _callback_session_owner=owner_handle,
+        )
+        if command is None:
+            return None
+        try:
+            correlation = command.correlation_key
+            if correlation is None:
+                raise ContractValidationError("claimed CTP command lacks correlation")
+            session = self._active_ctp_callback_sessions.get(owner_handle.owner_intent_id)
+            if session is None:
+                raise InvalidStateTransition("active CTP callback session binding was lost")
+            if (
+                command.account_key != account_key
+                or command.scope_key != scope_key
+                or command.trading_day != session.trading_day
+                or correlation.session_generation_id != session.session_generation_id
+                or correlation.dispatch_front_id != session.dispatch_front_id
+                or correlation.dispatch_session_id != session.dispatch_session_id
+            ):
+                raise ContractValidationError("claimed CTP command differs from source session")
+            if (
+                correlation.version != 2
+                or command.native_request_payload is None
+                or command.native_request_payload_sha256 is None
+            ):
+                raise ContractValidationError("claimed command lacks V2 native request payload")
+            binding = CtpManagedNativeCallBindingV2(
+                binding_id=uuid.uuid4().hex,
+                owner_intent_id=owner_handle.owner_intent_id,
+                account_key=command.account_key,
+                scope_key=command.scope_key,
+                command_id=command.command_id,
+                operation=command.operation,
+                trading_day=command.trading_day,
+                request_payload_json=canonical_json(dict(command.request_payload)),
+                request_payload_sha256=command.request_payload_sha256,
+                reservation_managed_intent_id=command.reservation_managed_intent_id,
+                managed_action_id=correlation.managed_action_id,
+                runtime_order_id=correlation.runtime_order_id,
+                order_ref=correlation.order_ref,
+                native_request_id=correlation.native_request_id,
+                native_action_ref=correlation.native_action_ref,
+                native_request_payload_json=canonical_json(
+                    dict(command.native_request_payload)
+                ),
+                native_request_payload_sha256=command.native_request_payload_sha256,
+                cancel_target_order_ref=(
+                    command.cancel_target_order_ref
+                    if command.operation == "CANCEL"
+                    else None
+                ),
+                cancel_target_exchange_id=command.cancel_target_exchange_id,
+                cancel_target_order_sys_id=command.cancel_target_order_sys_id,
+                cancel_target_front_id=command.cancel_target_front_id,
+                cancel_target_session_id=command.cancel_target_session_id,
+                session_binding_sha256=command.session_binding_sha256,
+                session_generation_id=correlation.session_generation_id,
+                dispatch_front_id=correlation.dispatch_front_id,
+                dispatch_session_id=correlation.dispatch_session_id,
+                writer_owner_id=writer_lease.owner_id,
+                writer_fencing_token=writer_lease.fencing_token,
+                expires_at_ns=time.time_ns() + binding_ttl_ns,
+            )
+            with self._lock:
+                self._issued_ctp_native_call_bindings[binding.binding_id] = binding
+            return CtpSessionNativeCallClaim(command=command, binding=binding)
+        except Exception:
+            with suppress(Exception):
+                self.poison_ctp_callback_session_owner(
+                    owner_handle, "owner_binding_mismatch"
+                )
+            raise
+
+    def verify_ctp_managed_native_call_binding(
+        self,
+        scope: ExecutionScope,
+        owner_handle: CtpCallbackSessionOwnerHandle,
+        binding: CtpManagedNativeCallBindingV2,
+        *,
+        writer_lease: WriterLease,
+    ) -> CtpManagedNativeCallBindingV2:
+        """Consume once and recheck the exact binding under Store transaction.
+
+        The SDK calls this while holding its lifecycle lock, then invokes the
+        pinned API after releasing every SDK and Store lock. This method never
+        acquires an SDK lock.
+        """
+
+        if type(owner_handle) is not CtpCallbackSessionOwnerHandle:
+            raise ContractValidationError("exact callback session owner is required")
+        if type(binding) is not CtpManagedNativeCallBindingV2:
+            with suppress(Exception):
+                self.poison_ctp_callback_session_owner(owner_handle, "owner_binding_mismatch")
+            raise ContractValidationError("Store-issued CTP native-call binding is required")
+        with self._lock:
+            issued = self._issued_ctp_native_call_bindings.get(binding.binding_id)
+            if issued is not binding or binding.binding_id in self._consumed_ctp_native_call_bindings:
+                with suppress(Exception):
+                    self.poison_ctp_callback_session_owner(
+                        owner_handle, "owner_binding_mismatch"
+                    )
+                raise ContractValidationError("CTP native-call binding is not fresh")
+            # Consume before the DB read. Any lock, lease, or commit ambiguity
+            # must leave this object unusable in this process.
+            self._consumed_ctp_native_call_bindings.add(binding.binding_id)
+            try:
+                account_key, _, scope_key = self._validate_ctp_order_identity_scope(scope)
+                now_ns = time.time_ns()
+                with self._transaction() as cursor:
+                    self._assert_active_writer_lease(cursor, scope, writer_lease, now_ns=now_ns)
+                    owner = self._require_ctp_callback_session_owner_handle(
+                        cursor,
+                        scope,
+                        owner_handle,
+                        allowed_states=frozenset({"ACTIVE"}),
+                        writer_lease=writer_lease,
+                        now_ns=now_ns,
+                    )
+                    session = self._active_ctp_callback_sessions.get(
+                        owner_handle.owner_intent_id
+                    )
+                    if (
+                        session is None
+                        or bool(owner["economic_query_observed"])
+                        or binding.expires_at_ns <= now_ns
+                        or binding.owner_intent_id != owner_handle.owner_intent_id
+                        or binding.account_key != account_key
+                        or binding.scope_key != scope_key
+                        or binding.trading_day != str(owner["trading_day"])
+                        or binding.session_generation_id
+                        != self._ctp_callback_session_generation_id(owner)
+                        or binding.dispatch_front_id != int(owner["front_id"])
+                        or binding.dispatch_session_id != int(owner["session_id"])
+                        or binding.session_binding_sha256 != session.session_binding_sha256
+                        or binding.writer_owner_id != writer_lease.owner_id
+                        or binding.writer_fencing_token != writer_lease.fencing_token
+                    ):
+                        raise ContractValidationError("CTP native-call binding is stale")
+                    row = cursor.execute(
+                        """
+                        SELECT * FROM ctp_dispatch_commands
+                        WHERE account_key = ? AND scope_key = ? AND command_id = ?
+                        """,
+                        (account_key, scope_key, binding.command_id),
+                    ).fetchone()
+                    if row is None or str(row["status"]) != "CLAIMED":
+                        raise InvalidStateTransition("bound CTP command is no longer CLAIMED")
+                    command = self._ctp_dispatch_command_from_row(row)
+                    correlation = command.correlation_key
+                    if (
+                        correlation is None
+                        or correlation.version != 2
+                        or command.native_request_payload is None
+                        or command.native_request_payload_sha256 is None
+                    ):
+                        raise ContractValidationError("bound CTP command lacks correlation")
+                    self._require_ctp_native_action_ref_allocation(cursor, row, correlation)
+                    expected_payload = canonical_json(dict(command.request_payload))
+                    expected_native_payload = canonical_json(
+                        dict(command.native_request_payload)
+                    )
+                    if (
+                        row["callback_owner_intent_id"] != owner_handle.owner_intent_id
+                        or int(row["native_call_inflight"]) != 1
+                        or row["local_queue_receipt_id"] is None
+                        or row["local_queue_receipt_queued"] != 1
+                        or str(row["claimed_owner_id"]) != writer_lease.owner_id
+                        or int(row["claimed_fencing_token"]) != writer_lease.fencing_token
+                        or binding.operation != command.operation
+                        or binding.trading_day != command.trading_day
+                        or binding.request_payload_json != expected_payload
+                        or binding.request_payload_sha256 != command.request_payload_sha256
+                        or binding.native_request_payload_json != expected_native_payload
+                        or binding.native_request_payload_sha256
+                        != command.native_request_payload_sha256
+                        or binding.reservation_managed_intent_id
+                        != command.reservation_managed_intent_id
+                        or binding.managed_action_id != correlation.managed_action_id
+                        or binding.runtime_order_id != correlation.runtime_order_id
+                        or binding.order_ref != correlation.order_ref
+                        or binding.native_request_id != correlation.native_request_id
+                        or binding.native_action_ref != correlation.native_action_ref
+                        or binding.cancel_target_order_ref
+                        != (command.cancel_target_order_ref if command.operation == "CANCEL" else None)
+                        or binding.cancel_target_exchange_id != command.cancel_target_exchange_id
+                        or binding.cancel_target_order_sys_id != command.cancel_target_order_sys_id
+                        or binding.cancel_target_front_id != command.cancel_target_front_id
+                        or binding.cancel_target_session_id != command.cancel_target_session_id
+                        or binding.session_binding_sha256 != command.session_binding_sha256
+                        or binding.session_generation_id != correlation.session_generation_id
+                        or binding.dispatch_front_id != correlation.dispatch_front_id
+                        or binding.dispatch_session_id != correlation.dispatch_session_id
+                    ):
+                        raise ContractValidationError("CTP native-call binding differs from command")
+                    self._require_command_session_binding(row, session)
+                    if command.operation == "CANCEL":
+                        self._require_fresh_ctp_cancel_target_row(
+                            cursor, scope, row, now_ns=time.monotonic_ns()
+                        )
+                return binding
+            except Exception as error:
+                with suppress(Exception):
+                    self.poison_ctp_callback_session_owner(
+                        owner_handle, "owner_binding_mismatch"
+                    )
+                if isinstance(error, ContractValidationError):
+                    raise
+                raise ContractValidationError("CTP native-call binding verification failed") from None
 
     @staticmethod
     def _ctp_dispatch_receipt_payload(receipt: CtpDispatchReceipt) -> tuple[str, str, str]:
@@ -5290,6 +8619,7 @@ class SqliteExecutionStore:
         receipt: CtpDispatchReceipt,
         *,
         writer_lease: WriterLease,
+        _callback_session_owner: CtpCallbackSessionOwnerHandle | None = None,
     ) -> CtpDispatchCommand:
         """Persist a local receipt only when every command binding echoes.
 
@@ -5313,6 +8643,31 @@ class SqliteExecutionStore:
             if row is None:
                 raise ContractValidationError("unknown CTP dispatch command")
             command = self._ctp_dispatch_command_from_row(row)
+            callback_owner_intent_id = row["callback_owner_intent_id"]
+            owner_state = None
+            if callback_owner_intent_id is None:
+                if _callback_session_owner is not None:
+                    raise ContractValidationError(
+                        "receipt owner was not bound to this CTP command"
+                    )
+            else:
+                if (
+                    _callback_session_owner is None
+                    or _callback_session_owner.owner_intent_id
+                    != str(callback_owner_intent_id)
+                ):
+                    raise InvalidStateTransition(
+                        "ordinary receipt completion is blocked for session-owned command"
+                    )
+                owner_row = self._require_ctp_callback_session_owner_handle(
+                    cursor,
+                    scope,
+                    _callback_session_owner,
+                    allowed_states=frozenset({"ACTIVE", "POISONED"}),
+                    writer_lease=writer_lease,
+                    now_ns=now_ns,
+                )
+                owner_state = str(owner_row["owner_state"])
             expected = (
                 command.command_id,
                 command.account_key,
@@ -5365,6 +8720,12 @@ class SqliteExecutionStore:
                 return command
             if command.status != "CLAIMED":
                 raise InvalidStateTransition("CTP dispatch command is not CLAIMED")
+            if callback_owner_intent_id is not None and int(row["native_call_inflight"]) != 1:
+                raise InvalidStateTransition("session-owned native call is not in flight")
+            if owner_state == "POISONED" and receipt.outcome != "UNKNOWN":
+                raise InvalidStateTransition(
+                    "poisoned CTP callback owner requires an UNKNOWN native receipt"
+                )
             if (
                 str(row["claimed_owner_id"]) != writer_lease.owner_id
                 or int(row["claimed_fencing_token"]) != writer_lease.fencing_token
@@ -5378,7 +8739,7 @@ class SqliteExecutionStore:
                     SET status = ?, updated_at_ns = ?, unknown_at_ns = ?,
                         unknown_reason = ?, native_receipt_payload_json = ?,
                         native_receipt_sha256 = ?, completion_echo_json = ?,
-                        completion_echo_sha256 = ?
+                        completion_echo_sha256 = ?, native_call_inflight = 0
                     WHERE account_key = ? AND command_id = ? AND status = 'CLAIMED'
                     """,
                     (
@@ -5400,7 +8761,8 @@ class SqliteExecutionStore:
                     UPDATE ctp_dispatch_commands
                     SET status = 'COMPLETED', updated_at_ns = ?, completed_at_ns = ?,
                         native_receipt_payload_json = ?, native_receipt_sha256 = ?,
-                        completion_echo_json = ?, completion_echo_sha256 = ?
+                        completion_echo_json = ?, completion_echo_sha256 = ?,
+                        native_call_inflight = 0
                     WHERE account_key = ? AND command_id = ? AND status = 'CLAIMED'
                     """,
                     (
@@ -5422,6 +8784,29 @@ class SqliteExecutionStore:
             ).fetchone()
             assert completed is not None
             return self._ctp_dispatch_command_from_row(completed)
+
+    def complete_ctp_dispatch_command_for_session(
+        self,
+        scope: ExecutionScope,
+        receipt: CtpDispatchReceipt,
+        *,
+        owner_handle: CtpCallbackSessionOwnerHandle,
+        writer_lease: WriterLease,
+    ) -> CtpDispatchCommand:
+        """Persist the native request receipt for an owner-bound claim."""
+
+        if (
+            type(owner_handle) is not CtpCallbackSessionOwnerHandle
+            or self._issued_ctp_callback_session_owners.get(owner_handle.owner_intent_id)
+            is not owner_handle
+        ):
+            raise ContractValidationError("exact same-Store CTP callback owner is required")
+        return self.complete_ctp_dispatch_command(
+            scope,
+            receipt,
+            writer_lease=writer_lease,
+            _callback_session_owner=owner_handle,
+        )
 
     @staticmethod
     def _ctp_dispatch_has_open_account_fence(cursor: sqlite3.Cursor, account_key: str) -> bool:
@@ -5507,9 +8892,31 @@ class SqliteExecutionStore:
         source_kind: str,
         updated_at_ns: int,
         callback_key: CtpDispatchCallbackKey | None = None,
+        source_event_identity: tuple[str, str, str] | None = None,
     ) -> None:
         if key.operation not in {"SUBMIT", "CANCEL"} or state not in _CTP_ORDER_PROJECTION_STATES:
             raise ContractValidationError("invalid CTP order projection")
+        if source_event_identity is not None and (
+            type(source_event_identity) is not tuple
+            or len(source_event_identity) != 3
+            or any(type(value) is not str or not value for value in source_event_identity)
+        ):
+            raise ContractValidationError("invalid CTP projection source event identity")
+        event_generation_id = (
+            source_event_identity[0]
+            if source_event_identity is not None
+            else None if callback_key is None else key.session_generation_id
+        )
+        event_stream_id = (
+            source_event_identity[1]
+            if source_event_identity is not None
+            else None if callback_key is None else callback_key.stream_id
+        )
+        event_id = (
+            source_event_identity[2]
+            if source_event_identity is not None
+            else None if callback_key is None else callback_key.event_id
+        )
         current = cursor.execute(
             """
             SELECT * FROM ctp_dispatch_order_projection
@@ -5578,9 +8985,9 @@ class SqliteExecutionStore:
                 payload_sha256(key.to_payload()),
                 source_digest_sha256,
                 source_kind,
-                None if callback_key is None else key.session_generation_id,
-                None if callback_key is None else callback_key.stream_id,
-                None if callback_key is None else callback_key.event_id,
+                event_generation_id,
+                event_stream_id,
+                event_id,
                 updated_at_ns,
             ),
         )
@@ -5759,6 +9166,8 @@ class SqliteExecutionStore:
         writer_lease: WriterLease,
         callback_verifier: CtpDispatchCallbackVerifier | None = None,
         source_lifecycle_fence_id: str | None = None,
+        _callback_session_owner: CtpCallbackSessionOwnerHandle | None = None,
+        _callback_ingress_event: CtpCallbackIngressEventV1 | None = None,
     ) -> CtpDispatchCallbackApplyResult:
         """Verify one callback, then atomically append, dedupe, and project it.
 
@@ -5794,11 +9203,43 @@ class SqliteExecutionStore:
             raise ContractValidationError("CTP callback payload must be a non-empty object")
         self._reject_sensitive_command_fields(callback_payload_value)
         callback_payload_digest = payload_sha256(callback_payload_value)
+        if (_callback_session_owner is None) != (_callback_ingress_event is None):
+            raise ContractValidationError("CTP callback session event binding is incomplete")
+        if _callback_ingress_event is not None and (
+                type(_callback_session_owner) is not CtpCallbackSessionOwnerHandle
+                or type(_callback_ingress_event) is not CtpCallbackIngressEventV1
+                or _callback_ingress_event.owner_handle is not _callback_session_owner
+                or self._issued_ctp_callback_session_owners.get(
+                    _callback_session_owner.owner_intent_id
+                )
+                is not _callback_session_owner
+                or self._issued_ctp_callback_ingress_events.get(
+                    (
+                        _callback_session_owner.owner_intent_id,
+                        _callback_ingress_event.source_sequence,
+                    )
+                )
+                is not _callback_ingress_event
+                or _callback_ingress_event.callback_class != "ROUTEABLE"
+                or callback_payload_value.get("envelope_type")
+                != "ctp_native_callback_envelope.v2"
+                or _callback_ingress_event.callback_name
+                != callback_payload_value.get("source_callback")
+                or callback_payload_value.get("ingress_source")
+                != {
+                    "owner_intent_id": _callback_session_owner.owner_intent_id,
+                    "source_sequence": _callback_ingress_event.source_sequence,
+                    "record_digest_sha256": _callback_ingress_event.record_digest_sha256,
+                }
+        ):
+            raise ContractValidationError("CTP callback payload is not bound to its ingress row")
         staged = self.read_ctp_dispatch_command(scope, command_id)
         if staged is None:
             raise ContractValidationError("unknown CTP dispatch command")
         if staged.status not in {"CLAIMED", "COMPLETED", "UNKNOWN"}:
             raise InvalidStateTransition("callback cannot apply to an undispatched CTP command")
+        if staged.correlation_key is None or staged.correlation_key.version != 2:
+            raise InvalidStateTransition("legacy CTP command is audit-only")
         require_ctp_dispatch_callback_match(staged, callback)
         verification_started_ns = time.time_ns()
         evidence = self._verify_ctp_dispatch_callback(
@@ -5812,6 +9253,8 @@ class SqliteExecutionStore:
         callback_json = canonical_json(callback.to_payload())
         callback_digest = payload_sha256(json.loads(callback_json))
         correlation_digest = payload_sha256(staged.correlation_key.to_payload())
+        ingress_payload: Mapping[str, Any] | None = None
+        ingress_binding: CtpCallbackSessionBindingV1 | None = None
         with self._transaction() as cursor:
             applied_at_ns = time.time_ns()
             self._assert_active_writer_lease(cursor, scope, writer_lease, now_ns=applied_at_ns)
@@ -5834,6 +9277,32 @@ class SqliteExecutionStore:
                 or current.correlation_key != staged.correlation_key
             ):
                 raise InvalidStateTransition("CTP callback command changed during verification")
+            assert current.correlation_key is not None
+            self._require_ctp_native_action_ref_allocation(cursor, row, current.correlation_key)
+            if _callback_ingress_event is not None:
+                assert _callback_session_owner is not None
+                owner_row, _, ingress_payload, ingress_binding = (
+                    self._require_current_ctp_callback_ingress_event(
+                    cursor,
+                    scope,
+                    _callback_ingress_event,
+                    writer_lease,
+                    )
+                )
+                if (
+                    row["callback_owner_intent_id"] != _callback_session_owner.owner_intent_id
+                    or str(owner_row["owner_state"]) != "ACTIVE"
+                    or int(row["native_call_inflight"]) != 0
+                    or str(row["status"]) not in {"COMPLETED", "UNKNOWN"}
+                    or row["local_queue_receipt_id"] is None
+                    or row["local_queue_receipt_queued"] != 1
+                    or ingress_binding is None
+                    or ingress_binding.session_generation_id
+                    != staged.correlation_key.session_generation_id
+                ):
+                    raise InvalidStateTransition(
+                        "CTP session callback command is not ready for ledger commit"
+                    )
             if source_lifecycle_fence_id is not None:
                 guard = cursor.execute(
                     """
@@ -5879,6 +9348,34 @@ class SqliteExecutionStore:
                 if not exact:
                     raise IntentConflictError(
                         "CTP callback event id conflicts with durable evidence"
+                    )
+                if _callback_ingress_event is not None:
+                    if (
+                        _callback_ingress_event.callback_name == "OnRtnOrder"
+                        and ingress_payload is not None
+                        and ingress_binding is not None
+                    ):
+                        self._insert_ctp_order_cumulative_observation(
+                            cursor,
+                            _callback_ingress_event,
+                            staged,
+                            ingress_binding,
+                            self._ctp_callback_field(ingress_payload, 0, "VolumeTraded"),
+                            callback_digest,
+                            observed_at_ns=applied_at_ns,
+                        )
+                    self._insert_ctp_callback_ingress_application(
+                        cursor,
+                        _callback_ingress_event,
+                        command_id,
+                        "APPLIED",
+                        {
+                            "callback_key_sha256": callback_digest,
+                            "callback_payload_sha256": callback_payload_digest,
+                            "source_digest_sha256": evidence.source_digest_sha256,
+                            "duplicate": True,
+                        },
+                        applied_at_ns=applied_at_ns,
                     )
                 fence_open = self._ctp_dispatch_has_open_account_fence(cursor, account_key)
                 return CtpDispatchCallbackApplyResult(
@@ -5944,12 +9441,473 @@ class SqliteExecutionStore:
                     updated_at_ns=applied_at_ns,
                     callback_key=callback,
                 )
+            if _callback_ingress_event is not None:
+                if (
+                    _callback_ingress_event.callback_name == "OnRtnOrder"
+                    and ingress_payload is not None
+                    and ingress_binding is not None
+                ):
+                    self._insert_ctp_order_cumulative_observation(
+                        cursor,
+                        _callback_ingress_event,
+                        staged,
+                        ingress_binding,
+                        self._ctp_callback_field(ingress_payload, 0, "VolumeTraded"),
+                        callback_digest,
+                        observed_at_ns=applied_at_ns,
+                    )
+                self._insert_ctp_callback_ingress_application(
+                    cursor,
+                    _callback_ingress_event,
+                    command_id,
+                    "APPLIED",
+                    {
+                        "callback_key_sha256": callback_digest,
+                        "callback_payload_sha256": callback_payload_digest,
+                        "source_digest_sha256": evidence.source_digest_sha256,
+                        "duplicate": False,
+                    },
+                    applied_at_ns=applied_at_ns,
+                )
             fence_open = self._ctp_dispatch_has_open_account_fence(cursor, account_key)
             return CtpDispatchCallbackApplyResult(
                 callback_key=callback,
                 projection_state=evidence.projection_state,
                 duplicate=False,
                 account_fence_open=fence_open,
+            )
+
+    def apply_ctp_verified_session_trade_fact(
+        self,
+        scope: ExecutionScope,
+        command_id: str,
+        event: CtpCallbackIngressEventV1,
+        trade_fact: Any,
+        *,
+        writer_lease: WriterLease,
+        trade_verifier: CtpDispatchTradeFactVerifier,
+    ) -> CtpDispatchTradeFactApplyResult:
+        """Commit one verified TradeField, inbox cursor, and fill projection.
+
+        CTP TradeField has no RequestID, FrontID, or SessionID. This V2 path
+        correlates by one exact prior SUBMIT OrderRef within the bound account,
+        day, and session, and persists no invented native request/session IDs.
+        Trade quantities aggregate only other unique trade facts; order
+        ``VolumeTraded`` snapshots are stored separately for prefix comparison.
+        Fees remain absent/incomplete.
+        """
+
+        from .ctp_native_callbacks import CtpNativeTradeFactV2
+
+        if type(trade_fact) is not CtpNativeTradeFactV2:
+            raise ContractValidationError("typed V2 native CTP trade fact is required")
+        # The protocol is structural. Its typed result and the exact event
+        # binding checked here are the contract, not a concrete class check.
+        verify_trade = getattr(trade_verifier, "verify_trade_fact", None)
+        if not callable(verify_trade):
+            raise ContractValidationError("trusted CTP trade verifier is required")
+        if (
+            type(event) is not CtpCallbackIngressEventV1
+            or event.owner_handle is None
+            or event.callback_class != "ROUTEABLE"
+            or event.callback_name != "OnRtnTrade"
+            or trade_fact.source_callback != "OnRtnTrade"
+        ):
+            raise ContractValidationError("CTP trade fact is not bound to a routeable event")
+        account_key, trading_day, scope_key = self._validate_ctp_order_identity_scope(scope)
+        if (
+            event.owner_handle.account_key != account_key
+            or event.owner_handle.scope_key != scope_key
+            or trade_fact.source_scope.account_key != account_key
+            or trade_fact.source_scope.scope_key != scope_key
+            or trade_fact.source_scope.trading_day != trading_day
+            or self._issued_ctp_callback_ingress_events.get(
+                (event.owner_handle.owner_intent_id, event.source_sequence)
+            )
+            is not event
+        ):
+            raise ContractValidationError("CTP trade source differs from execution scope")
+        fact_payload = trade_fact.to_payload()
+        fact_payload_json = canonical_json(fact_payload)
+        fact_payload_sha256 = payload_sha256(fact_payload)
+        native_fields = dict(trade_fact.native_fields)
+        binding, broker_id, user_id = self.read_ctp_callback_session_context_facts(
+            event.owner_handle
+        )
+        session = trade_fact.source_scope
+        expected_fingerprint = "acct_" + hashlib.sha256(
+            f"{broker_id}:{user_id}".encode("ascii")
+        ).hexdigest()[:16]
+        if (
+            session.session_epoch != binding.native_client_epoch
+            or session.session_generation_id != binding.session_generation_id
+            or session.native_api_generation != binding.native_api_generation
+            or session.connection_generation != binding.connection_generation
+            or session.dispatch_front_id != binding.dispatch_front_id
+            or session.dispatch_session_id != binding.dispatch_session_id
+            or session.account_fingerprint != expected_fingerprint
+            or native_fields.get("BrokerID") != broker_id
+            or native_fields.get("UserID") != user_id
+            or native_fields.get("TradingDay") != trading_day
+        ):
+            raise ContractValidationError("CTP trade fact differs from accepted source session")
+
+        record_payload = json.loads(event.record_payload_json)
+        if (
+            record_payload.get("digest") != event.record_digest_sha256
+            or record_payload.get("sequence") != event.source_sequence
+            or record_payload.get("callback_name") != "OnRtnTrade"
+            or record_payload.get("callback_class") != "ROUTEABLE"
+            or record_payload.get("phase") != "ACTIVE"
+            or record_payload.get("capture_complete") is not True
+        ):
+            raise ContractValidationError("CTP trade ingress record is not complete")
+        for name, value in native_fields.items():
+            source_value = self._ctp_callback_field(record_payload, 0, name)
+            if name == "Price":
+                try:
+                    if Decimal(str(source_value)) != Decimal(str(value)):
+                        raise ContractValidationError("CTP trade price differs from ingress row")
+                except Exception:
+                    raise ContractValidationError("CTP trade price differs from ingress row") from None
+            elif source_value != value:
+                raise ContractValidationError("CTP trade field differs from ingress row")
+
+        staged = self.read_ctp_dispatch_command(scope, command_id)
+        if staged is None or staged.correlation_key is None:
+            raise ContractValidationError("CTP trade command is unavailable")
+        correlation = staged.correlation_key
+        if (
+            staged.operation != "SUBMIT"
+            or staged.trading_day != trading_day
+            or staged.order_ref != native_fields.get("OrderRef")
+            or correlation.order_ref != native_fields.get("OrderRef")
+            or correlation.session_generation_id != binding.session_generation_id
+            or correlation.dispatch_front_id != binding.dispatch_front_id
+            or correlation.dispatch_session_id != binding.dispatch_session_id
+            or staged.session_binding_sha256 != binding.session_binding_sha256
+        ):
+            raise ContractValidationError("CTP trade does not match the reserved submit")
+        request_payload = dict(staged.request_payload)
+        required_match = {
+            "OrderRef": "OrderRef",
+            "InstrumentID": "InstrumentID",
+            "ExchangeID": "ExchangeID",
+            "Direction": "Direction",
+        }
+        if any(request_payload.get(request_name) != native_fields.get(fact_name)
+               for request_name, fact_name in required_match.items()):
+            raise ContractValidationError("CTP trade identity differs from submit request")
+        for request_name, fact_name in (
+            ("CombOffsetFlag", "OffsetFlag"),
+            ("CombHedgeFlag", "HedgeFlag"),
+        ):
+            requested_flag = request_payload.get(request_name)
+            native_flag = native_fields.get(fact_name)
+            if (
+                type(requested_flag) is not str
+                or not requested_flag
+                or native_flag != requested_flag[0]
+            ):
+                raise ContractValidationError("CTP trade side flags differ from submit request")
+        for identity_name in ("BrokerID", "InvestorID", "UserID"):
+            if (
+                identity_name in request_payload
+                and request_payload[identity_name] != native_fields.get(identity_name)
+            ):
+                raise ContractValidationError(
+                    "CTP trade account identity differs from submit request"
+                )
+        order_quantity = request_payload.get("VolumeTotalOriginal")
+        trade_quantity = native_fields.get("Volume")
+        if (
+            type(order_quantity) is not int
+            or order_quantity <= 0
+            or type(trade_quantity) is not int
+            or trade_quantity <= 0
+        ):
+            raise ContractValidationError("CTP trade or order quantity is invalid")
+        try:
+            price = Decimal(str(native_fields.get("Price")))
+            limit_price = Decimal(str(request_payload.get("LimitPrice")))
+        except Exception:
+            raise ContractValidationError("CTP trade price does not match a valid limit") from None
+        if (
+            not price.is_finite()
+            or not limit_price.is_finite()
+            or price <= 0
+            or limit_price <= 0
+            or (native_fields.get("Direction") == "0" and price > limit_price)
+            or (native_fields.get("Direction") == "1" and price < limit_price)
+            or native_fields.get("Direction") not in {"0", "1"}
+        ):
+            raise ContractValidationError("CTP trade price is outside the bound submit limit")
+
+        verification_started_ns = time.time_ns()
+        verification_failed = False
+        evidence: CtpVerifiedTradeFactEvidence | None = None
+        try:
+            evidence = verify_trade(
+                staged,
+                trade_fact,
+                event,
+                now_ns=verification_started_ns,
+            )
+        except Exception:
+            verification_failed = True
+        if verification_failed:
+            raise ContractValidationError("trusted CTP trade verification failed")
+        if type(evidence) is not CtpVerifiedTradeFactEvidence:
+            raise ContractValidationError("invalid typed CTP trade verification result")
+        if (
+            evidence.owner_intent_id != event.owner_handle.owner_intent_id
+            or evidence.source_sequence != event.source_sequence
+            or evidence.ingress_record_digest_sha256 != event.record_digest_sha256
+            or evidence.event_id != trade_fact.event_id
+            or evidence.trade_fact_sha256 != fact_payload_sha256
+            or evidence.verified_at_ns != verification_started_ns
+        ):
+            raise ContractValidationError("verified CTP trade binding does not match source event")
+
+        with self._transaction() as cursor:
+            applied_at_ns = time.time_ns()
+            owner_row, _, _, current_binding = self._require_current_ctp_callback_ingress_event(
+                cursor, scope, event, writer_lease
+            )
+            command_row = cursor.execute(
+                """
+                SELECT * FROM ctp_dispatch_commands
+                WHERE account_key = ? AND scope_key = ? AND command_id = ?
+                """,
+                (account_key, scope_key, command_id),
+            ).fetchone()
+            if command_row is None:
+                raise ContractValidationError("CTP trade command is unavailable")
+            current = self._ctp_dispatch_command_from_row(command_row)
+            if (
+                str(owner_row["owner_state"]) != "ACTIVE"
+                or current.status not in {"COMPLETED", "UNKNOWN"}
+                or current.correlation_key != correlation
+                or command_row["callback_owner_intent_id"] != event.owner_handle.owner_intent_id
+                or int(command_row["native_call_inflight"]) != 0
+                or command_row["local_queue_receipt_id"] is None
+                or command_row["local_queue_receipt_queued"] != 1
+                or current_binding.session_binding_sha256 != binding.session_binding_sha256
+                or evidence.expires_at_ns <= applied_at_ns
+            ):
+                raise InvalidStateTransition("CTP trade command or session changed before commit")
+            if current.status == "COMPLETED" and (
+                current.native_receipt_payload is None
+                or current.native_receipt_payload.get("outcome") == "REJECTED"
+            ):
+                raise InvalidStateTransition("CTP trade conflicts with local native receipt")
+
+            identity = native_fields
+            exchange_id = str(identity["ExchangeID"])
+            trade_id = str(identity["TradeID"])
+            order_sys_id = str(identity["OrderSysID"])
+            existing = cursor.execute(
+                """
+                SELECT * FROM ctp_dispatch_trade_fact_ledger
+                WHERE account_key = ? AND trading_day = ? AND exchange_id = ? AND trade_id = ?
+                """,
+                (account_key, trading_day, exchange_id, trade_id),
+            ).fetchone()
+            if existing is not None:
+                exact = (
+                    str(existing["command_id"]) == command_id
+                    and str(existing["fact_payload_json"]) == fact_payload_json
+                    and str(existing["fact_payload_sha256"]) == fact_payload_sha256
+                    and str(existing["order_sys_id"]) == order_sys_id
+                    and str(existing["order_ref"]) == str(identity["OrderRef"])
+                )
+                if not exact:
+                    raise IntentConflictError("CTP TradeID conflicts with durable trade fact")
+                self._insert_ctp_callback_ingress_application(
+                    cursor,
+                    event,
+                    command_id,
+                    "APPLIED",
+                    {
+                        "trade_event_id": trade_fact.event_id,
+                        "trade_fact_sha256": fact_payload_sha256,
+                        "duplicate": True,
+                    },
+                    applied_at_ns=applied_at_ns,
+                )
+                projection = cursor.execute(
+                    """
+                    SELECT provider_state FROM ctp_dispatch_order_projection
+                    WHERE account_key = ? AND runtime_order_id = ?
+                    """,
+                    (account_key, current.correlation_key.runtime_order_id),
+                ).fetchone()
+                state = None if projection is None else str(projection["provider_state"])
+                return CtpDispatchTradeFactApplyResult(
+                    command_id=command_id,
+                    event_id=trade_fact.event_id,
+                    trade_quantity=trade_quantity,
+                    cumulative_trade_quantity=int(existing["cumulative_trade_volume"]),
+                    projection_state=state,
+                    duplicate=True,
+                    account_fence_open=self._ctp_dispatch_has_open_account_fence(
+                        cursor, account_key
+                    ),
+                )
+
+            same_order = cursor.execute(
+                """
+                SELECT exchange_id, order_sys_id, instrument_id
+                FROM ctp_dispatch_trade_fact_ledger
+                WHERE account_key = ? AND trading_day = ? AND order_ref = ?
+                LIMIT 1
+                """,
+                (account_key, trading_day, str(identity["OrderRef"])),
+            ).fetchone()
+            if same_order is not None and (
+                str(same_order["exchange_id"]) != exchange_id
+                or str(same_order["order_sys_id"]) != order_sys_id
+                or str(same_order["instrument_id"]) != str(identity["InstrumentID"])
+            ):
+                raise IntentConflictError("CTP trade identity changed within one OrderRef")
+            prior = cursor.execute(
+                """
+                SELECT COALESCE(SUM(trade_volume), 0) AS total
+                FROM ctp_dispatch_trade_fact_ledger
+                WHERE account_key = ? AND command_id = ?
+                """,
+                (account_key, command_id),
+            ).fetchone()
+            cumulative_trade_quantity = int(prior["total"]) + trade_quantity
+            if cumulative_trade_quantity > order_quantity:
+                raise ContractValidationError("CTP trade facts exceed reserved order quantity")
+            latest_order = cursor.execute(
+                """
+                SELECT native_volume_traded FROM ctp_dispatch_order_cumulative_ledger
+                WHERE owner_intent_id = ? AND command_id = ? AND source_sequence < ?
+                ORDER BY source_sequence DESC LIMIT 1
+                """,
+                (event.owner_handle.owner_intent_id, command_id, event.source_sequence),
+            ).fetchone()
+            cumulative_order_quantity = (
+                None if latest_order is None else int(latest_order["native_volume_traded"])
+            )
+            if cumulative_order_quantity is None:
+                prefix_consistency = "NO_ORDER_CUMULATIVE"
+            elif cumulative_order_quantity == cumulative_trade_quantity:
+                prefix_consistency = "MATCHED"
+            elif cumulative_order_quantity > cumulative_trade_quantity:
+                prefix_consistency = "ORDER_CUMULATIVE_AHEAD"
+            else:
+                prefix_consistency = "TRADE_CUMULATIVE_AHEAD"
+
+            cursor.execute(
+                """
+                INSERT INTO ctp_dispatch_trade_fact_ledger(
+                    account_key, scope_key, trading_day, owner_intent_id,
+                    source_sequence, ingress_record_digest_sha256, command_id,
+                    managed_intent_id, runtime_order_id, order_ref,
+                    session_generation_id, callback_stream_id, callback_event_id,
+                    exchange_id, trade_id, order_sys_id, instrument_id, direction,
+                    offset_flag, hedge_flag, trade_price, trade_volume,
+                    cumulative_trade_volume, cumulative_order_volume,
+                    prefix_consistency, cumulative_commission, commission_quality,
+                    fact_payload_json, fact_payload_sha256, source_digest_sha256,
+                    verifier_id, verified_at_ns, applied_at_ns
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'INCOMPLETE', ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    account_key,
+                    scope_key,
+                    trading_day,
+                    event.owner_handle.owner_intent_id,
+                    event.source_sequence,
+                    event.record_digest_sha256,
+                    command_id,
+                    current.reservation_managed_intent_id,
+                    correlation.runtime_order_id,
+                    str(identity["OrderRef"]),
+                    binding.session_generation_id,
+                    session.stream_id,
+                    trade_fact.event_id,
+                    exchange_id,
+                    trade_id,
+                    order_sys_id,
+                    str(identity["InstrumentID"]),
+                    str(identity["Direction"]),
+                    str(identity["OffsetFlag"]),
+                    str(identity["HedgeFlag"]),
+                    str(identity["Price"]),
+                    trade_quantity,
+                    cumulative_trade_quantity,
+                    cumulative_order_quantity,
+                    prefix_consistency,
+                    fact_payload_json,
+                    fact_payload_sha256,
+                    evidence.source_digest_sha256,
+                    evidence.verifier_id,
+                    evidence.verified_at_ns,
+                    applied_at_ns,
+                ),
+            )
+            projection_row = cursor.execute(
+                """
+                SELECT provider_state FROM ctp_dispatch_order_projection
+                WHERE account_key = ? AND runtime_order_id = ?
+                """,
+                (account_key, correlation.runtime_order_id),
+            ).fetchone()
+            current_state = None if projection_row is None else str(projection_row["provider_state"])
+            if current_state == "REJECTED":
+                raise InvalidStateTransition("CTP trade conflicts with rejected order projection")
+            if current_state == "CANCELLED":
+                projection_state = "CANCELLED"
+            elif current_state == "FILLED":
+                projection_state = "FILLED"
+            else:
+                projection_state = (
+                    "FILLED" if cumulative_trade_quantity == order_quantity else "PARTIALLY_FILLED"
+                )
+                self._upsert_ctp_order_projection(
+                    cursor,
+                    correlation,
+                    projection_state,
+                    evidence.source_digest_sha256,
+                    source_kind="CALLBACK",
+                    updated_at_ns=applied_at_ns,
+                    source_event_identity=(
+                        binding.session_generation_id,
+                        session.stream_id,
+                        trade_fact.event_id,
+                    ),
+                )
+            self._insert_ctp_callback_ingress_application(
+                cursor,
+                event,
+                command_id,
+                "APPLIED",
+                {
+                    "trade_event_id": trade_fact.event_id,
+                    "trade_fact_sha256": fact_payload_sha256,
+                    "source_digest_sha256": evidence.source_digest_sha256,
+                    "cumulative_trade_quantity": cumulative_trade_quantity,
+                    "cumulative_order_quantity": cumulative_order_quantity,
+                    "prefix_consistency": prefix_consistency,
+                    "commission_quality": "INCOMPLETE",
+                    "duplicate": False,
+                },
+                applied_at_ns=applied_at_ns,
+            )
+            return CtpDispatchTradeFactApplyResult(
+                command_id=command_id,
+                event_id=trade_fact.event_id,
+                trade_quantity=trade_quantity,
+                cumulative_trade_quantity=cumulative_trade_quantity,
+                projection_state=projection_state,
+                duplicate=False,
+                account_fence_open=self._ctp_dispatch_has_open_account_fence(
+                    cursor, account_key
+                ),
             )
 
     def resolve_unknown_ctp_dispatch_command(
@@ -6243,22 +10201,43 @@ class SqliteExecutionStore:
         state: ExecutionState,
         payload: dict[str, Any],
         now_ns: int,
-    ) -> None:
+    ) -> ExecutionEvent:
+        identity_row = cursor.execute(
+            "SELECT value FROM execution_meta WHERE key = ?",
+            ("journal_incarnation_id",),
+        ).fetchone()
+        if identity_row is None:
+            raise DurableStoreError("execution journal identity is unavailable")
+        event_id = uuid.uuid4().hex
+        payload_json = self._event_payload(**payload)
         cursor.execute(
             """
             INSERT INTO execution_outbox(
-                event_id, intent_id, scope_key, event_type, state, payload_json, created_at_ns
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                event_id, intent_id, scope_key, event_type, state, payload_json, created_at_ns,
+                journal_incarnation_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                uuid.uuid4().hex,
+                event_id,
                 intent_id,
                 scope_key,
                 event_type,
                 state.value,
-                self._event_payload(**payload),
+                payload_json,
                 now_ns,
+                identity_row["value"],
             ),
+        )
+        return ExecutionEvent(
+            sequence=int(cursor.lastrowid),
+            event_id=event_id,
+            intent_id=intent_id,
+            scope_key=scope_key,
+            event_type=event_type,
+            state=state,
+            payload=json.loads(payload_json),
+            created_at_ns=now_ns,
+            journal_incarnation_id=str(identity_row["value"]),
         )
 
     def _append_cancel_event(
@@ -6974,6 +10953,17 @@ class SqliteExecutionStore:
                             "cancel_id": record.cancel_id,
                             "provider_order_id": record.provider_order_id,
                             "source": source,
+                            "filled_quantity": format(target_record.filled_quantity, "f"),
+                            "average_price": (
+                                None
+                                if target_record.average_price is None
+                                else format(target_record.average_price, "f")
+                            ),
+                            "cumulative_commission": (
+                                None
+                                if target_record.cumulative_commission is None
+                                else format(target_record.cumulative_commission, "f")
+                            ),
                         },
                         now_ns=now_ns,
                     )
@@ -7160,7 +11150,13 @@ class SqliteExecutionStore:
         blocked: bool = False,
         writer_lease: WriterLease | None = None,
     ) -> ExecutionRecord:
-        """Durably reject an intent before any provider dispatch."""
+        """Durably reject an intent before any provider dispatch.
+
+        The ``intent_rejected``/``intent_blocked`` events are no-dispatch
+        lifecycle facts. They are emitted only from ``PENDING_ADMISSION`` and
+        only while the record has no provider identity, fill, price, fee, or
+        dispatch attempt. Their payload contains only the local reason code.
+        """
 
         if not reason_code or not reason_code.replace("_", "").isalnum():
             raise ContractValidationError("invalid reason_code")
@@ -7174,6 +11170,14 @@ class SqliteExecutionStore:
             record = self._record_from_row(row)
             if record.state is not ExecutionState.PENDING_ADMISSION:
                 return record
+            if (
+                record.dispatch_attempts != 0
+                or record.provider_order_id is not None
+                or record.filled_quantity != Decimal("0")
+                or record.average_price is not None
+                or record.cumulative_commission is not None
+            ):
+                raise InvalidStateTransition("pending admission has dispatch evidence")
             cursor.execute(
                 """
                 UPDATE execution_records
@@ -7332,7 +11336,22 @@ class SqliteExecutionStore:
         source: str = "provider",
         writer_lease: WriterLease | None = None,
     ) -> ExecutionRecord:
-        """Apply monotonic provider evidence to a dispatch or unknown record."""
+        """Apply provider evidence while preserving the record-returning API."""
+
+        record, _event = self.record_observation_with_event(
+            observation, scope=scope, source=source, writer_lease=writer_lease
+        )
+        return record
+
+    def record_observation_with_event(
+        self,
+        observation: ProviderObservation,
+        *,
+        scope: ExecutionScope,
+        source: str = "provider",
+        writer_lease: WriterLease | None = None,
+    ) -> tuple[ExecutionRecord, ExecutionEvent | None]:
+        """Apply evidence and return the exact new event from the same transaction."""
 
         if source not in {"provider", "reconcile"}:
             raise ContractValidationError("invalid observation source")
@@ -7344,52 +11363,72 @@ class SqliteExecutionStore:
                 raise ContractValidationError("unknown intent_id")
             record = self._record_from_row(row)
             target = observation.state
-            if record.state is target:
-                if observation.filled_quantity == record.filled_quantity and (
-                    observation.provider_order_id is None
-                    or observation.provider_order_id == record.provider_order_id
+            same_state_partial_growth = (
+                record.state is ExecutionState.PARTIALLY_FILLED
+                and target is ExecutionState.PARTIALLY_FILLED
+                and observation.filled_quantity > record.filled_quantity
+            )
+            if record.state is target and not same_state_partial_growth:
+                if (
+                    observation.filled_quantity != record.filled_quantity
+                    or (
+                        observation.provider_order_id is not None
+                        and observation.provider_order_id != record.provider_order_id
+                    )
+                    or (
+                        observation.average_price is not None
+                        and observation.average_price != record.average_price
+                    )
                 ):
-                    if observation.cumulative_commission is None:
-                        return record
-                    if record.cumulative_commission == observation.cumulative_commission:
-                        return record
-                    if record.cumulative_commission is None:
-                        cursor.execute(
-                            """
-                            UPDATE execution_records
-                            SET cumulative_commission = ?, updated_at_ns = ?
-                            WHERE scope_key = ? AND intent_id = ?
-                            """,
-                            (
-                                format(observation.cumulative_commission, "f"),
-                                now_ns,
-                                scope.key,
-                                observation.intent_id,
-                            ),
-                        )
-                        self._append_event(
-                            cursor,
-                            intent_id=observation.intent_id,
-                            scope_key=scope.key,
-                            event_type="provider_commission_evidence",
-                            state=target,
-                            payload={
-                                "cumulative_commission": format(
-                                    observation.cumulative_commission, "f"
-                                ),
-                                "source": source,
-                            },
-                            now_ns=now_ns,
-                        )
-                        updated = self._fetch_record(cursor, scope.key, observation.intent_id)
-                        assert updated is not None
-                        return self._record_from_row(updated)
-                raise InvalidStateTransition("conflicting duplicate provider observation")
+                    raise InvalidStateTransition("conflicting duplicate provider observation")
+                if observation.cumulative_commission is None:
+                    return record, None
+                if record.cumulative_commission == observation.cumulative_commission:
+                    return record, None
+                if record.cumulative_commission is not None:
+                    raise InvalidStateTransition("conflicting duplicate provider commission")
+                cursor.execute(
+                    """
+                    UPDATE execution_records
+                    SET cumulative_commission = ?, updated_at_ns = ?
+                    WHERE scope_key = ? AND intent_id = ?
+                    """,
+                    (
+                        format(observation.cumulative_commission, "f"),
+                        now_ns,
+                        scope.key,
+                        observation.intent_id,
+                    ),
+                )
+                appended_event = self._append_event(
+                    cursor,
+                    intent_id=observation.intent_id,
+                    scope_key=scope.key,
+                    event_type="provider_commission_evidence",
+                    state=target,
+                    payload={
+                        "provider_order_id": record.provider_order_id,
+                        "filled_quantity": format(record.filled_quantity, "f"),
+                        "average_price": (
+                            None
+                            if record.average_price is None
+                            else format(record.average_price, "f")
+                        ),
+                        "cumulative_commission": format(
+                            observation.cumulative_commission, "f"
+                        ),
+                        "source": source,
+                    },
+                    now_ns=now_ns,
+                )
+                updated = self._fetch_record(cursor, scope.key, observation.intent_id)
+                assert updated is not None
+                return self._record_from_row(updated), appended_event
             if record.is_terminal:
                 if target in {ExecutionState.ACKED, ExecutionState.PARTIALLY_FILLED}:
-                    return record
+                    return record, None
                 raise InvalidStateTransition("conflicting terminal provider observation")
-            if not can_transition(record.state, target):
+            if not same_state_partial_growth and not can_transition(record.state, target):
                 raise InvalidStateTransition()
             payload = json.loads(row["payload_json"])
             intent_quantity = Decimal(payload["quantity"])
@@ -7419,7 +11458,11 @@ class SqliteExecutionStore:
                     (
                         format(observation.cumulative_commission, "f")
                         if observation.cumulative_commission is not None
-                        else row["cumulative_commission"]
+                        else (
+                            None
+                            if observation.filled_quantity > record.filled_quantity
+                            else row["cumulative_commission"]
+                        )
                     ),
                     0 if target in TERMINAL_STATES else record.review_required,
                     now_ns,
@@ -7427,7 +11470,7 @@ class SqliteExecutionStore:
                     observation.intent_id,
                 ),
             )
-            self._append_event(
+            appended_event = self._append_event(
                 cursor,
                 intent_id=observation.intent_id,
                 scope_key=scope.key,
@@ -7438,6 +11481,11 @@ class SqliteExecutionStore:
                 payload={
                     "provider_order_id": provider_order_id,
                     "filled_quantity": format(observation.filled_quantity, "f"),
+                    "average_price": (
+                        None
+                        if observation.average_price is None
+                        else format(observation.average_price, "f")
+                    ),
                     "cumulative_commission": (
                         None
                         if observation.cumulative_commission is None
@@ -7450,7 +11498,7 @@ class SqliteExecutionStore:
             )
             updated = self._fetch_record(cursor, scope.key, observation.intent_id)
             assert updated is not None
-            return self._record_from_row(updated)
+            return self._record_from_row(updated), appended_event
 
     @staticmethod
     def _validate_fill_progress(
@@ -7531,7 +11579,7 @@ class SqliteExecutionStore:
                     rows = self._connection.execute(
                         """
                         SELECT sequence, event_id, intent_id, scope_key, event_type, state, payload_json,
-                               created_at_ns
+                               created_at_ns, journal_incarnation_id
                         FROM execution_outbox WHERE sequence > ? ORDER BY sequence ASC LIMIT ?
                         """,
                         (after_sequence, limit),
@@ -7540,7 +11588,7 @@ class SqliteExecutionStore:
                     rows = self._connection.execute(
                         """
                         SELECT sequence, event_id, intent_id, scope_key, event_type, state, payload_json,
-                               created_at_ns
+                               created_at_ns, journal_incarnation_id
                         FROM execution_outbox
                         WHERE sequence > ? AND scope_key = ?
                         ORDER BY sequence ASC LIMIT ?
@@ -7560,6 +11608,7 @@ class SqliteExecutionStore:
                     state=ExecutionState(row["state"]),
                     payload=json.loads(row["payload_json"]),
                     created_at_ns=row["created_at_ns"],
+                    journal_incarnation_id=row["journal_incarnation_id"],
                 )
                 for row in rows
             )

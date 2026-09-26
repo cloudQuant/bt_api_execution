@@ -22,7 +22,7 @@ from hashlib import sha256
 from types import MappingProxyType
 from typing import Any, Literal, Protocol
 
-from .contracts import ExecutionScope, canonical_json
+from .contracts import ExecutionScope, canonical_json, payload_sha256
 from .errors import ContractValidationError
 from .store import (
     CtpCancelTarget,
@@ -98,7 +98,6 @@ class CtpManagedPreparedDispatch:
     native_request_id: int
     local_queue_receipt_id: str
     managed_cancel_intent_id: str | None = None
-    native_action_ref: str | None = None
     cancel_target_exchange_id: str | None = None
     cancel_target_order_sys_id: str | None = None
     cancel_target_front_id: int | None = None
@@ -132,7 +131,7 @@ class CtpManagedPreparedDispatch:
                 "managed CTP prepared binding is not canonical"
             ) from error
         if self.operation == "submit":
-            if self.managed_cancel_intent_id is not None or self.native_action_ref is not None:
+            if self.managed_cancel_intent_id is not None:
                 raise ContractValidationError("submit cannot carry cancel action identity")
             if any(
                 value is not None
@@ -151,8 +150,6 @@ class CtpManagedPreparedDispatch:
                 or self.managed_cancel_intent_id == self.managed_intent_id
             ):
                 raise ContractValidationError("cancel requires a distinct managed action id")
-            if type(self.native_action_ref) is not str or not self.native_action_ref:
-                raise ContractValidationError("cancel requires its exact native ActionRef")
             if (
                 type(self.cancel_target_exchange_id) is not str
                 or not self.cancel_target_exchange_id
@@ -193,6 +190,8 @@ class CtpManagedPreparedDispatch:
             "dispatch_session_id": self.dispatch_session_id,
         }
         decoded_session = json.loads(session_binding)
+        if "OrderActionRef" in json.loads(request_payload):
+            raise ContractValidationError("prepared logical payload cannot supply OrderActionRef")
         if any(decoded_session.get(key) != value for key, value in expected_session.items()):
             raise ContractValidationError("managed CTP session binding echo differs")
         # Keep the staged inputs detached from mutable caller dictionaries.
@@ -221,7 +220,7 @@ class CtpManagedDispatchBinding:
     dispatch_front_id: int
     dispatch_session_id: int
     native_request_id: int
-    native_action_ref: str | None
+    native_action_ref: int | None
     cancel_target_exchange_id: str | None
     cancel_target_order_sys_id: str | None
     cancel_target_front_id: int | None
@@ -229,12 +228,40 @@ class CtpManagedDispatchBinding:
     local_queue_receipt_id: str
     local_queue_receipt_queued: bool | None
     request_payload: Mapping[str, Any]
+    native_request_payload: Mapping[str, Any]
+    native_request_payload_sha256: str
     session_binding: Mapping[str, Any]
     order_ref_reservation_created_at_ns: int
 
+    def __post_init__(self) -> None:
+        if self.operation not in {"submit", "cancel"}:
+            raise ContractValidationError("invalid managed CTP binding operation")
+        if type(self.native_request_id) is not int or not 1 <= self.native_request_id <= 2_147_483_647:
+            raise ContractValidationError("invalid managed CTP binding RequestID")
+        if self.operation == "cancel":
+            if type(self.native_action_ref) is not int or not 1 <= self.native_action_ref <= 2_147_483_647:
+                raise ContractValidationError("invalid Store-issued native ActionRef")
+        elif self.native_action_ref is not None:
+            raise ContractValidationError("submit binding cannot carry a native ActionRef")
+        if not isinstance(self.request_payload, Mapping) or not isinstance(
+            self.native_request_payload, Mapping
+        ):
+            raise ContractValidationError("managed CTP binding lacks native request payload")
+        logical = dict(self.request_payload)
+        native = dict(self.native_request_payload)
+        if "OrderActionRef" in logical:
+            raise ContractValidationError("logical managed payload contains native ActionRef")
+        expected = dict(logical)
+        if self.operation == "cancel":
+            expected["OrderActionRef"] = self.native_action_ref
+        if native != expected or not _HEX_64.fullmatch(self.native_request_payload_sha256):
+            raise ContractValidationError("managed CTP native payload differs from Store binding")
+        if payload_sha256(native) != self.native_request_payload_sha256:
+            raise ContractValidationError("managed CTP native payload digest differs")
+
     @property
     def version(self) -> int:
-        return 1
+        return 2
 
     @property
     def managed_cancel_intent_id(self) -> str | None:
@@ -251,7 +278,13 @@ class CtpManagedDispatchBinding:
         reservation: CtpOrderIdentityReservation,
     ) -> CtpManagedDispatchBinding:
         key = command.correlation_key
-        if key is None or command.local_queue_receipt_id is None:
+        if (
+            key is None
+            or key.version != 2
+            or command.native_request_payload is None
+            or command.native_request_payload_sha256 is None
+            or command.local_queue_receipt_id is None
+        ):
             raise ContractValidationError("managed CTP command binding is incomplete")
         operation = "submit" if command.operation == "SUBMIT" else "cancel"
         return cls(
@@ -280,6 +313,8 @@ class CtpManagedDispatchBinding:
             local_queue_receipt_id=command.local_queue_receipt_id,
             local_queue_receipt_queued=command.local_queue_receipt_queued,
             request_payload=MappingProxyType(dict(command.request_payload)),
+            native_request_payload=MappingProxyType(dict(command.native_request_payload)),
+            native_request_payload_sha256=command.native_request_payload_sha256,
             session_binding=MappingProxyType(dict(command.session_binding)),
             order_ref_reservation_created_at_ns=reservation.created_at_ns,
         )
@@ -300,6 +335,7 @@ class CtpManagedDispatchBinding:
             "order_ref": self.order_ref,
             "cancel_target_order_ref": self.cancel_target_order_ref,
             "request_payload_sha256": self.request_payload_sha256,
+            "native_request_payload_sha256": self.native_request_payload_sha256,
             "approval_use_id": self.approval_use_id,
             "approval_digest": self.approval_digest,
             "session_binding_sha256": self.session_binding_sha256,
@@ -316,6 +352,7 @@ class CtpManagedDispatchBinding:
             "local_queue_receipt_queued": self.local_queue_receipt_queued,
             "managed_cancel_intent_id": self.managed_cancel_intent_id,
             "request_payload": dict(self.request_payload),
+            "native_request_payload": dict(self.native_request_payload),
             "session_binding": dict(self.session_binding),
             "order_ref_reservation_created_at_ns": self.order_ref_reservation_created_at_ns,
         }
@@ -432,7 +469,6 @@ class CtpManagedSingleWorkerCandidate:
             dispatch_front_id=prepared.dispatch_front_id,
             dispatch_session_id=prepared.dispatch_session_id,
             native_request_id=prepared.native_request_id,
-            native_action_ref=prepared.native_action_ref,
             local_queue_receipt_id=prepared.local_queue_receipt_id,
             cancel_target_projection=cancel_target_projection,
         )

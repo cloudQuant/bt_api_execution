@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import sqlite3
 from dataclasses import dataclass
 from decimal import Decimal
 
@@ -12,6 +14,7 @@ from bt_api_execution import (
     ExecutionScope,
     ExecutionState,
     IntentConflictError,
+    InvalidStateTransition,
     ManagedExecutionFacade,
     OrderIntent,
     ProviderObservation,
@@ -27,9 +30,12 @@ class _Permit:
 
 
 class _Gate:
-    def __init__(self, *, deny: bool = False, fail_validate: bool = False) -> None:
+    def __init__(
+        self, *, deny: bool = False, fail_validate: bool = False, fail_settle: bool = False
+    ) -> None:
         self.deny = deny
         self.fail_validate = fail_validate
+        self.fail_settle = fail_settle
         self.reserved: list[str] = []
         self.settled: list[str] = []
         self.released: list[tuple[str, str]] = []
@@ -50,6 +56,8 @@ class _Gate:
         self.released.append((permit_id, reason))
 
     def settle(self, permit_id: str) -> None:
+        if self.fail_settle:
+            raise RuntimeError(permit_id)
         self.settled.append(permit_id)
 
 
@@ -408,6 +416,307 @@ def test_observation_advances_acknowledged_order_without_second_permit_settlemen
         assert gate.settled == ["permit-signal-1"]
     finally:
         store.close()
+
+
+@pytest.mark.unit
+def test_same_partial_cumulative_observations_are_monotonic_snapshot_events(tmp_path) -> None:
+    gate = _Gate()
+    store, facade = _facade(tmp_path, gate)
+    try:
+        facade.submit(
+            _intent(),
+            lambda intent: ProviderObservation.accepted(intent.intent_id, "provider-order-1"),
+        )
+        first = ProviderObservation(
+            "signal-1",
+            ExecutionState.PARTIALLY_FILLED,
+            provider_order_id="provider-order-1",
+            filled_quantity=Decimal("0.5"),
+            average_price=Decimal("50000"),
+            cumulative_commission=Decimal("-0.10"),
+        )
+        first_event = facade.record_provider_observation_event(first)
+        assert first_event is not None
+        first_record = store.get("signal-1", scope=_scope())
+        assert first_record is not None
+        assert first_record.state is ExecutionState.PARTIALLY_FILLED
+        first_event_count = len(store.read_outbox())
+        assert facade.record_provider_observation_event(first) is None
+        assert len(store.read_outbox()) == first_event_count
+
+        second = ProviderObservation(
+            "signal-1",
+            ExecutionState.PARTIALLY_FILLED,
+            provider_order_id="provider-order-1",
+            filled_quantity=Decimal("1.25"),
+            average_price=Decimal("49999"),
+            cumulative_commission=Decimal("-0.04"),
+        )
+        second_event = facade.record_provider_observation_event(second)
+        assert second_event is not None
+        assert second_event.event_type == "reconciled_observation"
+        assert second_event.payload["filled_quantity"] == "1.25"
+        second_record = store.get("signal-1", scope=_scope())
+        assert second_record.filled_quantity == Decimal("1.25")
+        assert second_record.cumulative_commission == Decimal("-0.04")
+        assert gate.settled == ["permit-signal-1"]
+
+        events = [
+            event
+            for event in store.read_outbox()
+            if event.event_type in {"provider_observation", "reconciled_observation"}
+        ]
+        assert [event.payload["filled_quantity"] for event in events] == ["0", "0.5", "1.25"]
+        assert [event.payload["average_price"] for event in events] == [None, "50000", "49999"]
+        assert [event.payload["cumulative_commission"] for event in events] == [
+            None,
+            "-0.10",
+            "-0.04",
+        ]
+        assert all(
+            event.journal_incarnation_id == store.journal_source_identity()["generation"]
+            for event in events
+        )
+        assert len({event.event_id for event in events}) == len(events)
+
+        with pytest.raises(
+            InvalidStateTransition, match="conflicting duplicate provider observation"
+        ):
+            store.record_observation(
+                ProviderObservation(
+                    "signal-1",
+                    ExecutionState.PARTIALLY_FILLED,
+                    provider_order_id="provider-order-1",
+                    filled_quantity=Decimal("1.25"),
+                    average_price=Decimal("49998"),
+                    cumulative_commission=Decimal("-0.04"),
+                ),
+                scope=_scope(),
+                writer_lease=facade.acquire_writer_lease(),
+            )
+        with pytest.raises(
+            InvalidStateTransition, match="conflicting duplicate provider commission"
+        ):
+            store.record_observation(
+                ProviderObservation(
+                    "signal-1",
+                    ExecutionState.PARTIALLY_FILLED,
+                    provider_order_id="provider-order-1",
+                    filled_quantity=Decimal("1.25"),
+                    average_price=Decimal("49999"),
+                    cumulative_commission=Decimal("-0.05"),
+                ),
+                scope=_scope(),
+                writer_lease=facade.acquire_writer_lease(),
+            )
+        for invalid in (
+            ProviderObservation(
+                "signal-1",
+                ExecutionState.PARTIALLY_FILLED,
+                provider_order_id="provider-order-1",
+                filled_quantity=Decimal("1.0"),
+                average_price=Decimal("49999"),
+            ),
+            ProviderObservation(
+                "signal-1",
+                ExecutionState.PARTIALLY_FILLED,
+                provider_order_id="provider-order-1",
+                filled_quantity=Decimal("2"),
+                average_price=Decimal("49999"),
+            ),
+            ProviderObservation(
+                "signal-1",
+                ExecutionState.PARTIALLY_FILLED,
+                provider_order_id="other-order",
+                filled_quantity=Decimal("1.5"),
+                average_price=Decimal("49999"),
+            ),
+        ):
+            with pytest.raises(InvalidStateTransition):
+                store.record_observation(
+                    invalid,
+                    scope=_scope(),
+                    writer_lease=facade.acquire_writer_lease(),
+                )
+        assert len(store.read_outbox()) == first_event_count + 1
+    finally:
+        facade.close()
+        store.close()
+
+
+@pytest.mark.unit
+def test_unknown_to_known_fee_evidence_has_immutable_snapshot_and_replay_identity(tmp_path) -> None:
+    store, facade = _facade(tmp_path, _Gate())
+    try:
+        facade.submit(
+            _intent(),
+            lambda intent: ProviderObservation.accepted(intent.intent_id, "provider-order-1"),
+        )
+        partial_without_fee = ProviderObservation(
+            "signal-1",
+            ExecutionState.PARTIALLY_FILLED,
+            provider_order_id="provider-order-1",
+            filled_quantity=Decimal("0.5"),
+            average_price=Decimal("50000"),
+        )
+        assert facade.record_provider_observation_event(partial_without_fee) is not None
+        fee_evidence = ProviderObservation(
+            "signal-1",
+            ExecutionState.PARTIALLY_FILLED,
+            provider_order_id="provider-order-1",
+            filled_quantity=Decimal("0.5"),
+            average_price=Decimal("50000"),
+            cumulative_commission=Decimal("-0.10"),
+        )
+        fee_result = facade.record_provider_observation_event(fee_evidence)
+        assert fee_result is not None
+        events = store.read_outbox()
+        fee_event = events[-1]
+        assert fee_event == fee_result
+        assert fee_event.event_type == "provider_commission_evidence"
+        assert fee_event.payload["filled_quantity"] == "0.5"
+        assert fee_event.payload["average_price"] == "50000"
+        assert fee_event.payload["cumulative_commission"] == "-0.10"
+        assert fee_event.payload["source"] == "reconcile"
+        assert fee_event.journal_incarnation_id == store.journal_source_identity()["generation"]
+        assert (
+            store.read_outbox(after_sequence=fee_event.sequence - 1)[0].event_id
+            == fee_event.event_id
+        )
+    finally:
+        facade.close()
+        store.close()
+
+
+@pytest.mark.unit
+def test_observation_event_is_not_returned_when_admission_settlement_fails(tmp_path) -> None:
+    gate = _Gate()
+    store, facade = _facade(tmp_path, gate)
+    try:
+        record = facade.submit(_intent(), lambda intent: (_ for _ in ()).throw(TimeoutError()))
+        assert record.state is ExecutionState.UNKNOWN
+        gate.fail_settle = True
+        with pytest.raises(InvalidStateTransition, match="requires manual review"):
+            facade.record_provider_observation_event(
+                ProviderObservation(
+                    "signal-1",
+                    ExecutionState.PARTIALLY_FILLED,
+                    provider_order_id="provider-order-1",
+                    filled_quantity=Decimal("0.5"),
+                    average_price=Decimal("50000"),
+                )
+            )
+        durable = [
+            item for item in store.read_outbox() if item.event_type == "reconciled_observation"
+        ]
+        assert len(durable) == 1
+        assert durable[0].payload["filled_quantity"] == "0.5"
+        assert store.read_outbox(after_sequence=durable[0].sequence)[0].event_type == (
+            "manual_review_required"
+        )
+        current = store.get("signal-1", scope=_scope())
+        assert current is not None and current.review_required is True
+    finally:
+        facade.close()
+        store.close()
+
+
+@pytest.mark.unit
+def test_invalid_observation_event_raises_only_after_durable_review_latch(tmp_path) -> None:
+    store, facade = _facade(tmp_path, _Gate())
+    try:
+        facade.submit(
+            _intent(),
+            lambda intent: ProviderObservation.accepted(intent.intent_id, "provider-order-1"),
+        )
+        invalid = ProviderObservation(
+            "signal-1",
+            ExecutionState.PARTIALLY_FILLED,
+            provider_order_id="provider-order-1",
+            filled_quantity=Decimal("2"),
+            average_price=Decimal("50000"),
+        )
+
+        with pytest.raises(InvalidStateTransition, match="requires manual review"):
+            facade.record_provider_observation_event(invalid)
+
+        record = store.get("signal-1", scope=_scope())
+        assert record is not None
+        assert record.review_required is True
+        assert not any(
+            event.event_type in {"provider_observation", "reconciled_observation"}
+            and event.payload.get("filled_quantity") == "2"
+            for event in store.read_outbox()
+        )
+        assert store.read_outbox()[-1].event_type == "manual_review_required"
+    finally:
+        facade.close()
+        store.close()
+
+
+@pytest.mark.unit
+def test_v13_outbox_events_remain_unbound_during_v14_v15_migrations(tmp_path) -> None:
+    path = tmp_path / "execution.sqlite3"
+    store = SqliteExecutionStore(path)
+    facade = ManagedExecutionFacade(store, _scope(), writer_id="writer-a", admission_gate=_Gate())
+    try:
+        facade.submit(
+            _intent(),
+            lambda intent: ProviderObservation.accepted(intent.intent_id, "provider-order-1"),
+        )
+    finally:
+        facade.close()
+        store.close()
+
+    connection = sqlite3.connect(path)
+    try:
+        row = connection.execute(
+            "SELECT sequence, payload_json FROM execution_outbox "
+            "WHERE event_type = 'provider_observation' ORDER BY sequence DESC LIMIT 1"
+        ).fetchone()
+        assert row is not None
+        old_payload = json.loads(row[1])
+        old_payload.pop("average_price", None)
+        connection.execute(
+            "UPDATE execution_outbox SET payload_json = ? WHERE sequence = ?",
+            (json.dumps(old_payload, separators=(",", ":"), sort_keys=True), row[0]),
+        )
+        connection.execute("ALTER TABLE execution_outbox DROP COLUMN journal_incarnation_id")
+        connection.execute("DELETE FROM execution_meta WHERE key = 'journal_incarnation_id'")
+        connection.execute("UPDATE execution_meta SET value = '13' WHERE key = 'schema_version'")
+        connection.commit()
+    finally:
+        connection.close()
+
+    migrated = SqliteExecutionStore(path)
+    migrated_facade = ManagedExecutionFacade(
+        migrated, _scope(), writer_id="writer-b", admission_gate=_Gate()
+    )
+    try:
+        old_events = migrated.read_outbox()
+        assert old_events
+        assert all(event.journal_incarnation_id is None for event in old_events)
+        old_observation = next(
+            event for event in old_events if event.event_type == "provider_observation"
+        )
+        assert "average_price" not in old_observation.payload
+        identity = migrated.journal_source_identity()
+        migrated_facade.record_provider_observation(
+            ProviderObservation(
+                "signal-1",
+                ExecutionState.PARTIALLY_FILLED,
+                provider_order_id="provider-order-1",
+                filled_quantity=Decimal("1"),
+                average_price=Decimal("49999"),
+            )
+        )
+        new_event = migrated.read_outbox(after_sequence=old_events[-1].sequence)[0]
+        assert new_event.journal_incarnation_id == identity["generation"]
+        assert new_event.payload["average_price"] == "49999"
+        assert "average_price" not in migrated.read_outbox()[3].payload
+    finally:
+        migrated_facade.close()
+        migrated.close()
 
 
 @pytest.mark.unit

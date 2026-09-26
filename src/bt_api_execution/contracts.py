@@ -155,18 +155,29 @@ def _economic_scope_wire(
     epoch: int | None,
     *,
     strategy_attribution: bool,
+    generation_kind: str | None,
 ) -> dict[str, Any]:
     if not isinstance(scope, ExecutionScope):
         raise ContractValidationError("economic fact scope is required")
-    if generation is None:
-        raise ContractValidationError("economic fact generation is required for wire export")
-    generation = _text(generation, "generation")
-    if type(epoch) is not int or epoch <= 0:
-        raise ContractValidationError("economic fact epoch is required for wire export")
+    if generation_kind is not None:
+        generation_kind = _text(generation_kind, "generation_kind")
+        if generation_kind not in {"EXECUTION_JOURNAL", "PROVIDER_SESSION"}:
+            raise ContractValidationError("invalid generation_kind")
+    if generation is not None:
+        generation = _text(generation, "generation")
+    if (generation_kind is None) != (generation is None):
+        raise ContractValidationError("generation kind and identity must be supplied together")
+    if epoch is not None and (type(epoch) is not int or epoch <= 0):
+        raise ContractValidationError("invalid economic fact epoch")
+    if generation is None and epoch is not None:
+        raise ContractValidationError("an unscoped generation cannot carry an epoch")
+    if generation is not None and epoch is None:
+        raise ContractValidationError("a scoped generation requires an epoch")
     return {
         "provider": scope.provider,
         "environment": scope.environment,
         "account_fingerprint": scope.account_key.partition(":")[2],
+        "generation_kind": generation_kind,
         "generation": generation,
         "trading_day": scope.trading_day,
         "epoch": epoch,
@@ -810,6 +821,7 @@ class AccountSnapshot:
     field_source_refs: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     external_activity_coverage_ns: tuple[int, int] | None = None
     external_activity_source_refs: tuple[str, ...] = ()
+    generation_kind: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.scope, ExecutionScope):
@@ -827,6 +839,11 @@ class AccountSnapshot:
                 object.__setattr__(self, name, _text(value, name))
         if self.generation is not None:
             object.__setattr__(self, "generation", _text(self.generation, "generation"))
+        if self.generation_kind is not None:
+            generation_kind = _text(self.generation_kind, "generation_kind")
+            if generation_kind not in {"EXECUTION_JOURNAL", "PROVIDER_SESSION"}:
+                raise ContractValidationError("invalid generation_kind")
+            object.__setattr__(self, "generation_kind", generation_kind)
         object.__setattr__(self, "epoch", _optional_timestamp_ns(self.epoch, "epoch"))
         if self.external_activity_attribution not in _FACT_COMPLETENESS:
             raise ContractValidationError("invalid external activity attribution completeness")
@@ -861,15 +878,20 @@ class AccountSnapshot:
         object.__setattr__(self, "external_activity_source_refs", external_refs)
 
     def to_wire(self) -> dict[str, Any]:
-        """Return the strict ``bt_api.execution.account_snapshot.v1`` mapping."""
+        """Return the strict ``bt_api.execution.account_snapshot.v2`` mapping."""
 
         scope = _economic_scope_wire(
-            self.scope, self.generation, self.epoch, strategy_attribution=False
+            self.scope,
+            self.generation,
+            self.epoch,
+            strategy_attribution=False,
+            generation_kind=self.generation_kind,
         )
         values = {name: getattr(self, name) for name in _ACCOUNT_VALUE_FIELDS}
         scope_complete = scope["trading_day"] is not None
         context_complete = (
             scope_complete
+            and scope["generation"] is not None
             and self.currency is not None
             and self.reporting_currency is not None
             and self.equity_includes_fees is not None
@@ -882,7 +904,7 @@ class AccountSnapshot:
             required_context_complete=context_complete,
         )
         return {
-            "schema": "bt_api.execution.account_snapshot.v1",
+            "schema": "bt_api.execution.account_snapshot.v2",
             "fact_type": "account_snapshot",
             "scope": scope,
             "as_of_ns": self.as_of_ns,
@@ -960,6 +982,10 @@ class ExecutionQualityRecord:
     field_completeness: Mapping[str, str] = field(default_factory=dict)
     field_coverage_ns: Mapping[str, tuple[int, int]] = field(default_factory=dict)
     field_source_refs: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    generation_kind: str | None = None
+    native_quantity_basis: str | None = None
+    vwap_basis: str | None = None
+    fee_basis: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "intent_id", _text(self.intent_id, "intent_id"))
@@ -1001,6 +1027,18 @@ class ExecutionQualityRecord:
             raise ContractValidationError("invalid execution quality scope")
         if self.generation is not None:
             object.__setattr__(self, "generation", _text(self.generation, "generation"))
+        if self.generation_kind is not None:
+            generation_kind = _text(self.generation_kind, "generation_kind")
+            if generation_kind not in {"EXECUTION_JOURNAL", "PROVIDER_SESSION"}:
+                raise ContractValidationError("invalid generation_kind")
+            object.__setattr__(self, "generation_kind", generation_kind)
+        for name in ("native_quantity_basis", "vwap_basis", "fee_basis"):
+            basis = getattr(self, name)
+            if basis is not None:
+                basis = _text(basis, name)
+                if basis not in {"TRADE", "ORDER_CUMULATIVE"}:
+                    raise ContractValidationError(f"invalid {name}")
+                object.__setattr__(self, name, basis)
         object.__setattr__(self, "epoch", _optional_timestamp_ns(self.epoch, "epoch"))
         for name in ("currency", "fee_currency", "arrival_source"):
             value = getattr(self, name)
@@ -1010,6 +1048,14 @@ class ExecutionQualityRecord:
             value = getattr(self, name)
             if value is not None:
                 object.__setattr__(self, name, _text(value, name))
+        if (
+            any(
+                basis == "TRADE"
+                for basis in (self.native_quantity_basis, self.vwap_basis, self.fee_basis)
+            )
+            and self.trade_id is None
+        ):
+            raise ContractValidationError("TRADE measurement basis requires trade_id")
         for name in ("arrival_as_of_ns",):
             object.__setattr__(self, name, _optional_timestamp_ns(getattr(self, name), name))
         if self.arrival_as_of_ns is not None and self.arrival_as_of_ns > self.as_of_ns:
@@ -1046,10 +1092,27 @@ class ExecutionQualityRecord:
             if name != "stage_durations_ns"
         }
         values["stage_durations_ns"] = durations if durations else None
+        field_completeness = dict(self.field_completeness)
+        basis_for_field = {
+            "native_quantity": self.native_quantity_basis,
+            "vwap": self.vwap_basis,
+            "fee": self.fee_basis,
+        }
+        for name, basis in basis_for_field.items():
+            if (
+                values[name] is not None
+                and basis is None
+                and field_completeness.get(name) == "COMPLETE"
+            ):
+                # A scalar without its measurement basis is not a complete
+                # economic fact: consumers cannot tell whether to replace or
+                # accumulate it. Keep the value and provenance for audit, but
+                # prevent field-level COMPLETE from overstating its meaning.
+                field_completeness[name] = "INCOMPLETE"
         completeness, coverage, source_refs = _fact_field_metadata(
             _QUALITY_VALUE_FIELDS,
             values,
-            self.field_completeness,
+            field_completeness,
             self.field_coverage_ns,
             self.field_source_refs,
         )
@@ -1060,12 +1123,16 @@ class ExecutionQualityRecord:
             raise ContractValidationError("economic field coverage must not follow as_of_ns")
 
     def to_wire(self) -> dict[str, Any]:
-        """Return the strict ``bt_api.execution.execution_quality.v1`` mapping."""
+        """Return the strict ``bt_api.execution.execution_quality.v2`` mapping."""
 
         if self.scope is None:
             raise ContractValidationError("execution quality scope is required for wire export")
         scope = _economic_scope_wire(
-            self.scope, self.generation, self.epoch, strategy_attribution=True
+            self.scope,
+            self.generation,
+            self.epoch,
+            strategy_attribution=True,
+            generation_kind=self.generation_kind,
         )
         values = {
             name: getattr(self, name)
@@ -1082,6 +1149,10 @@ class ExecutionQualityRecord:
             and self.arrival_freshness_ns is not None
             and self.arrival_source is not None
             and self.side is not None
+            and scope["generation"] is not None
+            and self.native_quantity_basis is not None
+            and self.vwap_basis is not None
+            and (self.fee is None or self.fee_basis is not None)
             and bool(self.signal_id and self.child_id and self.order_id)
             and (self.trade_id is not None or self.rejection_reason is not None)
             and bool(self.stage_durations_ns)
@@ -1094,7 +1165,7 @@ class ExecutionQualityRecord:
             required_context_complete=context_complete,
         )
         return {
-            "schema": "bt_api.execution.execution_quality.v1",
+            "schema": "bt_api.execution.execution_quality.v2",
             "fact_type": "execution_quality",
             "scope": scope,
             "intent_id": self.intent_id,
@@ -1122,13 +1193,16 @@ class ExecutionQualityRecord:
                 "native_quantity": (
                     format(self.native_quantity, "f") if self.native_quantity is not None else None
                 ),
+                "native_quantity_basis": self.native_quantity_basis,
                 "contract_multiplier": (
                     format(self.contract_multiplier, "f")
                     if self.contract_multiplier is not None
                     else None
                 ),
                 "vwap": format(self.vwap, "f") if self.vwap is not None else None,
+                "vwap_basis": self.vwap_basis,
                 "fee": format(self.fee, "f") if self.fee is not None else None,
+                "fee_basis": self.fee_basis,
                 "fee_currency": self.fee_currency,
                 "slippage_amount": (
                     format(self.slippage_amount, "f") if self.slippage_amount is not None else None
@@ -1317,6 +1391,7 @@ class ExecutionEvent:
     state: ExecutionState
     payload: Mapping[str, Any]
     created_at_ns: int
+    journal_incarnation_id: str | None = None
 
     def __post_init__(self) -> None:
         if type(self.sequence) is not int or self.sequence <= 0:
@@ -1325,6 +1400,12 @@ class ExecutionEvent:
         object.__setattr__(self, "intent_id", _text(self.intent_id, "intent_id"))
         object.__setattr__(self, "scope_key", _text(self.scope_key, "scope_key"))
         object.__setattr__(self, "event_type", _text(self.event_type, "event_type"))
+        if self.journal_incarnation_id is not None and (
+            not isinstance(self.journal_incarnation_id, str)
+            or len(self.journal_incarnation_id) != 32
+            or any(character not in "0123456789abcdef" for character in self.journal_incarnation_id)
+        ):
+            raise ContractValidationError("invalid journal_incarnation_id")
         if type(self.created_at_ns) is not int or self.created_at_ns <= 0:
             raise ContractValidationError("invalid event timestamp")
 

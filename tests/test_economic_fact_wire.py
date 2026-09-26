@@ -62,6 +62,7 @@ def _complete_account_snapshot(**overrides) -> AccountSnapshot:
     source_refs = overrides.pop("field_source_refs", source_refs)
     external_coverage = overrides.pop("external_activity_coverage_ns", (100, 200))
     external_refs = overrides.pop("external_activity_source_refs", ("source-external-activity",))
+    generation_kind = overrides.pop("generation_kind", "EXECUTION_JOURNAL")
     values = {name: Decimal("1.2500") for name in _ACCOUNT_FIELDS}
     values.update(overrides.pop("values", {}))
     return AccountSnapshot(
@@ -71,6 +72,7 @@ def _complete_account_snapshot(**overrides) -> AccountSnapshot:
         completeness="COMPLETE",
         currency="USD",
         reporting_currency="USD",
+        generation_kind=generation_kind,
         generation="generation-7",
         epoch=3,
         external_activity_attribution="COMPLETE",
@@ -90,6 +92,11 @@ def _complete_quality_record(**overrides) -> ExecutionQualityRecord:
     completeness = overrides.pop("field_completeness", completeness)
     coverage = overrides.pop("field_coverage_ns", coverage)
     source_refs = overrides.pop("field_source_refs", source_refs)
+    generation_kind = overrides.pop("generation_kind", "EXECUTION_JOURNAL")
+    quantity_basis = overrides.pop("native_quantity_basis", "ORDER_CUMULATIVE")
+    vwap_basis = overrides.pop("vwap_basis", "ORDER_CUMULATIVE")
+    fee_basis = overrides.pop("fee_basis", "ORDER_CUMULATIVE")
+    trade_id = overrides.pop("trade_id", "trade-1")
     values = {
         "arrival_bid": Decimal("99.50"),
         "arrival_ask": Decimal("100.50"),
@@ -108,6 +115,7 @@ def _complete_quality_record(**overrides) -> ExecutionQualityRecord:
         source="provider.execution.observation",
         completeness="COMPLETE",
         scope=_scope(),
+        generation_kind=generation_kind,
         generation="generation-7",
         epoch=3,
         currency="USD",
@@ -115,12 +123,15 @@ def _complete_quality_record(**overrides) -> ExecutionQualityRecord:
         signal_id="signal-1",
         child_id="child-1",
         order_id="order-1",
-        trade_id="trade-1",
+        trade_id=trade_id,
         arrival_as_of_ns=190,
         arrival_freshness_ns=10,
         arrival_source="market.depth.snapshot",
         side="BUY",
         stage_durations_ns={"admission": 20, "dispatch": 50},
+        native_quantity_basis=quantity_basis,
+        vwap_basis=vwap_basis,
+        fee_basis=fee_basis,
         field_completeness=completeness,
         field_coverage_ns=coverage,
         field_source_refs=source_refs,
@@ -135,7 +146,7 @@ def test_account_snapshot_wire_is_scoped_exact_and_never_attributes_strategy() -
 
     wire = snapshot.to_wire()
 
-    assert wire["schema"] == "bt_api.execution.account_snapshot.v1"
+    assert wire["schema"] == "bt_api.execution.account_snapshot.v2"
     assert wire["fact_type"] == "account_snapshot"
     assert wire["completeness"] == "COMPLETE"
     assert wire["scope"]["account_fingerprint"] == _scope().account_key.removeprefix("account:")
@@ -187,6 +198,7 @@ def test_account_snapshot_missing_funding_cannot_be_marked_complete() -> None:
         equity=Decimal("10"),
         available_margin=Decimal("5"),
         currency="USD",
+        generation_kind="EXECUTION_JOURNAL",
         generation="generation-7",
         epoch=3,
     )
@@ -220,7 +232,7 @@ def test_complete_external_activity_coverage_must_reach_snapshot_as_of() -> None
 def test_quality_wire_keeps_lineage_currency_and_monotonic_durations() -> None:
     wire = _complete_quality_record().to_wire()
 
-    assert wire["schema"] == "bt_api.execution.execution_quality.v1"
+    assert wire["schema"] == "bt_api.execution.execution_quality.v2"
     assert wire["completeness"] == "COMPLETE"
     assert wire["scope"]["strategy_id"] == "strategy.alpha"
     assert wire["lineage"] == {
@@ -232,6 +244,9 @@ def test_quality_wire_keeps_lineage_currency_and_monotonic_durations() -> None:
     }
     assert wire["arrival"]["mid"] == "100.00"
     assert wire["execution"]["fee"] == "0.03"
+    assert wire["execution"]["native_quantity_basis"] == "ORDER_CUMULATIVE"
+    assert wire["execution"]["vwap_basis"] == "ORDER_CUMULATIVE"
+    assert wire["execution"]["fee_basis"] == "ORDER_CUMULATIVE"
     assert wire["execution"]["fee_currency"] == "USD"
     assert wire["execution"]["slippage_amount"] == "0.20"
     assert wire["execution"]["slippage_sign_convention"] == "positive_is_adverse"
@@ -305,7 +320,7 @@ def test_economic_fact_scalars_reject_bool_and_nonfinite_values(factory) -> None
 
 
 @pytest.mark.unit
-def test_legacy_constructors_remain_valid_but_wire_export_requires_scope_generation_epoch() -> None:
+def test_legacy_constructors_remain_valid_but_unknown_generation_is_incomplete() -> None:
     account = AccountSnapshot(
         _scope(), 200, "provider.account.snapshot", "COMPLETE", equity=Decimal("10")
     )
@@ -313,7 +328,28 @@ def test_legacy_constructors_remain_valid_but_wire_export_requires_scope_generat
 
     assert account.equity == Decimal("10")
     assert quality.intent_id == "intent-1"
-    with pytest.raises(ContractValidationError, match="generation is required"):
-        account.to_wire()
+    account_wire = account.to_wire()
+    assert account_wire["scope"]["generation_kind"] is None
+    assert account_wire["scope"]["generation"] is None
+    assert account_wire["completeness"] == "INCOMPLETE"
     with pytest.raises(ContractValidationError, match="scope is required"):
         quality.to_wire()
+
+
+@pytest.mark.unit
+def test_quality_measurement_bases_and_trade_identity_are_explicit() -> None:
+    record = _complete_quality_record(fee_basis=None)
+    wire = record.to_wire()
+    assert wire["completeness"] == "INCOMPLETE"
+    assert wire["field_evidence"]["fee"]["completeness"] == "INCOMPLETE"
+    assert wire["field_evidence"]["native_quantity"]["completeness"] == "COMPLETE"
+    assert wire["field_evidence"]["vwap"]["completeness"] == "COMPLETE"
+
+    quantity_without_basis = _complete_quality_record(native_quantity_basis=None).to_wire()
+    assert quantity_without_basis["field_evidence"]["native_quantity"]["completeness"] == (
+        "INCOMPLETE"
+    )
+    vwap_without_basis = _complete_quality_record(vwap_basis=None).to_wire()
+    assert vwap_without_basis["field_evidence"]["vwap"]["completeness"] == "INCOMPLETE"
+    with pytest.raises(ContractValidationError, match="requires trade_id"):
+        _complete_quality_record(fee_basis="TRADE", trade_id=None)
