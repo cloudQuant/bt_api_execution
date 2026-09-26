@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from threading import RLock
 from typing import TYPE_CHECKING, Any
 
 from .contracts import (
@@ -22,7 +23,12 @@ from .errors import (
 
 if TYPE_CHECKING:
     from .ports import AdmissionGate, DispatchPort, ReconciliationPort
-    from .store import ExecutionRecord, SqliteExecutionStore, WriterLease
+    from .store import (
+        CtpAccountFamilyOwnerHandle,
+        ExecutionRecord,
+        SqliteExecutionStore,
+        WriterLease,
+    )
 
 DispatchCallable = Callable[[OrderIntent], ProviderObservation]
 BeforeDispatchCallable = Callable[[OrderIntent], None]
@@ -78,6 +84,8 @@ class ManagedExecutionFacade:
         self._allow_unprotected = allow_unprotected
         self._pre_dispatch_guard = pre_dispatch_guard
         self._last_writer_lease: WriterLease | None = None
+        self._ctp_account_family_owner: CtpAccountFamilyOwnerHandle | None = None
+        self._ctp_family_owner_lock = RLock()
 
     @property
     def scope(self) -> ExecutionScope:
@@ -89,12 +97,27 @@ class ManagedExecutionFacade:
 
     def acquire_writer_lease(self) -> WriterLease:
         """Acquire or renew the account-level writer lease before a mutation."""
-
-        lease = self._store.acquire_or_renew_lease(
-            self._scope,
-            self._writer_id,
-            ttl_ns=self._lease_ttl_ns,
-        )
+        provider_is_ctp = self._scope.provider.lower() == "ctp"
+        if provider_is_ctp and self._scope.provider != "ctp":
+            raise ContractValidationError("CTP execution provider must use canonical lowercase")
+        if provider_is_ctp:
+            with self._ctp_family_owner_lock:
+                if self._ctp_account_family_owner is None:
+                    self._ctp_account_family_owner = (
+                        self._store.acquire_ctp_account_family_owner(self._scope)
+                    )
+                lease = self._store.acquire_or_renew_lease(
+                    self._scope,
+                    self._writer_id,
+                    ttl_ns=self._lease_ttl_ns,
+                    ctp_account_family_owner=self._ctp_account_family_owner,
+                )
+        else:
+            lease = self._store.acquire_or_renew_lease(
+                self._scope,
+                self._writer_id,
+                ttl_ns=self._lease_ttl_ns,
+            )
         self._last_writer_lease = lease
         return lease
 

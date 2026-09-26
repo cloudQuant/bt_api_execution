@@ -138,11 +138,21 @@ def _record(
 
 
 def _scope():
-    return ExecutionScope("CTP", "simulation", "acct-router", "strategy.router", "20260925")
+    account_ref = "ctp-account-ref.v1:" + hashlib.sha256(b"acct-router").hexdigest()
+    return ExecutionScope("ctp", "simulation", account_ref, "strategy.router", "20260925")
 
 
 def _lease(store, scope):
-    return store.acquire_or_renew_lease(scope, "router-test-owner", ttl_ns=60_000_000_000)
+    handle = getattr(store, "_test_ctp_account_family_owner", None)
+    if handle is None:
+        handle = store.acquire_ctp_account_family_owner(scope)
+        store._test_ctp_account_family_owner = handle
+    return store.acquire_or_renew_lease(
+        scope,
+        "router-test-owner",
+        ttl_ns=60_000_000_000,
+        ctp_account_family_owner=handle,
+    )
 
 
 def _runtime_id(value):
@@ -198,7 +208,7 @@ def _active_owner(store, scope, lease):
 
 def _proof(scope, session_generation_id):
     legacy_scope = ExecutionScope(
-        "CTP", "simulation", scope.account_ref, "strategy.legacy", "20260924"
+        "ctp", "simulation", scope.account_ref, "strategy.legacy", "20260924"
     )
     source_digests = (
         ("backtrader_prototype", hashlib.sha256(b"prototype fixture").hexdigest()),
@@ -807,17 +817,8 @@ def test_session_pre_native_failure_atomically_unknowns_and_poisons_across_resta
             "SELECT owner_state, poison_code FROM ctp_dispatch_callback_session_owners"
         ).fetchone()
         assert tuple(owner_row) == ("POISONED", "dispatch_stage_ambiguous")
-        with pytest.raises(InvalidStateTransition, match="already has a durable"):
-            reopened.create_ctp_callback_session_owner(scope, writer_lease=_lease(reopened, scope))
-        assert (
-            reopened.claim_ctp_dispatch_command(
-                scope,
-                "pre-native-command-" + failure_code,
-                writer_lease=_lease(reopened, scope),
-                authority_verifier=_Authority(),
-            )
-            is None
-        )
+        with pytest.raises(InvalidStateTransition, match="already has a persistent owner"):
+            reopened.acquire_ctp_account_family_owner(scope)
     finally:
         reopened.close()
 
@@ -1525,8 +1526,8 @@ def test_session_router_rolls_back_trade_projection_and_marker_as_one_transactio
             "SELECT owner_state, poison_code FROM ctp_dispatch_callback_session_owners"
         ).fetchone()
         assert tuple(owner_row) == ("POISONED", "callback_apply_failure")
-        with pytest.raises(InvalidStateTransition, match="already has a durable"):
-            reopened.create_ctp_callback_session_owner(scope, writer_lease=_lease(reopened, scope))
+        with pytest.raises(InvalidStateTransition, match="already has a persistent owner"):
+            reopened.acquire_ctp_account_family_owner(scope)
     finally:
         reopened.close()
 
@@ -1831,7 +1832,7 @@ def test_v17_upgrade_preserves_possibly_sent_cancel_as_pending_postcondition(tmp
     try:
         assert upgraded._connection.execute(
             "SELECT value FROM execution_meta WHERE key = 'schema_version'"
-        ).fetchone()[0] == "18"
+        ).fetchone()[0] == "20"
         row = upgraded._connection.execute(
             "SELECT identity_state, target_submit_command_id, owner_intent_id "
             "FROM ctp_dispatch_cancel_postconditions WHERE cancel_command_id = ?",
@@ -1921,9 +1922,7 @@ def test_resolved_cancel_contradiction_poisons_owner_durably_after_rollback(tmp_
         assert reopened._ctp_dispatch_has_open_account_fence(
             reopened._connection.cursor(), scope.account_key
         )
-        with pytest.raises(InvalidStateTransition):
-            reopened.create_ctp_callback_session_owner(
-                scope, writer_lease=_lease(reopened, scope)
-            )
+        with pytest.raises(InvalidStateTransition, match="already has a persistent owner"):
+            reopened.acquire_ctp_account_family_owner(scope)
     finally:
         reopened.close()

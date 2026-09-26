@@ -26,6 +26,7 @@ from bt_api_execution import (
     CtpVerifiedOrderTargetProjection,
     DurableStoreError,
     ExecutionScope,
+    InvalidStateTransition,
     SqliteExecutionStore,
     ctp_native_callback_source_facts,
     ctp_native_session_generation_id,
@@ -35,6 +36,23 @@ from bt_api_execution import (
 
 def _sha(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def _ctp_account_ref(label: bytes) -> str:
+    return "ctp-account-ref.v1:" + _sha(label)
+
+
+def _lease(store, scope, owner: str):
+    handle = getattr(store, "_test_ctp_account_family_owner", None)
+    if handle is None:
+        handle = store.acquire_ctp_account_family_owner(scope)
+        store._test_ctp_account_family_owner = handle
+    return store.acquire_or_renew_lease(
+        scope,
+        owner,
+        ttl_ns=30_000_000_000,
+        ctp_account_family_owner=handle,
+    )
 
 
 class _FakeTraderClient:
@@ -286,16 +304,20 @@ def _stage_dispatched_command(
         source_facts["login_session_id"],
     )
     scope = ExecutionScope(
-        "CTP", "simulation", "source-bridge-account", "source-bridge", "20260925"
+        "ctp",
+        "simulation",
+        _ctp_account_ref(b"source-bridge-account"),
+        "source-bridge",
+        "20260925",
     )
     store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
-    lease = store.acquire_or_renew_lease(scope, "source-bridge-test", ttl_ns=30_000_000_000)
+    lease = _lease(store, scope, "source-bridge-test")
     source_digests = (
         ("backtrader_prototype", _sha(b"source bridge legacy prototype fixture")),
         ("sdk_jsonl", _sha(b"source bridge empty SDK ledger fixture")),
     )
     legacy_scope = ExecutionScope(
-        "CTP", "simulation", scope.account_ref, "source-bridge-legacy", "20260924"
+        "ctp", "simulation", scope.account_ref, "source-bridge-legacy", "20260924"
     )
     legacy_mapping = CtpOrderRefLegacyMapping(
         source_name="backtrader_prototype",
@@ -1545,7 +1567,7 @@ def test_v11_resolved_guard_migrates_to_permanent_fence_and_stays_after_reopen(t
         version = migrated._connection.execute(
             "SELECT value FROM execution_meta WHERE key = 'schema_version'"
         ).fetchone()["value"]
-        assert version == "18"
+        assert version == "20"
         assert migrated.read_ctp_dispatch_command(bound.scope, bound.command_id).status == (
             "COMPLETED"
         )
@@ -1564,13 +1586,13 @@ def test_v11_resolved_guard_migrates_to_permanent_fence_and_stays_after_reopen(t
         )
 
         with pytest.raises(
-            ContractValidationError, match="permanent callback lifecycle fence"
+            InvalidStateTransition, match="unmapped legacy execution history"
         ):
             _stage_followup_ready_command(bound, migrated)
         migrated.close()
         migrated = None
 
-        # The combined v18 upgrade is idempotent and the old resolved bit never removes
+        # The combined v19 upgrade is idempotent and the old resolved bit never removes
         # the newly migrated account source-lifecycle fence.
         reopened = SqliteExecutionStore(tmp_path / "execution.sqlite3")
         assert reopened._connection.execute(
@@ -1578,7 +1600,7 @@ def test_v11_resolved_guard_migrates_to_permanent_fence_and_stays_after_reopen(t
             (bound.scope.account_key,),
         ).fetchone()[0] == 1
         with pytest.raises(
-            ContractValidationError, match="permanent callback lifecycle fence"
+            InvalidStateTransition, match="unmapped legacy execution history"
         ):
             _stage_followup_ready_command(bound, reopened)
     finally:
@@ -1604,7 +1626,7 @@ def test_v11_unmappable_resolved_guard_refuses_store_upgrade(tmp_path):
 
 
 @pytest.mark.unit
-def test_v12_permanent_fence_and_projectionless_cancel_migrate_to_v18(tmp_path):
+def test_v12_permanent_fence_and_projectionless_cancel_migrate_to_v19(tmp_path):
     bound = _stage_dispatched_command(tmp_path, operation="CANCEL")
     migrated = None
     reopened = None
@@ -1629,7 +1651,7 @@ def test_v12_permanent_fence_and_projectionless_cancel_migrate_to_v18(tmp_path):
         migrated = SqliteExecutionStore(tmp_path / "execution.sqlite3")
         assert migrated._connection.execute(
             "SELECT value FROM execution_meta WHERE key = 'schema_version'"
-        ).fetchone()[0] == "18"
+        ).fetchone()[0] == "20"
         command = migrated.read_ctp_dispatch_command(bound.scope, bound.command_id)
         assert command is not None
         assert command.status == "UNKNOWN"
@@ -1646,7 +1668,7 @@ def test_v12_permanent_fence_and_projectionless_cancel_migrate_to_v18(tmp_path):
         assert persisted_fence[0] == fence_id
 
         with pytest.raises(
-            ContractValidationError, match="permanent callback lifecycle fence"
+            InvalidStateTransition, match="unmapped legacy execution history"
         ):
             _stage_followup_ready_command(bound, migrated)
         migrated.close()
@@ -1760,15 +1782,10 @@ def test_callback_commit_lease_loss_leaves_durable_ingestion_fence(tmp_path):
         bound.store.close()
 
         reopened = SqliteExecutionStore(tmp_path / "execution.sqlite3")
-        replacement_lease = reopened.acquire_or_renew_lease(
-            bound.scope, "source-bridge-restarted-owner", ttl_ns=30_000_000_000
-        )
         with pytest.raises(
-            ContractValidationError, match="permanent callback lifecycle fence"
+            InvalidStateTransition, match="already has a persistent owner"
         ):
-            _stage_followup_ready_command(
-                bound, reopened, writer_lease=replacement_lease
-            )
+            reopened.acquire_ctp_account_family_owner(bound.scope)
     finally:
         if adapter is not None:
             adapter.close()
@@ -1876,7 +1893,11 @@ def test_callback_ledger_adapter_rejects_wrong_durable_scope_before_queue_claim(
     bound = _stage_dispatched_command(tmp_path)
     try:
         wrong_scope = ExecutionScope(
-            "CTP", "simulation", "different-account", "source-bridge", "20260925"
+            "ctp",
+            "simulation",
+            _ctp_account_ref(b"different-account"),
+            "source-bridge",
+            "20260925",
         )
         with pytest.raises(ContractValidationError, match="command is missing"):
             CtpNativeCallbackLedgerAdapter.bind_after_login(

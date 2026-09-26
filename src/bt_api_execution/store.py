@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import time
 import uuid
@@ -17,6 +18,7 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
+from functools import lru_cache
 from pathlib import Path
 from threading import RLock
 from types import MappingProxyType
@@ -68,6 +70,120 @@ def _is_local_queue_receipt_id(value: Any) -> bool:
 
 def _is_prefixed_digest(value: Any, prefix: str) -> bool:
     return type(value) is str and value.startswith(prefix) and _is_sha256(value[len(prefix) :])
+
+
+_CTP_ACCOUNT_REF_PREFIX = "ctp-account-ref.v1:"
+_CTP_ACCOUNT_FAMILY_PREFIX = "ctp-account-family.v1:"
+_CTP_ACCOUNT_FAMILY_DOMAIN = b"bt-api-execution/ctp-account-family/v1\0"
+_CTP_ACCOUNT_STORE_TABLES = frozenset(
+    {
+        "execution_meta",
+        "execution_records",
+        "execution_outbox",
+        "cancellation_records",
+        "cancellation_outbox",
+        "execution_writer_leases",
+        "ctp_account_family_owners",
+        "ctp_account_store_identity",
+        "ctp_account_family_legacy_fences",
+        "ctp_order_identity_reservations",
+        "ctp_order_target_projections",
+        "ctp_order_target_projection_consumptions",
+        "ctp_order_ref_watermarks",
+        "ctp_order_ref_account_watermarks",
+        "ctp_order_ref_cutover_sessions",
+        "ctp_order_ref_legacy_imports",
+        "ctp_dispatch_commands",
+        "ctp_native_action_ref_counters",
+        "ctp_native_action_ref_allocations",
+        "ctp_dispatch_callback_ledger",
+        "ctp_dispatch_trade_fact_ledger",
+        "ctp_dispatch_order_cumulative_ledger",
+        "ctp_dispatch_callback_source_lifecycle_fences",
+        "ctp_dispatch_callback_session_owners",
+        "ctp_dispatch_callback_ingress",
+        "ctp_dispatch_callback_ingress_applications",
+        "ctp_dispatch_order_projection",
+        "ctp_dispatch_cancel_projection",
+        "ctp_dispatch_unknown_resolutions",
+        "ctp_dispatch_authority_uses",
+        "ctp_dispatch_cancel_postconditions",
+        "ctp_dispatch_cancel_terminal_observations",
+        "ctp_dispatch_cancel_postcondition_resolutions",
+    }
+)
+_CTP_ACCOUNT_STORE_INDEXES = frozenset(
+    {
+        "execution_outbox_intent_sequence",
+        "cancellation_records_target",
+        "cancellation_outbox_cancel_sequence",
+        "ctp_order_identity_scope_day",
+        "ctp_order_target_projection_latest",
+        "ctp_order_target_query_request_once",
+        "ctp_order_target_consumption_command",
+        "ctp_dispatch_commands_scope_status",
+        "ctp_dispatch_commands_account_status",
+        "ctp_dispatch_callback_command",
+        "ctp_dispatch_trade_command",
+        "ctp_dispatch_order_cumulative_command",
+        "ctp_dispatch_callback_source_lifecycle_account",
+        "ctp_dispatch_cancel_postconditions_target",
+        "ctp_dispatch_cancel_terminal_by_target",
+        "ctp_dispatch_session_request_unique",
+        "ctp_dispatch_managed_action_unique",
+        "ctp_dispatch_native_action_ref_unique",
+        "ctp_dispatch_local_queue_receipt_unique",
+    }
+)
+_CTP_ACCOUNT_STORE_TRIGGERS = frozenset(
+    {
+        "ctp_account_family_owner_immutable_identity",
+        "ctp_account_family_owner_no_delete",
+        "ctp_account_store_identity_immutable_update",
+        "ctp_account_store_identity_immutable_delete",
+        "ctp_account_family_legacy_fence_immutable_update",
+        "ctp_account_family_legacy_fence_immutable_delete",
+        "ctp_order_ref_cutover_immutable_update",
+        "ctp_order_ref_cutover_immutable_delete",
+        "ctp_order_ref_legacy_import_immutable_update",
+        "ctp_order_ref_legacy_import_immutable_delete",
+        "ctp_native_action_ref_counter_monotonic",
+        "ctp_native_action_ref_counter_no_delete",
+        "ctp_native_action_ref_allocations_immutable_update",
+        "ctp_native_action_ref_allocations_immutable_delete",
+        "ctp_dispatch_session_owner_write_once",
+        "ctp_dispatch_trade_fact_immutable_update",
+        "ctp_dispatch_trade_fact_immutable_delete",
+        "ctp_dispatch_order_cumulative_immutable_update",
+        "ctp_dispatch_order_cumulative_immutable_delete",
+        "ctp_dispatch_callback_source_lifecycle_immutable_update",
+        "ctp_dispatch_callback_source_lifecycle_immutable_delete",
+        "ctp_callback_session_owner_immutable_identity",
+        "ctp_callback_session_owner_no_delete",
+        "ctp_callback_ingress_immutable_update",
+        "ctp_callback_ingress_immutable_delete",
+        "ctp_callback_ingress_applications_immutable_update",
+        "ctp_callback_ingress_applications_immutable_delete",
+        "ctp_dispatch_callback_immutable_update",
+        "ctp_dispatch_callback_immutable_delete",
+        "ctp_dispatch_resolution_immutable_update",
+        "ctp_dispatch_resolution_immutable_delete",
+        "ctp_dispatch_authority_uses_immutable_update",
+        "ctp_dispatch_authority_uses_immutable_delete",
+        "ctp_order_target_projections_immutable_update",
+        "ctp_order_target_projections_immutable_delete",
+        "ctp_order_target_consumptions_immutable_update",
+        "ctp_order_target_consumptions_immutable_delete",
+        "ctp_dispatch_cancel_postconditions_immutable_update",
+        "ctp_dispatch_cancel_postconditions_immutable_delete",
+        "ctp_dispatch_cancel_terminal_observations_immutable_update",
+        "ctp_dispatch_cancel_terminal_observations_immutable_delete",
+        "ctp_dispatch_cancel_postcondition_resolutions_immutable_update",
+        "ctp_dispatch_cancel_postcondition_resolutions_immutable_delete",
+        "ctp_dispatch_commands_immutable",
+        "ctp_dispatch_queue_receipt_once",
+    }
+)
 
 
 def _validate_correlation_text(value: Any, field_name: str) -> None:
@@ -133,6 +249,61 @@ class WriterLease:
     owner_id: str
     fencing_token: int
     expires_at_ns: int
+    family_key: str | None = None
+    family_owner_intent_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CtpAccountFamilyOwnerHandle:
+    """Same-Store handle for the one durable owner of a canonical CTP account family."""
+
+    family_key: str
+    owner_intent_id: str
+    account_key: str
+    scope_key: str
+
+    def __post_init__(self) -> None:
+        if not _is_prefixed_digest(self.family_key, "ctp-account-family.v1:"):
+            raise ContractValidationError("invalid CTP account family identity")
+        if not _is_local_queue_receipt_id(self.owner_intent_id):
+            raise ContractValidationError("invalid CTP account family owner identity")
+        if not _is_prefixed_digest(self.account_key, "account:"):
+            raise ContractValidationError("invalid CTP account family account key")
+        if not _is_prefixed_digest(self.scope_key, "scope:"):
+            raise ContractValidationError("invalid CTP account family scope key")
+
+
+@dataclass(frozen=True, slots=True)
+class CtpAccountStoreIdentity:
+    """Read-only identity facts for a Store opened through the CTP factory.
+
+    This describes the opened local database. It is not a writer lease, source
+    proof, or defense against a hostile process replacing or copying files.
+    """
+
+    ledger_kind: str
+    account_ref: str
+    family_key: str
+    journal_incarnation_id: str
+    family_owner_state: str | None
+    family_owner_intent_id: str | None
+    database_filename: str
+    file_device: int | None
+    file_id: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class CtpAccountStoreFileInspection:
+    """Read-only file classification used before either journal opens SQLite for writes."""
+
+    kind: str
+    identity: CtpAccountStoreIdentity | None
+
+    def __post_init__(self) -> None:
+        if self.kind not in {"MISSING", "LEGACY_CTP_JOURNAL", "CTP_EXECUTION_STORE"}:
+            raise ContractValidationError("invalid CTP account store file kind")
+        if (self.kind == "CTP_EXECUTION_STORE") != (self.identity is not None):
+            raise ContractValidationError("CTP account store inspection identity is inconsistent")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1726,7 +1897,14 @@ class SqliteExecutionStore:
     # Version 18 records account-wide cancel postconditions at the native
     # claim boundary and settles them only from verified terminal-order and
     # reconciled callback-inbox evidence.
-    _SCHEMA_VERSION = 18
+    # Version 19 adds a mode-independent CTP account-family owner. V18 stored
+    # only provider/environment/account and full-scope hashes, so an existing
+    # journal with execution history receives a permanent unmapped-history
+    # fence instead of guessing cross-mode aliases.
+    # Version 20 adds immutable exact account identity for the code-owned CTP
+    # journal factory. Existing V19 databases without this identity are not
+    # implicitly bound by migration.
+    _SCHEMA_VERSION = 20
 
     def __init__(self, path: str | Path, *, busy_timeout_ms: int = 5_000) -> None:
         if type(busy_timeout_ms) is not int or busy_timeout_ms <= 0:
@@ -1748,6 +1926,9 @@ class SqliteExecutionStore:
             self._lock = RLock()
             self._issued_ctp_order_target_projections: dict[
                 str, CtpOrderTargetProjectionHandle
+            ] = {}
+            self._issued_ctp_account_family_owners: dict[
+                str, CtpAccountFamilyOwnerHandle
             ] = {}
             self._issued_ctp_callback_session_owners: dict[
                 str, CtpCallbackSessionOwnerHandle
@@ -1789,6 +1970,713 @@ class SqliteExecutionStore:
         if len(value) != 32 or any(character not in "0123456789abcdef" for character in value):
             raise DurableStoreError("execution journal identity is invalid")
         return {"generation_kind": "EXECUTION_JOURNAL", "generation": value, "epoch": 1}
+
+    @classmethod
+    def _ctp_account_store_path(
+        cls, path: str | Path, scope: ExecutionScope | None
+    ) -> Path:
+        if scope is not None:
+            cls._ctp_account_family_key(scope)
+        try:
+            raw_path = os.fspath(path)
+        except TypeError as error:
+            raise ContractValidationError("CTP execution store path must be a file path") from error
+        if (
+            type(raw_path) is not str
+            or not raw_path
+            or raw_path != raw_path.strip()
+            or raw_path == ":memory:"
+            or raw_path.lower().startswith("file:")
+        ):
+            raise ContractValidationError("CTP execution store requires a regular file path")
+        candidate = Path(raw_path).expanduser()
+        if not candidate.is_absolute():
+            raise ContractValidationError("CTP execution store path must be absolute")
+        try:
+            if candidate.is_symlink():
+                raise ContractValidationError("CTP execution store path cannot be a symlink")
+            normalized = candidate.resolve(strict=False)
+            if not normalized.parent.is_dir():
+                raise ContractValidationError("CTP execution store parent directory is missing")
+            if normalized.exists() and not normalized.is_file():
+                raise ContractValidationError("CTP execution store path is not a regular file")
+        except OSError as error:
+            raise DurableStoreError("unable to inspect CTP execution store path") from error
+        return normalized
+
+    @staticmethod
+    def _ctp_store_sidecar_state(path: Path) -> tuple[tuple[int, int] | None, ...]:
+        signatures: list[tuple[int, int] | None] = []
+        for suffix in ("", "-journal", "-wal", "-shm"):
+            candidate = path if not suffix else Path(f"{path}{suffix}")
+            if candidate.is_symlink():
+                raise DurableStoreError("CTP execution store sidecar cannot be a symlink")
+            try:
+                stat_result = candidate.stat()
+            except FileNotFoundError:
+                signatures.append(None)
+                continue
+            except OSError as error:
+                raise DurableStoreError("unable to inspect CTP execution store sidecars") from error
+            # SQLite's shared-memory lock bytes can change during a read-only
+            # WAL connection; the main DB and WAL content signatures remain
+            # stable while their size/mtime pair is checked.
+            signatures.append(
+                (stat_result.st_size, 0 if suffix == "-shm" else stat_result.st_mtime_ns)
+            )
+        return tuple(signatures)
+
+    @staticmethod
+    def _ctp_preflight_state_is_stable(
+        before: tuple[tuple[int, int] | None, ...],
+        after: tuple[tuple[int, int] | None, ...],
+    ) -> bool:
+        if before[0] != after[0] or before[1] is not None or after[1] is not None:
+            return False
+        before_wal, after_wal = before[2], after[2]
+        if before_wal is None:
+            if after_wal is not None and after_wal[0] != 0:
+                return False
+        elif before_wal[0] == 0 and after_wal is not None and after_wal[0] == 0:
+            pass
+        elif before_wal != after_wal:
+            return False
+        before_shm, after_shm = before[3], after[3]
+        if before_shm is None:
+            # A read-only SQLite connection can create the 32 KiB WAL shared
+            # memory file, and an empty WAL file, to coordinate its read lock.
+            if after_shm is not None and after_shm[0] != 32_768:
+                return False
+        elif after_shm is None or before_shm[0] != after_shm[0]:
+            return False
+        return True
+
+    @classmethod
+    def _read_only_ctp_store_tables(cls, path: Path) -> set[str]:
+        if not path.is_file():
+            raise DurableStoreError("existing CTP journal is not a regular file")
+        before = cls._ctp_store_sidecar_state(path)
+        _, journal_signature, wal_signature, shm_signature = before
+        if journal_signature is not None or (wal_signature is None) != (shm_signature is None):
+            raise DurableStoreError("CTP journal has uncertain SQLite journal state")
+        connection: sqlite3.Connection | None = None
+        opened_path: Path | None = None
+        try:
+            connection = sqlite3.connect(
+                f"{path.as_uri()}?mode=ro", uri=True, isolation_level=None, timeout=1.0
+            )
+            connection.execute("PRAGMA query_only = ON")
+            connection.execute("BEGIN")
+            database_row = connection.execute("PRAGMA database_list").fetchone()
+            if database_row is None or database_row[1] != "main" or not database_row[2]:
+                raise DurableStoreError("CTP journal database filename is unavailable")
+            opened_path = Path(str(database_row[2])).resolve(strict=True)
+            if os.path.normcase(str(opened_path)) != os.path.normcase(str(path)):
+                raise DurableStoreError("CTP journal opened an unexpected database file")
+            tables = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+            legacy_table_names = {
+                "ctp_sim_orders",
+                "ctp_sim_journal_metadata",
+                "ctp_sim_journal_scopes",
+            }
+            if tables & legacy_table_names:
+                object_rows = connection.execute(
+                    "SELECT type FROM sqlite_master WHERE name NOT GLOB 'sqlite_*'"
+                ).fetchall()
+                if any(str(row[0]) != "table" for row in object_rows):
+                    raise DurableStoreError("legacy CTP journal contains unsupported schema objects")
+            # The legacy journal used to be allowed to start from an empty
+            # orders-only table. Its constructor adds the scope column and
+            # creates the metadata tables, but only when there are no rows to
+            # bind to an unknown historical scope. Recognize that precise
+            # pre-migration shape here so the legacy owner can preflight it
+            # before enabling WAL. Do not classify partial or populated
+            # layouts as legacy; the writable Store must reject those before
+            # it can mutate them.
+            if tables == {"ctp_sim_orders"}:
+                legacy_order_columns = frozenset(
+                    {
+                        "client_order_id",
+                        "approval_id",
+                        "request_digest",
+                        "request_json",
+                        "state",
+                        "order_ref",
+                        "order_sys_id",
+                        "front_id",
+                        "session_id",
+                        "status",
+                        "traded_quantity",
+                        "position_digest",
+                        "updated_at",
+                    }
+                )
+                columns = frozenset(
+                    str(row[1])
+                    for row in connection.execute("PRAGMA table_info(ctp_sim_orders)")
+                )
+                allowed_columns = {
+                    legacy_order_columns,
+                    legacy_order_columns | {"execution_scope_sha256"},
+                }
+                order_count = int(
+                    connection.execute("SELECT COUNT(*) FROM ctp_sim_orders").fetchone()[0]
+                )
+                if columns not in allowed_columns or order_count != 0:
+                    raise DurableStoreError(
+                        "orders-only legacy CTP journal is populated or has an unknown schema"
+                    )
+            connection.execute("COMMIT")
+        except DurableStoreError:
+            if connection is not None:
+                with suppress(sqlite3.Error):
+                    connection.execute("ROLLBACK")
+            raise
+        except (sqlite3.Error, OSError, ValueError) as error:
+            if connection is not None:
+                with suppress(sqlite3.Error):
+                    connection.execute("ROLLBACK")
+            raise DurableStoreError("read-only CTP journal inspection failed") from error
+        finally:
+            if connection is not None:
+                connection.close()
+        if not cls._ctp_preflight_state_is_stable(
+            before, cls._ctp_store_sidecar_state(path)
+        ):
+            raise DurableStoreError("CTP journal changed during read-only inspection")
+        if opened_path is None:
+            raise DurableStoreError("CTP journal database identity is unavailable")
+        return tables
+
+    @staticmethod
+    def _ctp_store_schema_objects(connection: sqlite3.Connection) -> tuple[tuple[str, ...], ...]:
+        rows = connection.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master "
+            "WHERE name NOT GLOB 'sqlite_*'"
+        ).fetchall()
+        return tuple(
+            sorted(
+                (
+                    str(row[0]),
+                    str(row[1]),
+                    str(row[2]),
+                    "" if row[3] is None else str(row[3]),
+                )
+                for row in rows
+            )
+        )
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def _code_owned_ctp_store_schema_objects(cls) -> tuple[tuple[str, ...], ...]:
+        """Build the exact current schema from code in an isolated memory DB."""
+
+        reference = cls(":memory:")
+        try:
+            return cls._ctp_store_schema_objects(reference._connection)
+        finally:
+            reference.close()
+
+    @classmethod
+    def inspect_ctp_account_store_file(
+        cls, path: str | Path, scope: ExecutionScope | None = None
+    ) -> CtpAccountStoreFileInspection:
+        """Classify an existing CTP journal before any writable SQLite open.
+
+        A known legacy `_ExecutionJournal` layout is reported so its existing
+        owner can continue using it. A V20 Store is returned only after exact
+        identity validation. Unknown, partial, mismatched, or uncertain files
+        fail closed; this inspection does not grant a writer lease.
+        """
+
+        target = cls._ctp_account_store_path(path, scope)
+        if not os.path.lexists(str(target)):
+            if any(
+                os.path.lexists(str(Path(f"{target}{suffix}")))
+                for suffix in ("-journal", "-wal", "-shm")
+            ):
+                raise DurableStoreError("CTP journal sidecars exist without a database")
+            return CtpAccountStoreFileInspection("MISSING", None)
+        tables = cls._read_only_ctp_store_tables(target)
+        legacy_tables = {
+            "ctp_sim_orders",
+            "ctp_sim_journal_metadata",
+            "ctp_sim_journal_scopes",
+        }
+        found_legacy_tables = tables & legacy_tables
+        if found_legacy_tables:
+            if found_legacy_tables == {"ctp_sim_orders"} and tables == {"ctp_sim_orders"}:
+                # _read_only_ctp_store_tables has already validated the exact
+                # supported empty orders-only pre-migration signature.
+                return CtpAccountStoreFileInspection("LEGACY_CTP_JOURNAL", None)
+            if found_legacy_tables != legacy_tables or tables != legacy_tables:
+                raise DurableStoreError("CTP journal layout is partial or ambiguous")
+            return CtpAccountStoreFileInspection("LEGACY_CTP_JOURNAL", None)
+        identity = cls._preflight_existing_ctp_account_store(target, scope)
+        return CtpAccountStoreFileInspection("CTP_EXECUTION_STORE", identity)
+
+    @classmethod
+    def _preflight_existing_ctp_account_store(
+        cls, path: Path, scope: ExecutionScope | None
+    ) -> CtpAccountStoreIdentity:
+        if not path.is_file():
+            raise DurableStoreError("existing CTP execution store is not a regular file")
+        before = cls._ctp_store_sidecar_state(path)
+        _, journal_signature, wal_signature, shm_signature = before
+        if journal_signature is not None or (wal_signature is None) != (shm_signature is None):
+            raise DurableStoreError("CTP execution store has uncertain SQLite journal state")
+
+        uri = f"{path.as_uri()}?mode=ro"
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = sqlite3.connect(uri, uri=True, isolation_level=None, timeout=1.0)
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA query_only = ON")
+            connection.execute("BEGIN")
+            database_row = connection.execute("PRAGMA database_list").fetchone()
+            if database_row is None or database_row[1] != "main" or not database_row[2]:
+                raise DurableStoreError("CTP execution store database identity is unavailable")
+            opened_path = Path(str(database_row[2])).resolve(strict=True)
+            if os.path.normcase(str(opened_path)) != os.path.normcase(str(path)):
+                raise DurableStoreError("CTP execution store opened an unexpected database file")
+
+            tables = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+            legacy_tables = {
+                "ctp_sim_orders",
+                "ctp_sim_journal_metadata",
+                "ctp_sim_journal_scopes",
+            }
+            if tables & legacy_tables:
+                raise DurableStoreError("legacy CTP execution journal cannot be opened as a Store")
+            required_tables = {
+                "execution_meta",
+                "execution_records",
+                "execution_writer_leases",
+                "ctp_dispatch_commands",
+                "ctp_account_family_owners",
+            }
+            if not required_tables.issubset(tables):
+                raise DurableStoreError("existing CTP execution store schema is unknown")
+
+            metadata = {
+                str(row["key"]): str(row["value"])
+                for row in connection.execute(
+                    "SELECT key, value FROM execution_meta"
+                ).fetchall()
+            }
+            if metadata.get("schema_version") != str(cls._SCHEMA_VERSION):
+                raise DurableStoreError("existing CTP execution store schema is not current")
+            non_internal_tables = tables - {"sqlite_sequence"}
+            if non_internal_tables != _CTP_ACCOUNT_STORE_TABLES:
+                raise DurableStoreError("existing CTP execution store schema is incomplete or unknown")
+            if cls._ctp_store_schema_objects(connection) != cls._code_owned_ctp_store_schema_objects():
+                raise DurableStoreError(
+                    "existing CTP execution store schema definitions do not match code"
+                )
+            if "ctp_account_store_identity" not in tables:
+                raise DurableStoreError("CTP execution store identity is missing or ambiguous")
+            journal_incarnation_id = metadata.get("journal_incarnation_id", "")
+            if len(journal_incarnation_id) != 32 or any(
+                character not in "0123456789abcdef" for character in journal_incarnation_id
+            ):
+                raise DurableStoreError("CTP execution store journal identity is invalid")
+
+            triggers = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+                ).fetchall()
+            }
+            if triggers != _CTP_ACCOUNT_STORE_TRIGGERS:
+                raise DurableStoreError("CTP execution store trigger schema is incomplete or unknown")
+            indexes = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'index'"
+                ).fetchall()
+            }
+            explicit_indexes = {
+                name for name in indexes if not name.startswith("sqlite_autoindex_")
+            }
+            if explicit_indexes != _CTP_ACCOUNT_STORE_INDEXES:
+                raise DurableStoreError("CTP execution store index schema is incomplete or unknown")
+            identity_rows = connection.execute(
+                "SELECT * FROM ctp_account_store_identity"
+            ).fetchall()
+            if len(identity_rows) != 1 or int(identity_rows[0]["singleton"]) != 1:
+                raise DurableStoreError("CTP execution store identity is missing or ambiguous")
+            identity_row = identity_rows[0]
+            account_ref = str(identity_row["account_ref"])
+            if not _is_prefixed_digest(account_ref, _CTP_ACCOUNT_REF_PREFIX):
+                raise DurableStoreError("CTP execution store account identity is malformed")
+            persisted_family_key = _CTP_ACCOUNT_FAMILY_PREFIX + hashlib.sha256(
+                _CTP_ACCOUNT_FAMILY_DOMAIN + account_ref.encode("ascii")
+            ).hexdigest()
+            if (
+                str(identity_row["ledger_kind"]) != "CTP_EXECUTION_V1"
+                or str(identity_row["family_key"]) != persisted_family_key
+                or (scope is not None and account_ref != scope.account_ref)
+                or str(identity_row["journal_incarnation_id"]) != journal_incarnation_id
+            ):
+                raise DurableStoreError("CTP execution store account identity does not match")
+            owner_row = connection.execute(
+                "SELECT owner_state, owner_intent_id FROM ctp_account_family_owners "
+                "WHERE family_key = ?",
+                (persisted_family_key,),
+            ).fetchone()
+            connection.execute("COMMIT")
+        except DurableStoreError:
+            if connection is not None:
+                with suppress(sqlite3.Error):
+                    connection.execute("ROLLBACK")
+            raise
+        except (sqlite3.Error, OSError, ValueError) as error:
+            if connection is not None:
+                with suppress(sqlite3.Error):
+                    connection.execute("ROLLBACK")
+            raise DurableStoreError("read-only CTP execution store preflight failed") from error
+        finally:
+            if connection is not None:
+                connection.close()
+
+        after = cls._ctp_store_sidecar_state(path)
+        if not cls._ctp_preflight_state_is_stable(before, after):
+            raise DurableStoreError("CTP execution store changed during read-only preflight")
+        stat_result = path.stat()
+        return CtpAccountStoreIdentity(
+            ledger_kind="CTP_EXECUTION_V1",
+            account_ref=account_ref,
+            family_key=persisted_family_key,
+            journal_incarnation_id=journal_incarnation_id,
+            family_owner_state=None if owner_row is None else str(owner_row["owner_state"]),
+            family_owner_intent_id=(
+                None if owner_row is None else str(owner_row["owner_intent_id"])
+            ),
+            database_filename=str(opened_path),
+            file_device=int(stat_result.st_dev),
+            file_id=int(stat_result.st_ino),
+        )
+
+    @classmethod
+    def open_ctp_account_store(
+        cls,
+        path: str | Path,
+        scope: ExecutionScope,
+        *,
+        busy_timeout_ms: int = 5_000,
+    ) -> SqliteExecutionStore:
+        """Open the one factory-bound CTP account ledger at a caller-owned path.
+
+        The main composition owns the path and flow lock. This factory rejects
+        existing legacy/unknown/unbound journals before the regular constructor
+        can set WAL mode or run schema DDL. A missing path is exclusively
+        created here, then bound to the exact canonical account reference.
+        """
+
+        if type(busy_timeout_ms) is not int or busy_timeout_ms <= 0:
+            raise ContractValidationError("invalid busy_timeout_ms")
+        family_key = cls._ctp_account_family_key(scope)
+        target = cls._ctp_account_store_path(path, scope)
+        sidecars = tuple(Path(f"{target}{suffix}") for suffix in ("-journal", "-wal", "-shm"))
+        if not os.path.lexists(str(target)):
+            if any(os.path.lexists(str(sidecar)) for sidecar in sidecars):
+                raise DurableStoreError("CTP execution store sidecars exist without a database")
+            try:
+                descriptor = os.open(str(target), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            except FileExistsError:
+                created_by_factory = False
+            except OSError as error:
+                raise DurableStoreError("unable to create CTP execution store") from error
+            else:
+                os.close(descriptor)
+                created_by_factory = True
+        else:
+            created_by_factory = False
+
+        if created_by_factory:
+            store: SqliteExecutionStore | None = None
+            try:
+                if any(os.path.lexists(str(sidecar)) for sidecar in sidecars):
+                    raise DurableStoreError("CTP execution store sidecars appeared during creation")
+                store = cls(target, busy_timeout_ms=busy_timeout_ms)
+                store._bind_new_ctp_account_store_identity(scope, family_key)
+                store.read_ctp_account_store_identity(scope)
+                return store
+            except BaseException:
+                if store is not None:
+                    store.close()
+                raise
+
+        preflight_identity = cls._preflight_existing_ctp_account_store(
+            target, scope
+        )
+        store = cls(target, busy_timeout_ms=busy_timeout_ms)
+        try:
+            identity = store.read_ctp_account_store_identity(scope)
+            if (
+                identity.journal_incarnation_id != preflight_identity.journal_incarnation_id
+                or identity.family_key != preflight_identity.family_key
+                or identity.account_ref != preflight_identity.account_ref
+                or identity.database_filename != preflight_identity.database_filename
+                or identity.file_device != preflight_identity.file_device
+                or identity.file_id != preflight_identity.file_id
+            ):
+                raise DurableStoreError("CTP execution store changed after preflight")
+            return store
+        except BaseException:
+            store.close()
+            raise
+
+    def _bind_new_ctp_account_store_identity(
+        self, scope: ExecutionScope, family_key: str
+    ) -> None:
+        with self._transaction() as cursor:
+            existing = cursor.execute(
+                "SELECT 1 FROM ctp_account_store_identity LIMIT 1"
+            ).fetchone()
+            if existing is not None:
+                raise DurableStoreError("new CTP execution store identity is already bound")
+            journal_row = cursor.execute(
+                "SELECT value FROM execution_meta WHERE key = 'journal_incarnation_id'"
+            ).fetchone()
+            if journal_row is None:
+                raise DurableStoreError("new CTP execution store has no journal identity")
+            cursor.execute(
+                """
+                INSERT INTO ctp_account_store_identity(
+                    singleton, ledger_kind, account_ref, family_key,
+                    journal_incarnation_id, created_at_ns
+                ) VALUES (1, 'CTP_EXECUTION_V1', ?, ?, ?, ?)
+                """,
+                (scope.account_ref, family_key, str(journal_row["value"]), time.time_ns()),
+            )
+
+    def read_ctp_account_store_identity(
+        self, scope: ExecutionScope
+    ) -> CtpAccountStoreIdentity:
+        """Read the exact CTP account identity bound to this opened database."""
+
+        family_key = self._ctp_account_family_key(scope)
+        try:
+            with self._read_transaction() as cursor:
+                identity_rows = cursor.execute(
+                    "SELECT * FROM ctp_account_store_identity"
+                ).fetchall()
+                if len(identity_rows) != 1:
+                    raise DurableStoreError("CTP execution store identity is missing or ambiguous")
+                identity_row = identity_rows[0]
+                journal_row = cursor.execute(
+                    "SELECT value FROM execution_meta WHERE key = 'journal_incarnation_id'"
+                ).fetchone()
+                if journal_row is None:
+                    raise DurableStoreError("CTP execution store journal identity is missing")
+                journal_incarnation_id = str(journal_row["value"])
+                if (
+                    str(identity_row["ledger_kind"]) != "CTP_EXECUTION_V1"
+                    or str(identity_row["account_ref"]) != scope.account_ref
+                    or str(identity_row["family_key"]) != family_key
+                    or str(identity_row["journal_incarnation_id"]) != journal_incarnation_id
+                ):
+                    raise DurableStoreError("CTP execution store account identity does not match")
+                owner_row = cursor.execute(
+                    "SELECT owner_state, owner_intent_id FROM ctp_account_family_owners "
+                    "WHERE family_key = ?",
+                    (family_key,),
+                ).fetchone()
+                database_row = self._connection.execute("PRAGMA database_list").fetchone()
+        except sqlite3.Error as error:
+            raise DurableStoreError("unable to read CTP execution store identity") from error
+        if database_row is None or database_row[1] != "main" or not database_row[2]:
+            raise DurableStoreError("CTP execution store database filename is unavailable")
+        try:
+            opened_path = Path(str(database_row[2])).resolve(strict=True)
+            stat_result = opened_path.stat()
+        except OSError as error:
+            raise DurableStoreError("unable to identify opened CTP execution store") from error
+        return CtpAccountStoreIdentity(
+            ledger_kind="CTP_EXECUTION_V1",
+            account_ref=scope.account_ref,
+            family_key=family_key,
+            journal_incarnation_id=journal_incarnation_id,
+            family_owner_state=None if owner_row is None else str(owner_row["owner_state"]),
+            family_owner_intent_id=(
+                None if owner_row is None else str(owner_row["owner_intent_id"])
+            ),
+            database_filename=str(opened_path),
+            file_device=int(stat_result.st_dev),
+            file_id=int(stat_result.st_ino),
+        )
+
+    @staticmethod
+    def _ctp_account_family_key(scope: ExecutionScope) -> str:
+        if (
+            type(scope) is not ExecutionScope
+            or scope.provider != "ctp"
+            or not _is_prefixed_digest(scope.account_ref, _CTP_ACCOUNT_REF_PREFIX)
+        ):
+            raise ContractValidationError(
+                "canonical lowercase CTP account scope is required for family ownership"
+            )
+        digest = hashlib.sha256(
+            _CTP_ACCOUNT_FAMILY_DOMAIN + scope.account_ref.encode("ascii")
+        ).hexdigest()
+        return _CTP_ACCOUNT_FAMILY_PREFIX + digest
+
+    @staticmethod
+    def _assert_no_unmapped_ctp_account_family_history(cursor: sqlite3.Cursor) -> None:
+        row = cursor.execute(
+            "SELECT 1 FROM ctp_account_family_legacy_fences WHERE fence_id = 1"
+        ).fetchone()
+        if row is not None:
+            raise InvalidStateTransition(
+                "CTP account family is blocked by unmapped legacy execution history; "
+                "a reviewed offline migration is required"
+            )
+
+    def acquire_ctp_account_family_owner(
+        self, scope: ExecutionScope
+    ) -> CtpAccountFamilyOwnerHandle:
+        """Persist the one mode-independent owner for a canonical CTP account.
+
+        This must precede the ordinary writer lease and native API creation.
+        The family identity is derived inside the Store from ``scope.account_ref``;
+        there is no caller-supplied fingerprint. Owners survive close/restart and
+        this candidate deliberately exposes no release or handoff operation.
+        """
+
+        family_key = self._ctp_account_family_key(scope)
+        account_key, trading_day, scope_key = self._validate_ctp_order_identity_scope(scope)
+        owner_intent_id = uuid.uuid4().hex
+        now_ns = time.time_ns()
+        legacy_blocked = False
+        existing_handle: CtpAccountFamilyOwnerHandle | None = None
+        with self._lock, self._transaction() as cursor:
+            existing = cursor.execute(
+                "SELECT * FROM ctp_account_family_owners WHERE family_key = ?",
+                (family_key,),
+            ).fetchone()
+            if existing is not None:
+                candidate = self._issued_ctp_account_family_owners.get(
+                    str(existing["owner_intent_id"])
+                )
+                if (
+                    candidate is not None
+                    and str(existing["owner_state"]) == "ACTIVE"
+                    and str(existing["family_key"]) == family_key
+                    and str(existing["account_key"]) == account_key
+                    and str(existing["environment"]) == scope.environment
+                ):
+                    existing_handle = candidate
+                else:
+                    raise InvalidStateTransition(
+                        "canonical CTP account family already has a persistent owner"
+                    )
+            else:
+                legacy = cursor.execute(
+                    "SELECT 1 FROM ctp_account_family_legacy_fences WHERE fence_id = 1"
+                ).fetchone()
+                if legacy is not None:
+                    legacy_blocked = True
+                else:
+                    cursor.execute(
+                        """
+                        INSERT INTO ctp_account_family_owners(
+                            family_key, owner_intent_id, account_key, scope_key,
+                            environment, trading_day, owner_state, poison_code,
+                            created_at_ns, updated_at_ns
+                        ) VALUES (?, ?, ?, ?, ?, ?, 'ACTIVE', NULL, ?, ?)
+                        """,
+                        (
+                            family_key,
+                            owner_intent_id,
+                            account_key,
+                            scope_key,
+                            scope.environment,
+                            trading_day,
+                            now_ns,
+                            now_ns,
+                        ),
+                    )
+        if legacy_blocked:
+            raise InvalidStateTransition(
+                "CTP account family is blocked by unmapped legacy execution history; "
+                "a reviewed offline migration is required"
+            )
+        if existing_handle is not None:
+            return existing_handle
+        handle = CtpAccountFamilyOwnerHandle(
+            family_key=family_key,
+            owner_intent_id=owner_intent_id,
+            account_key=account_key,
+            scope_key=scope_key,
+        )
+        with self._lock:
+            self._issued_ctp_account_family_owners[owner_intent_id] = handle
+        return handle
+
+    def _require_ctp_account_family_owner(
+        self,
+        cursor: sqlite3.Cursor,
+        scope: ExecutionScope,
+        owner_handle: CtpAccountFamilyOwnerHandle,
+    ) -> sqlite3.Row:
+        family_key = self._ctp_account_family_key(scope)
+        account_key, _, _ = self._validate_ctp_order_identity_scope(scope)
+        if (
+            type(owner_handle) is not CtpAccountFamilyOwnerHandle
+            or self._issued_ctp_account_family_owners.get(owner_handle.owner_intent_id)
+            is not owner_handle
+            or owner_handle.family_key != family_key
+            or owner_handle.account_key != account_key
+        ):
+            raise ContractValidationError(
+                "exact same-Store CTP account family owner handle is required"
+            )
+        self._assert_no_unmapped_ctp_account_family_history(cursor)
+        row = cursor.execute(
+            """
+            SELECT * FROM ctp_account_family_owners
+            WHERE family_key = ? AND owner_intent_id = ?
+              AND account_key = ?
+            """,
+            (family_key, owner_handle.owner_intent_id, account_key),
+        ).fetchone()
+        if (
+            row is None
+            or str(row["owner_state"]) != "ACTIVE"
+            or str(row["environment"]) != scope.environment
+        ):
+            raise InvalidStateTransition("durable CTP account family owner is not active")
+        return row
+
+    @staticmethod
+    def _poison_ctp_account_family_owner(
+        cursor: sqlite3.Cursor,
+        *,
+        account_key: str,
+        reason_code: str,
+        now_ns: int,
+    ) -> None:
+        """Make callback-source uncertainty block every later CTP mutation."""
+
+        cursor.execute(
+            """
+            UPDATE ctp_account_family_owners
+            SET owner_state = 'POISONED', poison_code = ?, updated_at_ns = ?
+            WHERE account_key = ? AND owner_state = 'ACTIVE'
+            """,
+            (reason_code, now_ns, account_key),
+        )
 
     def create_ctp_callback_session_owner(
         self,
@@ -2119,6 +3007,16 @@ class SqliteExecutionStore:
                         or str(owner["owner_state"]) not in {"PREPARED", "ACTIVE"}
                     ):
                         raise ContractValidationError("CTP callback owner is not live")
+                    self._assert_no_unmapped_ctp_account_family_history(cursor)
+                    family_rows = cursor.execute(
+                        """
+                        SELECT owner_state FROM ctp_account_family_owners
+                        WHERE account_key = ?
+                        """,
+                        (owner_handle.account_key,),
+                    ).fetchall()
+                    if len(family_rows) != 1 or str(family_rows[0]["owner_state"]) != "ACTIVE":
+                        raise ContractValidationError("CTP callback account family is not active")
                     seq = payload["sequence"]
                     expected_seq = int(owner["last_source_sequence"]) + 1
                     if seq != expected_seq:
@@ -2257,6 +3155,13 @@ class SqliteExecutionStore:
                     )
                     if cursor.rowcount != 1:
                         raise InvalidStateTransition("CTP callback owner changed during append")
+                    if poison_code is not None:
+                        self._poison_ctp_account_family_owner(
+                            cursor,
+                            account_key=owner_handle.account_key,
+                            reason_code=poison_code,
+                            now_ns=now_ns,
+                        )
             return CtpCallbackIngressCommit(
                 owner_intent_id=owner_handle.owner_intent_id,
                 source_sequence=payload["sequence"],
@@ -3313,6 +4218,12 @@ class SqliteExecutionStore:
                 )
                 if cursor.rowcount != 1:
                     raise InvalidStateTransition("CTP callback session owner changed")
+                self._poison_ctp_account_family_owner(
+                    cursor,
+                    account_key=owner_handle.account_key,
+                    reason_code=effective_reason,
+                    now_ns=time.time_ns(),
+                )
                 row = cursor.execute(
                     "SELECT * FROM ctp_dispatch_callback_session_owners "
                     "WHERE owner_intent_id = ?",
@@ -3694,6 +4605,81 @@ class SqliteExecutionStore:
                 ),
             )
 
+    @staticmethod
+    def _has_unmapped_execution_history(
+        cursor: sqlite3.Cursor, existing_tables: set[str] | frozenset[str]
+    ) -> bool:
+        """Return whether prior journal rows lack a V19 account-family binding.
+
+        Before V19, the durable identity retained only account/scope hashes.
+        Even generic execution rows cannot be attributed to a canonical CTP
+        account family without the original scope payload, so any such history
+        must block a new CTP family owner.
+        """
+
+        history_tables = (
+            "execution_records",
+            "execution_outbox",
+            "cancellation_records",
+            "cancellation_outbox",
+            "execution_writer_leases",
+            "ctp_order_identity_reservations",
+            "ctp_order_target_projections",
+            "ctp_order_target_projection_consumptions",
+            "ctp_order_ref_cutover_sessions",
+            "ctp_order_ref_legacy_imports",
+            "ctp_order_ref_watermarks",
+            "ctp_order_ref_account_watermarks",
+            "ctp_native_action_ref_counters",
+            "ctp_native_action_ref_allocations",
+            "ctp_dispatch_commands",
+            "ctp_dispatch_callback_ledger",
+            "ctp_dispatch_callback_source_lifecycle_fences",
+            "ctp_dispatch_callback_session_owners",
+            "ctp_dispatch_callback_ingress",
+            "ctp_dispatch_callback_ingress_applications",
+            "ctp_dispatch_trade_fact_ledger",
+            "ctp_dispatch_order_cumulative_ledger",
+            "ctp_dispatch_order_projection",
+            "ctp_dispatch_cancel_projection",
+            "ctp_dispatch_cancel_postconditions",
+            "ctp_dispatch_cancel_terminal_observations",
+            "ctp_dispatch_cancel_postcondition_resolutions",
+        )
+        for table in history_tables:
+            if table not in existing_tables:
+                continue
+            # ``table`` comes only from the fixed source-code tuple above and
+            # is first confirmed present in sqlite_master; identifiers cannot
+            # be bound as SQL parameters. Keep the migration probe narrow.
+            if cursor.execute(
+                f"SELECT 1 FROM {table} LIMIT 1"  # noqa: S608
+            ).fetchone() is not None:
+                return True
+        return False
+
+    def _migrate_ctp_account_family_legacy_fence(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        previous_tables: set[str],
+        previous_version: str,
+    ) -> None:
+        """Fence un-mappable pre-V19 journal history without rewriting it."""
+
+        if previous_version == str(self._SCHEMA_VERSION):
+            return
+        if not self._has_unmapped_execution_history(cursor, previous_tables):
+            return
+        cursor.execute(
+            """
+            INSERT OR IGNORE INTO ctp_account_family_legacy_fences(
+                fence_id, reason_code, source_schema_version, created_at_ns
+            ) VALUES (1, 'unmapped_legacy_execution_history', ?, ?)
+            """,
+            (previous_version, time.time_ns()),
+        )
+
     def _create_schema(self) -> None:
         with self._transaction() as cursor:
             # Capture lineage facts before CREATE TABLE IF NOT EXISTS adds the
@@ -3806,6 +4792,94 @@ class SqliteExecutionStore:
                     fencing_token INTEGER NOT NULL,
                     expires_at_ns INTEGER NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS ctp_account_family_owners (
+                    family_key TEXT PRIMARY KEY
+                        CHECK(length(family_key) = 86
+                              AND family_key GLOB 'ctp-account-family.v1:*'
+                              AND substr(family_key, 23) NOT GLOB '*[^0-9a-f]*'),
+                    owner_intent_id TEXT NOT NULL UNIQUE
+                        CHECK(length(owner_intent_id) = 32
+                              AND owner_intent_id NOT GLOB '*[^0-9a-f]*'),
+                    account_key TEXT NOT NULL
+                        CHECK(length(account_key) = 72
+                              AND account_key GLOB 'account:*'
+                              AND substr(account_key, 9) NOT GLOB '*[^0-9a-f]*'),
+                    scope_key TEXT NOT NULL
+                        CHECK(length(scope_key) = 70
+                              AND scope_key GLOB 'scope:*'
+                              AND substr(scope_key, 7) NOT GLOB '*[^0-9a-f]*'),
+                    environment TEXT NOT NULL,
+                    trading_day TEXT NOT NULL
+                        CHECK(length(trading_day) = 8
+                              AND trading_day NOT GLOB '*[^0-9]*'),
+                    owner_state TEXT NOT NULL CHECK(owner_state IN ('ACTIVE', 'POISONED')),
+                    poison_code TEXT,
+                    created_at_ns INTEGER NOT NULL CHECK(created_at_ns > 0),
+                    updated_at_ns INTEGER NOT NULL CHECK(updated_at_ns > 0),
+                    CHECK((owner_state = 'POISONED' AND poison_code IS NOT NULL)
+                       OR (owner_state = 'ACTIVE' AND poison_code IS NULL))
+                );
+                CREATE TRIGGER IF NOT EXISTS ctp_account_family_owner_immutable_identity
+                BEFORE UPDATE ON ctp_account_family_owners
+                WHEN NEW.family_key != OLD.family_key
+                  OR NEW.owner_intent_id != OLD.owner_intent_id
+                  OR NEW.account_key != OLD.account_key
+                  OR NEW.scope_key != OLD.scope_key
+                  OR NEW.environment != OLD.environment
+                  OR NEW.trading_day != OLD.trading_day
+                  OR (OLD.owner_state = 'POISONED' AND NEW.owner_state != 'POISONED')
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP account family owner identity is immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS ctp_account_family_owner_no_delete
+                BEFORE DELETE ON ctp_account_family_owners
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP account family owner is permanent');
+                END;
+                CREATE TABLE IF NOT EXISTS ctp_account_store_identity (
+                    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                    ledger_kind TEXT NOT NULL
+                        CHECK(ledger_kind = 'CTP_EXECUTION_V1'),
+                    account_ref TEXT NOT NULL
+                        CHECK(length(account_ref) = 83
+                              AND account_ref GLOB 'ctp-account-ref.v1:*'
+                              AND substr(account_ref, 20) NOT GLOB '*[^0-9a-f]*'),
+                    family_key TEXT NOT NULL
+                        CHECK(length(family_key) = 86
+                              AND family_key GLOB 'ctp-account-family.v1:*'
+                              AND substr(family_key, 23) NOT GLOB '*[^0-9a-f]*'),
+                    journal_incarnation_id TEXT NOT NULL
+                        CHECK(length(journal_incarnation_id) = 32
+                              AND journal_incarnation_id NOT GLOB '*[^0-9a-f]*'),
+                    created_at_ns INTEGER NOT NULL CHECK(created_at_ns > 0)
+                );
+                CREATE TRIGGER IF NOT EXISTS ctp_account_store_identity_immutable_update
+                BEFORE UPDATE ON ctp_account_store_identity
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP account store identity is immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS ctp_account_store_identity_immutable_delete
+                BEFORE DELETE ON ctp_account_store_identity
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP account store identity is immutable');
+                END;
+                CREATE TABLE IF NOT EXISTS ctp_account_family_legacy_fences (
+                    fence_id INTEGER PRIMARY KEY CHECK(fence_id = 1),
+                    reason_code TEXT NOT NULL
+                        CHECK(reason_code = 'unmapped_legacy_execution_history'),
+                    source_schema_version TEXT NOT NULL,
+                    created_at_ns INTEGER NOT NULL CHECK(created_at_ns > 0)
+                );
+                CREATE TRIGGER IF NOT EXISTS ctp_account_family_legacy_fence_immutable_update
+                BEFORE UPDATE ON ctp_account_family_legacy_fences
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP account family migration fence is immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS ctp_account_family_legacy_fence_immutable_delete
+                BEFORE DELETE ON ctp_account_family_legacy_fences
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP account family migration fence is permanent');
+                END;
                 CREATE TABLE IF NOT EXISTS ctp_order_identity_reservations (
                     account_key TEXT NOT NULL,
                     trading_day TEXT NOT NULL,
@@ -4800,6 +5874,27 @@ class SqliteExecutionStore:
                 }
                 if not required_v17_tables.issubset(previous_tables):
                     raise DurableStoreError("incomplete schema 17 CTP execution lineage")
+            elif version == "18":
+                required_v18_tables = {
+                    "execution_records",
+                    "execution_outbox",
+                    "execution_writer_leases",
+                    "ctp_dispatch_commands",
+                    "ctp_dispatch_callback_ledger",
+                    "ctp_dispatch_callback_source_lifecycle_fences",
+                    "ctp_dispatch_callback_session_owners",
+                    "ctp_dispatch_callback_ingress",
+                    "ctp_dispatch_callback_ingress_applications",
+                    "ctp_dispatch_trade_fact_ledger",
+                    "ctp_dispatch_order_cumulative_ledger",
+                    "ctp_dispatch_cancel_postconditions",
+                    "ctp_dispatch_cancel_terminal_observations",
+                    "ctp_dispatch_cancel_postcondition_resolutions",
+                    "ctp_order_target_projections",
+                    "ctp_order_target_projection_consumptions",
+                }
+                if not required_v18_tables.issubset(previous_tables):
+                    raise DurableStoreError("incomplete schema 18 CTP execution lineage")
             if version == "2":
                 columns = {
                     str(item["name"])
@@ -4810,7 +5905,7 @@ class SqliteExecutionStore:
                         "ALTER TABLE execution_records ADD COLUMN cumulative_commission TEXT"
                     )
             elif version not in {
-                "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17",
+                "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18",
                 str(self._SCHEMA_VERSION),
             }:
                 raise DurableStoreError("unsupported execution store schema")
@@ -4856,6 +5951,11 @@ class SqliteExecutionStore:
                         f"ALTER TABLE ctp_dispatch_commands ADD COLUMN {name} {declaration}"
                     )
             if version != str(self._SCHEMA_VERSION):
+                self._migrate_ctp_account_family_legacy_fence(
+                    cursor,
+                    previous_tables=previous_tables,
+                    previous_version=version,
+                )
                 self._migrate_legacy_ctp_callback_source_lifecycle_fences(
                     cursor, previous_tables=previous_tables
                 )
@@ -4986,8 +6086,10 @@ class SqliteExecutionStore:
 
     @staticmethod
     def _validate_ctp_order_identity_scope(scope: ExecutionScope) -> tuple[str, str, str]:
-        if not isinstance(scope, ExecutionScope) or scope.provider.upper() != "CTP":
-            raise ContractValidationError("CTP order identity requires a CTP execution scope")
+        if not isinstance(scope, ExecutionScope) or scope.provider != "ctp":
+            raise ContractValidationError(
+                "CTP order identity requires canonical lowercase CTP execution scope"
+            )
         trading_day = scope.trading_day
         if (
             not isinstance(trading_day, str)
@@ -7802,6 +8904,12 @@ class SqliteExecutionStore:
             )
             if cursor.rowcount != 1:
                 raise InvalidStateTransition("CTP owner poison transition changed")
+            self._poison_ctp_account_family_owner(
+                cursor,
+                account_key=account_key,
+                reason_code="dispatch_stage_ambiguous",
+                now_ns=now_ns,
+            )
             updated = cursor.execute(
                 """
                 SELECT * FROM ctp_dispatch_commands
@@ -8540,6 +9648,14 @@ class SqliteExecutionStore:
                 )
                 self._require_ctp_cancel_target_not_terminal(
                     cursor, account_key, fresh_target
+                )
+            elif self._unresolved_cancellations_for_account_cursor(
+                cursor,
+                account_key,
+                ctp_family_key=self._ctp_account_family_key(scope),
+            ):
+                raise InvalidStateTransition(
+                    "account has an unresolved managed cancellation"
                 )
             cursor.execute(
                 """
@@ -10995,6 +12111,32 @@ class SqliteExecutionStore:
             return tuple(recovered)
 
     @contextmanager
+    def _read_transaction(self) -> Iterator[sqlite3.Cursor]:
+        """Keep a consistent read snapshot without reserving SQLite's writer lock."""
+
+        with self._lock:
+            cursor = self._connection.cursor()
+            try:
+                cursor.execute("BEGIN")
+                yield cursor
+            except sqlite3.Error as error:
+                self._connection.rollback()
+                raise DurableStoreError("execution store read transaction failed") from error
+            except BaseException:
+                self._connection.rollback()
+                raise
+            else:
+                try:
+                    self._connection.commit()
+                except sqlite3.Error as error:
+                    self._connection.rollback()
+                    raise DurableStoreError(
+                        "execution store read transaction commit failed"
+                    ) from error
+            finally:
+                cursor.close()
+
+    @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Cursor]:
         with self._lock:
             cursor = self._connection.cursor()
@@ -11023,6 +12165,20 @@ class SqliteExecutionStore:
                             """,
                             (time.time_ns(), error.owner_intent_id),
                         )
+                        poisoned_owner = poison_cursor.execute(
+                            """
+                            SELECT account_key FROM ctp_dispatch_callback_session_owners
+                            WHERE owner_intent_id = ?
+                            """,
+                            (error.owner_intent_id,),
+                        ).fetchone()
+                        if poisoned_owner is not None:
+                            self._poison_ctp_account_family_owner(
+                                poison_cursor,
+                                account_key=str(poisoned_owner["account_key"]),
+                                reason_code="callback_apply_failure",
+                                now_ns=time.time_ns(),
+                            )
                         self._connection.commit()
                     except sqlite3.Error:
                         self._connection.rollback()
@@ -11204,6 +12360,36 @@ class SqliteExecutionStore:
             or writer_lease.fencing_token <= 0
         ):
             raise ContractValidationError("invalid writer lease")
+        is_ctp_scope = (
+            type(scope) is ExecutionScope and scope.provider.upper() == "CTP"
+        )
+        if is_ctp_scope:
+            family_key = SqliteExecutionStore._ctp_account_family_key(scope)
+            if (
+                writer_lease.family_key != family_key
+                or not _is_local_queue_receipt_id(writer_lease.family_owner_intent_id)
+            ):
+                raise WriterLeaseUnavailable()
+            SqliteExecutionStore._assert_no_unmapped_ctp_account_family_history(cursor)
+            family_row = cursor.execute(
+                """
+                SELECT owner_state FROM ctp_account_family_owners
+                WHERE family_key = ? AND owner_intent_id = ?
+                  AND account_key = ?
+                """,
+                (
+                    family_key,
+                    writer_lease.family_owner_intent_id,
+                    scope.account_key,
+                ),
+            ).fetchone()
+            if family_row is None or str(family_row["owner_state"]) != "ACTIVE":
+                raise WriterLeaseUnavailable()
+        elif (
+            writer_lease.family_key is not None
+            or writer_lease.family_owner_intent_id is not None
+        ):
+            raise ContractValidationError("non-CTP writer lease has a CTP account family")
         row = cursor.execute(
             "SELECT owner_id, fencing_token, expires_at_ns FROM execution_writer_leases "
             "WHERE scope_key = ?",
@@ -11360,6 +12546,97 @@ class SqliteExecutionStore:
             except sqlite3.Error as error:
                 raise DurableStoreError("unable to list unknown cancellation records") from error
         return [self._cancel_record_from_row(row) for row in rows]
+
+    @staticmethod
+    def _unresolved_cancellations_for_account_cursor(
+        cursor: sqlite3.Cursor,
+        account_key: str,
+        *,
+        ctp_family_key: str | None = None,
+    ) -> tuple[tuple[ExecutionScope, CancelRecord], ...]:
+        rows = cursor.execute(
+            """
+            SELECT * FROM cancellation_records
+            WHERE state IN (?, ?)
+            ORDER BY scope_key, created_at_ns, cancel_id
+            """,
+            (ExecutionState.DISPATCHING.value, ExecutionState.UNKNOWN.value),
+        ).fetchall()
+        matches: list[tuple[ExecutionScope, CancelRecord]] = []
+        for row in rows:
+            try:
+                payload_json = str(row["payload_json"])
+                payload = json.loads(payload_json)
+                intent = cancel_intent_from_payload(payload)
+                if (
+                    canonical_json(payload) != payload_json
+                    or intent.fingerprint != str(row["payload_sha256"])
+                    or intent.cancel_id != str(row["cancel_id"])
+                    or intent.scope.key != str(row["scope_key"])
+                    or intent.target_intent_id != str(row["target_intent_id"])
+                    or intent.provider_order_id != str(row["provider_order_id"])
+                ):
+                    raise ValueError("cancellation row does not match its payload")
+            except (ContractValidationError, TypeError, ValueError, json.JSONDecodeError):
+                raise DurableStoreError(
+                    "stored account-wide cancellation identity is unreadable"
+                ) from None
+            if ctp_family_key is not None:
+                if intent.scope.provider.lower() == "ctp":
+                    try:
+                        row_family_key = SqliteExecutionStore._ctp_account_family_key(
+                            intent.scope
+                        )
+                    except ContractValidationError:
+                        raise DurableStoreError(
+                            "stored account-wide cancellation identity is unreadable"
+                        ) from None
+                    if row_family_key == ctp_family_key:
+                        matches.append(
+                            (intent.scope, SqliteExecutionStore._cancel_record_from_row(row))
+                        )
+                elif intent.scope.account_key == account_key:
+                    matches.append(
+                        (intent.scope, SqliteExecutionStore._cancel_record_from_row(row))
+                    )
+            elif intent.scope.account_key == account_key:
+                matches.append((intent.scope, SqliteExecutionStore._cancel_record_from_row(row)))
+        return tuple(matches)
+
+    def list_unresolved_cancellations_for_account(
+        self,
+        scope: ExecutionScope,
+        *,
+        writer_lease: WriterLease,
+    ) -> tuple[tuple[ExecutionScope, CancelRecord], ...]:
+        """Read nonterminal cancellation facts across this exact account.
+
+        The account key deliberately excludes strategy and trading day, so the
+        returned scope alongside each record preserves its original identity.
+        Persisted payloads are reconstructed and checked before their account
+        is considered; malformed rows fail closed rather than disappearing
+        from an account-wide recovery scan.
+        """
+
+        if type(scope) is not ExecutionScope:
+            raise ContractValidationError("execution scope is required")
+        try:
+            with self._read_transaction() as cursor:
+                self._assert_active_writer_lease(cursor, scope, writer_lease)
+                unresolved = self._unresolved_cancellations_for_account_cursor(
+                    cursor,
+                    scope.account_key,
+                    ctp_family_key=(
+                        self._ctp_account_family_key(scope)
+                        if scope.provider == "ctp"
+                        else None
+                    ),
+                )
+        except sqlite3.Error as error:
+            raise DurableStoreError(
+                "unable to list unresolved cancellation records for account"
+            ) from error
+        return unresolved
 
     def recover_interrupted_cancellations(
         self,
@@ -12112,6 +13389,18 @@ class SqliteExecutionStore:
             record = self._record_from_row(row)
             if record.state is not ExecutionState.PENDING_DISPATCH:
                 return record, False
+            if self._unresolved_cancellations_for_account_cursor(
+                cursor,
+                scope.account_key,
+                ctp_family_key=(
+                    self._ctp_account_family_key(scope)
+                    if scope.provider.lower() == "ctp"
+                    else None
+                ),
+            ):
+                raise InvalidStateTransition(
+                    "account has an unresolved managed cancellation"
+                )
             cursor.execute(
                 """
                 UPDATE execution_records
@@ -12567,6 +13856,7 @@ class SqliteExecutionStore:
         owner_id: str,
         *,
         ttl_ns: int = 5_000_000_000,
+        ctp_account_family_owner: CtpAccountFamilyOwnerHandle | None = None,
     ) -> WriterLease:
         """Acquire or renew the sole dispatch writer lease for one account scope."""
 
@@ -12577,7 +13867,22 @@ class SqliteExecutionStore:
         now_ns = time.time_ns()
         expires_at_ns = now_ns + ttl_ns
         scope_key = scope.account_key
+        is_ctp_scope = (
+            type(scope) is ExecutionScope and scope.provider.upper() == "CTP"
+        )
+        if not is_ctp_scope and ctp_account_family_owner is not None:
+            raise ContractValidationError(
+                "CTP account family owner cannot be used for another provider"
+            )
         with self._transaction() as cursor:
+            if is_ctp_scope:
+                if ctp_account_family_owner is None:
+                    raise InvalidStateTransition(
+                        "CTP account family owner must precede the writer lease"
+                    )
+                self._require_ctp_account_family_owner(
+                    cursor, scope, ctp_account_family_owner
+                )
             row = cursor.execute(
                 "SELECT * FROM execution_writer_leases WHERE scope_key = ?", (scope_key,)
             ).fetchone()
@@ -12613,7 +13918,14 @@ class SqliteExecutionStore:
                 )
             else:
                 raise WriterLeaseUnavailable()
-        return WriterLease(scope_key, owner_id, token, expires_at_ns)
+        return WriterLease(
+            scope_key,
+            owner_id,
+            token,
+            expires_at_ns,
+            None if not is_ctp_scope else ctp_account_family_owner.family_key,
+            None if not is_ctp_scope else ctp_account_family_owner.owner_intent_id,
+        )
 
     def release_lease(
         self,
@@ -12622,7 +13934,12 @@ class SqliteExecutionStore:
         *,
         fencing_token: int,
     ) -> bool:
-        """Release only the exact current owner/token lease generation."""
+        """Expire only the exact owner/token generation without reusing its token.
+
+        The row is a durable fencing-generation tombstone. Deleting it would
+        reset the next acquisition to token 1 and could make a stale lease
+        object valid again when the same owner_id is reused.
+        """
 
         if type(fencing_token) is not int or fencing_token <= 0:
             raise ContractValidationError("invalid writer fencing_token")
@@ -12630,8 +13947,10 @@ class SqliteExecutionStore:
         with self._transaction() as cursor:
             result = cursor.execute(
                 """
-                DELETE FROM execution_writer_leases
+                UPDATE execution_writer_leases
+                SET expires_at_ns = 0
                 WHERE scope_key = ? AND owner_id = ? AND fencing_token = ?
+                  AND expires_at_ns != 0
                 """,
                 (scope.account_key, owner_id, fencing_token),
             )

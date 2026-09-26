@@ -18,11 +18,21 @@ from bt_api_execution import (
 
 
 def _scope() -> ExecutionScope:
-    return ExecutionScope("CTP", "simulation", "acct-session-owner", "strategy.owner", "20260925")
+    account_ref = "ctp-account-ref.v1:" + hashlib.sha256(b"acct-session-owner").hexdigest()
+    return ExecutionScope("ctp", "simulation", account_ref, "strategy.owner", "20260925")
 
 
 def _lease(store: SqliteExecutionStore, scope: ExecutionScope):
-    return store.acquire_or_renew_lease(scope, "session-owner-test", ttl_ns=60_000_000_000)
+    handle = getattr(store, "_test_ctp_account_family_owner", None)
+    if handle is None:
+        handle = store.acquire_ctp_account_family_owner(scope)
+        store._test_ctp_account_family_owner = handle
+    return store.acquire_or_renew_lease(
+        scope,
+        "session-owner-test",
+        ttl_ns=60_000_000_000,
+        ctp_account_family_owner=handle,
+    )
 
 
 _SOURCE_TAGS = {
@@ -222,9 +232,8 @@ def test_callback_session_owner_is_persisted_before_start_and_cannot_be_recreate
 
     reopened = SqliteExecutionStore(database)
     try:
-        lease = _lease(reopened, scope)
-        with pytest.raises(InvalidStateTransition, match="already has a durable"):
-            reopened.create_ctp_callback_session_owner(scope, writer_lease=lease)
+        with pytest.raises(InvalidStateTransition, match="already has a persistent owner"):
+            reopened.acquire_ctp_account_family_owner(scope)
 
         forged = CtpCallbackSessionOwnerHandle(
             owner_intent_id=owner.owner_intent_id,
@@ -258,8 +267,8 @@ def test_callback_session_owner_poison_is_durable_and_never_resets(tmp_path):
 
     repeated = store.poison_ctp_callback_session_owner(owner, "owner_stop")
     assert repeated == commit
-    with pytest.raises(InvalidStateTransition, match="already has a durable"):
-        store.create_ctp_callback_session_owner(scope, writer_lease=lease)
+    with pytest.raises(InvalidStateTransition, match="already has a persistent owner"):
+        store.acquire_ctp_account_family_owner(scope)
     store.close()
 
     reopened = SqliteExecutionStore(database)
@@ -269,8 +278,8 @@ def test_callback_session_owner_poison_is_durable_and_never_resets(tmp_path):
         ).fetchone()
         assert row is not None
         assert tuple(row) == ("POISONED", "disconnect")
-        with pytest.raises(InvalidStateTransition, match="already has a durable"):
-            reopened.create_ctp_callback_session_owner(scope, writer_lease=_lease(reopened, scope))
+        with pytest.raises(InvalidStateTransition, match="already has a persistent owner"):
+            reopened.acquire_ctp_account_family_owner(scope)
     finally:
         reopened.close()
 

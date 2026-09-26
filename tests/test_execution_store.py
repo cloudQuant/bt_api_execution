@@ -12,7 +12,9 @@ from bt_api_execution import (
     DurableStoreError,
     ExecutionScope,
     IntentConflictError,
+    InvalidStateTransition,
     SqliteExecutionStore,
+    WriterLeaseUnavailable,
     payload_sha256,
 )
 
@@ -76,7 +78,7 @@ def test_v2_execution_store_adds_nullable_cumulative_commission_column(tmp_path)
             "SELECT value FROM execution_meta WHERE key = 'schema_version'"
         ).fetchone()["value"]
         assert "cumulative_commission" in columns
-        assert version == "18"
+        assert version == "20"
     finally:
         store.close()
 
@@ -107,7 +109,7 @@ def test_v3_execution_store_adds_ctp_order_identity_reservations(tmp_path) -> No
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-        assert version == "18"
+        assert version == "20"
         assert "ctp_order_identity_reservations" in tables
         assert "ctp_dispatch_commands" in tables
         assert "ctp_dispatch_authority_uses" in tables
@@ -143,7 +145,7 @@ def test_v10_execution_store_adds_callback_lifecycle_fence_schema(tmp_path) -> N
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-        assert version == "18"
+        assert version == "20"
         assert "ctp_dispatch_callback_source_lifecycle_fences" in tables
         assert "ctp_dispatch_callback_ingestion_resolutions" not in tables
         assert "ctp_order_target_projections" in tables
@@ -199,7 +201,7 @@ def test_v10_execution_store_migrates_immutable_cancel_target_projection_tables(
                 "SELECT name FROM sqlite_master WHERE type = 'trigger'"
             ).fetchall()
         }
-        assert version == "18"
+        assert version == "20"
         assert {
             "ctp_order_target_projections",
             "ctp_order_target_projection_consumptions",
@@ -237,7 +239,7 @@ def test_v11_projection_lineage_migrates_without_inventing_callback_fence(tmp_pa
     try:
         assert migrated._connection.execute(
             "SELECT value FROM execution_meta WHERE key = 'schema_version'"
-        ).fetchone()[0] == "18"
+        ).fetchone()[0] == "20"
         tables = {
             str(row["name"])
             for row in migrated._connection.execute(
@@ -259,7 +261,7 @@ def test_v11_projection_lineage_migrates_without_inventing_callback_fence(tmp_pa
     try:
         assert reopened._connection.execute(
             "SELECT value FROM execution_meta WHERE key = 'schema_version'"
-        ).fetchone()[0] == "18"
+        ).fetchone()[0] == "20"
         assert reopened._connection.execute(
             "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences"
         ).fetchone()[0] == 0
@@ -282,6 +284,44 @@ def test_ambiguous_v11_store_lineage_is_rejected_before_upgrade(tmp_path) -> Non
 
 
 @pytest.mark.unit
+def test_released_writer_lease_generation_is_never_reused_after_reopen(tmp_path) -> None:
+    path = tmp_path / "execution.sqlite3"
+    scope = ExecutionScope("FAKE", "simulation", "acct_demo", "strategy.demo")
+    store = SqliteExecutionStore(path)
+    first = store.acquire_or_renew_lease(scope, "writer.same")
+    assert first.fencing_token == 1
+    assert store.release_lease(
+        scope, "writer.same", fencing_token=first.fencing_token
+    )
+
+    second = store.acquire_or_renew_lease(scope, "writer.same")
+    assert second.fencing_token == 2
+    with pytest.raises(WriterLeaseUnavailable):
+        store.assert_writer_lease(scope, first)
+    assert not store.release_lease(
+        scope, "writer.same", fencing_token=first.fencing_token
+    )
+    store.assert_writer_lease(scope, second)
+    assert store.release_lease(
+        scope, "writer.same", fencing_token=second.fencing_token
+    )
+    store.close()
+
+    reopened = SqliteExecutionStore(path)
+    try:
+        third = reopened.acquire_or_renew_lease(scope, "writer.same")
+        assert third.fencing_token == 3
+        with pytest.raises(WriterLeaseUnavailable):
+            reopened.assert_writer_lease(scope, second)
+        assert not reopened.release_lease(
+            scope, "writer.same", fencing_token=second.fencing_token
+        )
+        reopened.assert_writer_lease(scope, third)
+    finally:
+        reopened.close()
+
+
+@pytest.mark.unit
 def test_v12_store_without_lifecycle_fence_table_is_rejected(tmp_path) -> None:
     path = tmp_path / "execution.sqlite3"
     store = SqliteExecutionStore(path)
@@ -297,8 +337,25 @@ def test_v12_store_without_lifecycle_fence_table_is_rejected(tmp_path) -> None:
         SqliteExecutionStore(path)
 
 
+def _ctp_account_ref(label: str = "acct_ref") -> str:
+    return "ctp-account-ref.v1:" + sha256(label.encode("ascii")).hexdigest()
+
+
 def _ctp_scope(*, day: str = "20260925", strategy: str = "strategy.demo") -> ExecutionScope:
-    return ExecutionScope("CTP", "simulation", "acct_ref", strategy, trading_day=day)
+    return ExecutionScope("ctp", "simulation", _ctp_account_ref(), strategy, trading_day=day)
+
+
+def _lease(store: SqliteExecutionStore, scope: ExecutionScope, owner: str):
+    handle = getattr(store, "_test_ctp_account_family_owner", None)
+    if handle is None:
+        handle = store.acquire_ctp_account_family_owner(scope)
+        store._test_ctp_account_family_owner = handle
+    return store.acquire_or_renew_lease(
+        scope,
+        owner,
+        ttl_ns=30_000_000_000,
+        ctp_account_family_owner=handle,
+    )
 
 
 def _runtime_order_id(token: str) -> str:
@@ -338,7 +395,7 @@ def _seed_proof(scope: ExecutionScope, session: str = "test-seed-session") -> Ct
 
 
 def _reserve_seeded(store, scope, managed_intent_id, runtime_order_id, *, session="test-seed-session"):
-    lease = store.acquire_or_renew_lease(scope, "execution-store-test", ttl_ns=30_000_000_000)
+    lease = _lease(store, scope, "execution-store-test")
     return store.seed_ctp_order_ref_and_reserve_identity(
         scope,
         _seed_proof(scope, session),
@@ -361,20 +418,15 @@ def test_ctp_order_identity_reservation_is_idempotent_and_survives_restart(tmp_p
         assert first.trading_day == "20260925"
         assert first.scope_key == scope.key
         assert _reserve_seeded(store, scope, "intent-1", runtime_id) == first
-    finally:
-        store.close()
 
-    reopened = SqliteExecutionStore(path)
-    try:
-        assert reopened.read_ctp_order_identity(scope, "intent-1") == first
-        second = _reserve_seeded(reopened, scope, "intent-2", _runtime_order_id("second"))
+        second = _reserve_seeded(store, scope, "intent-2", _runtime_order_id("second"))
         assert second.order_ref == "000000000002"
 
         # A new trading day and another strategy share the same account-level
-        # allocation history; previously committed refs are never reused.
+        # allocation history within this one-shot owner process.
         next_day = _ctp_scope(day="20260926", strategy="strategy.other")
         third = _reserve_seeded(
-            reopened,
+            store,
             next_day,
             "intent-1",
             _runtime_order_id("next-day"),
@@ -382,6 +434,18 @@ def test_ctp_order_identity_reservation_is_idempotent_and_survives_restart(tmp_p
         )
         assert third.order_ref == "000000000003"
         assert third.account_key == first.account_key
+    finally:
+        store.close()
+
+    reopened = SqliteExecutionStore(path)
+    try:
+        assert reopened.read_ctp_order_identity(scope, "intent-1") == first
+        assert reopened.read_ctp_order_identity(scope, "intent-2") == second
+        assert reopened.read_ctp_order_identity(
+            _ctp_scope(day="20260926", strategy="strategy.other"), "intent-1"
+        ) == third
+        with pytest.raises(InvalidStateTransition, match="already has a persistent owner"):
+            reopened.acquire_ctp_account_family_owner(scope)
         assert reopened.read_ctp_order_identity(scope, "missing") is None
     finally:
         reopened.close()
@@ -484,9 +548,7 @@ def test_ctp_order_identity_allocation_serializes_independent_store_connections(
     path = tmp_path / "execution.sqlite3"
     stores = [SqliteExecutionStore(path) for _ in range(8)]
     scope = _ctp_scope()
-    lease = stores[0].acquire_or_renew_lease(
-        scope, "execution-store-concurrency-test", ttl_ns=30_000_000_000
-    )
+    lease = _lease(stores[0], scope, "execution-store-concurrency-test")
     proof = _seed_proof(scope)
     try:
         def reserve(index: int) -> str:
