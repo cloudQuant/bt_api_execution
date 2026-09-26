@@ -14,6 +14,7 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field, is_dataclass
 from decimal import Decimal, InvalidOperation
 from enum import Enum, StrEnum
+from types import MappingProxyType
 from typing import Any, cast
 
 from .errors import ContractValidationError
@@ -40,6 +41,196 @@ def _decimal(value: Decimal, field_name: str, *, positive: bool = False) -> Deci
     if not value.is_finite() or (positive and value <= 0):
         raise ContractValidationError(f"invalid {field_name}")
     return value
+
+
+_FACT_COMPLETENESS = frozenset({"COMPLETE", "PARTIAL", "INCOMPLETE", "UNAVAILABLE", "UNKNOWN"})
+_ACCOUNT_VALUE_FIELDS = (
+    "equity",
+    "cash",
+    "available_margin",
+    "margin",
+    "realized_pnl",
+    "unrealized_pnl",
+    "fee",
+    "funding",
+    "net_cashflow",
+    "fx_rate",
+    "settlement_price",
+)
+_QUALITY_VALUE_FIELDS = (
+    "arrival_bid",
+    "arrival_ask",
+    "arrival_mid",
+    "native_quantity",
+    "contract_multiplier",
+    "vwap",
+    "fee",
+    "slippage_amount",
+    "slippage_bps",
+    "stage_durations_ns",
+)
+
+
+def _economic_decimal(value: Decimal | int | str | None, field_name: str) -> Decimal | None:
+    """Validate exact economic scalar input without accepting bool or float."""
+
+    if value is None:
+        return None
+    if type(value) is bool or isinstance(value, float):
+        raise ContractValidationError(f"invalid {field_name}")
+    return _decimal(value, field_name)
+
+
+def _optional_timestamp_ns(value: int | None, field_name: str) -> int | None:
+    if value is None:
+        return None
+    if type(value) is not int or value <= 0:
+        raise ContractValidationError(f"invalid {field_name}")
+    return value
+
+
+def _fact_field_metadata(
+    fields: tuple[str, ...],
+    values: Mapping[str, object | None],
+    completeness: Mapping[str, str],
+    coverage_ns: Mapping[str, tuple[int, int]],
+    source_refs: Mapping[str, tuple[str, ...]],
+) -> tuple[
+    Mapping[str, str],
+    Mapping[str, tuple[int, int]],
+    Mapping[str, tuple[str, ...]],
+]:
+    """Freeze and validate per-field provenance while keeping absent facts absent."""
+
+    if not all(isinstance(value, Mapping) for value in (completeness, coverage_ns, source_refs)):
+        raise ContractValidationError("invalid economic field metadata")
+    allowed = set(fields)
+    if any(set(mapping) - allowed for mapping in (completeness, coverage_ns, source_refs)):
+        raise ContractValidationError("unknown economic field metadata")
+
+    normalized_completeness: dict[str, str] = {}
+    normalized_coverage: dict[str, tuple[int, int]] = {}
+    normalized_source_refs: dict[str, tuple[str, ...]] = {}
+    for name in fields:
+        status = completeness.get(name, "INCOMPLETE" if values[name] is None else "UNKNOWN")
+        if not isinstance(status, str) or status not in _FACT_COMPLETENESS:
+            raise ContractValidationError(f"invalid {name} completeness")
+        interval = coverage_ns.get(name)
+        if interval is not None:
+            if (
+                not isinstance(interval, (tuple, list))
+                or len(interval) != 2
+                or type(interval[0]) is not int
+                or type(interval[1]) is not int
+                or interval[0] <= 0
+                or interval[1] < interval[0]
+            ):
+                raise ContractValidationError(f"invalid {name} coverage")
+            normalized_coverage[name] = (interval[0], interval[1])
+        refs = source_refs.get(name, ())
+        if not isinstance(refs, (tuple, list)) or isinstance(refs, str):
+            raise ContractValidationError(f"invalid {name} source references")
+        normalized_refs = tuple(_text(ref, f"{name} source reference") for ref in refs)
+        if len(set(normalized_refs)) != len(normalized_refs):
+            raise ContractValidationError(f"duplicate {name} source reference")
+        if status == "COMPLETE":
+            if values[name] is None:
+                raise ContractValidationError(f"complete {name} is missing a value")
+            if name not in normalized_coverage or not normalized_refs:
+                raise ContractValidationError(f"complete {name} is missing coverage or source")
+        normalized_completeness[name] = status
+        if normalized_refs:
+            normalized_source_refs[name] = normalized_refs
+
+    return (
+        MappingProxyType(normalized_completeness),
+        MappingProxyType(normalized_coverage),
+        MappingProxyType(normalized_source_refs),
+    )
+
+
+def _economic_scope_wire(
+    scope: ExecutionScope,
+    generation: str | None,
+    epoch: int | None,
+    *,
+    strategy_attribution: bool,
+) -> dict[str, Any]:
+    if not isinstance(scope, ExecutionScope):
+        raise ContractValidationError("economic fact scope is required")
+    if generation is None:
+        raise ContractValidationError("economic fact generation is required for wire export")
+    generation = _text(generation, "generation")
+    if type(epoch) is not int or epoch <= 0:
+        raise ContractValidationError("economic fact epoch is required for wire export")
+    return {
+        "provider": scope.provider,
+        "environment": scope.environment,
+        "account_fingerprint": scope.account_key.partition(":")[2],
+        "generation": generation,
+        "trading_day": scope.trading_day,
+        "epoch": epoch,
+        "strategy_id": scope.strategy_id if strategy_attribution else None,
+    }
+
+
+def _fact_effective_completeness(
+    requested: str,
+    field_completeness: Mapping[str, str],
+    required_fields: tuple[str, ...],
+    *,
+    required_context_complete: bool,
+) -> str:
+    if requested == "UNAVAILABLE":
+        return "UNAVAILABLE"
+    if (
+        requested == "COMPLETE"
+        and required_context_complete
+        and all(field_completeness[name] == "COMPLETE" for name in required_fields)
+    ):
+        return "COMPLETE"
+    return "INCOMPLETE"
+
+
+def _field_metadata_wire(
+    fields: tuple[str, ...],
+    completeness: Mapping[str, str],
+    coverage_ns: Mapping[str, tuple[int, int]],
+    source_refs: Mapping[str, tuple[str, ...]],
+) -> dict[str, dict[str, Any]]:
+    return {
+        name: {
+            "completeness": completeness[name],
+            "coverage_start_ns": coverage_ns[name][0] if name in coverage_ns else None,
+            "coverage_end_ns": coverage_ns[name][1] if name in coverage_ns else None,
+            "source_refs": list(source_refs.get(name, ())),
+        }
+        for name in fields
+    }
+
+
+def _coverage_interval(value: tuple[int, int] | None, field_name: str) -> tuple[int, int] | None:
+    if value is None:
+        return None
+    if (
+        not isinstance(value, (tuple, list))
+        or len(value) != 2
+        or type(value[0]) is not int
+        or type(value[1]) is not int
+        or value[0] <= 0
+        or value[1] < value[0]
+    ):
+        raise ContractValidationError(f"invalid {field_name} coverage")
+    return (value[0], value[1])
+
+
+def _source_references(value: tuple[str, ...], field_name: str) -> tuple[str, ...]:
+    if not isinstance(value, (tuple, list)) or isinstance(value, str):
+        raise ContractValidationError(f"invalid {field_name} source references")
+    normalized = tuple(_text(item, f"{field_name} source reference") for item in value)
+    if len(normalized) != len(set(normalized)):
+        raise ContractValidationError(f"duplicate {field_name} source reference")
+    return normalized
 
 
 def _json_default(value: Any) -> Any:
@@ -585,7 +776,13 @@ class InstrumentMetadataSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class AccountSnapshot:
-    """Read-only, explicitly complete-or-incomplete account evidence."""
+    """Read-only account facts with an explicit versioned scalar wire form.
+
+    The original positional fields remain first.  New provenance fields are
+    additive so existing callers can keep constructing snapshots, while
+    :meth:`to_wire` refuses to invent a generation or epoch and downgrades
+    caller-supplied ``COMPLETE`` when any required field is unsupported.
+    """
 
     scope: ExecutionScope
     as_of_ns: int
@@ -594,26 +791,141 @@ class AccountSnapshot:
     equity: Decimal | None = None
     available_margin: Decimal | None = None
     currency: str | None = None
+    generation: str | None = None
+    epoch: int | None = None
+    cash: Decimal | None = None
+    margin: Decimal | None = None
+    realized_pnl: Decimal | None = None
+    unrealized_pnl: Decimal | None = None
+    fee: Decimal | None = None
+    funding: Decimal | None = None
+    net_cashflow: Decimal | None = None
+    reporting_currency: str | None = None
+    fx_rate: Decimal | None = None
+    settlement_price: Decimal | None = None
+    external_activity_attribution: str = "INCOMPLETE"
+    equity_includes_fees: bool | None = None
+    field_completeness: Mapping[str, str] = field(default_factory=dict)
+    field_coverage_ns: Mapping[str, tuple[int, int]] = field(default_factory=dict)
+    field_source_refs: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    external_activity_coverage_ns: tuple[int, int] | None = None
+    external_activity_source_refs: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        if not isinstance(self.scope, ExecutionScope):
+            raise ContractValidationError("invalid account snapshot scope")
         if type(self.as_of_ns) is not int or self.as_of_ns <= 0:
             raise ContractValidationError("invalid as_of_ns")
         object.__setattr__(self, "source", _text(self.source, "source"))
         if self.completeness not in {"COMPLETE", "INCOMPLETE", "UNAVAILABLE"}:
             raise ContractValidationError("invalid completeness")
-        if self.equity is not None:
-            object.__setattr__(self, "equity", _decimal(self.equity, "equity"))
-        if self.available_margin is not None:
-            object.__setattr__(
-                self, "available_margin", _decimal(self.available_margin, "available_margin")
+        for name in _ACCOUNT_VALUE_FIELDS:
+            object.__setattr__(self, name, _economic_decimal(getattr(self, name), name))
+        for name in ("currency", "reporting_currency"):
+            value = getattr(self, name)
+            if value is not None:
+                object.__setattr__(self, name, _text(value, name))
+        if self.generation is not None:
+            object.__setattr__(self, "generation", _text(self.generation, "generation"))
+        object.__setattr__(self, "epoch", _optional_timestamp_ns(self.epoch, "epoch"))
+        if self.external_activity_attribution not in _FACT_COMPLETENESS:
+            raise ContractValidationError("invalid external activity attribution completeness")
+        if self.equity_includes_fees is not None and type(self.equity_includes_fees) is not bool:
+            raise ContractValidationError("invalid equity_includes_fees")
+        values = {name: getattr(self, name) for name in _ACCOUNT_VALUE_FIELDS}
+        completeness, coverage, source_refs = _fact_field_metadata(
+            _ACCOUNT_VALUE_FIELDS,
+            values,
+            self.field_completeness,
+            self.field_coverage_ns,
+            self.field_source_refs,
+        )
+        object.__setattr__(self, "field_completeness", completeness)
+        object.__setattr__(self, "field_coverage_ns", coverage)
+        object.__setattr__(self, "field_source_refs", source_refs)
+        if any(end > self.as_of_ns for _, end in coverage.values()):
+            raise ContractValidationError("economic field coverage must not follow as_of_ns")
+        external_coverage = _coverage_interval(
+            self.external_activity_coverage_ns, "external activity"
+        )
+        external_refs = _source_references(self.external_activity_source_refs, "external activity")
+        if self.external_activity_attribution == "COMPLETE" and (
+            external_coverage is None or external_coverage[1] != self.as_of_ns or not external_refs
+        ):
+            raise ContractValidationError(
+                "complete external activity attribution requires as_of coverage and source refs"
             )
-        if self.currency is not None:
-            object.__setattr__(self, "currency", _text(self.currency, "currency"))
+        if external_coverage is not None and external_coverage[1] > self.as_of_ns:
+            raise ContractValidationError("external activity coverage must not follow as_of_ns")
+        object.__setattr__(self, "external_activity_coverage_ns", external_coverage)
+        object.__setattr__(self, "external_activity_source_refs", external_refs)
+
+    def to_wire(self) -> dict[str, Any]:
+        """Return the strict ``bt_api.execution.account_snapshot.v1`` mapping."""
+
+        scope = _economic_scope_wire(
+            self.scope, self.generation, self.epoch, strategy_attribution=False
+        )
+        values = {name: getattr(self, name) for name in _ACCOUNT_VALUE_FIELDS}
+        scope_complete = scope["trading_day"] is not None
+        context_complete = (
+            scope_complete
+            and self.currency is not None
+            and self.reporting_currency is not None
+            and self.equity_includes_fees is not None
+            and self.external_activity_attribution == "COMPLETE"
+        )
+        effective = _fact_effective_completeness(
+            self.completeness,
+            self.field_completeness,
+            _ACCOUNT_VALUE_FIELDS,
+            required_context_complete=context_complete,
+        )
+        return {
+            "schema": "bt_api.execution.account_snapshot.v1",
+            "fact_type": "account_snapshot",
+            "scope": scope,
+            "as_of_ns": self.as_of_ns,
+            "source": self.source,
+            "currency": self.currency,
+            "reporting_currency": self.reporting_currency,
+            "fx_rate_direction": (
+                "reporting_currency_units_per_currency_unit"
+                if self.currency is not None and self.reporting_currency is not None
+                else None
+            ),
+            "completeness": effective,
+            "values": {
+                name: format(values[name], "f") if values[name] is not None else None
+                for name in _ACCOUNT_VALUE_FIELDS
+            },
+            "field_evidence": _field_metadata_wire(
+                _ACCOUNT_VALUE_FIELDS,
+                self.field_completeness,
+                self.field_coverage_ns,
+                self.field_source_refs,
+            ),
+            "external_activity_attribution": self.external_activity_attribution,
+            "external_activity_evidence": {
+                "coverage_start_ns": (
+                    self.external_activity_coverage_ns[0]
+                    if self.external_activity_coverage_ns is not None
+                    else None
+                ),
+                "coverage_end_ns": (
+                    self.external_activity_coverage_ns[1]
+                    if self.external_activity_coverage_ns is not None
+                    else None
+                ),
+                "source_refs": list(self.external_activity_source_refs),
+            },
+            "equity_includes_fees": self.equity_includes_fees,
+        }
 
 
 @dataclass(frozen=True, slots=True)
 class ExecutionQualityRecord:
-    """Provider-result quality facts; absent values remain absent rather than inferred."""
+    """Per-execution quality facts; absent values stay null and incomplete."""
 
     intent_id: str
     as_of_ns: int
@@ -622,6 +934,32 @@ class ExecutionQualityRecord:
     latency_ms: Decimal | None = None
     fee: Decimal | None = None
     slippage: Decimal | None = None
+    scope: ExecutionScope | None = None
+    generation: str | None = None
+    epoch: int | None = None
+    currency: str | None = None
+    fee_currency: str | None = None
+    signal_id: str | None = None
+    child_id: str | None = None
+    order_id: str | None = None
+    trade_id: str | None = None
+    arrival_bid: Decimal | None = None
+    arrival_ask: Decimal | None = None
+    arrival_mid: Decimal | None = None
+    arrival_as_of_ns: int | None = None
+    arrival_freshness_ns: int | None = None
+    arrival_source: str | None = None
+    side: str | Side | None = None
+    native_quantity: Decimal | None = None
+    contract_multiplier: Decimal | None = None
+    vwap: Decimal | None = None
+    slippage_amount: Decimal | None = None
+    slippage_bps: Decimal | None = None
+    stage_durations_ns: Mapping[str, int] = field(default_factory=dict)
+    rejection_reason: str | None = None
+    field_completeness: Mapping[str, str] = field(default_factory=dict)
+    field_coverage_ns: Mapping[str, tuple[int, int]] = field(default_factory=dict)
+    field_source_refs: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "intent_id", _text(self.intent_id, "intent_id"))
@@ -630,10 +968,194 @@ class ExecutionQualityRecord:
         object.__setattr__(self, "source", _text(self.source, "source"))
         if self.completeness not in {"COMPLETE", "INCOMPLETE", "UNAVAILABLE"}:
             raise ContractValidationError("invalid completeness")
-        for name in ("latency_ms", "fee", "slippage"):
+        for name in (
+            "latency_ms",
+            "fee",
+            "slippage",
+            "arrival_bid",
+            "arrival_ask",
+            "arrival_mid",
+            "native_quantity",
+            "contract_multiplier",
+            "vwap",
+            "slippage_amount",
+            "slippage_bps",
+        ):
+            value = _economic_decimal(getattr(self, name), name)
+            if (
+                value is not None
+                and name
+                in {
+                    "arrival_bid",
+                    "arrival_ask",
+                    "arrival_mid",
+                    "native_quantity",
+                    "contract_multiplier",
+                    "vwap",
+                }
+                and value <= 0
+            ):
+                raise ContractValidationError(f"invalid {name}")
+            object.__setattr__(self, name, value)
+        if self.scope is not None and not isinstance(self.scope, ExecutionScope):
+            raise ContractValidationError("invalid execution quality scope")
+        if self.generation is not None:
+            object.__setattr__(self, "generation", _text(self.generation, "generation"))
+        object.__setattr__(self, "epoch", _optional_timestamp_ns(self.epoch, "epoch"))
+        for name in ("currency", "fee_currency", "arrival_source"):
             value = getattr(self, name)
             if value is not None:
-                object.__setattr__(self, name, _decimal(value, name))
+                object.__setattr__(self, name, _text(value, name))
+        for name in ("signal_id", "child_id", "order_id", "trade_id"):
+            value = getattr(self, name)
+            if value is not None:
+                object.__setattr__(self, name, _text(value, name))
+        for name in ("arrival_as_of_ns",):
+            object.__setattr__(self, name, _optional_timestamp_ns(getattr(self, name), name))
+        if self.arrival_as_of_ns is not None and self.arrival_as_of_ns > self.as_of_ns:
+            raise ContractValidationError("arrival_as_of_ns must not be after the quality record")
+        if self.arrival_freshness_ns is not None and (
+            type(self.arrival_freshness_ns) is not int or self.arrival_freshness_ns < 0
+        ):
+            raise ContractValidationError("invalid arrival_freshness_ns")
+        if self.side is not None:
+            side = self.side.value if isinstance(self.side, Side) else self.side
+            if side not in {Side.BUY.value, Side.SELL.value}:
+                raise ContractValidationError("invalid execution quality side")
+            object.__setattr__(self, "side", side)
+        if self.rejection_reason is not None and not _SAFE_REASON.fullmatch(self.rejection_reason):
+            raise ContractValidationError("invalid rejection_reason")
+        if (self.slippage_amount is not None or self.slippage_bps is not None) and (
+            self.arrival_mid is None or self.vwap is None
+        ):
+            raise ContractValidationError("slippage requires arrival_mid and vwap evidence")
+        if not isinstance(self.stage_durations_ns, Mapping):
+            raise ContractValidationError("invalid stage_durations_ns")
+        durations: dict[str, int] = {}
+        for name, duration in self.stage_durations_ns.items():
+            normalized_name = _text(name, "stage duration name")
+            if type(duration) is not int or duration < 0:
+                raise ContractValidationError("invalid stage duration")
+            durations[normalized_name] = duration
+        if len(durations) != len(self.stage_durations_ns):
+            raise ContractValidationError("duplicate stage duration name")
+        object.__setattr__(self, "stage_durations_ns", MappingProxyType(durations))
+        values: dict[str, object | None] = {
+            name: getattr(self, name)
+            for name in _QUALITY_VALUE_FIELDS
+            if name != "stage_durations_ns"
+        }
+        values["stage_durations_ns"] = durations if durations else None
+        completeness, coverage, source_refs = _fact_field_metadata(
+            _QUALITY_VALUE_FIELDS,
+            values,
+            self.field_completeness,
+            self.field_coverage_ns,
+            self.field_source_refs,
+        )
+        object.__setattr__(self, "field_completeness", completeness)
+        object.__setattr__(self, "field_coverage_ns", coverage)
+        object.__setattr__(self, "field_source_refs", source_refs)
+        if any(end > self.as_of_ns for _, end in coverage.values()):
+            raise ContractValidationError("economic field coverage must not follow as_of_ns")
+
+    def to_wire(self) -> dict[str, Any]:
+        """Return the strict ``bt_api.execution.execution_quality.v1`` mapping."""
+
+        if self.scope is None:
+            raise ContractValidationError("execution quality scope is required for wire export")
+        scope = _economic_scope_wire(
+            self.scope, self.generation, self.epoch, strategy_attribution=True
+        )
+        values = {
+            name: getattr(self, name)
+            for name in _QUALITY_VALUE_FIELDS
+            if name != "stage_durations_ns"
+        }
+        values["stage_durations_ns"] = dict(self.stage_durations_ns) or None
+        scope_complete = scope["trading_day"] is not None
+        context_complete = (
+            scope_complete
+            and self.currency is not None
+            and (self.fee is None or self.fee_currency is not None)
+            and self.arrival_as_of_ns is not None
+            and self.arrival_freshness_ns is not None
+            and self.arrival_source is not None
+            and self.side is not None
+            and bool(self.signal_id and self.child_id and self.order_id)
+            and (self.trade_id is not None or self.rejection_reason is not None)
+            and bool(self.stage_durations_ns)
+            and (self.latency_ms is None and self.slippage is None)
+        )
+        effective = _fact_effective_completeness(
+            self.completeness,
+            self.field_completeness,
+            _QUALITY_VALUE_FIELDS,
+            required_context_complete=context_complete,
+        )
+        return {
+            "schema": "bt_api.execution.execution_quality.v1",
+            "fact_type": "execution_quality",
+            "scope": scope,
+            "intent_id": self.intent_id,
+            "as_of_ns": self.as_of_ns,
+            "source": self.source,
+            "currency": self.currency,
+            "completeness": effective,
+            "lineage": {
+                "signal_id": self.signal_id,
+                "intent_id": self.intent_id,
+                "child_id": self.child_id,
+                "order_id": self.order_id,
+                "trade_id": self.trade_id,
+            },
+            "arrival": {
+                "bid": format(self.arrival_bid, "f") if self.arrival_bid is not None else None,
+                "ask": format(self.arrival_ask, "f") if self.arrival_ask is not None else None,
+                "mid": format(self.arrival_mid, "f") if self.arrival_mid is not None else None,
+                "as_of_ns": self.arrival_as_of_ns,
+                "freshness_ns": self.arrival_freshness_ns,
+                "source": self.arrival_source,
+            },
+            "execution": {
+                "side": self.side,
+                "native_quantity": (
+                    format(self.native_quantity, "f") if self.native_quantity is not None else None
+                ),
+                "contract_multiplier": (
+                    format(self.contract_multiplier, "f")
+                    if self.contract_multiplier is not None
+                    else None
+                ),
+                "vwap": format(self.vwap, "f") if self.vwap is not None else None,
+                "fee": format(self.fee, "f") if self.fee is not None else None,
+                "fee_currency": self.fee_currency,
+                "slippage_amount": (
+                    format(self.slippage_amount, "f") if self.slippage_amount is not None else None
+                ),
+                "slippage_bps": (
+                    format(self.slippage_bps, "f") if self.slippage_bps is not None else None
+                ),
+                "slippage_sign_convention": "positive_is_adverse",
+                "stage_durations_ns": dict(self.stage_durations_ns),
+                "stage_durations_clock": "monotonic",
+                "rejection_reason": self.rejection_reason,
+                "legacy_metrics": {
+                    "latency_ms_unscoped": (
+                        format(self.latency_ms, "f") if self.latency_ms is not None else None
+                    ),
+                    "slippage_untyped": (
+                        format(self.slippage, "f") if self.slippage is not None else None
+                    ),
+                },
+            },
+            "field_evidence": _field_metadata_wire(
+                _QUALITY_VALUE_FIELDS,
+                self.field_completeness,
+                self.field_coverage_ns,
+                self.field_source_refs,
+            ),
+        }
 
 
 @dataclass(frozen=True, slots=True)
