@@ -1295,9 +1295,9 @@ class SqliteExecutionStore:
     # Version 10 binds a prepublished local queue receipt to the same command
     # row and gates its unique worker claim on that receipt being queued.
     # Version 11 adds immutable, same-process-fresh CTP order-target evidence.
-    # Version 12 introduces an intermediate per-event callback guard format.
-    # Version 13 preserves callback uncertainty as a permanent source-lifecycle
-    # fence alongside the order-target projection.
+    # Version 12 introduced a permanent callback source-lifecycle fence in a
+    # separate candidate. Version 13 combines that fence with order-target
+    # projections while migrating the distinct v11 lineages by old table facts.
     _SCHEMA_VERSION = 13
 
     def __init__(self, path: str | Path, *, busy_timeout_ms: int = 5_000) -> None:
@@ -1332,16 +1332,10 @@ class SqliteExecutionStore:
             self._connection.close()
 
     def _migrate_legacy_ctp_callback_source_lifecycle_fences(
-        self, cursor: sqlite3.Cursor
+        self, cursor: sqlite3.Cursor, *, previous_tables: set[str]
     ) -> None:
-        """Fail closed while migrating callback facts from pre-v12 schemas."""
+        """Fail closed while migrating callback facts from pre-v13 schemas."""
 
-        table_names = {
-            str(row["name"])
-            for row in cursor.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
-            ).fetchall()
-        }
         fenced_accounts = {
             str(row["account_key"])
             for row in cursor.execute(
@@ -1350,7 +1344,7 @@ class SqliteExecutionStore:
         }
 
         legacy_guard_table = "ctp_dispatch_callback_ingestion_guards"
-        if legacy_guard_table in table_names:
+        if legacy_guard_table in previous_tables:
             columns = {
                 str(row["name"])
                 for row in cursor.execute(
@@ -1482,6 +1476,17 @@ class SqliteExecutionStore:
 
     def _create_schema(self) -> None:
         with self._transaction() as cursor:
+            # Capture lineage facts before CREATE TABLE IF NOT EXISTS adds the
+            # current v13 tables. In particular, schema number 11 was used by
+            # two isolated candidates: one had order-target projections, the
+            # other had per-event callback guards. Never infer the old shape
+            # from tables created by this migration.
+            previous_tables = {
+                str(row["name"])
+                for row in cursor.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
             self._execute_schema_statements(
                 cursor,
                 """
@@ -2011,6 +2016,58 @@ class SqliteExecutionStore:
                 version = str(self._SCHEMA_VERSION)
             else:
                 version = str(row["value"])
+            target_projection_tables = {
+                "ctp_order_target_projections",
+                "ctp_order_target_projection_consumptions",
+            }
+            legacy_guard_tables = {
+                "ctp_dispatch_callback_ingestion_guards",
+                "ctp_dispatch_callback_ingestion_resolutions",
+            }
+            if version == "11":
+                if "ctp_dispatch_callback_ledger" not in previous_tables:
+                    raise DurableStoreError(
+                        "schema 11 callback ledger table is missing"
+                    )
+                had_target_projection_tables = target_projection_tables.issubset(
+                    previous_tables
+                )
+                had_legacy_guard_tables = legacy_guard_tables.issubset(previous_tables)
+                has_partial_target_tables = bool(
+                    target_projection_tables & previous_tables
+                ) and not had_target_projection_tables
+                has_partial_guard_tables = bool(legacy_guard_tables & previous_tables) and not (
+                    had_legacy_guard_tables
+                )
+                if (
+                    had_target_projection_tables == had_legacy_guard_tables
+                    or has_partial_target_tables
+                    or has_partial_guard_tables
+                ):
+                    raise DurableStoreError(
+                        "ambiguous schema 11 execution store lineage"
+                    )
+            elif version == "12":
+                if "ctp_dispatch_callback_ledger" not in previous_tables:
+                    raise DurableStoreError(
+                        "schema 12 callback ledger table is missing"
+                    )
+                if "ctp_dispatch_callback_source_lifecycle_fences" not in previous_tables:
+                    raise DurableStoreError(
+                        "schema 12 callback lifecycle fence table is missing"
+                    )
+                if target_projection_tables & previous_tables:
+                    raise DurableStoreError(
+                        "inconsistent schema 12 execution store lineage"
+                    )
+                had_legacy_guard_tables = legacy_guard_tables.issubset(previous_tables)
+                has_partial_guard_tables = bool(legacy_guard_tables & previous_tables) and not (
+                    had_legacy_guard_tables
+                )
+                if has_partial_guard_tables:
+                    raise DurableStoreError(
+                        "inconsistent schema 12 callback guard lineage"
+                    )
             if version == "2":
                 columns = {
                     str(item["name"])
@@ -2055,7 +2112,9 @@ class SqliteExecutionStore:
                         f"ALTER TABLE ctp_dispatch_commands ADD COLUMN {name} {declaration}"
                     )
             if version != str(self._SCHEMA_VERSION):
-                self._migrate_legacy_ctp_callback_source_lifecycle_fences(cursor)
+                self._migrate_legacy_ctp_callback_source_lifecycle_fences(
+                    cursor, previous_tables=previous_tables
+                )
                 # Old rows have no exact OrderRef cutover-session evidence.
                 # Never let migration make those commands dispatchable.
                 cursor.execute(

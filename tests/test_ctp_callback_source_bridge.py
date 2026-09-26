@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import queue
+import sqlite3
 import threading
 import time
 import traceback
@@ -22,8 +23,8 @@ from bt_api_execution import (
     CtpOrderRefLegacyMapping,
     CtpOrderRefSeedProof,
     CtpVerifiedCallbackEvidence,
-    DurableStoreError,
     CtpVerifiedOrderTargetProjection,
+    DurableStoreError,
     ExecutionScope,
     InvalidStateTransition,
     SqliteExecutionStore,
@@ -497,6 +498,15 @@ def _write_legacy_v11_resolved_guard(bound, *, correlation_digest=None):
         payload_sha256(command.correlation_key.to_payload())
         if correlation_digest is None
         else correlation_digest
+    )
+    # Recreate the guard-only schema-11 candidate shape. The final Store will
+    # create projection tables after it snapshots these preexisting tables.
+    bound.store._connection.execute(
+        "DROP TABLE ctp_order_target_projection_consumptions"
+    )
+    bound.store._connection.execute("DROP TABLE ctp_order_target_projections")
+    bound.store._connection.execute(
+        "DROP TABLE ctp_dispatch_callback_source_lifecycle_fences"
     )
     bound.store._connection.executescript(
         """
@@ -1559,7 +1569,7 @@ def test_v11_resolved_guard_migrates_to_permanent_fence_and_stays_after_reopen(t
         version = migrated._connection.execute(
             "SELECT value FROM execution_meta WHERE key = 'schema_version'"
         ).fetchone()["value"]
-        assert version == "12"
+        assert version == "13"
         assert migrated.read_ctp_dispatch_command(bound.scope, bound.command_id).status == (
             "COMPLETED"
         )
@@ -1595,7 +1605,7 @@ def test_v11_resolved_guard_migrates_to_permanent_fence_and_stays_after_reopen(t
         migrated.close()
         migrated = None
 
-        # The v12 upgrade is idempotent and the old resolved bit never removes
+        # The v13 upgrade is idempotent and the old resolved bit never removes
         # the newly migrated account source-lifecycle fence.
         reopened = SqliteExecutionStore(tmp_path / "execution.sqlite3")
         assert reopened._connection.execute(
@@ -1630,6 +1640,86 @@ def test_v11_unmappable_resolved_guard_refuses_store_upgrade(tmp_path):
         ):
             SqliteExecutionStore(tmp_path / "execution.sqlite3")
     finally:
+        bound.store.close()
+
+
+@pytest.mark.unit
+def test_v12_permanent_fence_and_projectionless_cancel_migrate_to_v13(tmp_path):
+    bound = _stage_dispatched_command(tmp_path, operation="CANCEL")
+    migrated = None
+    reopened = None
+    try:
+        fence_id = bound.store.create_ctp_callback_source_lifecycle_fence(
+            bound.scope, bound.command_id, writer_lease=bound.lease
+        )
+        bound.store.close()
+
+        # A real v12 callback-fence candidate predates target projections. Keep
+        # its dispatched CANCEL command and permanent callback fence while
+        # removing only the later v13 projection structures.
+        connection = sqlite3.connect(tmp_path / "execution.sqlite3")
+        try:
+            connection.execute("DROP TABLE ctp_order_target_projection_consumptions")
+            connection.execute("DROP TABLE ctp_order_target_projections")
+            connection.execute("UPDATE execution_meta SET value = '12' WHERE key = 'schema_version'")
+            connection.commit()
+        finally:
+            connection.close()
+
+        migrated = SqliteExecutionStore(tmp_path / "execution.sqlite3")
+        assert migrated._connection.execute(
+            "SELECT value FROM execution_meta WHERE key = 'schema_version'"
+        ).fetchone()[0] == "13"
+        command = migrated.read_ctp_dispatch_command(bound.scope, bound.command_id)
+        assert command is not None
+        assert command.status == "UNKNOWN"
+        assert command.unknown_reason == "schema_upgrade_requires_ctp_orderref_cutover"
+        assert migrated._connection.execute(
+            "SELECT COUNT(*) FROM ctp_order_target_projections"
+        ).fetchone()[0] == 0
+        persisted_fence = migrated._connection.execute(
+            "SELECT source_lifecycle_fence_id FROM ctp_dispatch_callback_source_lifecycle_fences "
+            "WHERE account_key = ?",
+            (bound.scope.account_key,),
+        ).fetchone()
+        assert persisted_fence is not None
+        assert persisted_fence[0] == fence_id
+
+        next_command = _stage_followup_ready_command(bound, migrated)
+
+        class _MustNotVerify:
+            def verify_action(self, command, *, now_ns):
+                raise AssertionError("claim reached authority verifier after v12 fence migration")
+
+        with pytest.raises(
+            InvalidStateTransition, match="CTP callback source lifecycle fence"
+        ):
+            migrated.claim_ctp_dispatch_command(
+                bound.scope,
+                next_command.command_id,
+                writer_lease=bound.lease,
+                authority_verifier=_MustNotVerify(),
+            )
+        migrated.close()
+        migrated = None
+
+        reopened = SqliteExecutionStore(tmp_path / "execution.sqlite3")
+        assert reopened.read_ctp_dispatch_command(bound.scope, bound.command_id).status == (
+            "UNKNOWN"
+        )
+        assert reopened._connection.execute(
+            "SELECT source_lifecycle_fence_id FROM ctp_dispatch_callback_source_lifecycle_fences "
+            "WHERE account_key = ?",
+            (bound.scope.account_key,),
+        ).fetchone()[0] == fence_id
+        assert reopened._connection.execute(
+            "SELECT COUNT(*) FROM ctp_order_target_projections"
+        ).fetchone()[0] == 0
+    finally:
+        if migrated is not None:
+            migrated.close()
+        if reopened is not None:
+            reopened.close()
         bound.store.close()
 
 

@@ -164,6 +164,7 @@ def test_v10_execution_store_migrates_immutable_cancel_target_projection_tables(
     try:
         connection.execute("DROP TABLE ctp_order_target_projection_consumptions")
         connection.execute("DROP TABLE ctp_order_target_projections")
+        connection.execute("DROP TABLE ctp_dispatch_callback_source_lifecycle_fences")
         connection.execute("UPDATE execution_meta SET value = '10' WHERE key = 'schema_version'")
         connection.commit()
     finally:
@@ -220,6 +221,80 @@ def test_v10_execution_store_migrates_immutable_cancel_target_projection_tables(
         assert "ctp_order_target_consumptions_immutable_delete" in triggers
     finally:
         migrated.close()
+
+
+@pytest.mark.unit
+def test_v11_projection_lineage_migrates_without_inventing_callback_fence(tmp_path) -> None:
+    path = tmp_path / "execution.sqlite3"
+    store = SqliteExecutionStore(path)
+    store._connection.execute(
+        "DROP TABLE ctp_dispatch_callback_source_lifecycle_fences"
+    )
+    store._connection.execute("UPDATE execution_meta SET value = '11' WHERE key = 'schema_version'")
+    store.close()
+
+    migrated = SqliteExecutionStore(path)
+    try:
+        assert migrated._connection.execute(
+            "SELECT value FROM execution_meta WHERE key = 'schema_version'"
+        ).fetchone()[0] == "13"
+        tables = {
+            str(row["name"])
+            for row in migrated._connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        assert {
+            "ctp_order_target_projections",
+            "ctp_order_target_projection_consumptions",
+            "ctp_dispatch_callback_source_lifecycle_fences",
+        }.issubset(tables)
+        assert migrated._connection.execute(
+            "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences"
+        ).fetchone()[0] == 0
+    finally:
+        migrated.close()
+
+    reopened = SqliteExecutionStore(path)
+    try:
+        assert reopened._connection.execute(
+            "SELECT value FROM execution_meta WHERE key = 'schema_version'"
+        ).fetchone()[0] == "13"
+        assert reopened._connection.execute(
+            "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences"
+        ).fetchone()[0] == 0
+    finally:
+        reopened.close()
+
+
+@pytest.mark.unit
+def test_ambiguous_v11_store_lineage_is_rejected_before_upgrade(tmp_path) -> None:
+    path = tmp_path / "execution.sqlite3"
+    store = SqliteExecutionStore(path)
+    store._connection.execute("DROP TABLE ctp_order_target_projection_consumptions")
+    store._connection.execute("DROP TABLE ctp_order_target_projections")
+    store._connection.execute("DROP TABLE ctp_dispatch_callback_source_lifecycle_fences")
+    store._connection.execute("UPDATE execution_meta SET value = '11' WHERE key = 'schema_version'")
+    store.close()
+
+    with pytest.raises(DurableStoreError, match="ambiguous schema 11 execution store lineage"):
+        SqliteExecutionStore(path)
+
+
+@pytest.mark.unit
+def test_v12_store_without_lifecycle_fence_table_is_rejected(tmp_path) -> None:
+    path = tmp_path / "execution.sqlite3"
+    store = SqliteExecutionStore(path)
+    store._connection.execute("DROP TABLE ctp_order_target_projection_consumptions")
+    store._connection.execute("DROP TABLE ctp_order_target_projections")
+    store._connection.execute("DROP TABLE ctp_dispatch_callback_source_lifecycle_fences")
+    store._connection.execute("UPDATE execution_meta SET value = '12' WHERE key = 'schema_version'")
+    store.close()
+
+    with pytest.raises(
+        DurableStoreError, match="schema 12 callback lifecycle fence table is missing"
+    ):
+        SqliteExecutionStore(path)
 
 
 def _ctp_scope(*, day: str = "20260925", strategy: str = "strategy.demo") -> ExecutionScope:
