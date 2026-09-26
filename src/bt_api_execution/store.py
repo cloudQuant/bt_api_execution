@@ -1109,7 +1109,9 @@ class SqliteExecutionStore:
     # session-bound cutover evidence with imported legacy identity mappings.
     # Version 10 binds a prepublished local queue receipt to the same command
     # row and gates its unique worker claim on that receipt being queued.
-    _SCHEMA_VERSION = 10
+    # Version 11 persisted per-event callback ingestion guards. Version 12
+    # replaces them with a permanent account source-lifecycle fence.
+    _SCHEMA_VERSION = 12
 
     def __init__(self, path: str | Path, *, busy_timeout_ms: int = 5_000) -> None:
         if type(busy_timeout_ms) is not int or busy_timeout_ms <= 0:
@@ -1138,6 +1140,155 @@ class SqliteExecutionStore:
 
         with self._lock:
             self._connection.close()
+
+    def _migrate_legacy_ctp_callback_source_lifecycle_fences(
+        self, cursor: sqlite3.Cursor
+    ) -> None:
+        """Fail closed while migrating callback facts from pre-v12 schemas."""
+
+        table_names = {
+            str(row["name"])
+            for row in cursor.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        fenced_accounts = {
+            str(row["account_key"])
+            for row in cursor.execute(
+                "SELECT account_key FROM ctp_dispatch_callback_source_lifecycle_fences"
+            ).fetchall()
+        }
+
+        legacy_guard_table = "ctp_dispatch_callback_ingestion_guards"
+        if legacy_guard_table in table_names:
+            columns = {
+                str(row["name"])
+                for row in cursor.execute(
+                    "PRAGMA table_info(ctp_dispatch_callback_ingestion_guards)"
+                ).fetchall()
+            }
+            required = {
+                "account_key",
+                "scope_key",
+                "command_id",
+                "guard_id",
+                "correlation_key_sha256",
+                "session_binding_sha256",
+                "created_at_ns",
+            }
+            if not required.issubset(columns):
+                raise DurableStoreError(
+                    "legacy CTP callback lifecycle fence cannot be migrated"
+                )
+            legacy_guards = cursor.execute(
+                """
+                SELECT account_key, scope_key, command_id, guard_id,
+                       correlation_key_sha256, session_binding_sha256
+                FROM ctp_dispatch_callback_ingestion_guards
+                ORDER BY account_key, created_at_ns, command_id, guard_id
+                """
+            ).fetchall()
+            for old in legacy_guards:
+                account_key = str(old["account_key"])
+                command_id = str(old["command_id"])
+                command_row = cursor.execute(
+                    """
+                    SELECT * FROM ctp_dispatch_commands
+                    WHERE account_key = ? AND command_id = ?
+                    """,
+                    (account_key, command_id),
+                ).fetchone()
+                if command_row is None:
+                    raise DurableStoreError(
+                        "legacy CTP callback lifecycle fence has no command"
+                    )
+                command = self._ctp_dispatch_command_from_row(command_row)
+                if (
+                    command.correlation_key is None
+                    or not _is_local_queue_receipt_id(str(old["guard_id"]))
+                    or not _is_sha256(str(old["correlation_key_sha256"]))
+                    or not _is_sha256(str(old["session_binding_sha256"]))
+                    or command.scope_key != str(old["scope_key"])
+                    or command.session_binding_sha256
+                    != str(old["session_binding_sha256"])
+                    or payload_sha256(command.correlation_key.to_payload())
+                    != str(old["correlation_key_sha256"])
+                ):
+                    raise DurableStoreError(
+                        "legacy CTP callback lifecycle fence binding is inconsistent"
+                    )
+                if account_key not in fenced_accounts:
+                    cursor.execute(
+                        """
+                        INSERT INTO ctp_dispatch_callback_source_lifecycle_fences(
+                            account_key, scope_key, command_id, source_lifecycle_fence_id,
+                            correlation_key_sha256, session_binding_sha256, created_at_ns
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            account_key,
+                            command.scope_key,
+                            command_id,
+                            str(old["guard_id"]),
+                            str(old["correlation_key_sha256"]),
+                            str(old["session_binding_sha256"]),
+                            time.time_ns(),
+                        ),
+                    )
+                    fenced_accounts.add(account_key)
+
+        # A callback ledger row proves the old source consumer may already
+        # have consumed native events even when no legacy guard was persisted.
+        # Preserve that uncertainty instead of reopening claims after upgrade.
+        legacy_callbacks = cursor.execute(
+            """
+            SELECT account_key, command_id, correlation_key_sha256
+            FROM ctp_dispatch_callback_ledger
+            ORDER BY account_key, applied_at_ns, command_id
+            """
+        ).fetchall()
+        for old in legacy_callbacks:
+            account_key = str(old["account_key"])
+            command_id = str(old["command_id"])
+            command_row = cursor.execute(
+                """
+                SELECT * FROM ctp_dispatch_commands
+                WHERE account_key = ? AND command_id = ?
+                """,
+                (account_key, command_id),
+            ).fetchone()
+            if command_row is None:
+                raise DurableStoreError("legacy CTP callback ledger has no command")
+            command = self._ctp_dispatch_command_from_row(command_row)
+            if (
+                command.correlation_key is None
+                or not _is_sha256(str(old["correlation_key_sha256"]))
+                or payload_sha256(command.correlation_key.to_payload())
+                != str(old["correlation_key_sha256"])
+            ):
+                raise DurableStoreError(
+                    "legacy CTP callback ledger binding is inconsistent"
+                )
+            if account_key in fenced_accounts:
+                continue
+            cursor.execute(
+                """
+                INSERT INTO ctp_dispatch_callback_source_lifecycle_fences(
+                    account_key, scope_key, command_id, source_lifecycle_fence_id,
+                    correlation_key_sha256, session_binding_sha256, created_at_ns
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    account_key,
+                    command.scope_key,
+                    command_id,
+                    uuid.uuid4().hex,
+                    str(old["correlation_key_sha256"]),
+                    command.session_binding_sha256,
+                    time.time_ns(),
+                ),
+            )
+            fenced_accounts.add(account_key)
 
     def _create_schema(self) -> None:
         with self._transaction() as cursor:
@@ -1427,6 +1578,34 @@ class SqliteExecutionStore:
                 );
                 CREATE INDEX IF NOT EXISTS ctp_dispatch_callback_command
                     ON ctp_dispatch_callback_ledger(account_key, command_id, applied_at_ns);
+                CREATE TABLE IF NOT EXISTS ctp_dispatch_callback_source_lifecycle_fences (
+                    account_key TEXT NOT NULL,
+                    scope_key TEXT NOT NULL,
+                    command_id TEXT NOT NULL,
+                    source_lifecycle_fence_id TEXT NOT NULL
+                        CHECK(length(source_lifecycle_fence_id) = 32
+                              AND source_lifecycle_fence_id NOT GLOB '*[^0-9a-f]*'),
+                    correlation_key_sha256 TEXT NOT NULL
+                        CHECK(length(correlation_key_sha256) = 64),
+                    session_binding_sha256 TEXT NOT NULL
+                        CHECK(length(session_binding_sha256) = 64),
+                    created_at_ns INTEGER NOT NULL,
+                    PRIMARY KEY(account_key, command_id, source_lifecycle_fence_id),
+                    FOREIGN KEY(account_key, command_id)
+                        REFERENCES ctp_dispatch_commands(account_key, command_id)
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS ctp_dispatch_callback_source_lifecycle_account
+                    ON ctp_dispatch_callback_source_lifecycle_fences(account_key);
+                CREATE TRIGGER IF NOT EXISTS ctp_dispatch_callback_source_lifecycle_immutable_update
+                BEFORE UPDATE ON ctp_dispatch_callback_source_lifecycle_fences
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP callback source lifecycle fence is immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS ctp_dispatch_callback_source_lifecycle_immutable_delete
+                BEFORE DELETE ON ctp_dispatch_callback_source_lifecycle_fences
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP callback source lifecycle fence is immutable');
+                END;
                 CREATE TABLE IF NOT EXISTS ctp_dispatch_order_projection (
                     account_key TEXT NOT NULL,
                     runtime_order_id TEXT NOT NULL,
@@ -1583,7 +1762,8 @@ class SqliteExecutionStore:
                         "ALTER TABLE execution_records ADD COLUMN cumulative_commission TEXT"
                     )
             elif version not in {
-                "3", "4", "5", "6", "7", "8", "9", str(self._SCHEMA_VERSION)
+                "3", "4", "5", "6", "7", "8", "9", "10", "11",
+                str(self._SCHEMA_VERSION),
             }:
                 raise DurableStoreError("unsupported execution store schema")
 
@@ -1616,6 +1796,7 @@ class SqliteExecutionStore:
                         f"ALTER TABLE ctp_dispatch_commands ADD COLUMN {name} {declaration}"
                     )
             if version != str(self._SCHEMA_VERSION):
+                self._migrate_legacy_ctp_callback_source_lifecycle_fences(cursor)
                 # Old rows have no exact OrderRef cutover-session evidence.
                 # Never let migration make those commands dispatchable.
                 cursor.execute(
@@ -4045,7 +4226,12 @@ class SqliteExecutionStore:
                 return None
             unresolved = cursor.execute(
                 """
-                SELECT command_id, status FROM ctp_dispatch_commands
+                SELECT command_id, status,
+                       EXISTS (
+                           SELECT 1 FROM ctp_dispatch_callback_source_lifecycle_fences AS fence
+                           WHERE fence.account_key = ctp_dispatch_commands.account_key
+                       ) AS callback_source_fenced
+                FROM ctp_dispatch_commands
                 WHERE account_key = ? AND (
                     status = 'CLAIMED'
                     OR (status = 'UNKNOWN' AND NOT EXISTS (
@@ -4053,12 +4239,21 @@ class SqliteExecutionStore:
                         WHERE resolution.account_key = ctp_dispatch_commands.account_key
                           AND resolution.command_id = ctp_dispatch_commands.command_id
                     ))
+                    OR EXISTS (
+                        SELECT 1 FROM ctp_dispatch_callback_source_lifecycle_fences AS fence
+                        WHERE fence.account_key = ctp_dispatch_commands.account_key
+                    )
                 )
                 ORDER BY created_at_ns, command_id LIMIT 1
                 """,
                 (account_key,),
             ).fetchone()
             if unresolved is not None:
+                if bool(unresolved["callback_source_fenced"]):
+                    raise InvalidStateTransition(
+                        "account has CTP callback source lifecycle fence: "
+                        + str(unresolved["command_id"])
+                    )
                 raise InvalidStateTransition(
                     "account has unresolved CTP dispatch command: " + str(unresolved["command_id"])
                 )
@@ -4406,6 +4601,10 @@ class SqliteExecutionStore:
                     WHERE resolution.account_key = ctp_dispatch_commands.account_key
                       AND resolution.command_id = ctp_dispatch_commands.command_id
                 ))
+                OR EXISTS (
+                    SELECT 1 FROM ctp_dispatch_callback_source_lifecycle_fences AS fence
+                    WHERE fence.account_key = ctp_dispatch_commands.account_key
+                )
             )
             LIMIT 1
             """,
@@ -4646,6 +4845,76 @@ class SqliteExecutionStore:
             ),
         )
 
+    def create_ctp_callback_source_lifecycle_fence(
+        self,
+        scope: ExecutionScope,
+        command_id: str,
+        *,
+        writer_lease: WriterLease,
+    ) -> str:
+        """Persist a fail-closed fence before polling the callback source.
+
+        This immutable account fence covers the whole source-consumer
+        lifecycle. There is no resolution API: callbacks, timeout, close,
+        process exit, or verifier results cannot prove that no later source
+        event exists. The fence blocks future account claims permanently.
+        It does not grant callback trust.
+        """
+
+        account_key, _, scope_key = self._validate_ctp_order_identity_scope(scope)
+        self._validate_command_identifier(command_id, "command_id")
+        source_lifecycle_fence_id = uuid.uuid4().hex
+        with self._transaction() as cursor:
+            now_ns = time.time_ns()
+            self._assert_active_writer_lease(cursor, scope, writer_lease, now_ns=now_ns)
+            row = cursor.execute(
+                """
+                SELECT * FROM ctp_dispatch_commands
+                WHERE account_key = ? AND scope_key = ? AND command_id = ?
+                """,
+                (account_key, scope_key, command_id),
+            ).fetchone()
+            if row is None:
+                raise ContractValidationError("unknown CTP dispatch command")
+            command = self._ctp_dispatch_command_from_row(row)
+            if command.status not in {"CLAIMED", "COMPLETED", "UNKNOWN"}:
+                raise InvalidStateTransition(
+                    "callback ingestion cannot begin for an undispatched CTP command"
+                )
+            if command.correlation_key is None:
+                raise ContractValidationError("CTP command lacks versioned correlation keys")
+            existing = cursor.execute(
+                """
+                SELECT fence.source_lifecycle_fence_id
+                FROM ctp_dispatch_callback_source_lifecycle_fences AS fence
+                WHERE fence.account_key = ?
+                LIMIT 1
+                """,
+                (account_key,),
+            ).fetchone()
+            if existing is not None:
+                raise InvalidStateTransition(
+                    "account has an existing CTP callback source lifecycle fence"
+                )
+            cursor.execute(
+                """
+                INSERT INTO ctp_dispatch_callback_source_lifecycle_fences(
+                    account_key, scope_key, command_id, source_lifecycle_fence_id,
+                    correlation_key_sha256, session_binding_sha256, created_at_ns
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    account_key,
+                    scope_key,
+                    command_id,
+                    source_lifecycle_fence_id,
+                    payload_sha256(command.correlation_key.to_payload()),
+                    command.session_binding_sha256,
+                    now_ns,
+                ),
+            )
+        return source_lifecycle_fence_id
+
     def apply_ctp_verified_dispatch_callback(
         self,
         scope: ExecutionScope,
@@ -4655,6 +4924,7 @@ class SqliteExecutionStore:
         *,
         writer_lease: WriterLease,
         callback_verifier: CtpDispatchCallbackVerifier | None = None,
+        source_lifecycle_fence_id: str | None = None,
     ) -> CtpDispatchCallbackApplyResult:
         """Verify one callback, then atomically append, dedupe, and project it.
 
@@ -4668,6 +4938,10 @@ class SqliteExecutionStore:
 
         account_key, _, scope_key = self._validate_ctp_order_identity_scope(scope)
         self._validate_command_identifier(command_id, "command_id")
+        if source_lifecycle_fence_id is not None and not _is_local_queue_receipt_id(
+            source_lifecycle_fence_id
+        ):
+            raise ContractValidationError("invalid CTP callback source lifecycle fence id")
         if type(callback) is not CtpDispatchCallbackKey:
             raise ContractValidationError("typed CTP callback correlation key is required")
         if not isinstance(callback_payload, Mapping):
@@ -4726,6 +5000,24 @@ class SqliteExecutionStore:
                 or current.correlation_key != staged.correlation_key
             ):
                 raise InvalidStateTransition("CTP callback command changed during verification")
+            if source_lifecycle_fence_id is not None:
+                guard = cursor.execute(
+                    """
+                    SELECT * FROM ctp_dispatch_callback_source_lifecycle_fences
+                    WHERE account_key = ? AND scope_key = ? AND command_id = ?
+                      AND source_lifecycle_fence_id = ?
+                    """,
+                    (account_key, scope_key, command_id, source_lifecycle_fence_id),
+                ).fetchone()
+                if (
+                    guard is None
+                    or str(guard["correlation_key_sha256"]) != correlation_digest
+                    or str(guard["session_binding_sha256"])
+                    != staged.session_binding_sha256
+                ):
+                    raise ContractValidationError(
+                        "CTP callback source lifecycle fence does not match command"
+                    )
             duplicate = cursor.execute(
                 """
                 SELECT * FROM ctp_dispatch_callback_ledger

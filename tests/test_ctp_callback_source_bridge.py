@@ -4,6 +4,7 @@ import hashlib
 import queue
 import threading
 import time
+import traceback
 import uuid
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -15,10 +16,15 @@ from bt_api_execution import (
     ContractValidationError,
     CtpCancelTarget,
     CtpDispatchAuthority,
+    CtpDispatchReceipt,
+    CtpNativeCallbackLedgerAdapter,
     CtpNativeCallbackSourceBridge,
     CtpOrderRefLegacyMapping,
     CtpOrderRefSeedProof,
+    CtpVerifiedCallbackEvidence,
+    DurableStoreError,
     ExecutionScope,
+    InvalidStateTransition,
     SqliteExecutionStore,
     ctp_native_callback_source_facts,
     ctp_native_session_generation_id,
@@ -216,6 +222,38 @@ class _FakeActionAuthorityVerifier:
         )
 
 
+class _FakeCallbackLedgerVerifier:
+    """Test-only verifier for a lifecycle-bound callback envelope."""
+
+    def __init__(self, *, error: Exception | None = None, during_verify=None) -> None:
+        self.error = error
+        self.during_verify = during_verify
+        self.calls = []
+
+    def verify_callback(self, command, callback, callback_payload, *, now_ns):
+        self.calls.append((command, callback, dict(callback_payload), now_ns))
+        if self.error is not None:
+            raise self.error
+        if self.during_verify is not None:
+            self.during_verify()
+        assert callback_payload["envelope_type"] == (
+            "ctp_lifecycle_bound_native_callback_envelope.v1"
+        )
+        source = callback_payload["source_event"]
+        assert source["login_verified"] is True
+        assert source["callback_session_matches_login"] is True
+        return CtpVerifiedCallbackEvidence(
+            evidence_type="ctp_verified_callback.v1",
+            callback_key=callback,
+            callback_payload_sha256=payload_sha256(callback_payload),
+            projection_state="ACKNOWLEDGED",
+            source_digest_sha256=payload_sha256(source),
+            verifier_id="fake-lifecycle-callback-verifier",
+            verified_at_ns=now_ns,
+            expires_at_ns=now_ns + 5_000_000_000,
+        )
+
+
 @dataclass
 class _BoundDispatch:
     store: SqliteExecutionStore
@@ -365,6 +403,118 @@ def _stage_dispatched_command(
     )
 
 
+def _stage_followup_ready_command(bound, store, *, writer_lease=None):
+    if writer_lease is None:
+        writer_lease = bound.lease
+    intent_id = "source-bridge-followup-intent"
+    runtime_order_id = "bt-managed-v1:" + _sha(b"source-bridge-followup-runtime")
+    reservation = store.reserve_ctp_order_identity(
+        bound.scope, intent_id, runtime_order_id
+    )
+    original = store.read_ctp_dispatch_command(bound.scope, bound.command_id)
+    assert original is not None and original.correlation_key is not None
+    generation = original.correlation_key.session_generation_id
+    session_binding = {
+        "session_identity": "opaque-session-v1",
+        "session_generation_id": generation,
+        "dispatch_front_id": original.correlation_key.dispatch_front_id,
+        "dispatch_session_id": original.correlation_key.dispatch_session_id,
+        "native_callback_source": dict(bound.source_facts),
+    }
+    return store.stage_ctp_dispatch_command(
+        bound.scope,
+        "source-bridge-followup-command",
+        "SUBMIT",
+        {"InstrumentID": "rb2710", "OrderRef": reservation.order_ref},
+        approval_use_id="source-bridge-followup-approval",
+        approval_digest=_sha(b"source-bridge-followup-approval"),
+        session_binding=session_binding,
+        writer_lease=writer_lease,
+        managed_intent_id=reservation.managed_intent_id,
+        order_ref=reservation.order_ref,
+        session_generation_id=generation,
+        dispatch_front_id=original.correlation_key.dispatch_front_id,
+        dispatch_session_id=original.correlation_key.dispatch_session_id,
+        native_request_id=29,
+    )
+
+
+def _write_legacy_v11_resolved_guard(bound, *, correlation_digest=None):
+    command = bound.store.read_ctp_dispatch_command(bound.scope, bound.command_id)
+    assert command is not None and command.correlation_key is not None
+    guard_id = "f" * 32
+    correlation_digest = (
+        payload_sha256(command.correlation_key.to_payload())
+        if correlation_digest is None
+        else correlation_digest
+    )
+    bound.store._connection.executescript(
+        """
+        CREATE TABLE ctp_dispatch_callback_ingestion_guards (
+            account_key TEXT NOT NULL,
+            scope_key TEXT NOT NULL,
+            command_id TEXT NOT NULL,
+            guard_id TEXT NOT NULL,
+            correlation_key_sha256 TEXT NOT NULL,
+            session_binding_sha256 TEXT NOT NULL,
+            created_at_ns INTEGER NOT NULL,
+            PRIMARY KEY(account_key, command_id, guard_id)
+        );
+        CREATE TABLE ctp_dispatch_callback_ingestion_resolutions (
+            account_key TEXT NOT NULL,
+            scope_key TEXT NOT NULL,
+            command_id TEXT NOT NULL,
+            guard_id TEXT NOT NULL,
+            correlation_key_sha256 TEXT NOT NULL,
+            callback_key_sha256 TEXT NOT NULL,
+            callback_payload_sha256 TEXT NOT NULL,
+            resolved_at_ns INTEGER NOT NULL,
+            PRIMARY KEY(account_key, command_id, guard_id)
+        );
+        """
+    )
+    bound.store._connection.execute(
+        """
+        INSERT INTO ctp_dispatch_callback_ingestion_guards(
+            account_key, scope_key, command_id, guard_id,
+            correlation_key_sha256, session_binding_sha256, created_at_ns
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            command.account_key,
+            command.scope_key,
+            command.command_id,
+            guard_id,
+            correlation_digest,
+            command.session_binding_sha256,
+            1,
+        ),
+    )
+    bound.store._connection.execute(
+        """
+        INSERT INTO ctp_dispatch_callback_ingestion_resolutions(
+            account_key, scope_key, command_id, guard_id,
+            correlation_key_sha256, callback_key_sha256,
+            callback_payload_sha256, resolved_at_ns
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            command.account_key,
+            command.scope_key,
+            command.command_id,
+            guard_id,
+            correlation_digest,
+            _sha(b"legacy callback key"),
+            _sha(b"legacy callback payload"),
+            2,
+        ),
+    )
+    bound.store._connection.execute(
+        "UPDATE execution_meta SET value = '11' WHERE key = 'schema_version'"
+    )
+    return command, guard_id
+
+
 def _source_event(
     client: _FakeTraderClient,
     *,
@@ -446,6 +596,32 @@ def _source_event(
         stable_source_key=stable_source_key,
     )
     return event
+
+
+def _unknown_receipt(command, *, outcome="UNKNOWN"):
+    return CtpDispatchReceipt(
+        receipt_type="ctp_dispatch_receipt.v2",
+        command_id=command.command_id,
+        account_key=command.account_key,
+        scope_key=command.scope_key,
+        trading_day=command.trading_day,
+        operation=command.operation,
+        request_payload_sha256=command.request_payload_sha256,
+        reservation_managed_intent_id=command.reservation_managed_intent_id,
+        order_ref=command.order_ref,
+        cancel_target_order_ref=command.cancel_target_order_ref,
+        cancel_target_exchange_id=command.cancel_target_exchange_id,
+        cancel_target_order_sys_id=command.cancel_target_order_sys_id,
+        cancel_target_front_id=command.cancel_target_front_id,
+        cancel_target_session_id=command.cancel_target_session_id,
+        approval_use_id=command.approval_use_id,
+        approval_digest=command.approval_digest,
+        session_binding_sha256=command.session_binding_sha256,
+        outcome=outcome,
+        native_receipt_payload={"kind": "fake-send", "outcome": outcome},
+        correlation_key=command.correlation_key,
+        local_queue_receipt_id=command.local_queue_receipt_id,
+    )
 
 
 @pytest.mark.unit
@@ -1064,4 +1240,711 @@ def test_bridge_requires_source_event_sequence_after_persisted_baseline(tmp_path
         with pytest.raises(ContractValidationError, match="source event identity or sequence"):
             bridge.next_envelope(timeout=0)
     finally:
+        bound.store.close()
+
+
+@pytest.mark.unit
+def test_callback_ledger_adapter_applies_same_send_event_and_keeps_unknown_fenced(tmp_path):
+    bound = _stage_dispatched_command(tmp_path)
+    adapter = None
+    try:
+        reservation = bound.store.read_ctp_order_identity(
+            bound.scope, "source-bridge-intent"
+        )
+        command = bound.store.read_ctp_dispatch_command(bound.scope, bound.command_id)
+        assert reservation is not None and command is not None
+        assert command.status == "CLAIMED"
+        verifier = _FakeCallbackLedgerVerifier()
+        adapter = CtpNativeCallbackLedgerAdapter.bind_after_login(
+            store=bound.store,
+            scope=bound.scope,
+            command_id=bound.command_id,
+            writer_lease=bound.lease,
+            native_trader_client=bound.client,
+            callback_verifier=verifier,
+        )
+
+        sent: list[str] = []
+
+        def fake_native_send(claimed_command):
+            assert claimed_command.status == "CLAIMED"
+            assert claimed_command.request_payload["OrderRef"] == reservation.order_ref
+            assert claimed_command.correlation_key.order_ref == reservation.order_ref
+            sent.append(claimed_command.command_id)
+            # This fake models the SDK source queue being written by its native
+            # callback handler after the send call. No caller callback fields
+            # are passed to the ledger adapter.
+            bound.client._events.put(_source_event(bound.client))
+
+        fake_native_send(command)
+        bound.store.complete_ctp_dispatch_command(
+            bound.scope,
+            _unknown_receipt(command),
+            writer_lease=bound.lease,
+        )
+
+        applied = adapter.apply_next(timeout=0)
+
+        assert applied is not None and applied.duplicate is False
+        assert sent == [bound.command_id]
+        assert len(verifier.calls) == 1
+        assert verifier.calls[0][0].correlation_key == command.correlation_key
+        assert bound.store.read_ctp_dispatch_command(bound.scope, bound.command_id).status == (
+            "UNKNOWN"
+        )
+        projection = bound.store.read_ctp_dispatch_projection(bound.scope, bound.command_id)
+        assert projection is not None
+        assert projection.command_status == "UNKNOWN"
+        assert projection.submit_action.order_state.provider_state == "ACKNOWLEDGED"
+        assert applied.account_fence_open is True
+        assert (
+            bound.store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_callback_ledger WHERE command_id = ?",
+                (bound.command_id,),
+            ).fetchone()[0]
+            == 1
+        )
+        assert bound.store._connection.execute(
+            "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences"
+        ).fetchone()[0] == 1
+        assert bound.store._connection.execute(
+            """
+            SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences
+            WHERE account_key = ?
+            """
+            , (bound.scope.account_key,)
+        ).fetchone()[0] == 1
+    finally:
+        if adapter is not None:
+            adapter.close()
+        bound.store.close()
+
+
+@pytest.mark.unit
+def test_source_lifecycle_fence_blocks_new_claim_after_queued_receipt_and_restart(tmp_path):
+    bound = _stage_dispatched_command(tmp_path)
+    adapter = None
+    store_path = tmp_path / "execution.sqlite3"
+    reopened = None
+    try:
+        command = bound.store.read_ctp_dispatch_command(bound.scope, bound.command_id)
+        assert command is not None
+        adapter = CtpNativeCallbackLedgerAdapter.bind_after_login(
+            store=bound.store,
+            scope=bound.scope,
+            command_id=bound.command_id,
+            writer_lease=bound.lease,
+            native_trader_client=bound.client,
+            callback_verifier=_FakeCallbackLedgerVerifier(
+                error=RuntimeError("fake verifier rejection")
+            ),
+        )
+        assert bound.store._connection.execute(
+            "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences"
+        ).fetchone()[0] == 1
+
+        # Fake native send is complete: its local QUEUED receipt is immutable,
+        # but callback ingestion is still pending.
+        bound.client._events.put(_source_event(bound.client))
+        completed = bound.store.complete_ctp_dispatch_command(
+            bound.scope,
+            _unknown_receipt(command, outcome="QUEUED"),
+            writer_lease=bound.lease,
+        )
+        assert completed.status == "COMPLETED"
+        with pytest.raises(ContractValidationError, match="may have been consumed"):
+            adapter.apply_next(timeout=0)
+        adapter.close()
+        adapter = None
+        bound.store.close()
+        # A process restart cannot lose the uncertainty fence or rewrite the
+        # already durable QUEUED receipt.
+        reopened = SqliteExecutionStore(store_path)
+        assert reopened.read_ctp_dispatch_command(bound.scope, bound.command_id).status == (
+            "COMPLETED"
+        )
+        next_command = _stage_followup_ready_command(bound, reopened)
+
+        class _MustNotVerify:
+            def verify_action(self, command, *, now_ns):
+                raise AssertionError("claim reached authority verifier despite callback guard")
+
+        with pytest.raises(
+            InvalidStateTransition, match="CTP callback source lifecycle fence"
+        ):
+            reopened.claim_ctp_dispatch_command(
+                bound.scope,
+                next_command.command_id,
+                writer_lease=bound.lease,
+                authority_verifier=_MustNotVerify(),
+            )
+        assert reopened._connection.execute(
+            "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences WHERE account_key = ?",
+            (bound.scope.account_key,),
+        ).fetchone()[0] == 1
+    finally:
+        if adapter is not None:
+            adapter.close()
+        if reopened is not None:
+            reopened.close()
+        bound.store.close()
+
+
+@pytest.mark.unit
+def test_callback_poll_timeout_keeps_lifecycle_fence_for_same_bridge_retry(tmp_path):
+    bound = _stage_dispatched_command(tmp_path)
+    adapter = None
+    try:
+        adapter = CtpNativeCallbackLedgerAdapter.bind_after_login(
+            store=bound.store,
+            scope=bound.scope,
+            command_id=bound.command_id,
+            writer_lease=bound.lease,
+            native_trader_client=bound.client,
+            callback_verifier=_FakeCallbackLedgerVerifier(),
+        )
+        assert adapter.apply_next(timeout=0) is None
+        assert bound.store._connection.execute(
+            "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences"
+        ).fetchone()[0] == 1
+        assert bound.store._connection.execute(
+            "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences"
+        ).fetchone()[0] == 1
+
+        bound.client._events.put(_source_event(bound.client))
+        assert adapter.apply_next(timeout=0) is not None
+        assert bound.store._connection.execute(
+            "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences"
+        ).fetchone()[0] == 1
+        assert bound.store._connection.execute(
+            "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences"
+        ).fetchone()[0] == 1
+    finally:
+        if adapter is not None:
+            adapter.close()
+        bound.store.close()
+
+
+@pytest.mark.unit
+def test_source_lifecycle_fence_covers_event_queued_between_polls_and_restart(tmp_path):
+    bound = _stage_dispatched_command(tmp_path)
+    adapter = None
+    reopened = None
+    try:
+        command = bound.store.read_ctp_dispatch_command(bound.scope, bound.command_id)
+        assert command is not None
+        adapter = CtpNativeCallbackLedgerAdapter.bind_after_login(
+            store=bound.store,
+            scope=bound.scope,
+            command_id=bound.command_id,
+            writer_lease=bound.lease,
+            native_trader_client=bound.client,
+            callback_verifier=_FakeCallbackLedgerVerifier(),
+        )
+        bound.store.complete_ctp_dispatch_command(
+            bound.scope,
+            _unknown_receipt(command, outcome="QUEUED"),
+            writer_lease=bound.lease,
+        )
+        bound.client._events.put(_source_event(bound.client, sequence=1))
+        assert adapter.apply_next(timeout=0) is not None
+        assert bound.store.read_ctp_dispatch_command(bound.scope, bound.command_id).status == (
+            "COMPLETED"
+        )
+
+        # A later callback arrives after event 1's commit but before another
+        # poll. A crash at this point must still leave the account fenced.
+        bound.client._events.put(_source_event(bound.client, sequence=2))
+        assert bound.client._events.qsize() == 1
+        adapter.close()
+        adapter = None
+        bound.store.close()
+
+        reopened = SqliteExecutionStore(tmp_path / "execution.sqlite3")
+        next_command = _stage_followup_ready_command(bound, reopened)
+
+        class _MustNotVerify:
+            def verify_action(self, command, *, now_ns):
+                raise AssertionError("claim reached authority verifier despite lifecycle fence")
+
+        with pytest.raises(
+            InvalidStateTransition, match="CTP callback source lifecycle fence"
+        ):
+            reopened.claim_ctp_dispatch_command(
+                bound.scope,
+                next_command.command_id,
+                writer_lease=bound.lease,
+                authority_verifier=_MustNotVerify(),
+            )
+        assert reopened._connection.execute(
+            "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences WHERE account_key = ?",
+            (bound.scope.account_key,),
+        ).fetchone()[0] == 1
+        assert bound.client._events.qsize() == 1
+    finally:
+        if adapter is not None:
+            adapter.close()
+        if reopened is not None:
+            reopened.close()
+        bound.store.close()
+
+
+@pytest.mark.unit
+def test_v11_resolved_guard_migrates_to_permanent_fence_and_stays_after_reopen(tmp_path):
+    bound = _stage_dispatched_command(tmp_path)
+    migrated = None
+    reopened = None
+    try:
+        command = bound.store.read_ctp_dispatch_command(bound.scope, bound.command_id)
+        assert command is not None
+        bound.store.complete_ctp_dispatch_command(
+            bound.scope,
+            _unknown_receipt(command, outcome="QUEUED"),
+            writer_lease=bound.lease,
+        )
+        command, legacy_guard_id = _write_legacy_v11_resolved_guard(bound)
+        bound.store.close()
+
+        migrated = SqliteExecutionStore(tmp_path / "execution.sqlite3")
+        version = migrated._connection.execute(
+            "SELECT value FROM execution_meta WHERE key = 'schema_version'"
+        ).fetchone()["value"]
+        assert version == "12"
+        assert migrated.read_ctp_dispatch_command(bound.scope, bound.command_id).status == (
+            "COMPLETED"
+        )
+        fence = migrated._connection.execute(
+            """
+            SELECT * FROM ctp_dispatch_callback_source_lifecycle_fences
+            WHERE account_key = ?
+            """,
+            (bound.scope.account_key,),
+        ).fetchone()
+        assert fence is not None
+        assert fence["command_id"] == bound.command_id
+        assert fence["source_lifecycle_fence_id"] == legacy_guard_id
+        assert fence["correlation_key_sha256"] == payload_sha256(
+            command.correlation_key.to_payload()
+        )
+
+        next_command = _stage_followup_ready_command(bound, migrated)
+
+        class _MustNotVerify:
+            def verify_action(self, command, *, now_ns):
+                raise AssertionError("claim reached authority verifier despite migrated fence")
+
+        with pytest.raises(
+            InvalidStateTransition, match="CTP callback source lifecycle fence"
+        ):
+            migrated.claim_ctp_dispatch_command(
+                bound.scope,
+                next_command.command_id,
+                writer_lease=bound.lease,
+                authority_verifier=_MustNotVerify(),
+            )
+        migrated.close()
+        migrated = None
+
+        # The v12 upgrade is idempotent and the old resolved bit never removes
+        # the newly migrated account source-lifecycle fence.
+        reopened = SqliteExecutionStore(tmp_path / "execution.sqlite3")
+        assert reopened._connection.execute(
+            "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences WHERE account_key = ?",
+            (bound.scope.account_key,),
+        ).fetchone()[0] == 1
+        with pytest.raises(
+            InvalidStateTransition, match="CTP callback source lifecycle fence"
+        ):
+            reopened.claim_ctp_dispatch_command(
+                bound.scope,
+                next_command.command_id,
+                writer_lease=bound.lease,
+                authority_verifier=_MustNotVerify(),
+            )
+    finally:
+        if migrated is not None:
+            migrated.close()
+        if reopened is not None:
+            reopened.close()
+        bound.store.close()
+
+
+@pytest.mark.unit
+def test_v11_unmappable_resolved_guard_refuses_store_upgrade(tmp_path):
+    bound = _stage_dispatched_command(tmp_path)
+    try:
+        _write_legacy_v11_resolved_guard(bound, correlation_digest="0" * 64)
+        bound.store.close()
+        with pytest.raises(
+            DurableStoreError, match="legacy CTP callback lifecycle fence binding is inconsistent"
+        ):
+            SqliteExecutionStore(tmp_path / "execution.sqlite3")
+    finally:
+        bound.store.close()
+
+
+@pytest.mark.unit
+def test_callback_projection_failure_rolls_back_ledger_but_keeps_lifecycle_fence(tmp_path):
+    bound = _stage_dispatched_command(tmp_path)
+    adapter = None
+    try:
+        command = bound.store.read_ctp_dispatch_command(bound.scope, bound.command_id)
+        assert command is not None
+        bound.client._events.put(_source_event(bound.client))
+        adapter = CtpNativeCallbackLedgerAdapter.bind_after_login(
+            store=bound.store,
+            scope=bound.scope,
+            command_id=bound.command_id,
+            writer_lease=bound.lease,
+            native_trader_client=bound.client,
+            callback_verifier=_FakeCallbackLedgerVerifier(),
+        )
+        bound.store.complete_ctp_dispatch_command(
+            bound.scope,
+            _unknown_receipt(command, outcome="QUEUED"),
+            writer_lease=bound.lease,
+        )
+        bound.store._connection.execute(
+            """
+            CREATE TRIGGER reject_callback_projection
+            BEFORE INSERT ON ctp_dispatch_order_projection
+            BEGIN
+                SELECT RAISE(ABORT, 'test projection storage failure');
+            END
+            """
+        )
+
+        with pytest.raises(ContractValidationError, match="may have been consumed"):
+            adapter.apply_next(timeout=0)
+        assert bound.store._connection.execute(
+            "SELECT COUNT(*) FROM ctp_dispatch_callback_ledger"
+        ).fetchone()[0] == 0
+        assert bound.store._connection.execute(
+            "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences"
+        ).fetchone()[0] == 1
+        assert bound.store._connection.execute(
+            "SELECT COUNT(*) FROM ctp_dispatch_order_projection"
+        ).fetchone()[0] == 0
+    finally:
+        if adapter is not None:
+            adapter.close()
+        bound.store.close()
+
+
+@pytest.mark.unit
+def test_callback_commit_lease_loss_leaves_durable_ingestion_fence(tmp_path):
+    bound = _stage_dispatched_command(tmp_path)
+    adapter = None
+    reopened = None
+    try:
+        command = bound.store.read_ctp_dispatch_command(bound.scope, bound.command_id)
+        assert command is not None
+        bound.client._events.put(_source_event(bound.client))
+        adapter = CtpNativeCallbackLedgerAdapter.bind_after_login(
+            store=bound.store,
+            scope=bound.scope,
+            command_id=bound.command_id,
+            writer_lease=bound.lease,
+            native_trader_client=bound.client,
+            callback_verifier=_FakeCallbackLedgerVerifier(),
+        )
+        bound.store.complete_ctp_dispatch_command(
+            bound.scope,
+            _unknown_receipt(command, outcome="QUEUED"),
+            writer_lease=bound.lease,
+        )
+        bound.store._connection.execute(
+            "UPDATE execution_writer_leases SET expires_at_ns = ? WHERE scope_key = ?",
+            (time.time_ns() - 1, bound.scope.account_key),
+        )
+
+        with pytest.raises(ContractValidationError, match="may have been consumed"):
+            adapter.apply_next(timeout=0)
+        assert bound.store._connection.execute(
+            "SELECT COUNT(*) FROM ctp_dispatch_callback_ledger"
+        ).fetchone()[0] == 0
+        assert bound.store._connection.execute(
+            "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences"
+        ).fetchone()[0] == 1
+        adapter.close()
+        adapter = None
+        bound.store.close()
+
+        reopened = SqliteExecutionStore(tmp_path / "execution.sqlite3")
+        replacement_lease = reopened.acquire_or_renew_lease(
+            bound.scope, "source-bridge-restarted-owner", ttl_ns=30_000_000_000
+        )
+        next_command = _stage_followup_ready_command(
+            bound, reopened, writer_lease=replacement_lease
+        )
+
+        class _MustNotVerify:
+            def verify_action(self, command, *, now_ns):
+                raise AssertionError("claim reached authority verifier despite callback guard")
+
+        with pytest.raises(
+            InvalidStateTransition, match="CTP callback source lifecycle fence"
+        ):
+            reopened.claim_ctp_dispatch_command(
+                bound.scope,
+                next_command.command_id,
+                writer_lease=replacement_lease,
+                authority_verifier=_MustNotVerify(),
+            )
+    finally:
+        if adapter is not None:
+            adapter.close()
+        if reopened is not None:
+            reopened.close()
+        bound.store.close()
+
+
+@pytest.mark.unit
+def test_adapter_cleanup_failure_does_not_leak_callback_source_exception(tmp_path, monkeypatch):
+    bound = _stage_dispatched_command(tmp_path)
+    adapter = None
+    try:
+        bound.client._events.put(_source_event(bound.client))
+        adapter = CtpNativeCallbackLedgerAdapter.bind_after_login(
+            store=bound.store,
+            scope=bound.scope,
+            command_id=bound.command_id,
+            writer_lease=bound.lease,
+            native_trader_client=bound.client,
+            callback_verifier=_FakeCallbackLedgerVerifier(
+                error=RuntimeError("fake callback verifier failure")
+            ),
+        )
+        consumer_token = bound.client._callback_consumer_token
+
+        def fail_consumer_release(token):
+            assert token is consumer_token
+            raise RuntimeError("SENTINEL_CALLBACK_QUEUE_RELEASE_FAILURE")
+
+        monkeypatch.setattr(
+            bound.client, "_release_native_callback_event_consumer", fail_consumer_release
+        )
+        with pytest.raises(
+            ContractValidationError,
+            match="CTP callback may have been consumed without a durable verified ledger commit",
+        ) as failure:
+            adapter.apply_next(timeout=0)
+
+        rendered = "".join(traceback.format_exception(failure.value))
+        assert "SENTINEL_CALLBACK_QUEUE_RELEASE_FAILURE" not in rendered
+        assert bound.store._connection.execute(
+            "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences"
+        ).fetchone()[0] == 1
+        assert bound.store._connection.execute(
+            "SELECT COUNT(*) FROM ctp_dispatch_callback_ledger"
+        ).fetchone()[0] == 0
+    finally:
+        bound.client._revoke_native_callback_event_consumer()
+        if adapter is not None:
+            adapter.close()
+        bound.store.close()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("mismatch", ["target", "source"])
+def test_callback_ledger_adapter_poison_closes_on_target_or_source_mismatch(
+    tmp_path, mismatch: str
+):
+    bound = _stage_dispatched_command(tmp_path)
+    adapter = None
+    try:
+        event = _source_event(
+            bound.client,
+            overrides=(
+                {"OrderRef": "000000000099"} if mismatch == "target" else None
+            ),
+        )
+        if mismatch == "source":
+            event.callback_session_matches_login = False
+        bound.client._events.put(event)
+        adapter = CtpNativeCallbackLedgerAdapter.bind_after_login(
+            store=bound.store,
+            scope=bound.scope,
+            command_id=bound.command_id,
+            writer_lease=bound.lease,
+            native_trader_client=bound.client,
+            callback_verifier=_FakeCallbackLedgerVerifier(),
+        )
+
+        with pytest.raises(ContractValidationError, match="may have been consumed"):
+            adapter.apply_next(timeout=0)
+        assert bound.store.read_ctp_dispatch_command(bound.scope, bound.command_id).status == (
+            "CLAIMED"
+        )
+        assert (
+            bound.store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_callback_ledger"
+            ).fetchone()[0]
+            == 0
+        )
+        assert bound.store._connection.execute(
+            "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences"
+        ).fetchone()[0] == 1
+        with pytest.raises(ContractValidationError, match="adapter is closed"):
+            adapter.apply_next(timeout=0)
+    finally:
+        if adapter is not None:
+            adapter.close()
+        bound.store.close()
+
+
+@pytest.mark.unit
+def test_callback_ledger_adapter_rejects_wrong_durable_scope_before_queue_claim(tmp_path):
+    bound = _stage_dispatched_command(tmp_path)
+    try:
+        wrong_scope = ExecutionScope(
+            "CTP", "simulation", "different-account", "source-bridge", "20260925"
+        )
+        with pytest.raises(ContractValidationError, match="command is missing"):
+            CtpNativeCallbackLedgerAdapter.bind_after_login(
+                store=bound.store,
+                scope=wrong_scope,
+                command_id=bound.command_id,
+                writer_lease=bound.lease,
+                native_trader_client=bound.client,
+                callback_verifier=_FakeCallbackLedgerVerifier(),
+            )
+        assert bound.client._callback_consumer_token is None
+        assert bound.client._events.empty()
+    finally:
+        bound.store.close()
+
+
+@pytest.mark.unit
+def test_callback_ledger_adapter_replay_poison_does_not_append_second_row(tmp_path):
+    bound = _stage_dispatched_command(tmp_path)
+    adapter = None
+    try:
+        event = _source_event(bound.client)
+        bound.client._events.put(event)
+        adapter = CtpNativeCallbackLedgerAdapter.bind_after_login(
+            store=bound.store,
+            scope=bound.scope,
+            command_id=bound.command_id,
+            writer_lease=bound.lease,
+            native_trader_client=bound.client,
+            callback_verifier=_FakeCallbackLedgerVerifier(),
+        )
+        assert adapter.apply_next(timeout=0) is not None
+
+        bound.client._events.put(event)
+        with pytest.raises(ContractValidationError, match="may have been consumed"):
+            adapter.apply_next(timeout=0)
+        assert (
+            bound.store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_callback_ledger"
+            ).fetchone()[0]
+            == 1
+        )
+        assert bound.store.read_ctp_dispatch_projection(bound.scope, bound.command_id) is not None
+    finally:
+        if adapter is not None:
+            adapter.close()
+        bound.store.close()
+
+
+@pytest.mark.unit
+def test_callback_ledger_adapter_rechecks_reentrant_lifecycle_change(tmp_path):
+    bound = _stage_dispatched_command(tmp_path)
+    adapter = None
+    try:
+        bound.client._events.put(_source_event(bound.client))
+
+        def mutate_lifecycle_during_verification():
+            # The source lock is reentrant on this thread. The adapter must
+            # detect this after the injected verifier returns, before commit.
+            with bound.client._query_state_lock:
+                bound.client._connection_generation += 1
+
+        adapter = CtpNativeCallbackLedgerAdapter.bind_after_login(
+            store=bound.store,
+            scope=bound.scope,
+            command_id=bound.command_id,
+            writer_lease=bound.lease,
+            native_trader_client=bound.client,
+            callback_verifier=_FakeCallbackLedgerVerifier(
+                during_verify=mutate_lifecycle_during_verification
+            ),
+        )
+
+        with pytest.raises(ContractValidationError, match="may have been consumed"):
+            adapter.apply_next(timeout=0)
+        assert (
+            bound.store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_callback_ledger"
+            ).fetchone()[0]
+            == 0
+        )
+        assert bound.store.read_ctp_dispatch_command(bound.scope, bound.command_id).status == (
+            "CLAIMED"
+        )
+        assert bound.store._connection.execute(
+            "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences"
+        ).fetchone()[0] == 1
+    finally:
+        if adapter is not None:
+            adapter.close()
+        bound.store.close()
+
+
+@pytest.mark.unit
+def test_callback_ledger_commit_precedes_cross_thread_source_disconnect(tmp_path):
+    bound = _stage_dispatched_command(tmp_path)
+    adapter = None
+    disconnect_thread = None
+    try:
+        bound.client._events.put(_source_event(bound.client))
+        disconnect_attempted = threading.Event()
+        disconnected = threading.Event()
+
+        def disconnect():
+            disconnect_attempted.set()
+            with bound.client._query_state_lock:
+                bound.client._connected = False
+                bound.client._login_state = "disconnected"
+                disconnected.set()
+
+        def start_disconnect_during_verification():
+            nonlocal disconnect_thread
+            disconnect_thread = threading.Thread(target=disconnect)
+            disconnect_thread.start()
+            assert disconnect_attempted.wait(1.0)
+            assert not disconnected.is_set()
+
+        adapter = CtpNativeCallbackLedgerAdapter.bind_after_login(
+            store=bound.store,
+            scope=bound.scope,
+            command_id=bound.command_id,
+            writer_lease=bound.lease,
+            native_trader_client=bound.client,
+            callback_verifier=_FakeCallbackLedgerVerifier(
+                during_verify=start_disconnect_during_verification
+            ),
+        )
+
+        applied = adapter.apply_next(timeout=0)
+        assert applied is not None
+        assert disconnect_thread is not None
+        disconnect_thread.join(timeout=1.0)
+        assert not disconnect_thread.is_alive()
+        assert disconnected.is_set()
+        assert bound.store._connection.execute(
+            "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences"
+        ).fetchone()[0] == 1
+        assert (
+            bound.store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_callback_ledger"
+            ).fetchone()[0]
+            == 1
+        )
+    finally:
+        if adapter is not None:
+            adapter.close()
+        if disconnect_thread is not None and disconnect_thread.is_alive():
+            disconnect_thread.join(timeout=1.0)
         bound.store.close()

@@ -486,7 +486,7 @@ def test_v4_execution_store_migrates_to_verified_callback_ledger_v8(tmp_path):
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-        assert version == "10"
+        assert version == "12"
         assert "ctp_dispatch_commands" in tables
         assert "ctp_order_ref_watermarks" in tables
         assert "ctp_dispatch_authority_uses" in tables
@@ -540,7 +540,7 @@ def test_v5_execution_store_migrates_one_use_authority_table(tmp_path):
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-        assert version == "10"
+        assert version == "12"
         assert "ctp_dispatch_authority_uses" in tables
     finally:
         migrated.close()
@@ -638,7 +638,7 @@ def test_v7_typed_command_migrates_to_callback_ledger_without_reopening_dispatch
             migrated._connection.execute(
                 "SELECT value FROM execution_meta WHERE key = 'schema_version'"
             ).fetchone()[0]
-            == "10"
+            == "12"
         )
         assert (
             migrated._connection.execute(
@@ -680,7 +680,7 @@ def test_v8_store_migrates_orderref_cutover_state_fail_closed(tmp_path):
         version = migrated._connection.execute(
             "SELECT value FROM execution_meta WHERE key = 'schema_version'"
         ).fetchone()["value"]
-        assert version == "10"
+        assert version == "12"
         command = migrated.read_ctp_dispatch_command(scope, staged.command_id)
         assert command is not None
         assert command.status == "UNKNOWN"

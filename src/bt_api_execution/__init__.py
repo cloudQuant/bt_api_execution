@@ -40,6 +40,7 @@ from .ctp_callback_source_bridge import (
     CtpNativeCallbackSourceBridge,
     ctp_native_callback_source_facts,
 )
+from .ctp_callback_ledger_adapter import CtpNativeCallbackLedgerAdapter
 from .ctp_native_callbacks import (
     CtpNativeCallbackEnvelope,
     CtpNativeSessionContext,
@@ -118,6 +119,7 @@ __all__ = [
     "CtpNativeCallbackEnvelope",
     "CtpLifecycleBoundNativeCallbackEnvelope",
     "CtpNativeCallbackSourceBridge",
+    "CtpNativeCallbackLedgerAdapter",
     "CtpNativeSessionContext",
     "CtpCancelActionProjection",
     "CtpProjectedOrderState",

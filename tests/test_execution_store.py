@@ -76,7 +76,7 @@ def test_v2_execution_store_adds_nullable_cumulative_commission_column(tmp_path)
             "SELECT value FROM execution_meta WHERE key = 'schema_version'"
         ).fetchone()["value"]
         assert "cumulative_commission" in columns
-        assert version == "10"
+        assert version == "12"
     finally:
         store.close()
 
@@ -107,10 +107,43 @@ def test_v3_execution_store_adds_ctp_order_identity_reservations(tmp_path) -> No
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-        assert version == "10"
+        assert version == "12"
         assert "ctp_order_identity_reservations" in tables
         assert "ctp_dispatch_commands" in tables
         assert "ctp_dispatch_authority_uses" in tables
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+def test_v10_execution_store_adds_callback_ingestion_guard_schema(tmp_path) -> None:
+    path = tmp_path / "execution.sqlite3"
+    connection = sqlite3.connect(path)
+    try:
+        connection.executescript(
+            """
+            CREATE TABLE execution_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO execution_meta(key, value) VALUES ('schema_version', '10');
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    store = SqliteExecutionStore(path)
+    try:
+        version = store._connection.execute(
+            "SELECT value FROM execution_meta WHERE key = 'schema_version'"
+        ).fetchone()["value"]
+        tables = {
+            row["name"]
+            for row in store._connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        assert version == "12"
+        assert "ctp_dispatch_callback_source_lifecycle_fences" in tables
+        assert "ctp_dispatch_callback_ingestion_resolutions" not in tables
     finally:
         store.close()
 
