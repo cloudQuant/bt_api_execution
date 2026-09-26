@@ -117,6 +117,14 @@ _CTP_CALLBACK_OWNER_POISON_CODES = frozenset(
 )
 
 
+class _CtpCancelPostconditionConflictError(ContractValidationError):
+    """A verified callback contradicts an already-resolved cancel target."""
+
+    def __init__(self, owner_intent_id: str):
+        super().__init__("verified CTP callback contradicts a resolved cancel target")
+        self.owner_intent_id = owner_intent_id
+
+
 @dataclass(frozen=True, slots=True)
 class WriterLease:
     """A scope-local writer lease with a monotonically increasing fence."""
@@ -1715,7 +1723,10 @@ class SqliteExecutionStore:
     # Version 14 adds local journal lineage to new outbox rows only.
     # Version 15 adds a one-shot account callback session owner and durable
     # all-SPI ingress inbox, plus exact owner-bound native-call state.
-    _SCHEMA_VERSION = 17
+    # Version 18 records account-wide cancel postconditions at the native
+    # claim boundary and settles them only from verified terminal-order and
+    # reconciled callback-inbox evidence.
+    _SCHEMA_VERSION = 18
 
     def __init__(self, path: str | Path, *, busy_timeout_ms: int = 5_000) -> None:
         if type(busy_timeout_ms) is not int or busy_timeout_ms <= 0:
@@ -3556,6 +3567,133 @@ class SqliteExecutionStore:
             )
             fenced_accounts.add(account_key)
 
+    def _migrate_ctp_cancel_postconditions(self, cursor: sqlite3.Cursor) -> None:
+        """Keep every possibly-sent historical cancel behind an open obligation.
+
+        The old command receipt describes a local call result, not terminal
+        order state. Migration therefore never resolves a cancel. A V2 cancel
+        is bound only when the original submit, owner, session and independent
+        native identities can all be read back exactly; otherwise an
+        UNMAPPABLE account obligation remains permanently open.
+        """
+
+        rows = cursor.execute(
+            """
+            SELECT * FROM ctp_dispatch_commands
+            WHERE operation = 'CANCEL'
+              AND (status != 'READY' OR claimed_at_ns IS NOT NULL
+                   OR native_call_inflight = 1)
+            ORDER BY account_key, created_at_ns, command_id
+            """
+        ).fetchall()
+        for row in rows:
+            account_key = str(row["account_key"])
+            cancel_command_id = str(row["command_id"])
+            existing = cursor.execute(
+                "SELECT 1 FROM ctp_dispatch_cancel_postconditions "
+                "WHERE account_key = ? AND cancel_command_id = ?",
+                (account_key, cancel_command_id),
+            ).fetchone()
+            if existing is not None:
+                continue
+
+            target_submit = None
+            owner_intent_id = row["callback_owner_intent_id"]
+            if (
+                int(row["correlation_version"]) == 2
+                and type(owner_intent_id) is str
+                and row["native_action_ref_int"] is not None
+                and row["native_request_id"] is not None
+                and row["runtime_order_id"] is not None
+                and row["cancel_target_order_ref"] is not None
+            ):
+                candidates = cursor.execute(
+                    """
+                    SELECT * FROM ctp_dispatch_commands
+                    WHERE account_key = ? AND operation = 'SUBMIT'
+                      AND runtime_order_id = ? AND order_ref = ?
+                    ORDER BY created_at_ns, command_id
+                    """,
+                    (
+                        account_key,
+                        str(row["runtime_order_id"]),
+                        str(row["cancel_target_order_ref"]),
+                    ),
+                ).fetchall()
+                if len(candidates) == 1:
+                    candidate = candidates[0]
+                    same_session = (
+                        str(candidate["trading_day"]) == str(row["trading_day"])
+                        and str(candidate["session_generation_id"])
+                        == str(row["session_generation_id"])
+                        and candidate["dispatch_front_id"] == row["dispatch_front_id"]
+                        and candidate["dispatch_session_id"] == row["dispatch_session_id"]
+                        and candidate["callback_owner_intent_id"] == owner_intent_id
+                        and candidate["session_binding_sha256"]
+                        == row["session_binding_sha256"]
+                        and str(candidate["status"]) in {"COMPLETED", "UNKNOWN"}
+                    )
+                    if same_session:
+                        target_submit = candidate
+
+            identity_state = "EXACT" if target_submit is not None else "UNMAPPABLE"
+            if target_submit is None:
+                correlation_digest = payload_sha256(
+                    {
+                        "migration": "ctp_cancel_postcondition.v1",
+                        "account_key": account_key,
+                        "cancel_command_id": cancel_command_id,
+                        "request_payload_sha256": str(row["request_payload_sha256"]),
+                    }
+                )
+                owner_intent_id = None
+                fields = (None,) * 14
+            else:
+                correlation = self._ctp_dispatch_command_from_row(row).correlation_key
+                assert correlation is not None
+                correlation_digest = payload_sha256(correlation.to_payload())
+                fields = (
+                    str(target_submit["command_id"]),
+                    str(target_submit["runtime_order_id"]),
+                    str(row["cancel_target_order_ref"]),
+                    str(row["cancel_target_exchange_id"]),
+                    str(row["cancel_target_order_sys_id"]),
+                    int(row["cancel_target_front_id"]),
+                    int(row["cancel_target_session_id"]),
+                    str(row["session_generation_id"]),
+                    int(row["dispatch_front_id"]),
+                    int(row["dispatch_session_id"]),
+                    int(row["native_request_id"]),
+                    int(target_submit["native_request_id"]),
+                    int(row["native_action_ref_int"]),
+                    str(owner_intent_id),
+                )
+            cursor.execute(
+                """
+                INSERT INTO ctp_dispatch_cancel_postconditions(
+                    account_key, cancel_command_id, scope_key, trading_day,
+                    target_submit_command_id, runtime_order_id, target_order_ref,
+                    target_exchange_id, target_order_sys_id, target_front_id,
+                    target_session_id, session_generation_id, dispatch_front_id,
+                    dispatch_session_id, native_request_id, target_native_request_id,
+                    native_action_ref_int,
+                    owner_intent_id, identity_state, correlation_key_sha256,
+                    session_binding_sha256, created_at_ns
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    account_key,
+                    cancel_command_id,
+                    str(row["scope_key"]),
+                    str(row["trading_day"]),
+                    *fields,
+                    identity_state,
+                    correlation_digest,
+                    str(row["session_binding_sha256"]),
+                    int(row["updated_at_ns"]),
+                ),
+            )
+
     def _create_schema(self) -> None:
         with self._transaction() as cursor:
             # Capture lineage facts before CREATE TABLE IF NOT EXISTS adds the
@@ -4404,6 +4542,148 @@ class SqliteExecutionStore:
                 END;
                 """,
             )
+            self._execute_schema_statements(
+                cursor,
+                """
+                CREATE TABLE IF NOT EXISTS ctp_dispatch_cancel_postconditions (
+                    account_key TEXT NOT NULL,
+                    cancel_command_id TEXT NOT NULL,
+                    scope_key TEXT NOT NULL,
+                    trading_day TEXT NOT NULL,
+                    target_submit_command_id TEXT,
+                    runtime_order_id TEXT,
+                    target_order_ref TEXT,
+                    target_exchange_id TEXT,
+                    target_order_sys_id TEXT,
+                    target_front_id INTEGER,
+                    target_session_id INTEGER,
+                    session_generation_id TEXT,
+                    dispatch_front_id INTEGER,
+                    dispatch_session_id INTEGER,
+                    native_request_id INTEGER,
+                    target_native_request_id INTEGER,
+                    native_action_ref_int INTEGER,
+                    owner_intent_id TEXT,
+                    identity_state TEXT NOT NULL CHECK(identity_state IN ('EXACT', 'UNMAPPABLE')),
+                    correlation_key_sha256 TEXT NOT NULL CHECK(length(correlation_key_sha256) = 64),
+                    session_binding_sha256 TEXT NOT NULL CHECK(length(session_binding_sha256) = 64),
+                    created_at_ns INTEGER NOT NULL,
+                    PRIMARY KEY(account_key, cancel_command_id),
+                    CHECK(identity_state != 'EXACT' OR (
+                        target_submit_command_id IS NOT NULL
+                        AND runtime_order_id IS NOT NULL
+                        AND target_order_ref IS NOT NULL
+                        AND target_exchange_id IS NOT NULL
+                        AND target_order_sys_id IS NOT NULL
+                        AND target_front_id IS NOT NULL
+                        AND target_session_id IS NOT NULL
+                        AND session_generation_id IS NOT NULL
+                        AND dispatch_front_id IS NOT NULL
+                        AND dispatch_session_id IS NOT NULL
+                        AND native_request_id IS NOT NULL
+                        AND target_native_request_id IS NOT NULL
+                        AND native_action_ref_int IS NOT NULL
+                        AND owner_intent_id IS NOT NULL
+                    )),
+                    FOREIGN KEY(account_key, cancel_command_id)
+                        REFERENCES ctp_dispatch_commands(account_key, command_id),
+                    FOREIGN KEY(account_key, target_submit_command_id)
+                        REFERENCES ctp_dispatch_commands(account_key, command_id),
+                    FOREIGN KEY(owner_intent_id)
+                        REFERENCES ctp_dispatch_callback_session_owners(owner_intent_id)
+                );
+                CREATE INDEX IF NOT EXISTS ctp_dispatch_cancel_postconditions_target
+                    ON ctp_dispatch_cancel_postconditions(
+                        account_key, target_submit_command_id, identity_state
+                    );
+                CREATE TRIGGER IF NOT EXISTS ctp_dispatch_cancel_postconditions_immutable_update
+                BEFORE UPDATE ON ctp_dispatch_cancel_postconditions
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP cancel postcondition is immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS ctp_dispatch_cancel_postconditions_immutable_delete
+                BEFORE DELETE ON ctp_dispatch_cancel_postconditions
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP cancel postcondition is immutable');
+                END;
+                CREATE TABLE IF NOT EXISTS ctp_dispatch_cancel_terminal_observations (
+                    account_key TEXT NOT NULL,
+                    cancel_command_id TEXT NOT NULL,
+                    owner_intent_id TEXT NOT NULL,
+                    source_sequence INTEGER NOT NULL CHECK(source_sequence > 0),
+                    submit_command_id TEXT NOT NULL,
+                    terminal_state TEXT NOT NULL CHECK(terminal_state IN ('FILLED', 'CANCELLED', 'REJECTED')),
+                    order_volume_traded INTEGER NOT NULL CHECK(order_volume_traded >= 0),
+                    trade_volume_at_prefix INTEGER NOT NULL CHECK(trade_volume_at_prefix >= 0),
+                    callback_key_sha256 TEXT NOT NULL CHECK(length(callback_key_sha256) = 64),
+                    ingress_record_digest_sha256 TEXT NOT NULL
+                        CHECK(length(ingress_record_digest_sha256) = 64),
+                    source_digest_sha256 TEXT NOT NULL CHECK(length(source_digest_sha256) = 64),
+                    identity_sha256 TEXT NOT NULL CHECK(length(identity_sha256) = 64),
+                    observed_at_ns INTEGER NOT NULL,
+                    PRIMARY KEY(account_key, cancel_command_id, owner_intent_id, source_sequence),
+                    FOREIGN KEY(account_key, cancel_command_id)
+                        REFERENCES ctp_dispatch_cancel_postconditions(account_key, cancel_command_id),
+                    FOREIGN KEY(account_key, submit_command_id)
+                        REFERENCES ctp_dispatch_commands(account_key, command_id),
+                    FOREIGN KEY(owner_intent_id, source_sequence)
+                        REFERENCES ctp_dispatch_callback_ingress(owner_intent_id, source_sequence)
+                );
+                CREATE INDEX IF NOT EXISTS ctp_dispatch_cancel_terminal_by_target
+                    ON ctp_dispatch_cancel_terminal_observations(
+                        account_key, submit_command_id, source_sequence
+                    );
+                CREATE TRIGGER IF NOT EXISTS ctp_dispatch_cancel_terminal_observations_immutable_update
+                BEFORE UPDATE ON ctp_dispatch_cancel_terminal_observations
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP cancel terminal observation is immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS ctp_dispatch_cancel_terminal_observations_immutable_delete
+                BEFORE DELETE ON ctp_dispatch_cancel_terminal_observations
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP cancel terminal observation is immutable');
+                END;
+                CREATE TABLE IF NOT EXISTS ctp_dispatch_cancel_postcondition_resolutions (
+                    account_key TEXT NOT NULL,
+                    cancel_command_id TEXT NOT NULL,
+                    terminal_owner_intent_id TEXT NOT NULL,
+                    terminal_source_sequence INTEGER NOT NULL CHECK(terminal_source_sequence > 0),
+                    reconciliation_owner_intent_id TEXT NOT NULL,
+                    reconciliation_source_sequence INTEGER NOT NULL CHECK(reconciliation_source_sequence > 0),
+                    order_volume_traded INTEGER NOT NULL CHECK(order_volume_traded >= 0),
+                    trade_volume INTEGER NOT NULL CHECK(trade_volume >= 0),
+                    terminal_record_digest_sha256 TEXT NOT NULL
+                        CHECK(length(terminal_record_digest_sha256) = 64),
+                    reconciliation_record_digest_sha256 TEXT NOT NULL
+                        CHECK(length(reconciliation_record_digest_sha256) = 64),
+                    resolution_digest_sha256 TEXT NOT NULL CHECK(length(resolution_digest_sha256) = 64),
+                    resolved_at_ns INTEGER NOT NULL,
+                    PRIMARY KEY(account_key, cancel_command_id),
+                    CHECK(order_volume_traded = trade_volume),
+                    FOREIGN KEY(account_key, cancel_command_id)
+                        REFERENCES ctp_dispatch_cancel_postconditions(account_key, cancel_command_id),
+                    FOREIGN KEY(account_key, cancel_command_id, terminal_owner_intent_id,
+                                terminal_source_sequence)
+                        REFERENCES ctp_dispatch_cancel_terminal_observations(
+                            account_key, cancel_command_id, owner_intent_id, source_sequence
+                        ),
+                    FOREIGN KEY(terminal_owner_intent_id, terminal_source_sequence)
+                        REFERENCES ctp_dispatch_callback_ingress(owner_intent_id, source_sequence),
+                    FOREIGN KEY(reconciliation_owner_intent_id, reconciliation_source_sequence)
+                        REFERENCES ctp_dispatch_callback_ingress(owner_intent_id, source_sequence)
+                );
+                CREATE TRIGGER IF NOT EXISTS ctp_dispatch_cancel_postcondition_resolutions_immutable_update
+                BEFORE UPDATE ON ctp_dispatch_cancel_postcondition_resolutions
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP cancel postcondition resolution is immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS ctp_dispatch_cancel_postcondition_resolutions_immutable_delete
+                BEFORE DELETE ON ctp_dispatch_cancel_postcondition_resolutions
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP cancel postcondition resolution is immutable');
+                END;
+                """,
+            )
             row = cursor.execute(
                 "SELECT value FROM execution_meta WHERE key = ?", ("schema_version",)
             ).fetchone()
@@ -4505,6 +4785,21 @@ class SqliteExecutionStore:
                 }
                 if not required_v16_tables.issubset(previous_tables):
                     raise DurableStoreError("incomplete schema 16 CTP execution lineage")
+            elif version == "17":
+                required_v17_tables = {
+                    "ctp_dispatch_commands",
+                    "ctp_dispatch_callback_ledger",
+                    "ctp_dispatch_callback_source_lifecycle_fences",
+                    "ctp_dispatch_callback_session_owners",
+                    "ctp_dispatch_callback_ingress",
+                    "ctp_dispatch_callback_ingress_applications",
+                    "ctp_dispatch_trade_fact_ledger",
+                    "ctp_dispatch_order_cumulative_ledger",
+                    "ctp_order_target_projections",
+                    "ctp_order_target_projection_consumptions",
+                }
+                if not required_v17_tables.issubset(previous_tables):
+                    raise DurableStoreError("incomplete schema 17 CTP execution lineage")
             if version == "2":
                 columns = {
                     str(item["name"])
@@ -4515,7 +4810,7 @@ class SqliteExecutionStore:
                         "ALTER TABLE execution_records ADD COLUMN cumulative_commission TEXT"
                     )
             elif version not in {
-                "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16",
+                "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17",
                 str(self._SCHEMA_VERSION),
             }:
                 raise DurableStoreError("unsupported execution store schema")
@@ -4565,6 +4860,7 @@ class SqliteExecutionStore:
                     cursor, previous_tables=previous_tables
                 )
                 self._migrate_legacy_ctp_action_ref_accounts(cursor)
+                self._migrate_ctp_cancel_postconditions(cursor)
                 # Old rows have no exact OrderRef cutover-session evidence.
                 # Never let migration make those commands dispatchable.
                 cursor.execute(
@@ -8130,6 +8426,12 @@ class SqliteExecutionStore:
                 raise InvalidStateTransition(
                     "account has unresolved CTP dispatch command: " + str(unresolved["command_id"])
                 )
+            if str(row["operation"]) == "SUBMIT" and self._ctp_has_pending_cancel_postcondition(
+                cursor, account_key
+            ):
+                raise InvalidStateTransition(
+                    "account has a cancel awaiting verified terminal-order evidence"
+                )
             watermark = cursor.execute(
                 """
                 SELECT native_max_order_ref, legacy_ledger_max_order_ref, updated_at_ns
@@ -8230,11 +8532,14 @@ class SqliteExecutionStore:
                     )
                 self._require_command_session_binding(row_after_verification, fresh_binding)
             if str(row_after_verification["operation"]) == "CANCEL":
-                self._require_fresh_ctp_cancel_target_row(
+                fresh_target = self._require_fresh_ctp_cancel_target_row(
                     cursor,
                     scope,
                     row_after_verification,
                     now_ns=time.monotonic_ns(),
+                )
+                self._require_ctp_cancel_target_not_terminal(
+                    cursor, account_key, fresh_target
                 )
             cursor.execute(
                 """
@@ -8288,11 +8593,16 @@ class SqliteExecutionStore:
             ).fetchone()
             assert claimed is not None
             if str(claimed["operation"]) == "CANCEL":
-                self._require_fresh_ctp_cancel_target_row(
+                self._insert_ctp_cancel_postcondition_for_claim(
                     cursor,
                     scope,
                     claimed,
-                    now_ns=time.monotonic_ns(),
+                    owner_intent_id=(
+                        None
+                        if session_owner is None
+                        else _callback_session_owner.owner_intent_id
+                    ),
+                    created_at_ns=claim_now_ns,
                 )
             return self._ctp_dispatch_command_from_row(claimed)
 
@@ -8524,8 +8834,11 @@ class SqliteExecutionStore:
                         raise ContractValidationError("CTP native-call binding differs from command")
                     self._require_command_session_binding(row, session)
                     if command.operation == "CANCEL":
-                        self._require_fresh_ctp_cancel_target_row(
+                        fresh_target = self._require_fresh_ctp_cancel_target_row(
                             cursor, scope, row, now_ns=time.monotonic_ns()
+                        )
+                        self._require_ctp_cancel_target_not_terminal(
+                            cursor, account_key, fresh_target
                         )
                 return binding
             except Exception as error:
@@ -8824,12 +9137,532 @@ class SqliteExecutionStore:
                     SELECT 1 FROM ctp_dispatch_callback_source_lifecycle_fences AS fence
                     WHERE fence.account_key = ctp_dispatch_commands.account_key
                 )
+                OR EXISTS (
+                    SELECT 1 FROM ctp_dispatch_cancel_postconditions AS postcondition
+                    WHERE postcondition.account_key = ctp_dispatch_commands.account_key
+                      AND NOT EXISTS (
+                          SELECT 1 FROM ctp_dispatch_cancel_postcondition_resolutions AS resolution
+                          WHERE resolution.account_key = postcondition.account_key
+                            AND resolution.cancel_command_id = postcondition.cancel_command_id
+                      )
+                )
+                OR EXISTS (
+                    SELECT 1 FROM ctp_dispatch_callback_session_owners AS owner
+                    WHERE owner.account_key = ctp_dispatch_commands.account_key
+                      AND owner.owner_state = 'POISONED'
+                )
             )
             LIMIT 1
             """,
             (account_key,),
         ).fetchone()
         return row is not None
+
+    @staticmethod
+    def _require_ctp_cancel_target_not_terminal(
+        cursor: sqlite3.Cursor, account_key: str, target: CtpVerifiedOrderTargetProjection
+    ) -> None:
+        row = cursor.execute(
+            """
+            SELECT provider_state, terminal FROM ctp_dispatch_order_projection
+            WHERE account_key = ? AND runtime_order_id = ?
+            """,
+            (account_key, target.runtime_order_id),
+        ).fetchone()
+        if row is not None and (int(row["terminal"]) == 1 or str(row["provider_state"]) in _CTP_ORDER_TERMINAL_STATES):
+            raise InvalidStateTransition("CTP cancel target is already terminal")
+
+    @staticmethod
+    def _ctp_has_pending_cancel_postcondition(cursor: sqlite3.Cursor, account_key: str) -> bool:
+        return cursor.execute(
+            """
+            SELECT 1 FROM ctp_dispatch_cancel_postconditions AS postcondition
+            WHERE postcondition.account_key = ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM ctp_dispatch_cancel_postcondition_resolutions AS resolution
+                  WHERE resolution.account_key = postcondition.account_key
+                    AND resolution.cancel_command_id = postcondition.cancel_command_id
+              )
+            LIMIT 1
+            """,
+            (account_key,),
+        ).fetchone() is not None
+
+    def _insert_ctp_cancel_postcondition_for_claim(
+        self,
+        cursor: sqlite3.Cursor,
+        scope: ExecutionScope,
+        cancel_row: sqlite3.Row,
+        *,
+        owner_intent_id: str | None,
+        created_at_ns: int,
+    ) -> None:
+        """Record one exact cancel obligation in the READY→CLAIMED transaction."""
+
+        command = self._ctp_dispatch_command_from_row(cancel_row)
+        correlation = command.correlation_key
+        if command.operation != "CANCEL" or correlation is None or correlation.version != 2:
+            raise ContractValidationError("CTP cancel claim lacks exact V2 identity")
+        target = self._require_fresh_ctp_cancel_target_row(
+            cursor, scope, cancel_row, now_ns=time.monotonic_ns()
+        )
+        submit_rows = cursor.execute(
+            """
+            SELECT * FROM ctp_dispatch_commands
+            WHERE account_key = ? AND operation = 'SUBMIT'
+              AND runtime_order_id = ? AND order_ref = ?
+              AND trading_day = ? AND session_generation_id = ?
+              AND dispatch_front_id = ? AND dispatch_session_id = ?
+              AND callback_owner_intent_id = ?
+              AND correlation_version = 2
+              AND status IN ('COMPLETED', 'UNKNOWN')
+            ORDER BY created_at_ns, command_id
+            """,
+            (
+                command.account_key,
+                target.runtime_order_id,
+                target.order_ref,
+                command.trading_day,
+                correlation.session_generation_id,
+                correlation.dispatch_front_id,
+                correlation.dispatch_session_id,
+                owner_intent_id,
+            ),
+        ).fetchall()
+        if (
+            owner_intent_id is None
+            or len(submit_rows) != 1
+            or target.exchange_id != command.cancel_target_exchange_id
+            or target.order_sys_id != command.cancel_target_order_sys_id
+            or target.front_id != command.cancel_target_front_id
+            or target.session_id != command.cancel_target_session_id
+        ):
+            # A V2 cancel without a uniquely linked source-owned submit is not
+            # safe to release with a callback. Preserve it as an unmappable
+            # account obligation rather than manufacturing a relation.
+            cursor.execute(
+                """
+                INSERT INTO ctp_dispatch_cancel_postconditions(
+                    account_key, cancel_command_id, scope_key, trading_day,
+                    identity_state, correlation_key_sha256, session_binding_sha256,
+                    created_at_ns
+                ) VALUES (?, ?, ?, ?, 'UNMAPPABLE', ?, ?, ?)
+                """,
+                (
+                    command.account_key,
+                    command.command_id,
+                    command.scope_key,
+                    command.trading_day,
+                    payload_sha256(correlation.to_payload()),
+                    command.session_binding_sha256,
+                    created_at_ns,
+                ),
+            )
+            return
+
+        submit_row = submit_rows[0]
+        submit_command = self._ctp_dispatch_command_from_row(submit_row)
+        submit_correlation = submit_command.correlation_key
+        if (
+            submit_correlation is None
+            or submit_correlation.version != 2
+            or submit_correlation.runtime_order_id != target.runtime_order_id
+            or submit_correlation.order_ref != target.order_ref
+            or submit_command.session_binding_sha256 != command.session_binding_sha256
+        ):
+            raise ContractValidationError("CTP cancel target submit binding is inconsistent")
+        cursor.execute(
+            """
+            INSERT INTO ctp_dispatch_cancel_postconditions(
+                account_key, cancel_command_id, scope_key, trading_day,
+                target_submit_command_id, runtime_order_id, target_order_ref,
+                target_exchange_id, target_order_sys_id, target_front_id,
+                target_session_id, session_generation_id, dispatch_front_id,
+                dispatch_session_id, native_request_id, target_native_request_id,
+                native_action_ref_int,
+                owner_intent_id, identity_state, correlation_key_sha256,
+                session_binding_sha256, created_at_ns
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'EXACT', ?, ?, ?)
+            """,
+            (
+                command.account_key,
+                command.command_id,
+                command.scope_key,
+                command.trading_day,
+                submit_command.command_id,
+                target.runtime_order_id,
+                target.order_ref,
+                target.exchange_id,
+                target.order_sys_id,
+                target.front_id,
+                target.session_id,
+                correlation.session_generation_id,
+                correlation.dispatch_front_id,
+                correlation.dispatch_session_id,
+                correlation.native_request_id,
+                submit_correlation.native_request_id,
+                correlation.native_action_ref,
+                owner_intent_id,
+                payload_sha256(correlation.to_payload()),
+                command.session_binding_sha256,
+                created_at_ns,
+            ),
+        )
+
+    def _record_ctp_cancel_terminal_observations(
+        self,
+        cursor: sqlite3.Cursor,
+        command: CtpDispatchCommand,
+        event: CtpCallbackIngressEventV1,
+        callback: CtpDispatchCallbackKey,
+        callback_payload: Mapping[str, Any],
+        evidence: CtpVerifiedCallbackEvidence,
+        *,
+        applied_at_ns: int,
+    ) -> None:
+        if (
+            event.callback_name != "OnRtnOrder"
+            or command.operation != "SUBMIT"
+        ):
+            return
+        is_terminal = evidence.projection_state in _CTP_ORDER_TERMINAL_STATES
+        native_fields = callback_payload.get("native_fields")
+        if not isinstance(native_fields, Mapping):
+            raise ContractValidationError("verified terminal order lacks native fields")
+        required = (
+            "RequestID", "OrderRef", "ExchangeID", "OrderSysID", "FrontID",
+            "SessionID", "TradingDay", "VolumeTraded",
+        )
+        if any(name not in native_fields for name in required):
+            raise ContractValidationError("verified terminal order identity is incomplete")
+        correlation = command.correlation_key
+        if correlation is None or correlation.version != 2:
+            raise ContractValidationError("terminal order command lacks V2 correlation")
+        if (
+            type(native_fields["RequestID"]) is not int
+            or native_fields["RequestID"] != correlation.native_request_id
+            or native_fields["OrderRef"] != correlation.order_ref
+            or type(native_fields["FrontID"]) is not int
+            or native_fields["FrontID"] != correlation.dispatch_front_id
+            or type(native_fields["SessionID"]) is not int
+            or native_fields["SessionID"] != correlation.dispatch_session_id
+            or native_fields["TradingDay"] != command.trading_day
+            or type(native_fields["VolumeTraded"]) is not int
+            or native_fields["VolumeTraded"] < 0
+        ):
+            raise ContractValidationError("verified terminal order differs from submit identity")
+        owner_intent_id = event.owner_handle.owner_intent_id
+        order_cumulative = cursor.execute(
+            """
+            SELECT native_volume_traded, trade_volume_at_prefix
+            FROM ctp_dispatch_order_cumulative_ledger
+            WHERE owner_intent_id = ? AND source_sequence = ? AND command_id = ?
+            """,
+            (owner_intent_id, event.source_sequence, command.command_id),
+        ).fetchone()
+        if (
+            order_cumulative is None
+            or int(order_cumulative["native_volume_traded"]) != native_fields["VolumeTraded"]
+        ):
+            raise ContractValidationError("terminal order cumulative evidence is unavailable")
+
+        obligations = cursor.execute(
+            """
+            SELECT postcondition.* FROM ctp_dispatch_cancel_postconditions AS postcondition
+            WHERE postcondition.account_key = ?
+              AND postcondition.target_submit_command_id = ?
+              AND postcondition.identity_state = 'EXACT'
+              AND postcondition.owner_intent_id = ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM ctp_dispatch_cancel_postcondition_resolutions AS resolution
+                  WHERE resolution.account_key = postcondition.account_key
+                    AND resolution.cancel_command_id = postcondition.cancel_command_id
+              )
+            ORDER BY postcondition.cancel_command_id
+            """,
+            (command.account_key, command.command_id, owner_intent_id),
+        ).fetchall() if is_terminal else ()
+        identity = {
+            "account_key": command.account_key,
+            "trading_day": command.trading_day,
+            "owner_intent_id": owner_intent_id,
+            "session_generation_id": correlation.session_generation_id,
+            "dispatch_front_id": correlation.dispatch_front_id,
+            "dispatch_session_id": correlation.dispatch_session_id,
+            "native_request_id": correlation.native_request_id,
+            "order_ref": correlation.order_ref,
+            "exchange_id": native_fields["ExchangeID"],
+            "order_sys_id": native_fields["OrderSysID"],
+            "front_id": native_fields["FrontID"],
+            "session_id": native_fields["SessionID"],
+        }
+        identity_digest = payload_sha256(identity)
+        for obligation in obligations:
+            if (
+                str(obligation["runtime_order_id"]) != correlation.runtime_order_id
+                or str(obligation["target_order_ref"]) != str(native_fields["OrderRef"])
+                or str(obligation["target_exchange_id"]) != str(native_fields["ExchangeID"])
+                or str(obligation["target_order_sys_id"]) != str(native_fields["OrderSysID"])
+                or int(obligation["target_front_id"]) != native_fields["FrontID"]
+                or int(obligation["target_session_id"]) != native_fields["SessionID"]
+                or str(obligation["session_generation_id"]) != correlation.session_generation_id
+                or int(obligation["dispatch_front_id"]) != correlation.dispatch_front_id
+                or int(obligation["dispatch_session_id"]) != correlation.dispatch_session_id
+                or int(obligation["target_native_request_id"])
+                != correlation.native_request_id
+                or str(obligation["owner_intent_id"]) != owner_intent_id
+            ):
+                raise ContractValidationError("terminal order does not match cancel obligation")
+            cursor.execute(
+                """
+                INSERT OR IGNORE INTO ctp_dispatch_cancel_terminal_observations(
+                    account_key, cancel_command_id, owner_intent_id, source_sequence,
+                    submit_command_id, terminal_state, order_volume_traded,
+                    trade_volume_at_prefix, callback_key_sha256,
+                    ingress_record_digest_sha256, source_digest_sha256,
+                    identity_sha256, observed_at_ns
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    command.account_key,
+                    str(obligation["cancel_command_id"]),
+                    owner_intent_id,
+                    event.source_sequence,
+                    command.command_id,
+                    evidence.projection_state,
+                    int(native_fields["VolumeTraded"]),
+                    int(order_cumulative["trade_volume_at_prefix"]),
+                    payload_sha256(callback.to_payload()),
+                    event.record_digest_sha256,
+                    evidence.source_digest_sha256,
+                    identity_digest,
+                    applied_at_ns,
+                ),
+            )
+            self._require_same_ctp_cancel_terminal_observation(
+                cursor,
+                command.account_key,
+                str(obligation["cancel_command_id"]),
+                owner_intent_id,
+                event.source_sequence,
+                evidence.projection_state,
+                int(native_fields["VolumeTraded"]),
+                event.record_digest_sha256,
+                identity_digest,
+            )
+        self._reconcile_ctp_cancel_postconditions(
+            cursor,
+            command.account_key,
+            command.command_id,
+            owner_intent_id,
+            event.source_sequence,
+            event.record_digest_sha256,
+            applied_at_ns=applied_at_ns,
+        )
+
+    @staticmethod
+    def _require_same_ctp_cancel_terminal_observation(
+        cursor: sqlite3.Cursor,
+        account_key: str,
+        cancel_command_id: str,
+        owner_intent_id: str,
+        source_sequence: int,
+        terminal_state: str,
+        order_volume_traded: int,
+        record_digest: str,
+        identity_digest: str,
+    ) -> None:
+        row = cursor.execute(
+            """
+            SELECT terminal_state, order_volume_traded,
+                   ingress_record_digest_sha256, identity_sha256
+            FROM ctp_dispatch_cancel_terminal_observations
+            WHERE account_key = ? AND cancel_command_id = ?
+              AND owner_intent_id = ? AND source_sequence = ?
+            """,
+            (account_key, cancel_command_id, owner_intent_id, source_sequence),
+        ).fetchone()
+        if row is None or (
+            str(row["terminal_state"]) != terminal_state
+            or int(row["order_volume_traded"]) != order_volume_traded
+            or str(row["ingress_record_digest_sha256"]) != record_digest
+            or str(row["identity_sha256"]) != identity_digest
+        ):
+            raise IntentConflictError("CTP terminal order observation changed")
+
+    @staticmethod
+    def _poison_if_ctp_cancel_resolution_contradicted(
+        cursor: sqlite3.Cursor,
+        account_key: str,
+        submit_command_id: str,
+        owner_intent_id: str,
+        through_sequence: int,
+    ) -> None:
+        resolutions = cursor.execute(
+            """
+            SELECT resolution.cancel_command_id, resolution.order_volume_traded,
+                   resolution.trade_volume, postcondition.target_submit_command_id
+            FROM ctp_dispatch_cancel_postcondition_resolutions AS resolution
+            JOIN ctp_dispatch_cancel_postconditions AS postcondition
+              ON postcondition.account_key = resolution.account_key
+             AND postcondition.cancel_command_id = resolution.cancel_command_id
+            WHERE resolution.account_key = ?
+              AND postcondition.target_submit_command_id = ?
+            """,
+            (account_key, submit_command_id),
+        ).fetchall()
+        for resolution in resolutions:
+            order_row = cursor.execute(
+                """
+                SELECT native_volume_traded FROM ctp_dispatch_order_cumulative_ledger
+                WHERE account_key = ? AND command_id = ? AND owner_intent_id = ?
+                  AND source_sequence <= ?
+                ORDER BY source_sequence DESC LIMIT 1
+                """,
+                (account_key, submit_command_id, owner_intent_id, through_sequence),
+            ).fetchone()
+            trades = cursor.execute(
+                """
+                SELECT COALESCE(SUM(trade_volume), 0) AS total
+                FROM ctp_dispatch_trade_fact_ledger
+                WHERE account_key = ? AND command_id = ? AND owner_intent_id = ?
+                  AND source_sequence <= ?
+                """,
+                (account_key, submit_command_id, owner_intent_id, through_sequence),
+            ).fetchone()
+            if (
+                order_row is not None
+                and int(order_row["native_volume_traded"]) != int(resolution["order_volume_traded"])
+            ) or int(trades["total"]) != int(resolution["trade_volume"]):
+                raise _CtpCancelPostconditionConflictError(owner_intent_id)
+
+    def _reconcile_ctp_cancel_postconditions(
+        self,
+        cursor: sqlite3.Cursor,
+        account_key: str,
+        submit_command_id: str,
+        owner_intent_id: str,
+        through_sequence: int,
+        reconciliation_record_digest: str,
+        *,
+        applied_at_ns: int,
+    ) -> None:
+        self._poison_if_ctp_cancel_resolution_contradicted(
+            cursor,
+            account_key,
+            submit_command_id,
+            owner_intent_id,
+            through_sequence,
+        )
+        obligations = cursor.execute(
+            """
+            SELECT postcondition.* FROM ctp_dispatch_cancel_postconditions AS postcondition
+            WHERE postcondition.account_key = ?
+              AND postcondition.target_submit_command_id = ?
+              AND postcondition.owner_intent_id = ?
+              AND postcondition.identity_state = 'EXACT'
+              AND NOT EXISTS (
+                  SELECT 1 FROM ctp_dispatch_cancel_postcondition_resolutions AS resolution
+                  WHERE resolution.account_key = postcondition.account_key
+                    AND resolution.cancel_command_id = postcondition.cancel_command_id
+              )
+            ORDER BY postcondition.cancel_command_id
+            """,
+            (account_key, submit_command_id, owner_intent_id),
+        ).fetchall()
+        for obligation in obligations:
+            terminal = cursor.execute(
+                """
+                SELECT * FROM ctp_dispatch_cancel_terminal_observations
+                WHERE account_key = ? AND cancel_command_id = ?
+                  AND owner_intent_id = ? AND source_sequence <= ?
+                ORDER BY source_sequence DESC LIMIT 1
+                """,
+                (
+                    account_key,
+                    str(obligation["cancel_command_id"]),
+                    owner_intent_id,
+                    through_sequence,
+                ),
+            ).fetchone()
+            if terminal is None:
+                continue
+            latest_order = cursor.execute(
+                """
+                SELECT source_sequence, native_volume_traded FROM ctp_dispatch_order_cumulative_ledger
+                WHERE account_key = ? AND command_id = ? AND owner_intent_id = ?
+                  AND source_sequence <= ?
+                ORDER BY source_sequence DESC LIMIT 1
+                """,
+                (account_key, submit_command_id, owner_intent_id, through_sequence),
+            ).fetchone()
+            if latest_order is None:
+                continue
+            terminal_volume = int(terminal["order_volume_traded"])
+            latest_order_volume = int(latest_order["native_volume_traded"])
+            if latest_order_volume != terminal_volume:
+                # A verified order report after terminal evidence cannot
+                # silently change that terminal order's cumulative amount.
+                if int(latest_order["source_sequence"]) > int(terminal["source_sequence"]):
+                    raise _CtpCancelPostconditionConflictError(owner_intent_id)
+                continue
+            trade_row = cursor.execute(
+                """
+                SELECT COALESCE(SUM(trade_volume), 0) AS total
+                FROM ctp_dispatch_trade_fact_ledger
+                WHERE account_key = ? AND command_id = ? AND owner_intent_id = ?
+                  AND source_sequence <= ?
+                """,
+                (account_key, submit_command_id, owner_intent_id, through_sequence),
+            ).fetchone()
+            trade_volume = int(trade_row["total"])
+            if trade_volume > terminal_volume:
+                raise _CtpCancelPostconditionConflictError(owner_intent_id)
+            if trade_volume != terminal_volume:
+                continue
+            terminal_record_digest = str(terminal["ingress_record_digest_sha256"])
+            resolution_digest = payload_sha256(
+                {
+                    "schema": "ctp_cancel_postcondition_resolution.v1",
+                    "account_key": account_key,
+                    "cancel_command_id": str(obligation["cancel_command_id"]),
+                    "submit_command_id": submit_command_id,
+                    "terminal_owner_intent_id": owner_intent_id,
+                    "terminal_source_sequence": int(terminal["source_sequence"]),
+                    "reconciliation_owner_intent_id": owner_intent_id,
+                    "reconciliation_source_sequence": through_sequence,
+                    "order_volume_traded": terminal_volume,
+                    "trade_volume": trade_volume,
+                    "terminal_record_digest_sha256": terminal_record_digest,
+                    "reconciliation_record_digest_sha256": reconciliation_record_digest,
+                }
+            )
+            cursor.execute(
+                """
+                INSERT INTO ctp_dispatch_cancel_postcondition_resolutions(
+                    account_key, cancel_command_id,
+                    terminal_owner_intent_id, terminal_source_sequence,
+                    reconciliation_owner_intent_id, reconciliation_source_sequence,
+                    order_volume_traded, trade_volume,
+                    terminal_record_digest_sha256, reconciliation_record_digest_sha256,
+                    resolution_digest_sha256, resolved_at_ns
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    account_key,
+                    str(obligation["cancel_command_id"]),
+                    owner_intent_id,
+                    int(terminal["source_sequence"]),
+                    owner_intent_id,
+                    through_sequence,
+                    terminal_volume,
+                    trade_volume,
+                    terminal_record_digest,
+                    reconciliation_record_digest,
+                    resolution_digest,
+                    applied_at_ns,
+                ),
+            )
 
     @staticmethod
     def _verify_ctp_dispatch_callback(
@@ -9364,6 +10197,15 @@ class SqliteExecutionStore:
                             callback_digest,
                             observed_at_ns=applied_at_ns,
                         )
+                        self._record_ctp_cancel_terminal_observations(
+                            cursor,
+                            staged,
+                            _callback_ingress_event,
+                            callback,
+                            callback_payload_value,
+                            evidence,
+                            applied_at_ns=applied_at_ns,
+                        )
                     self._insert_ctp_callback_ingress_application(
                         cursor,
                         _callback_ingress_event,
@@ -9455,6 +10297,15 @@ class SqliteExecutionStore:
                         self._ctp_callback_field(ingress_payload, 0, "VolumeTraded"),
                         callback_digest,
                         observed_at_ns=applied_at_ns,
+                    )
+                    self._record_ctp_cancel_terminal_observations(
+                        cursor,
+                        staged,
+                        _callback_ingress_event,
+                        callback,
+                        callback_payload_value,
+                        evidence,
+                        applied_at_ns=applied_at_ns,
                     )
                 self._insert_ctp_callback_ingress_application(
                     cursor,
@@ -9735,6 +10586,15 @@ class SqliteExecutionStore:
                     },
                     applied_at_ns=applied_at_ns,
                 )
+                self._reconcile_ctp_cancel_postconditions(
+                    cursor,
+                    account_key,
+                    command_id,
+                    event.owner_handle.owner_intent_id,
+                    event.source_sequence,
+                    event.record_digest_sha256,
+                    applied_at_ns=applied_at_ns,
+                )
                 projection = cursor.execute(
                     """
                     SELECT provider_state FROM ctp_dispatch_order_projection
@@ -9896,6 +10756,15 @@ class SqliteExecutionStore:
                     "commission_quality": "INCOMPLETE",
                     "duplicate": False,
                 },
+                applied_at_ns=applied_at_ns,
+            )
+            self._reconcile_ctp_cancel_postconditions(
+                cursor,
+                account_key,
+                command_id,
+                event.owner_handle.owner_intent_id,
+                event.source_sequence,
+                event.record_digest_sha256,
                 applied_at_ns=applied_at_ns,
             )
             return CtpDispatchTradeFactApplyResult(
@@ -10135,8 +11004,30 @@ class SqliteExecutionStore:
             except sqlite3.Error as error:
                 self._connection.rollback()
                 raise DurableStoreError("execution store transaction failed") from error
-            except BaseException:
+            except BaseException as error:
                 self._connection.rollback()
+                if isinstance(error, _CtpCancelPostconditionConflictError):
+                    poison_cursor = self._connection.cursor()
+                    try:
+                        poison_cursor.execute("BEGIN IMMEDIATE")
+                        poison_cursor.execute(
+                            """
+                            UPDATE ctp_dispatch_callback_session_owners
+                            SET owner_state = 'POISONED', poison_code = 'callback_apply_failure',
+                                poison_observed_sequence = MAX(
+                                    last_source_sequence, COALESCE(poison_observed_sequence, 0)
+                                ),
+                                updated_at_ns = ?
+                            WHERE owner_intent_id = ?
+                              AND owner_state IN ('PREPARED', 'ACTIVE')
+                            """,
+                            (time.time_ns(), error.owner_intent_id),
+                        )
+                        self._connection.commit()
+                    except sqlite3.Error:
+                        self._connection.rollback()
+                    finally:
+                        poison_cursor.close()
                 raise
             else:
                 try:

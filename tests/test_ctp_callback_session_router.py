@@ -259,6 +259,30 @@ class _CallbackVerifier:
         )
 
 
+class _TerminalOrderCallbackVerifier:
+    def verify_callback(self, command, callback, callback_payload, *, now_ns):
+        if command.operation == "CANCEL":
+            state = "ACKNOWLEDGED"
+        elif callback_payload.get("source_callback") == "OnRtnOrder":
+            state = {
+                "0": "FILLED",
+                "5": "CANCELLED",
+                "a": "REJECTED",
+            }.get(callback_payload.get("native_fields", {}).get("OrderStatus"), "PARTIALLY_FILLED")
+        else:
+            state = "ACKNOWLEDGED"
+        return CtpVerifiedCallbackEvidence(
+            evidence_type="ctp_verified_callback.v1",
+            callback_key=callback,
+            callback_payload_sha256=payload_sha256(callback_payload),
+            projection_state=state,
+            source_digest_sha256=hashlib.sha256(b"fake terminal callback verifier").hexdigest(),
+            verifier_id="fake-router-terminal-callback",
+            verified_at_ns=now_ns,
+            expires_at_ns=now_ns + 5_000_000_000,
+        )
+
+
 class _TradeVerifier:
     def verify_trade_fact(self, command, trade_fact, source_event, *, now_ns):
         return CtpVerifiedTradeFactEvidence(
@@ -425,6 +449,162 @@ def _queue_and_complete(
         scope, receipt, owner_handle=owner, writer_lease=lease
     )
     return staged
+
+
+def _stage_cancel_and_complete(
+    store, scope, lease, owner, reservation, command_id, request_id, *, claim=True
+):
+    session = store._active_ctp_callback_sessions[owner.owner_intent_id]
+    target = CtpCancelTarget(
+        order_ref=reservation.order_ref,
+        exchange_id="SHFE",
+        order_sys_id="sys-" + reservation.order_ref,
+        front_id=session.dispatch_front_id,
+        session_id=session.dispatch_session_id,
+    )
+    projection = store.issue_ctp_order_target_projection(
+        scope,
+        reservation.managed_intent_id,
+        {"session_generation_id": session.session_generation_id},
+        verifier=_OrderTargetVerifier(),
+    )
+    receipt_id = hashlib.sha256(command_id.encode("ascii")).hexdigest()[:32]
+    staged = store.stage_ctp_dispatch_command(
+        scope,
+        command_id,
+        "CANCEL",
+        {
+            "InstrumentID": "rb2710",
+            "OrderRef": target.order_ref,
+            "ExchangeID": target.exchange_id,
+            "OrderSysID": target.order_sys_id,
+            "FrontID": target.front_id,
+            "SessionID": target.session_id,
+            "ActionFlag": "0",
+            "LimitPrice": 0.0,
+            "VolumeChange": 0,
+        },
+        approval_use_id="approval-" + command_id,
+        approval_digest=hashlib.sha256(
+            ("approval-" + command_id).encode("ascii")
+        ).hexdigest(),
+        session_binding={
+            "binding_type": "ctp_callback_session_binding.v1",
+            "owner_intent_id": session.owner_intent_id,
+            "account_key": session.account_key,
+            "scope_key": session.scope_key,
+            "trading_day": session.trading_day,
+            "session_generation_id": session.session_generation_id,
+            "dispatch_front_id": session.dispatch_front_id,
+            "dispatch_session_id": session.dispatch_session_id,
+            "source_tags": {
+                "source_instance_id": session.source_instance_id,
+                "native_client_epoch": session.native_client_epoch,
+                "native_api_source_id": session.native_api_source_id,
+                "native_spi_source_id": session.native_spi_source_id,
+                "native_api_generation": session.native_api_generation,
+                "connection_generation": session.source_connection_generation,
+            },
+            "source_high_watermark": session.source_high_watermark,
+        },
+        writer_lease=lease,
+        managed_action_id="cancel-action-" + command_id,
+        cancel_target=target,
+        session_generation_id=session.session_generation_id,
+        dispatch_front_id=session.dispatch_front_id,
+        dispatch_session_id=session.dispatch_session_id,
+        native_request_id=request_id,
+        local_queue_receipt_id=receipt_id,
+        cancel_target_projection=projection,
+    )
+    store.record_ctp_dispatch_queue_receipt(
+        scope,
+        command_id,
+        {
+            "kind": "command_receipt",
+            "command": "cancel",
+            "receipt_id": receipt_id,
+            "queued": True,
+        },
+        writer_lease=lease,
+    )
+    if not claim:
+        return staged
+    claim = store.claim_ctp_dispatch_command_for_session(
+        scope,
+        command_id,
+        owner_handle=owner,
+        writer_lease=lease,
+        authority_verifier=_Authority(),
+        required_local_queue_receipt_id=receipt_id,
+    )
+    assert claim is not None
+    command = claim.command
+    receipt = CtpDispatchReceipt(
+        receipt_type="ctp_dispatch_receipt.v2",
+        command_id=command.command_id,
+        account_key=command.account_key,
+        scope_key=command.scope_key,
+        trading_day=command.trading_day,
+        operation=command.operation,
+        request_payload_sha256=command.request_payload_sha256,
+        reservation_managed_intent_id=command.reservation_managed_intent_id,
+        order_ref=command.order_ref,
+        cancel_target_order_ref=command.cancel_target_order_ref,
+        cancel_target_exchange_id=command.cancel_target_exchange_id,
+        cancel_target_order_sys_id=command.cancel_target_order_sys_id,
+        cancel_target_front_id=command.cancel_target_front_id,
+        cancel_target_session_id=command.cancel_target_session_id,
+        approval_use_id=command.approval_use_id,
+        approval_digest=command.approval_digest,
+        session_binding_sha256=command.session_binding_sha256,
+        outcome="QUEUED",
+        native_receipt_payload={"request_id": request_id, "queue_code": 0},
+        correlation_key=command.correlation_key,
+        local_queue_receipt_id=receipt_id,
+    )
+    completed = store.complete_ctp_dispatch_command_for_session(
+        scope, receipt, owner_handle=owner, writer_lease=lease
+    )
+    return completed
+
+
+def _order_fields(scope, reservation, request_id, volume_traded, notify_sequence, status="5"):
+    return (
+        (0, "BrokerID", "broker"),
+        (0, "InvestorID", "user"),
+        (0, "UserID", "user"),
+        (0, "InstrumentID", "rb2710"),
+        (0, "RequestID", request_id),
+        (0, "OrderRef", reservation.order_ref),
+        (0, "ExchangeID", "SHFE"),
+        (0, "OrderSysID", "sys-" + reservation.order_ref),
+        (0, "FrontID", 31),
+        (0, "SessionID", 41),
+        (0, "TradingDay", scope.trading_day),
+        (0, "OrderStatus", status),
+        (0, "OrderSubmitStatus", "3"),
+        (0, "VolumeTraded", volume_traded),
+        (0, "VolumeTotal", 1 - volume_traded),
+        (0, "NotifySequence", notify_sequence),
+        (0, "SequenceNo", 800 + notify_sequence),
+    )
+
+
+def _append_order_event(owner, store, scope, reservation, sequence, volume, notify_sequence, *, status="5"):
+    store.append_ctp_callback_ingress(
+        owner,
+        _record(
+            owner,
+            "OnRtnOrder",
+            sequence,
+            phase="ACTIVE",
+            callback_class="ROUTEABLE",
+            fields=_order_fields(
+                scope, reservation, 71, volume, notify_sequence, status=status
+            ),
+        ),
+    )
 
 
 @pytest.mark.unit
@@ -1393,3 +1573,357 @@ def test_session_router_serializes_one_adapter_consuming_multiple_audit_events(t
         assert tuple(owner_row) == ("ACTIVE", None)
     finally:
         store.close()
+
+
+@pytest.mark.unit
+def test_cancel_postcondition_waits_for_terminal_order_and_trade_prefix_before_submit_claim(
+    tmp_path,
+):
+    scope = _scope()
+    store = SqliteExecutionStore(tmp_path / "cancel-postcondition-async.sqlite3")
+    lease = _lease(store, scope)
+    try:
+        owner = _active_owner(store, scope, lease)
+        binding = store._active_ctp_callback_sessions[owner.owner_intent_id]
+        target = _reserve(store, scope, lease, binding.session_generation_id, "postcondition-target")
+        submit_payload = {
+            "BrokerID": "broker", "InvestorID": "user", "UserID": "user",
+            "InstrumentID": "rb2710", "ExchangeID": "SHFE", "OrderRef": target.order_ref,
+            "Direction": "0", "CombOffsetFlag": "0", "CombHedgeFlag": "1",
+            "LimitPrice": 100.0, "VolumeTotalOriginal": 1,
+            "OrderPriceType": "2", "TimeCondition": "3",
+        }
+        _queue_and_complete(store, scope, lease, owner, target, "submit-target", submit_payload, 71)
+        cancel = _stage_cancel_and_complete(
+            store, scope, lease, owner, target, "cancel-target", 501
+        )
+        postcondition = store._connection.execute(
+            "SELECT identity_state, target_submit_command_id, native_action_ref_int, owner_intent_id "
+            "FROM ctp_dispatch_cancel_postconditions WHERE cancel_command_id = 'cancel-target'"
+        ).fetchone()
+        assert tuple(postcondition) == (
+            "EXACT", "submit-target", cancel.correlation_key.native_action_ref,
+            owner.owner_intent_id,
+        )
+
+        # Native action acknowledgement only updates the action projection.
+        action = cancel.correlation_key
+        store.append_ctp_callback_ingress(
+            owner,
+            _record(
+                owner,
+                "OnRspOrderAction",
+                4,
+                phase="ACTIVE",
+                callback_class="ROUTEABLE",
+                request_id=action.native_request_id,
+                is_last=True,
+                fields=(
+                    (0, "BrokerID", "broker"), (0, "InvestorID", "user"),
+                    (0, "UserID", "user"), (0, "InstrumentID", "rb2710"),
+                    (0, "OrderRef", target.order_ref), (0, "ExchangeID", "SHFE"),
+                    (0, "OrderSysID", "sys-" + target.order_ref), (0, "FrontID", 31),
+                    (0, "SessionID", 41), (0, "RequestID", action.native_request_id),
+                    (0, "OrderActionRef", action.native_action_ref), (0, "ActionFlag", "0"),
+                    (1, "ErrorID", 0),
+                ),
+            ),
+        )
+        result = _adapter_for(store, owner).apply_next_ingress(
+            callback_verifier=_TerminalOrderCallbackVerifier(),
+            trade_fact_verifier=_TradeVerifier(),
+        )
+        assert result.projection_state == "ACKNOWLEDGED"
+        assert store._connection.execute(
+            "SELECT COUNT(*) FROM ctp_dispatch_cancel_postcondition_resolutions"
+        ).fetchone()[0] == 0
+
+        second = _reserve(store, scope, lease, binding.session_generation_id, "postcondition-next")
+        next_payload = dict(submit_payload, OrderRef=second.order_ref)
+        staged, _ = _queue_and_complete(
+            store, scope, lease, owner, second, "submit-next", next_payload, 72,
+            claim_command=False,
+        )
+        receipt_id = hashlib.sha256(b"submit-next").hexdigest()[:32]
+        with pytest.raises(InvalidStateTransition, match="cancel awaiting verified terminal-order"):
+            store.claim_ctp_dispatch_command_for_session(
+                scope,
+                staged.command_id,
+                owner_handle=owner,
+                writer_lease=lease,
+                authority_verifier=_Authority(),
+                required_local_queue_receipt_id=receipt_id,
+            )
+
+        _append_order_event(owner, store, scope, target, 5, 1, 381)
+        result = _adapter_for(store, owner).apply_next_ingress(
+            callback_verifier=_TerminalOrderCallbackVerifier(),
+            trade_fact_verifier=_TradeVerifier(),
+        )
+        assert result.projection_state == "CANCELLED"
+        assert store._connection.execute(
+            "SELECT COUNT(*) FROM ctp_dispatch_cancel_terminal_observations"
+        ).fetchone()[0] == 1
+        assert store._connection.execute(
+            "SELECT COUNT(*) FROM ctp_dispatch_cancel_postcondition_resolutions"
+        ).fetchone()[0] == 0
+        with pytest.raises(InvalidStateTransition, match="cancel awaiting verified terminal-order"):
+            store.claim_ctp_dispatch_command_for_session(
+                scope,
+                staged.command_id,
+                owner_handle=owner,
+                writer_lease=lease,
+                authority_verifier=_Authority(),
+                required_local_queue_receipt_id=receipt_id,
+            )
+
+        store.append_ctp_callback_ingress(
+            owner,
+            _record(
+                owner, "OnRtnTrade", 6, phase="ACTIVE", callback_class="ROUTEABLE",
+                fields=_trade_fields(order_ref=target.order_ref, trade_id="postcondition-fill"),
+            ),
+        )
+        trade_result = _adapter_for(store, owner).apply_next_ingress(
+            callback_verifier=_TerminalOrderCallbackVerifier(),
+            trade_fact_verifier=_TradeVerifier(),
+        )
+        assert trade_result.cumulative_trade_quantity == 1
+        resolution = store._connection.execute(
+            "SELECT order_volume_traded, trade_volume, terminal_source_sequence, "
+            "reconciliation_source_sequence FROM ctp_dispatch_cancel_postcondition_resolutions"
+        ).fetchone()
+        assert tuple(resolution) == (1, 1, 5, 6)
+        claimed = store.claim_ctp_dispatch_command_for_session(
+            scope,
+            staged.command_id,
+            owner_handle=owner,
+            writer_lease=lease,
+            authority_verifier=_Authority(),
+            required_local_queue_receipt_id=receipt_id,
+        )
+        assert claimed is not None and claimed.command.command_id == "submit-next"
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+def test_cancel_postcondition_resolves_when_trade_prefix_precedes_terminal_order(tmp_path):
+    scope = _scope()
+    store = SqliteExecutionStore(tmp_path / "cancel-postcondition-trade-first.sqlite3")
+    lease = _lease(store, scope)
+    try:
+        owner = _active_owner(store, scope, lease)
+        binding = store._active_ctp_callback_sessions[owner.owner_intent_id]
+        target = _reserve(store, scope, lease, binding.session_generation_id, "trade-first-target")
+        payload = {
+            "BrokerID": "broker", "InvestorID": "user", "UserID": "user",
+            "InstrumentID": "rb2710", "ExchangeID": "SHFE", "OrderRef": target.order_ref,
+            "Direction": "0", "CombOffsetFlag": "0", "CombHedgeFlag": "1",
+            "LimitPrice": 100.0, "VolumeTotalOriginal": 1,
+            "OrderPriceType": "2", "TimeCondition": "3",
+        }
+        _queue_and_complete(store, scope, lease, owner, target, "submit-trade-first", payload, 71)
+        _stage_cancel_and_complete(
+            store, scope, lease, owner, target, "cancel-trade-first", 501
+        )
+        store.append_ctp_callback_ingress(
+            owner,
+            _record(
+                owner, "OnRtnTrade", 4, phase="ACTIVE", callback_class="ROUTEABLE",
+                fields=_trade_fields(order_ref=target.order_ref, trade_id="trade-before-terminal"),
+            ),
+        )
+        _adapter_for(store, owner).apply_next_ingress(
+            callback_verifier=_TerminalOrderCallbackVerifier(),
+            trade_fact_verifier=_TradeVerifier(),
+        )
+        assert store._connection.execute(
+            "SELECT COUNT(*) FROM ctp_dispatch_cancel_postcondition_resolutions"
+        ).fetchone()[0] == 0
+        _append_order_event(owner, store, scope, target, 5, 1, 381, status="0")
+        _adapter_for(store, owner).apply_next_ingress(
+            callback_verifier=_TerminalOrderCallbackVerifier(),
+            trade_fact_verifier=_TradeVerifier(),
+        )
+        resolution = store._connection.execute(
+            "SELECT order_volume_traded, trade_volume, terminal_source_sequence, "
+            "reconciliation_source_sequence FROM ctp_dispatch_cancel_postcondition_resolutions"
+        ).fetchone()
+        assert tuple(resolution) == (1, 1, 5, 5)
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+def test_cancel_claim_rejects_target_already_terminal_in_verified_projection(tmp_path):
+    scope = _scope()
+    store = SqliteExecutionStore(tmp_path / "cancel-terminal-before-claim.sqlite3")
+    lease = _lease(store, scope)
+    try:
+        owner = _active_owner(store, scope, lease)
+        binding = store._active_ctp_callback_sessions[owner.owner_intent_id]
+        target = _reserve(store, scope, lease, binding.session_generation_id, "terminal-before-cancel")
+        payload = {
+            "BrokerID": "broker", "InvestorID": "user", "UserID": "user",
+            "InstrumentID": "rb2710", "ExchangeID": "SHFE", "OrderRef": target.order_ref,
+            "Direction": "0", "CombOffsetFlag": "0", "CombHedgeFlag": "1",
+            "LimitPrice": 100.0, "VolumeTotalOriginal": 1,
+            "OrderPriceType": "2", "TimeCondition": "3",
+        }
+        _queue_and_complete(store, scope, lease, owner, target, "submit-terminal-first", payload, 71)
+        _append_order_event(owner, store, scope, target, 4, 1, 381)
+        _adapter_for(store, owner).apply_next_ingress(
+            callback_verifier=_TerminalOrderCallbackVerifier(),
+            trade_fact_verifier=_TradeVerifier(),
+        )
+        staged = _stage_cancel_and_complete(
+            store, scope, lease, owner, target, "cancel-after-terminal", 501, claim=False
+        )
+        receipt_id = hashlib.sha256(b"cancel-after-terminal").hexdigest()[:32]
+        with pytest.raises(InvalidStateTransition, match="target is already terminal"):
+            store.claim_ctp_dispatch_command_for_session(
+                scope,
+                staged.command_id,
+                owner_handle=owner,
+                writer_lease=lease,
+                authority_verifier=_Authority(),
+                required_local_queue_receipt_id=receipt_id,
+            )
+        assert store._connection.execute(
+            "SELECT COUNT(*) FROM ctp_dispatch_cancel_postconditions"
+        ).fetchone()[0] == 0
+        current = store.read_ctp_dispatch_command(scope, staged.command_id)
+        assert current is not None and current.status == "READY"
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+def test_v17_upgrade_preserves_possibly_sent_cancel_as_pending_postcondition(tmp_path):
+    scope = _scope()
+    path = tmp_path / "cancel-postcondition-v17-upgrade.sqlite3"
+    store = SqliteExecutionStore(path)
+    lease = _lease(store, scope)
+    owner = _active_owner(store, scope, lease)
+    binding = store._active_ctp_callback_sessions[owner.owner_intent_id]
+    target = _reserve(store, scope, lease, binding.session_generation_id, "migration-target")
+    payload = {
+        "BrokerID": "broker", "InvestorID": "user", "UserID": "user",
+        "InstrumentID": "rb2710", "ExchangeID": "SHFE", "OrderRef": target.order_ref,
+        "Direction": "0", "CombOffsetFlag": "0", "CombHedgeFlag": "1",
+        "LimitPrice": 100.0, "VolumeTotalOriginal": 1,
+        "OrderPriceType": "2", "TimeCondition": "3",
+    }
+    _queue_and_complete(store, scope, lease, owner, target, "submit-migration-target", payload, 71)
+    _stage_cancel_and_complete(
+        store, scope, lease, owner, target, "cancel-migration-target", 501
+    )
+    store._connection.execute("DROP TABLE ctp_dispatch_cancel_postcondition_resolutions")
+    store._connection.execute("DROP TABLE ctp_dispatch_cancel_terminal_observations")
+    store._connection.execute("DROP TABLE ctp_dispatch_cancel_postconditions")
+    store._connection.execute(
+        "UPDATE execution_meta SET value = '17' WHERE key = 'schema_version'"
+    )
+    store.close()
+
+    upgraded = SqliteExecutionStore(path)
+    try:
+        assert upgraded._connection.execute(
+            "SELECT value FROM execution_meta WHERE key = 'schema_version'"
+        ).fetchone()[0] == "18"
+        row = upgraded._connection.execute(
+            "SELECT identity_state, target_submit_command_id, owner_intent_id "
+            "FROM ctp_dispatch_cancel_postconditions WHERE cancel_command_id = ?",
+            ("cancel-migration-target",),
+        ).fetchone()
+        assert tuple(row) == (
+            "EXACT", "submit-migration-target", owner.owner_intent_id
+        )
+        assert upgraded._ctp_has_pending_cancel_postcondition(
+            upgraded._connection.cursor(), scope.account_key
+        )
+        assert upgraded._connection.execute(
+            "SELECT COUNT(*) FROM ctp_dispatch_cancel_postcondition_resolutions"
+        ).fetchone()[0] == 0
+    finally:
+        upgraded.close()
+
+
+@pytest.mark.unit
+def test_resolved_cancel_contradiction_poisons_owner_durably_after_rollback(tmp_path):
+    scope = _scope()
+    path = tmp_path / "cancel-postcondition-contradiction.sqlite3"
+    store = SqliteExecutionStore(path)
+    lease = _lease(store, scope)
+    try:
+        owner = _active_owner(store, scope, lease)
+        binding = store._active_ctp_callback_sessions[owner.owner_intent_id]
+        target = _reserve(store, scope, lease, binding.session_generation_id, "contradiction-target")
+        payload = {
+            "BrokerID": "broker", "InvestorID": "user", "UserID": "user",
+            "InstrumentID": "rb2710", "ExchangeID": "SHFE", "OrderRef": target.order_ref,
+            "Direction": "0", "CombOffsetFlag": "0", "CombHedgeFlag": "1",
+            "LimitPrice": 100.0, "VolumeTotalOriginal": 1,
+            "OrderPriceType": "2", "TimeCondition": "3",
+        }
+        _queue_and_complete(store, scope, lease, owner, target, "submit-contradiction", payload, 71)
+        _stage_cancel_and_complete(
+            store, scope, lease, owner, target, "cancel-contradiction", 501
+        )
+        _append_order_event(owner, store, scope, target, 4, 1, 381)
+        adapter = _adapter_for(store, owner)
+        adapter.apply_next_ingress(
+            callback_verifier=_TerminalOrderCallbackVerifier(),
+            trade_fact_verifier=_TradeVerifier(),
+        )
+        store.append_ctp_callback_ingress(
+            owner,
+            _record(
+                owner, "OnRtnTrade", 5, phase="ACTIVE", callback_class="ROUTEABLE",
+                fields=_trade_fields(order_ref=target.order_ref, trade_id="contradiction-fill"),
+            ),
+        )
+        adapter.apply_next_ingress(
+            callback_verifier=_TerminalOrderCallbackVerifier(),
+            trade_fact_verifier=_TradeVerifier(),
+        )
+        assert store._connection.execute(
+            "SELECT COUNT(*) FROM ctp_dispatch_cancel_postcondition_resolutions"
+        ).fetchone()[0] == 1
+
+        _append_order_event(owner, store, scope, target, 6, 0, 382)
+        with pytest.raises(ContractValidationError):
+            adapter.apply_next_ingress(
+                callback_verifier=_TerminalOrderCallbackVerifier(),
+                trade_fact_verifier=_TradeVerifier(),
+            )
+        owner_row = store._connection.execute(
+            "SELECT owner_state, poison_code FROM ctp_dispatch_callback_session_owners "
+            "WHERE owner_intent_id = ?",
+            (owner.owner_intent_id,),
+        ).fetchone()
+        assert tuple(owner_row) == ("POISONED", "callback_apply_failure")
+        assert store._connection.execute(
+            "SELECT COUNT(*) FROM ctp_dispatch_callback_ingress_applications "
+            "WHERE owner_intent_id = ? AND source_sequence = 6",
+            (owner.owner_intent_id,),
+        ).fetchone()[0] == 0
+    finally:
+        store.close()
+
+    reopened = SqliteExecutionStore(path)
+    try:
+        owner_row = reopened._connection.execute(
+            "SELECT owner_state, poison_code FROM ctp_dispatch_callback_session_owners"
+        ).fetchone()
+        assert tuple(owner_row) == ("POISONED", "callback_apply_failure")
+        assert reopened._ctp_dispatch_has_open_account_fence(
+            reopened._connection.cursor(), scope.account_key
+        )
+        with pytest.raises(InvalidStateTransition):
+            reopened.create_ctp_callback_session_owner(
+                scope, writer_lease=_lease(reopened, scope)
+            )
+    finally:
+        reopened.close()

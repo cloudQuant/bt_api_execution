@@ -1545,7 +1545,7 @@ def test_v11_resolved_guard_migrates_to_permanent_fence_and_stays_after_reopen(t
         version = migrated._connection.execute(
             "SELECT value FROM execution_meta WHERE key = 'schema_version'"
         ).fetchone()["value"]
-        assert version == "17"
+        assert version == "18"
         assert migrated.read_ctp_dispatch_command(bound.scope, bound.command_id).status == (
             "COMPLETED"
         )
@@ -1570,7 +1570,7 @@ def test_v11_resolved_guard_migrates_to_permanent_fence_and_stays_after_reopen(t
         migrated.close()
         migrated = None
 
-        # The combined v17 upgrade is idempotent and the old resolved bit never removes
+        # The combined v18 upgrade is idempotent and the old resolved bit never removes
         # the newly migrated account source-lifecycle fence.
         reopened = SqliteExecutionStore(tmp_path / "execution.sqlite3")
         assert reopened._connection.execute(
@@ -1604,7 +1604,7 @@ def test_v11_unmappable_resolved_guard_refuses_store_upgrade(tmp_path):
 
 
 @pytest.mark.unit
-def test_v12_permanent_fence_and_projectionless_cancel_migrate_to_v17(tmp_path):
+def test_v12_permanent_fence_and_projectionless_cancel_migrate_to_v18(tmp_path):
     bound = _stage_dispatched_command(tmp_path, operation="CANCEL")
     migrated = None
     reopened = None
@@ -1629,7 +1629,7 @@ def test_v12_permanent_fence_and_projectionless_cancel_migrate_to_v17(tmp_path):
         migrated = SqliteExecutionStore(tmp_path / "execution.sqlite3")
         assert migrated._connection.execute(
             "SELECT value FROM execution_meta WHERE key = 'schema_version'"
-        ).fetchone()[0] == "17"
+        ).fetchone()[0] == "18"
         command = migrated.read_ctp_dispatch_command(bound.scope, bound.command_id)
         assert command is not None
         assert command.status == "UNKNOWN"

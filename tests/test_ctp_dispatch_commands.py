@@ -618,7 +618,7 @@ def test_v4_execution_store_migrates_to_verified_callback_ledger_v8(tmp_path):
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-        assert version == "17"
+        assert version == "18"
         assert "ctp_dispatch_commands" in tables
         assert "ctp_order_ref_watermarks" in tables
         assert "ctp_dispatch_authority_uses" in tables
@@ -672,7 +672,7 @@ def test_v5_execution_store_migrates_one_use_authority_table(tmp_path):
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-        assert version == "17"
+        assert version == "18"
         assert "ctp_dispatch_authority_uses" in tables
     finally:
         migrated.close()
@@ -774,7 +774,7 @@ def test_v7_typed_command_migrates_to_callback_ledger_without_reopening_dispatch
             migrated._connection.execute(
                 "SELECT value FROM execution_meta WHERE key = 'schema_version'"
             ).fetchone()[0]
-            == "17"
+            == "18"
         )
         assert (
             migrated._connection.execute(
@@ -816,7 +816,7 @@ def test_v8_store_migrates_orderref_cutover_state_fail_closed(tmp_path):
         version = migrated._connection.execute(
             "SELECT value FROM execution_meta WHERE key = 'schema_version'"
         ).fetchone()["value"]
-        assert version == "17"
+        assert version == "18"
         command = migrated.read_ctp_dispatch_command(scope, staged.command_id)
         assert command is not None
         assert command.status == "UNKNOWN"
@@ -2592,7 +2592,19 @@ def test_unknown_cancel_resolution_requires_terminal_action_and_target(tmp_path)
             writer_lease=lease,
             reconciliation_verifier=_FakeCtpDispatchReconciliationVerifier("CANCELLED", "TERMINAL"),
         )
-        assert not resolved.account_fence_open
+        assert resolved.account_fence_open
+        pending_obligation = store._connection.execute(
+            "SELECT identity_state FROM ctp_dispatch_cancel_postconditions "
+            "WHERE cancel_command_id = ?",
+            (cancel.command_id,),
+        ).fetchone()
+        assert pending_obligation is not None
+        assert pending_obligation[0] == "UNMAPPABLE"
+        assert store._connection.execute(
+            "SELECT COUNT(*) FROM ctp_dispatch_cancel_postcondition_resolutions "
+            "WHERE cancel_command_id = ?",
+            (cancel.command_id,),
+        ).fetchone()[0] == 0
         assert resolved.order_terminal_state == "CANCELLED"
         assert resolved.cancel_action_terminal_state == "TERMINAL"
         order_projection = store._connection.execute(
@@ -2998,8 +3010,8 @@ def test_receipt_requires_exact_typed_echo_and_is_idempotently_stored(tmp_path):
 
 
 @pytest.mark.unit
-def test_schema_v15_to_v17_preserves_unknown_command_and_permanent_owner_fence(tmp_path):
-    database = tmp_path / "schema-v15-to-v17-owner.sqlite3"
+def test_schema_v15_to_v18_preserves_unknown_command_and_permanent_owner_fence(tmp_path):
+    database = tmp_path / "schema-v15-to-v18-owner.sqlite3"
     scope = _scope()
     store = SqliteExecutionStore(database)
     lease = _lease(store, scope)
@@ -3042,7 +3054,7 @@ def test_schema_v15_to_v17_preserves_unknown_command_and_permanent_owner_fence(t
     try:
         assert migrated._connection.execute(
             "SELECT value FROM execution_meta WHERE key = 'schema_version'"
-        ).fetchone()[0] == "17"
+        ).fetchone()[0] == "18"
         command = migrated.read_ctp_dispatch_command(scope, staged.command_id)
         assert command.status == "UNKNOWN"
         assert command.unknown_reason == "preserved-v15-unknown"
@@ -3075,7 +3087,7 @@ def test_schema_v15_to_v17_preserves_unknown_command_and_permanent_owner_fence(t
     try:
         assert reopened._connection.execute(
             "SELECT value FROM execution_meta WHERE key = 'schema_version'"
-        ).fetchone()[0] == "17"
+        ).fetchone()[0] == "18"
         assert reopened.read_ctp_dispatch_command(scope, staged.command_id).status == "UNKNOWN"
         owner_row = reopened._connection.execute(
             "SELECT owner_state, poison_code FROM ctp_dispatch_callback_session_owners "
@@ -3088,7 +3100,7 @@ def test_schema_v15_to_v17_preserves_unknown_command_and_permanent_owner_fence(t
 
 
 @pytest.mark.unit
-def test_schema_v16_to_v17_migrates_valid_completed_submit(tmp_path):
+def test_schema_v16_to_v18_migrates_valid_completed_submit(tmp_path):
     database = tmp_path / "schema-v16-valid-submit.sqlite3"
     scope = _scope()
     store = SqliteExecutionStore(database)
@@ -3110,7 +3122,7 @@ def test_schema_v16_to_v17_migrates_valid_completed_submit(tmp_path):
     try:
         assert migrated._connection.execute(
             "SELECT value FROM execution_meta WHERE key = 'schema_version'"
-        ).fetchone()[0] == "17"
+        ).fetchone()[0] == "18"
         command = migrated.read_ctp_dispatch_command(scope, staged.command_id)
         assert command is not None and command.status == "COMPLETED"
         assert command.correlation_key is not None
@@ -3121,7 +3133,7 @@ def test_schema_v16_to_v17_migrates_valid_completed_submit(tmp_path):
 
 @pytest.mark.unit
 @pytest.mark.parametrize("malformed_account_key", ["", "   "])
-def test_schema_v16_to_v17_rejects_malformed_identity_on_terminal_submit(
+def test_schema_v16_to_v18_rejects_malformed_identity_on_terminal_submit(
     tmp_path, malformed_account_key
 ):
     database = tmp_path / "schema-v16-malformed-terminal-submit.sqlite3"
@@ -3173,7 +3185,7 @@ def test_schema_v16_to_v17_rejects_malformed_identity_on_terminal_submit(
 
 
 @pytest.mark.unit
-def test_schema_v16_to_v17_rejects_dispatch_foreign_key_mismatch(tmp_path):
+def test_schema_v16_to_v18_rejects_dispatch_foreign_key_mismatch(tmp_path):
     database = tmp_path / "schema-v16-dispatch-foreign-key-mismatch.sqlite3"
     scope = _scope()
     store = SqliteExecutionStore(database)
@@ -3224,7 +3236,7 @@ def test_schema_v16_to_v17_rejects_dispatch_foreign_key_mismatch(tmp_path):
 
 
 @pytest.mark.unit
-def test_schema_v16_to_v17_rejects_cross_account_legacy_cancel_graph(tmp_path):
+def test_schema_v16_to_v18_rejects_cross_account_legacy_cancel_graph(tmp_path):
     database = tmp_path / "schema-v16-legacy-cancel-cross-account.sqlite3"
     scope = _scope()
     store = SqliteExecutionStore(database)
