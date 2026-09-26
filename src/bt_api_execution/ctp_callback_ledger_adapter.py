@@ -10,6 +10,7 @@ the callback ledger row and typed projection.
 from __future__ import annotations
 
 import threading
+from contextlib import suppress
 
 from .contracts import canonical_json
 from .ctp_callback_source_bridge import (
@@ -154,12 +155,10 @@ class CtpNativeCallbackLedgerAdapter:
                 source_lifecycle_fence_id=source_lifecycle_fence_id,
             )
         except Exception:
-            try:
+            with suppress(Exception):
                 bridge.close()
-            except Exception:
                 # Preserve the binding failure; queue cleanup is best effort
                 # and never clears the durable account lifecycle fence.
-                pass
             raise
 
     def apply_next(
@@ -237,23 +236,19 @@ class CtpNativeCallbackLedgerAdapter:
             if self._closed:
                 return
             self._closed = True
-        try:
+        with suppress(Exception):
             self._source_bridge.close()
-        except Exception:
             # Cleanup diagnostics may contain provider-owned details. They do
             # not change the durable fence or the adapter's fail-closed state.
-            pass
 
     def _poison(self) -> None:
         with self._state_lock:
             self._poisoned = True
             self._closed = True
-        try:
+        with suppress(Exception):
             self._source_bridge.close()
-        except Exception:
             # Keep the public adapter failure fixed and sanitized even if the
             # SDK queue lease cleanup itself fails.
-            pass
 
     def __enter__(self) -> CtpNativeCallbackLedgerAdapter:
         with self._state_lock:
