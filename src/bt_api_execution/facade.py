@@ -3,19 +3,32 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from threading import RLock
 from typing import TYPE_CHECKING, Any
 
-from .contracts import ExecutionScope, ExecutionState, OrderIntent, ProviderObservation
+from .contracts import (
+    ExecutionEvent,
+    ExecutionScope,
+    ExecutionState,
+    OrderIntent,
+    ProviderObservation,
+)
 from .errors import (
     AdmissionDenied,
     AdmissionRequired,
     ContractValidationError,
+    InvalidStateTransition,
     WriterLeaseUnavailable,
 )
 
 if TYPE_CHECKING:
     from .ports import AdmissionGate, DispatchPort, ReconciliationPort
-    from .store import ExecutionRecord, SqliteExecutionStore, WriterLease
+    from .store import (
+        CtpAccountFamilyOwnerHandle,
+        ExecutionRecord,
+        SqliteExecutionStore,
+        WriterLease,
+    )
 
 DispatchCallable = Callable[[OrderIntent], ProviderObservation]
 BeforeDispatchCallable = Callable[[OrderIntent], None]
@@ -71,6 +84,8 @@ class ManagedExecutionFacade:
         self._allow_unprotected = allow_unprotected
         self._pre_dispatch_guard = pre_dispatch_guard
         self._last_writer_lease: WriterLease | None = None
+        self._ctp_account_family_owner: CtpAccountFamilyOwnerHandle | None = None
+        self._ctp_family_owner_lock = RLock()
 
     @property
     def scope(self) -> ExecutionScope:
@@ -82,12 +97,27 @@ class ManagedExecutionFacade:
 
     def acquire_writer_lease(self) -> WriterLease:
         """Acquire or renew the account-level writer lease before a mutation."""
-
-        lease = self._store.acquire_or_renew_lease(
-            self._scope,
-            self._writer_id,
-            ttl_ns=self._lease_ttl_ns,
-        )
+        provider_is_ctp = self._scope.provider.lower() == "ctp"
+        if provider_is_ctp and self._scope.provider != "ctp":
+            raise ContractValidationError("CTP execution provider must use canonical lowercase")
+        if provider_is_ctp:
+            with self._ctp_family_owner_lock:
+                if self._ctp_account_family_owner is None:
+                    self._ctp_account_family_owner = (
+                        self._store.acquire_ctp_account_family_owner(self._scope)
+                    )
+                lease = self._store.acquire_or_renew_lease(
+                    self._scope,
+                    self._writer_id,
+                    ttl_ns=self._lease_ttl_ns,
+                    ctp_account_family_owner=self._ctp_account_family_owner,
+                )
+        else:
+            lease = self._store.acquire_or_renew_lease(
+                self._scope,
+                self._writer_id,
+                ttl_ns=self._lease_ttl_ns,
+            )
         self._last_writer_lease = lease
         return lease
 
@@ -210,13 +240,37 @@ class ManagedExecutionFacade:
         ``PARTIALLY_FILLED`` orders do not settle it a second time.
         """
 
+        record, _event, _review_required = self._record_provider_observation_with_event(observation)
+        return record
+
+    def record_provider_observation_event(
+        self, observation: ProviderObservation
+    ) -> ExecutionEvent | None:
+        """Persist one observation and return only its newly appended outbox event.
+
+        Exact retries return ``None``. Invalid evidence and permit-settlement
+        failures first persist a review-required latch, then raise
+        :class:`InvalidStateTransition` so callers cannot confuse them with a
+        duplicate. The returned event is the same immutable row created by the
+        store transaction; this method does not publish to monitor or call a
+        provider port.
+        """
+
+        _record, event, review_required = self._record_provider_observation_with_event(observation)
+        if review_required:
+            raise InvalidStateTransition("provider observation requires manual review")
+        return event
+
+    def _record_provider_observation_with_event(
+        self, observation: ProviderObservation
+    ) -> tuple[ExecutionRecord, ExecutionEvent | None, bool]:
         writer_lease = self.acquire_writer_lease()
         record = self._require_owned_record(observation.intent_id)
         if record.state not in _OBSERVATION_RECORDING_STATES:
-            return record
+            return record, None, record.review_required
         previous_state = record.state
         try:
-            record = self._store.record_observation(
+            record, event = self._store.record_observation_with_event(
                 observation,
                 scope=self._scope,
                 source="reconcile",
@@ -225,17 +279,19 @@ class ManagedExecutionFacade:
         except WriterLeaseUnavailable:
             raise
         except Exception:
-            return self._store.mark_review_required(
+            marked = self._store.mark_review_required(
                 observation.intent_id,
                 self._scope,
                 "invalid_reconcile_evidence",
                 writer_lease=writer_lease,
             )
-        return self._settle_after_evidenced_outcome(
+            return marked, None, True
+        settled_record, settlement_ok = self._settle_after_evidenced_outcome_result(
             record,
             settle_permit=previous_state in _PERMIT_SETTLEMENT_SOURCE_STATES,
             writer_lease=writer_lease,
         )
+        return settled_record, event if settlement_ok else None, not settlement_ok
 
     def reconcile_with_port(
         self,
@@ -459,6 +515,18 @@ class ManagedExecutionFacade:
         settle_permit: bool = True,
         writer_lease: WriterLease,
     ) -> ExecutionRecord:
+        settled_record, _settlement_ok = self._settle_after_evidenced_outcome_result(
+            record, settle_permit=settle_permit, writer_lease=writer_lease
+        )
+        return settled_record
+
+    def _settle_after_evidenced_outcome_result(
+        self,
+        record: ExecutionRecord,
+        *,
+        settle_permit: bool = True,
+        writer_lease: WriterLease,
+    ) -> tuple[ExecutionRecord, bool]:
         if (
             not settle_permit
             or record.state
@@ -471,13 +539,16 @@ class ManagedExecutionFacade:
             }
             or self._admission_gate is None
         ):
-            return record
+            return record, True
         if record.permit_reference is None:
-            return self._store.mark_review_required(
-                record.intent_id,
-                self._scope,
-                "admission_settlement_unavailable",
-                writer_lease=writer_lease,
+            return (
+                self._store.mark_review_required(
+                    record.intent_id,
+                    self._scope,
+                    "admission_settlement_unavailable",
+                    writer_lease=writer_lease,
+                ),
+                False,
             )
         try:
             self._store.assert_writer_lease(self._scope, writer_lease)
@@ -485,13 +556,16 @@ class ManagedExecutionFacade:
         except WriterLeaseUnavailable:
             raise
         except Exception:
-            return self._store.mark_review_required(
-                record.intent_id,
-                self._scope,
-                "admission_settlement_failed",
-                writer_lease=writer_lease,
+            return (
+                self._store.mark_review_required(
+                    record.intent_id,
+                    self._scope,
+                    "admission_settlement_failed",
+                    writer_lease=writer_lease,
+                ),
+                False,
             )
-        return record
+        return record, True
 
     @staticmethod
     def _dispatch(

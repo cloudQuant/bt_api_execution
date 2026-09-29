@@ -249,7 +249,9 @@ def test_expired_cancellation_writer_cannot_project_provider_result_after_fencin
     assert entered.wait(timeout=5)
     try:
         time.sleep(0.15)
-        contender = store.acquire_or_renew_lease(_scope(), "writer.contender", ttl_ns=1_000_000_000)
+        contender = store.acquire_or_renew_lease(
+            _scope(), "writer.contender", ttl_ns=1_000_000_000
+        )
         assert contender.fencing_token > order_facade._last_writer_lease.fencing_token
         release.set()
         thread.join(timeout=5)
@@ -418,11 +420,13 @@ def test_restart_recovery_latches_claimed_cancel_unknown_without_retry(tmp_path)
 def test_unknown_cancellation_recovery_scan_is_exact_scope_even_for_shared_cancel_id(
     tmp_path,
 ) -> None:
-    """A startup recovery reader must never cross strategy-scoped cancel records."""
+    """A startup recovery reader keeps same-ID cancellations in separate scopes."""
 
     store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
     first_scope = _scope_for("strategy.one")
-    second_scope = _scope_for("strategy.two")
+    second_scope = ExecutionScope(
+        "FAKE", "simulation", "acct_demo.second", "strategy.two", "20260922"
+    )
     provider_calls: list[tuple[str, str]] = []
     try:
         for scope, intent_id, provider_order_id in (
@@ -473,8 +477,7 @@ def test_unknown_cancellation_recovery_scan_is_exact_scope_even_for_shared_cance
                 )
                 assert record.state is ExecutionState.UNKNOWN
             finally:
-                # The dispatch writer is account-scoped even though each
-                # cancellation record is strategy-scoped.
+                # Each independent account has its own dispatch writer.
                 order_facade.close()
 
         first_unknown = store.list_unknown_cancellations(first_scope)
