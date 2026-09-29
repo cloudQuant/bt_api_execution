@@ -208,7 +208,14 @@ def _logged_in_sdk_client_with_fake_api(client_module: Any) -> tuple[Any, Any]:
         True,
     )
     spi.OnRspUserLogin(
-        SimpleNamespace(FrontID=7, SessionID=19, TradingDay="20260925", MaxOrderRef="90"),
+        SimpleNamespace(
+            BrokerID="9999",
+            UserID="fake-user",
+            FrontID=7,
+            SessionID=19,
+            TradingDay="20260925",
+            MaxOrderRef="90",
+        ),
         SimpleNamespace(ErrorID=0, ErrorMsg=""),
         api.login_request_ids[-1],
         True,
