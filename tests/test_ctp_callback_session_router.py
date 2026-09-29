@@ -70,25 +70,65 @@ def _record(
         named_args = []
     elif name in {"OnRspAuthenticate", "OnRspUserLogin"}:
         named_args = [
-            {"argument_slot": 0, "name": "pRspField", "present": True,
-             "scalar_captured": False, "value": None},
-            {"argument_slot": 1, "name": "pRspInfo", "present": True,
-             "scalar_captured": False, "value": None},
-            {"argument_slot": 2, "name": "nRequestID", "present": True,
-             "scalar_captured": True, "value": sequence + 14},
-            {"argument_slot": 3, "name": "bIsLast", "present": True,
-             "scalar_captured": True, "value": True},
+            {
+                "argument_slot": 0,
+                "name": "pRspField",
+                "present": True,
+                "scalar_captured": False,
+                "value": None,
+            },
+            {
+                "argument_slot": 1,
+                "name": "pRspInfo",
+                "present": True,
+                "scalar_captured": False,
+                "value": None,
+            },
+            {
+                "argument_slot": 2,
+                "name": "nRequestID",
+                "present": True,
+                "scalar_captured": True,
+                "value": sequence + 14,
+            },
+            {
+                "argument_slot": 3,
+                "name": "bIsLast",
+                "present": True,
+                "scalar_captured": True,
+                "value": True,
+            },
         ]
     elif name == "OnRspOrderAction":
         named_args = [
-            {"argument_slot": 0, "name": "pInputOrderAction", "present": True,
-             "scalar_captured": False, "value": None},
-            {"argument_slot": 1, "name": "pRspInfo", "present": True,
-             "scalar_captured": False, "value": None},
-            {"argument_slot": 2, "name": "nRequestID", "present": True,
-             "scalar_captured": True, "value": request_id},
-            {"argument_slot": 3, "name": "bIsLast", "present": True,
-             "scalar_captured": True, "value": is_last},
+            {
+                "argument_slot": 0,
+                "name": "pInputOrderAction",
+                "present": True,
+                "scalar_captured": False,
+                "value": None,
+            },
+            {
+                "argument_slot": 1,
+                "name": "pRspInfo",
+                "present": True,
+                "scalar_captured": False,
+                "value": None,
+            },
+            {
+                "argument_slot": 2,
+                "name": "nRequestID",
+                "present": True,
+                "scalar_captured": True,
+                "value": request_id,
+            },
+            {
+                "argument_slot": 3,
+                "name": "bIsLast",
+                "present": True,
+                "scalar_captured": True,
+                "value": is_last,
+            },
         ]
     else:
         argument_name = {
@@ -97,8 +137,13 @@ def _record(
             "OnRtnInstrumentStatus": "pInstrumentStatus",
         }.get(name, "pField")
         named_args = [
-            {"argument_slot": 0, "name": argument_name, "present": True,
-             "scalar_captured": False, "value": None}
+            {
+                "argument_slot": 0,
+                "name": argument_name,
+                "present": True,
+                "scalar_captured": False,
+                "value": None,
+            }
         ]
     flattened = [
         {
@@ -171,7 +216,14 @@ def _active_owner(store, scope, lease):
     )
     store.append_ctp_callback_ingress(
         owner,
-        _record(owner, "OnFrontConnected", 1, phase="PRE_LOGIN", callback_class="PRE_LOGIN", generation=0),
+        _record(
+            owner,
+            "OnFrontConnected",
+            1,
+            phase="PRE_LOGIN",
+            callback_class="PRE_LOGIN",
+            generation=0,
+        ),
     )
     store.append_ctp_callback_ingress(
         owner,
@@ -495,9 +547,7 @@ def _stage_cancel_and_complete(
             "VolumeChange": 0,
         },
         approval_use_id="approval-" + command_id,
-        approval_digest=hashlib.sha256(
-            ("approval-" + command_id).encode("ascii")
-        ).hexdigest(),
+        approval_digest=hashlib.sha256(("approval-" + command_id).encode("ascii")).hexdigest(),
         session_binding={
             "binding_type": "ctp_callback_session_binding.v1",
             "owner_intent_id": session.owner_intent_id,
@@ -601,7 +651,9 @@ def _order_fields(scope, reservation, request_id, volume_traded, notify_sequence
     )
 
 
-def _append_order_event(owner, store, scope, reservation, sequence, volume, notify_sequence, *, status="5"):
+def _append_order_event(
+    owner, store, scope, reservation, sequence, volume, notify_sequence, *, status="5"
+):
     store.append_ctp_callback_ingress(
         owner,
         _record(
@@ -610,9 +662,7 @@ def _append_order_event(owner, store, scope, reservation, sequence, volume, noti
             sequence,
             phase="ACTIVE",
             callback_class="ROUTEABLE",
-            fields=_order_fields(
-                scope, reservation, 71, volume, notify_sequence, status=status
-            ),
+            fields=_order_fields(scope, reservation, 71, volume, notify_sequence, status=status),
         ),
     )
 
@@ -675,9 +725,7 @@ def test_session_native_call_binding_is_store_exact_and_consumed_once(tmp_path):
 )
 def test_session_command_binding_cannot_be_caller_relabelled(tmp_path, mutation):
     scope = _scope()
-    store = SqliteExecutionStore(
-        tmp_path / f"session-router-binding-mismatch-{mutation}.sqlite3"
-    )
+    store = SqliteExecutionStore(tmp_path / f"session-router-binding-mismatch-{mutation}.sqlite3")
     lease = _lease(store, scope)
     try:
         owner = _active_owner(store, scope, lease)
@@ -808,9 +856,7 @@ def test_session_pre_native_failure_atomically_unknowns_and_poisons_across_resta
 
     reopened = SqliteExecutionStore(path)
     try:
-        command = reopened.read_ctp_dispatch_command(
-            scope, "pre-native-command-" + failure_code
-        )
+        command = reopened.read_ctp_dispatch_command(scope, "pre-native-command-" + failure_code)
         assert command is not None and command.status == "UNKNOWN"
         assert command.unknown_reason == "session_pre_native_failure:" + failure_code
         owner_row = reopened._connection.execute(
@@ -931,6 +977,7 @@ def test_session_router_applies_interleaved_trade_facts_and_order_cumulative_wit
         first = _reserve(store, scope, lease, binding.session_generation_id, "intent-one")
         second = _reserve(store, scope, lease, binding.session_generation_id, "intent-two")
         third = _reserve(store, scope, lease, binding.session_generation_id, "intent-three")
+
         def payload(reservation, exchange="SHFE"):
             return {
                 "BrokerID": "broker",
@@ -947,6 +994,7 @@ def test_session_router_applies_interleaved_trade_facts_and_order_cumulative_wit
                 "OrderPriceType": "2",
                 "TimeCondition": "3",
             }
+
         _queue_and_complete(store, scope, lease, owner, first, "command-one", payload(first), 71)
         _queue_and_complete(store, scope, lease, owner, second, "command-two", payload(second), 72)
         _queue_and_complete(
@@ -1071,7 +1119,10 @@ def test_session_router_applies_interleaved_trade_facts_and_order_cumulative_wit
             "commission_quality FROM ctp_dispatch_trade_fact_ledger "
             "ORDER BY source_sequence"
         ).fetchall()
-        assert [(row["command_id"], row["trade_id"], row["cumulative_trade_volume"]) for row in trade_rows] == [
+        assert [
+            (row["command_id"], row["trade_id"], row["cumulative_trade_volume"])
+            for row in trade_rows
+        ] == [
             ("command-one", "trade-1", 1),
             ("command-two", "trade-2", 1),
             ("command-one", "trade-3", 2),
@@ -1084,9 +1135,12 @@ def test_session_router_applies_interleaved_trade_facts_and_order_cumulative_wit
             "FROM ctp_dispatch_order_cumulative_ledger"
         ).fetchone()
         assert tuple(cumulative) == (2, 2, "MATCHED")
-        assert store._connection.execute(
-            "SELECT COUNT(*) FROM ctp_dispatch_trade_fact_ledger WHERE trade_id = 'trade-1'"
-        ).fetchone()[0] == 2
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_trade_fact_ledger WHERE trade_id = 'trade-1'"
+            ).fetchone()[0]
+            == 2
+        )
         assert store.read_next_ctp_callback_ingress(owner) is None
     finally:
         store.close()
@@ -1283,17 +1337,33 @@ def test_session_router_poison_on_changed_duplicate_trade_and_wrong_day(tmp_path
         adapter = _adapter_for(store, owner)
         store.append_ctp_callback_ingress(
             owner,
-            _record(owner, "OnRtnTrade", 4, phase="ACTIVE", callback_class="ROUTEABLE",
-                    fields=_trade_fields(order_ref=reservation.order_ref, trade_id="trade-repeat")),
+            _record(
+                owner,
+                "OnRtnTrade",
+                4,
+                phase="ACTIVE",
+                callback_class="ROUTEABLE",
+                fields=_trade_fields(order_ref=reservation.order_ref, trade_id="trade-repeat"),
+            ),
         )
-        assert adapter.apply_next_ingress(
-            callback_verifier=_CallbackVerifier(), trade_fact_verifier=_TradeVerifier()
-        ).trade_quantity == 1
+        assert (
+            adapter.apply_next_ingress(
+                callback_verifier=_CallbackVerifier(), trade_fact_verifier=_TradeVerifier()
+            ).trade_quantity
+            == 1
+        )
         store.append_ctp_callback_ingress(
             owner,
-            _record(owner, "OnRtnTrade", 5, phase="ACTIVE", callback_class="ROUTEABLE",
-                    fields=_trade_fields(order_ref=reservation.order_ref,
-                                         trade_id="trade-repeat", price=98.0)),
+            _record(
+                owner,
+                "OnRtnTrade",
+                5,
+                phase="ACTIVE",
+                callback_class="ROUTEABLE",
+                fields=_trade_fields(
+                    order_ref=reservation.order_ref, trade_id="trade-repeat", price=98.0
+                ),
+            ),
         )
         with pytest.raises(ContractValidationError, match="application failed"):
             adapter.apply_next_ingress(
@@ -1305,14 +1375,20 @@ def test_session_router_poison_on_changed_duplicate_trade_and_wrong_day(tmp_path
             (owner.owner_intent_id,),
         ).fetchone()
         assert tuple(state) == ("POISONED", "callback_apply_failure")
-        assert store._connection.execute(
-            "SELECT COUNT(*) FROM ctp_dispatch_trade_fact_ledger"
-        ).fetchone()[0] == 1
-        assert store._connection.execute(
-            "SELECT COUNT(*) FROM ctp_dispatch_callback_ingress_applications "
-            "WHERE owner_intent_id = ? AND source_sequence = 5",
-            (owner.owner_intent_id,),
-        ).fetchone()[0] == 0
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_trade_fact_ledger"
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_callback_ingress_applications "
+                "WHERE owner_intent_id = ? AND source_sequence = 5",
+                (owner.owner_intent_id,),
+            ).fetchone()[0]
+            == 0
+        )
     finally:
         store.close()
 
@@ -1327,11 +1403,19 @@ def test_session_router_rejects_wrong_trading_day_without_fabricated_trade_reque
         binding = store._active_ctp_callback_sessions[owner.owner_intent_id]
         reservation = _reserve(store, scope, lease, binding.session_generation_id, "intent-one")
         payload = {
-            "BrokerID": "broker", "InvestorID": "user", "UserID": "user",
-            "InstrumentID": "rb2710", "ExchangeID": "SHFE", "OrderRef": reservation.order_ref,
-            "Direction": "0", "CombOffsetFlag": "0", "CombHedgeFlag": "1",
-            "LimitPrice": 100.0, "VolumeTotalOriginal": 3,
-            "OrderPriceType": "2", "TimeCondition": "3",
+            "BrokerID": "broker",
+            "InvestorID": "user",
+            "UserID": "user",
+            "InstrumentID": "rb2710",
+            "ExchangeID": "SHFE",
+            "OrderRef": reservation.order_ref,
+            "Direction": "0",
+            "CombOffsetFlag": "0",
+            "CombHedgeFlag": "1",
+            "LimitPrice": 100.0,
+            "VolumeTotalOriginal": 3,
+            "OrderPriceType": "2",
+            "TimeCondition": "3",
         }
         _queue_and_complete(store, scope, lease, owner, reservation, "command-one", payload, 71)
         adapter = _adapter_for(store, owner)
@@ -1342,20 +1426,28 @@ def test_session_router_rejects_wrong_trading_day_without_fabricated_trade_reque
         assert not {"RequestID", "FrontID", "SessionID"} & {name for _, name, _ in fields}
         store.append_ctp_callback_ingress(
             owner,
-            _record(owner, "OnRtnTrade", 4, phase="ACTIVE", callback_class="ROUTEABLE", fields=fields),
+            _record(
+                owner, "OnRtnTrade", 4, phase="ACTIVE", callback_class="ROUTEABLE", fields=fields
+            ),
         )
         with pytest.raises(ContractValidationError, match="application failed"):
             adapter.apply_next_ingress(
                 callback_verifier=_CallbackVerifier(), trade_fact_verifier=_TradeVerifier()
             )
-        assert store._connection.execute(
-            "SELECT COUNT(*) FROM ctp_dispatch_trade_fact_ledger"
-        ).fetchone()[0] == 0
-        assert store._connection.execute(
-            "SELECT owner_state FROM ctp_dispatch_callback_session_owners "
-            "WHERE owner_intent_id = ?",
-            (owner.owner_intent_id,),
-        ).fetchone()[0] == "POISONED"
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_trade_fact_ledger"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            store._connection.execute(
+                "SELECT owner_state FROM ctp_dispatch_callback_session_owners "
+                "WHERE owner_intent_id = ?",
+                (owner.owner_intent_id,),
+            ).fetchone()[0]
+            == "POISONED"
+        )
     finally:
         store.close()
 
@@ -1370,11 +1462,19 @@ def test_session_router_poison_on_order_cumulative_rollback(tmp_path):
         binding = store._active_ctp_callback_sessions[owner.owner_intent_id]
         reservation = _reserve(store, scope, lease, binding.session_generation_id, "intent-one")
         request = {
-            "BrokerID": "broker", "InvestorID": "user", "UserID": "user",
-            "InstrumentID": "rb2710", "ExchangeID": "SHFE", "OrderRef": reservation.order_ref,
-            "Direction": "0", "CombOffsetFlag": "0", "CombHedgeFlag": "1",
-            "LimitPrice": 100.0, "VolumeTotalOriginal": 3,
-            "OrderPriceType": "2", "TimeCondition": "3",
+            "BrokerID": "broker",
+            "InvestorID": "user",
+            "UserID": "user",
+            "InstrumentID": "rb2710",
+            "ExchangeID": "SHFE",
+            "OrderRef": reservation.order_ref,
+            "Direction": "0",
+            "CombOffsetFlag": "0",
+            "CombHedgeFlag": "1",
+            "LimitPrice": 100.0,
+            "VolumeTotalOriginal": 3,
+            "OrderPriceType": "2",
+            "TimeCondition": "3",
         }
         _queue_and_complete(store, scope, lease, owner, reservation, "command-one", request, 71)
         adapter = _adapter_for(store, owner)
@@ -1420,14 +1520,20 @@ def test_session_router_poison_on_order_cumulative_rollback(tmp_path):
             adapter.apply_next_ingress(
                 callback_verifier=_CallbackVerifier(), trade_fact_verifier=_TradeVerifier()
             )
-        assert store._connection.execute(
-            "SELECT COUNT(*) FROM ctp_dispatch_order_cumulative_ledger"
-        ).fetchone()[0] == 1
-        assert store._connection.execute(
-            "SELECT COUNT(*) FROM ctp_dispatch_callback_ingress_applications "
-            "WHERE owner_intent_id = ? AND source_sequence = 5",
-            (owner.owner_intent_id,),
-        ).fetchone()[0] == 0
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_order_cumulative_ledger"
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_callback_ingress_applications "
+                "WHERE owner_intent_id = ? AND source_sequence = 5",
+                (owner.owner_intent_id,),
+            ).fetchone()[0]
+            == 0
+        )
         assert store._connection.execute(
             "SELECT owner_state, poison_code FROM ctp_dispatch_callback_session_owners "
             "WHERE owner_intent_id = ?",
@@ -1476,9 +1582,7 @@ def test_session_router_rolls_back_trade_projection_and_marker_as_one_transactio
                 4,
                 phase="ACTIVE",
                 callback_class="ROUTEABLE",
-                fields=_trade_fields(
-                    order_ref=reservation.order_ref, trade_id="atomic-trade"
-                ),
+                fields=_trade_fields(order_ref=reservation.order_ref, trade_id="atomic-trade"),
             ),
         )
 
@@ -1493,35 +1597,50 @@ def test_session_router_rolls_back_trade_projection_and_marker_as_one_transactio
                 callback_verifier=_CallbackVerifier(), trade_fact_verifier=_TradeVerifier()
             )
 
-        assert store._connection.execute(
-            "SELECT COUNT(*) FROM ctp_dispatch_trade_fact_ledger"
-        ).fetchone()[0] == 0
-        assert store._connection.execute(
-            "SELECT COUNT(*) FROM ctp_dispatch_order_projection"
-        ).fetchone()[0] == 0
-        assert store._connection.execute(
-            "SELECT COUNT(*) FROM ctp_dispatch_callback_ingress_applications "
-            "WHERE owner_intent_id = ? AND source_sequence = 4",
-            (owner.owner_intent_id,),
-        ).fetchone()[0] == 0
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_trade_fact_ledger"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_order_projection"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_callback_ingress_applications "
+                "WHERE owner_intent_id = ? AND source_sequence = 4",
+                (owner.owner_intent_id,),
+            ).fetchone()[0]
+            == 0
+        )
         owner_row = store._connection.execute(
             "SELECT owner_state, poison_code FROM ctp_dispatch_callback_session_owners "
             "WHERE owner_intent_id = ?",
             (owner.owner_intent_id,),
         ).fetchone()
         assert tuple(owner_row) == ("POISONED", "callback_apply_failure")
-        assert store._connection.execute(
-            "SELECT COUNT(*) FROM ctp_dispatch_callback_ingress WHERE owner_intent_id = ?",
-            (owner.owner_intent_id,),
-        ).fetchone()[0] == 4
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_callback_ingress WHERE owner_intent_id = ?",
+                (owner.owner_intent_id,),
+            ).fetchone()[0]
+            == 4
+        )
     finally:
         store.close()
 
     reopened = SqliteExecutionStore(path)
     try:
-        assert reopened._connection.execute(
-            "SELECT COUNT(*) FROM ctp_dispatch_trade_fact_ledger"
-        ).fetchone()[0] == 0
+        assert (
+            reopened._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_trade_fact_ledger"
+            ).fetchone()[0]
+            == 0
+        )
         owner_row = reopened._connection.execute(
             "SELECT owner_state, poison_code FROM ctp_dispatch_callback_session_owners"
         ).fetchone()
@@ -1561,11 +1680,14 @@ def test_session_router_serializes_one_adapter_consuming_multiple_audit_events(t
         with ThreadPoolExecutor(max_workers=2) as executor:
             results = tuple(executor.map(apply_one, (1, 2)))
         assert {result.source_sequence for result in results} == {4, 5}
-        assert store._connection.execute(
-            "SELECT COUNT(*) FROM ctp_dispatch_callback_ingress_applications "
-            "WHERE owner_intent_id = ? AND outcome = 'AUDIT_ONLY'",
-            (owner.owner_intent_id,),
-        ).fetchone()[0] == 5  # three login records and two informational records
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_callback_ingress_applications "
+                "WHERE owner_intent_id = ? AND outcome = 'AUDIT_ONLY'",
+                (owner.owner_intent_id,),
+            ).fetchone()[0]
+            == 5
+        )  # three login records and two informational records
         owner_row = store._connection.execute(
             "SELECT owner_state, poison_code FROM ctp_dispatch_callback_session_owners "
             "WHERE owner_intent_id = ?",
@@ -1586,13 +1708,23 @@ def test_cancel_postcondition_waits_for_terminal_order_and_trade_prefix_before_s
     try:
         owner = _active_owner(store, scope, lease)
         binding = store._active_ctp_callback_sessions[owner.owner_intent_id]
-        target = _reserve(store, scope, lease, binding.session_generation_id, "postcondition-target")
+        target = _reserve(
+            store, scope, lease, binding.session_generation_id, "postcondition-target"
+        )
         submit_payload = {
-            "BrokerID": "broker", "InvestorID": "user", "UserID": "user",
-            "InstrumentID": "rb2710", "ExchangeID": "SHFE", "OrderRef": target.order_ref,
-            "Direction": "0", "CombOffsetFlag": "0", "CombHedgeFlag": "1",
-            "LimitPrice": 100.0, "VolumeTotalOriginal": 1,
-            "OrderPriceType": "2", "TimeCondition": "3",
+            "BrokerID": "broker",
+            "InvestorID": "user",
+            "UserID": "user",
+            "InstrumentID": "rb2710",
+            "ExchangeID": "SHFE",
+            "OrderRef": target.order_ref,
+            "Direction": "0",
+            "CombOffsetFlag": "0",
+            "CombHedgeFlag": "1",
+            "LimitPrice": 100.0,
+            "VolumeTotalOriginal": 1,
+            "OrderPriceType": "2",
+            "TimeCondition": "3",
         }
         _queue_and_complete(store, scope, lease, owner, target, "submit-target", submit_payload, 71)
         cancel = _stage_cancel_and_complete(
@@ -1603,7 +1735,9 @@ def test_cancel_postcondition_waits_for_terminal_order_and_trade_prefix_before_s
             "FROM ctp_dispatch_cancel_postconditions WHERE cancel_command_id = 'cancel-target'"
         ).fetchone()
         assert tuple(postcondition) == (
-            "EXACT", "submit-target", cancel.correlation_key.native_action_ref,
+            "EXACT",
+            "submit-target",
+            cancel.correlation_key.native_action_ref,
             owner.owner_intent_id,
         )
 
@@ -1620,12 +1754,18 @@ def test_cancel_postcondition_waits_for_terminal_order_and_trade_prefix_before_s
                 request_id=action.native_request_id,
                 is_last=True,
                 fields=(
-                    (0, "BrokerID", "broker"), (0, "InvestorID", "user"),
-                    (0, "UserID", "user"), (0, "InstrumentID", "rb2710"),
-                    (0, "OrderRef", target.order_ref), (0, "ExchangeID", "SHFE"),
-                    (0, "OrderSysID", "sys-" + target.order_ref), (0, "FrontID", 31),
-                    (0, "SessionID", 41), (0, "RequestID", action.native_request_id),
-                    (0, "OrderActionRef", action.native_action_ref), (0, "ActionFlag", "0"),
+                    (0, "BrokerID", "broker"),
+                    (0, "InvestorID", "user"),
+                    (0, "UserID", "user"),
+                    (0, "InstrumentID", "rb2710"),
+                    (0, "OrderRef", target.order_ref),
+                    (0, "ExchangeID", "SHFE"),
+                    (0, "OrderSysID", "sys-" + target.order_ref),
+                    (0, "FrontID", 31),
+                    (0, "SessionID", 41),
+                    (0, "RequestID", action.native_request_id),
+                    (0, "OrderActionRef", action.native_action_ref),
+                    (0, "ActionFlag", "0"),
                     (1, "ErrorID", 0),
                 ),
             ),
@@ -1635,14 +1775,24 @@ def test_cancel_postcondition_waits_for_terminal_order_and_trade_prefix_before_s
             trade_fact_verifier=_TradeVerifier(),
         )
         assert result.projection_state == "ACKNOWLEDGED"
-        assert store._connection.execute(
-            "SELECT COUNT(*) FROM ctp_dispatch_cancel_postcondition_resolutions"
-        ).fetchone()[0] == 0
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_cancel_postcondition_resolutions"
+            ).fetchone()[0]
+            == 0
+        )
 
         second = _reserve(store, scope, lease, binding.session_generation_id, "postcondition-next")
         next_payload = dict(submit_payload, OrderRef=second.order_ref)
         staged, _ = _queue_and_complete(
-            store, scope, lease, owner, second, "submit-next", next_payload, 72,
+            store,
+            scope,
+            lease,
+            owner,
+            second,
+            "submit-next",
+            next_payload,
+            72,
             claim_command=False,
         )
         receipt_id = hashlib.sha256(b"submit-next").hexdigest()[:32]
@@ -1662,12 +1812,18 @@ def test_cancel_postcondition_waits_for_terminal_order_and_trade_prefix_before_s
             trade_fact_verifier=_TradeVerifier(),
         )
         assert result.projection_state == "CANCELLED"
-        assert store._connection.execute(
-            "SELECT COUNT(*) FROM ctp_dispatch_cancel_terminal_observations"
-        ).fetchone()[0] == 1
-        assert store._connection.execute(
-            "SELECT COUNT(*) FROM ctp_dispatch_cancel_postcondition_resolutions"
-        ).fetchone()[0] == 0
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_cancel_terminal_observations"
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_cancel_postcondition_resolutions"
+            ).fetchone()[0]
+            == 0
+        )
         with pytest.raises(InvalidStateTransition, match="cancel awaiting verified terminal-order"):
             store.claim_ctp_dispatch_command_for_session(
                 scope,
@@ -1681,7 +1837,11 @@ def test_cancel_postcondition_waits_for_terminal_order_and_trade_prefix_before_s
         store.append_ctp_callback_ingress(
             owner,
             _record(
-                owner, "OnRtnTrade", 6, phase="ACTIVE", callback_class="ROUTEABLE",
+                owner,
+                "OnRtnTrade",
+                6,
+                phase="ACTIVE",
+                callback_class="ROUTEABLE",
                 fields=_trade_fields(order_ref=target.order_ref, trade_id="postcondition-fill"),
             ),
         )
@@ -1718,20 +1878,30 @@ def test_cancel_postcondition_resolves_when_trade_prefix_precedes_terminal_order
         binding = store._active_ctp_callback_sessions[owner.owner_intent_id]
         target = _reserve(store, scope, lease, binding.session_generation_id, "trade-first-target")
         payload = {
-            "BrokerID": "broker", "InvestorID": "user", "UserID": "user",
-            "InstrumentID": "rb2710", "ExchangeID": "SHFE", "OrderRef": target.order_ref,
-            "Direction": "0", "CombOffsetFlag": "0", "CombHedgeFlag": "1",
-            "LimitPrice": 100.0, "VolumeTotalOriginal": 1,
-            "OrderPriceType": "2", "TimeCondition": "3",
+            "BrokerID": "broker",
+            "InvestorID": "user",
+            "UserID": "user",
+            "InstrumentID": "rb2710",
+            "ExchangeID": "SHFE",
+            "OrderRef": target.order_ref,
+            "Direction": "0",
+            "CombOffsetFlag": "0",
+            "CombHedgeFlag": "1",
+            "LimitPrice": 100.0,
+            "VolumeTotalOriginal": 1,
+            "OrderPriceType": "2",
+            "TimeCondition": "3",
         }
         _queue_and_complete(store, scope, lease, owner, target, "submit-trade-first", payload, 71)
-        _stage_cancel_and_complete(
-            store, scope, lease, owner, target, "cancel-trade-first", 501
-        )
+        _stage_cancel_and_complete(store, scope, lease, owner, target, "cancel-trade-first", 501)
         store.append_ctp_callback_ingress(
             owner,
             _record(
-                owner, "OnRtnTrade", 4, phase="ACTIVE", callback_class="ROUTEABLE",
+                owner,
+                "OnRtnTrade",
+                4,
+                phase="ACTIVE",
+                callback_class="ROUTEABLE",
                 fields=_trade_fields(order_ref=target.order_ref, trade_id="trade-before-terminal"),
             ),
         )
@@ -1739,9 +1909,12 @@ def test_cancel_postcondition_resolves_when_trade_prefix_precedes_terminal_order
             callback_verifier=_TerminalOrderCallbackVerifier(),
             trade_fact_verifier=_TradeVerifier(),
         )
-        assert store._connection.execute(
-            "SELECT COUNT(*) FROM ctp_dispatch_cancel_postcondition_resolutions"
-        ).fetchone()[0] == 0
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_cancel_postcondition_resolutions"
+            ).fetchone()[0]
+            == 0
+        )
         _append_order_event(owner, store, scope, target, 5, 1, 381, status="0")
         _adapter_for(store, owner).apply_next_ingress(
             callback_verifier=_TerminalOrderCallbackVerifier(),
@@ -1764,15 +1937,27 @@ def test_cancel_claim_rejects_target_already_terminal_in_verified_projection(tmp
     try:
         owner = _active_owner(store, scope, lease)
         binding = store._active_ctp_callback_sessions[owner.owner_intent_id]
-        target = _reserve(store, scope, lease, binding.session_generation_id, "terminal-before-cancel")
+        target = _reserve(
+            store, scope, lease, binding.session_generation_id, "terminal-before-cancel"
+        )
         payload = {
-            "BrokerID": "broker", "InvestorID": "user", "UserID": "user",
-            "InstrumentID": "rb2710", "ExchangeID": "SHFE", "OrderRef": target.order_ref,
-            "Direction": "0", "CombOffsetFlag": "0", "CombHedgeFlag": "1",
-            "LimitPrice": 100.0, "VolumeTotalOriginal": 1,
-            "OrderPriceType": "2", "TimeCondition": "3",
+            "BrokerID": "broker",
+            "InvestorID": "user",
+            "UserID": "user",
+            "InstrumentID": "rb2710",
+            "ExchangeID": "SHFE",
+            "OrderRef": target.order_ref,
+            "Direction": "0",
+            "CombOffsetFlag": "0",
+            "CombHedgeFlag": "1",
+            "LimitPrice": 100.0,
+            "VolumeTotalOriginal": 1,
+            "OrderPriceType": "2",
+            "TimeCondition": "3",
         }
-        _queue_and_complete(store, scope, lease, owner, target, "submit-terminal-first", payload, 71)
+        _queue_and_complete(
+            store, scope, lease, owner, target, "submit-terminal-first", payload, 71
+        )
         _append_order_event(owner, store, scope, target, 4, 1, 381)
         _adapter_for(store, owner).apply_next_ingress(
             callback_verifier=_TerminalOrderCallbackVerifier(),
@@ -1791,9 +1976,12 @@ def test_cancel_claim_rejects_target_already_terminal_in_verified_projection(tmp
                 authority_verifier=_Authority(),
                 required_local_queue_receipt_id=receipt_id,
             )
-        assert store._connection.execute(
-            "SELECT COUNT(*) FROM ctp_dispatch_cancel_postconditions"
-        ).fetchone()[0] == 0
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_cancel_postconditions"
+            ).fetchone()[0]
+            == 0
+        )
         current = store.read_ctp_dispatch_command(scope, staged.command_id)
         assert current is not None and current.status == "READY"
     finally:
@@ -1810,43 +1998,51 @@ def test_v17_upgrade_preserves_possibly_sent_cancel_as_pending_postcondition(tmp
     binding = store._active_ctp_callback_sessions[owner.owner_intent_id]
     target = _reserve(store, scope, lease, binding.session_generation_id, "migration-target")
     payload = {
-        "BrokerID": "broker", "InvestorID": "user", "UserID": "user",
-        "InstrumentID": "rb2710", "ExchangeID": "SHFE", "OrderRef": target.order_ref,
-        "Direction": "0", "CombOffsetFlag": "0", "CombHedgeFlag": "1",
-        "LimitPrice": 100.0, "VolumeTotalOriginal": 1,
-        "OrderPriceType": "2", "TimeCondition": "3",
+        "BrokerID": "broker",
+        "InvestorID": "user",
+        "UserID": "user",
+        "InstrumentID": "rb2710",
+        "ExchangeID": "SHFE",
+        "OrderRef": target.order_ref,
+        "Direction": "0",
+        "CombOffsetFlag": "0",
+        "CombHedgeFlag": "1",
+        "LimitPrice": 100.0,
+        "VolumeTotalOriginal": 1,
+        "OrderPriceType": "2",
+        "TimeCondition": "3",
     }
     _queue_and_complete(store, scope, lease, owner, target, "submit-migration-target", payload, 71)
-    _stage_cancel_and_complete(
-        store, scope, lease, owner, target, "cancel-migration-target", 501
-    )
+    _stage_cancel_and_complete(store, scope, lease, owner, target, "cancel-migration-target", 501)
     store._connection.execute("DROP TABLE ctp_dispatch_cancel_postcondition_resolutions")
     store._connection.execute("DROP TABLE ctp_dispatch_cancel_terminal_observations")
     store._connection.execute("DROP TABLE ctp_dispatch_cancel_postconditions")
-    store._connection.execute(
-        "UPDATE execution_meta SET value = '17' WHERE key = 'schema_version'"
-    )
+    store._connection.execute("UPDATE execution_meta SET value = '17' WHERE key = 'schema_version'")
     store.close()
 
     upgraded = SqliteExecutionStore(path)
     try:
-        assert upgraded._connection.execute(
-            "SELECT value FROM execution_meta WHERE key = 'schema_version'"
-        ).fetchone()[0] == "20"
+        assert (
+            upgraded._connection.execute(
+                "SELECT value FROM execution_meta WHERE key = 'schema_version'"
+            ).fetchone()[0]
+            == "20"
+        )
         row = upgraded._connection.execute(
             "SELECT identity_state, target_submit_command_id, owner_intent_id "
             "FROM ctp_dispatch_cancel_postconditions WHERE cancel_command_id = ?",
             ("cancel-migration-target",),
         ).fetchone()
-        assert tuple(row) == (
-            "EXACT", "submit-migration-target", owner.owner_intent_id
-        )
+        assert tuple(row) == ("EXACT", "submit-migration-target", owner.owner_intent_id)
         assert upgraded._ctp_has_pending_cancel_postcondition(
             upgraded._connection.cursor(), scope.account_key
         )
-        assert upgraded._connection.execute(
-            "SELECT COUNT(*) FROM ctp_dispatch_cancel_postcondition_resolutions"
-        ).fetchone()[0] == 0
+        assert (
+            upgraded._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_cancel_postcondition_resolutions"
+            ).fetchone()[0]
+            == 0
+        )
     finally:
         upgraded.close()
 
@@ -1860,18 +2056,26 @@ def test_resolved_cancel_contradiction_poisons_owner_durably_after_rollback(tmp_
     try:
         owner = _active_owner(store, scope, lease)
         binding = store._active_ctp_callback_sessions[owner.owner_intent_id]
-        target = _reserve(store, scope, lease, binding.session_generation_id, "contradiction-target")
+        target = _reserve(
+            store, scope, lease, binding.session_generation_id, "contradiction-target"
+        )
         payload = {
-            "BrokerID": "broker", "InvestorID": "user", "UserID": "user",
-            "InstrumentID": "rb2710", "ExchangeID": "SHFE", "OrderRef": target.order_ref,
-            "Direction": "0", "CombOffsetFlag": "0", "CombHedgeFlag": "1",
-            "LimitPrice": 100.0, "VolumeTotalOriginal": 1,
-            "OrderPriceType": "2", "TimeCondition": "3",
+            "BrokerID": "broker",
+            "InvestorID": "user",
+            "UserID": "user",
+            "InstrumentID": "rb2710",
+            "ExchangeID": "SHFE",
+            "OrderRef": target.order_ref,
+            "Direction": "0",
+            "CombOffsetFlag": "0",
+            "CombHedgeFlag": "1",
+            "LimitPrice": 100.0,
+            "VolumeTotalOriginal": 1,
+            "OrderPriceType": "2",
+            "TimeCondition": "3",
         }
         _queue_and_complete(store, scope, lease, owner, target, "submit-contradiction", payload, 71)
-        _stage_cancel_and_complete(
-            store, scope, lease, owner, target, "cancel-contradiction", 501
-        )
+        _stage_cancel_and_complete(store, scope, lease, owner, target, "cancel-contradiction", 501)
         _append_order_event(owner, store, scope, target, 4, 1, 381)
         adapter = _adapter_for(store, owner)
         adapter.apply_next_ingress(
@@ -1881,7 +2085,11 @@ def test_resolved_cancel_contradiction_poisons_owner_durably_after_rollback(tmp_
         store.append_ctp_callback_ingress(
             owner,
             _record(
-                owner, "OnRtnTrade", 5, phase="ACTIVE", callback_class="ROUTEABLE",
+                owner,
+                "OnRtnTrade",
+                5,
+                phase="ACTIVE",
+                callback_class="ROUTEABLE",
                 fields=_trade_fields(order_ref=target.order_ref, trade_id="contradiction-fill"),
             ),
         )
@@ -1889,9 +2097,12 @@ def test_resolved_cancel_contradiction_poisons_owner_durably_after_rollback(tmp_
             callback_verifier=_TerminalOrderCallbackVerifier(),
             trade_fact_verifier=_TradeVerifier(),
         )
-        assert store._connection.execute(
-            "SELECT COUNT(*) FROM ctp_dispatch_cancel_postcondition_resolutions"
-        ).fetchone()[0] == 1
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_cancel_postcondition_resolutions"
+            ).fetchone()[0]
+            == 1
+        )
 
         _append_order_event(owner, store, scope, target, 6, 0, 382)
         with pytest.raises(ContractValidationError):
@@ -1905,11 +2116,14 @@ def test_resolved_cancel_contradiction_poisons_owner_durably_after_rollback(tmp_
             (owner.owner_intent_id,),
         ).fetchone()
         assert tuple(owner_row) == ("POISONED", "callback_apply_failure")
-        assert store._connection.execute(
-            "SELECT COUNT(*) FROM ctp_dispatch_callback_ingress_applications "
-            "WHERE owner_intent_id = ? AND source_sequence = 6",
-            (owner.owner_intent_id,),
-        ).fetchone()[0] == 0
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_callback_ingress_applications "
+                "WHERE owner_intent_id = ? AND source_sequence = 6",
+                (owner.owner_intent_id,),
+            ).fetchone()[0]
+            == 0
+        )
     finally:
         store.close()
 

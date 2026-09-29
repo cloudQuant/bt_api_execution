@@ -38,9 +38,7 @@ def test_factory_bound_store_rejects_other_account_and_provider_before_mutations
         with pytest.raises(ContractValidationError, match="immutable CTP account store identity"):
             store.acquire_or_renew_lease(scope_b, "account-b", ttl_ns=30_000_000_000)
         with pytest.raises(ContractValidationError, match="immutable CTP account store identity"):
-            store.acquire_or_renew_lease(
-                generic_scope, "generic-account", ttl_ns=30_000_000_000
-            )
+            store.acquire_or_renew_lease(generic_scope, "generic-account", ttl_ns=30_000_000_000)
         with pytest.raises(ContractValidationError, match="immutable CTP account store identity"):
             store.reserve_ctp_order_identity(
                 scope_b,
@@ -56,19 +54,24 @@ def test_factory_bound_store_rejects_other_account_and_provider_before_mutations
             time.time_ns() + 30_000_000_000,
         )
         with pytest.raises(ContractValidationError, match="immutable CTP account store identity"):
-            store.create_ctp_callback_session_owner(
-                scope_b, writer_lease=foreign_lease
-            )
+            store.create_ctp_callback_session_owner(scope_b, writer_lease=foreign_lease)
 
-        assert store._connection.execute(
-            "SELECT COUNT(*) FROM ctp_account_family_owners"
-        ).fetchone()[0] == 0
-        assert store._connection.execute(
-            "SELECT COUNT(*) FROM execution_writer_leases"
-        ).fetchone()[0] == 0
-        assert store._connection.execute(
-            "SELECT COUNT(*) FROM ctp_order_identity_reservations"
-        ).fetchone()[0] == 0
+        assert (
+            store._connection.execute("SELECT COUNT(*) FROM ctp_account_family_owners").fetchone()[
+                0
+            ]
+            == 0
+        )
+        assert (
+            store._connection.execute("SELECT COUNT(*) FROM execution_writer_leases").fetchone()[0]
+            == 0
+        )
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_order_identity_reservations"
+            ).fetchone()[0]
+            == 0
+        )
 
         owner_a = store.acquire_ctp_account_family_owner(scope_a)
         lease_a = store.acquire_or_renew_lease(
@@ -104,12 +107,18 @@ def test_raw_constructor_reopen_keeps_factory_identity_guard(tmp_path) -> None:
             raw_store.acquire_ctp_account_family_owner(scope_b)
         with pytest.raises(ContractValidationError, match="immutable CTP account store identity"):
             raw_store.acquire_or_renew_lease(scope_b, "account-b", ttl_ns=30_000_000_000)
-        assert raw_store._connection.execute(
-            "SELECT COUNT(*) FROM ctp_account_family_owners"
-        ).fetchone()[0] == 0
-        assert raw_store._connection.execute(
-            "SELECT COUNT(*) FROM execution_writer_leases"
-        ).fetchone()[0] == 0
+        assert (
+            raw_store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_account_family_owners"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            raw_store._connection.execute(
+                "SELECT COUNT(*) FROM execution_writer_leases"
+            ).fetchone()[0]
+            == 0
+        )
 
         owner_a = raw_store.acquire_ctp_account_family_owner(scope_a)
         lease_a = raw_store.acquire_or_renew_lease(
@@ -289,8 +298,14 @@ def test_factory_preflight_rejects_foreign_ctp_dispatch_history_without_owner(
                           'foreign-intent', '000000000001', 'foreign-approval', ?,
                           '{}', ?, 'READY', 1, 1)
                 """,
-                (scope_b.account_key, scope_b.key, scope_b.trading_day,
-                 "a" * 64, "b" * 64, "c" * 64),
+                (
+                    scope_b.account_key,
+                    scope_b.key,
+                    scope_b.trading_day,
+                    "a" * 64,
+                    "b" * 64,
+                    "c" * 64,
+                ),
             )
         connection.commit()
     finally:
@@ -314,8 +329,7 @@ def test_factory_creates_and_reopens_exact_account_identity_through_wal(tmp_path
     first = SqliteExecutionStore.open_ctp_account_store(path, scope)
     try:
         assert (
-            SqliteExecutionStore.inspect_ctp_account_store_file(path).kind
-            == "CTP_EXECUTION_STORE"
+            SqliteExecutionStore.inspect_ctp_account_store_file(path).kind == "CTP_EXECUTION_STORE"
         )
         owner = first.acquire_ctp_account_family_owner(scope)
         identity = first.read_ctp_account_store_identity(scope)
@@ -437,19 +451,20 @@ def test_factory_rejects_incomplete_v20_schema_before_recreating_guard(tmp_path)
     assert path.read_bytes() == before
     check = sqlite3.connect(path)
     try:
-        assert check.execute(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' "
-            "AND name='ctp_dispatch_trade_fact_immutable_update'"
-        ).fetchone()[0] == 0
+        assert (
+            check.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' "
+                "AND name='ctp_dispatch_trade_fact_immutable_update'"
+            ).fetchone()[0]
+            == 0
+        )
     finally:
         check.close()
 
 
 @pytest.mark.unit
 @pytest.mark.parametrize("tamper", ["trigger_body", "identity_column"])
-def test_factory_rejects_same_name_but_malformed_v20_schema_before_writes(
-    tmp_path, tamper
-) -> None:
+def test_factory_rejects_same_name_but_malformed_v20_schema_before_writes(tmp_path, tamper) -> None:
     path = tmp_path / f"malformed-schema-{tamper}.sqlite3"
     store = SqliteExecutionStore.open_ctp_account_store(path, _scope())
     store.close()
@@ -462,9 +477,7 @@ def test_factory_rejects_same_name_but_malformed_v20_schema_before_writes(
                 "BEFORE UPDATE ON ctp_dispatch_trade_fact_ledger BEGIN SELECT 1; END"
             )
         else:
-            connection.execute(
-                "ALTER TABLE ctp_account_store_identity ADD COLUMN unexpected TEXT"
-            )
+            connection.execute("ALTER TABLE ctp_account_store_identity ADD COLUMN unexpected TEXT")
         connection.commit()
     finally:
         connection.close()
@@ -511,9 +524,12 @@ def test_factory_rejects_v19_without_identity_before_schema_upgrade(tmp_path) ->
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         } == before_tables
-        assert check.execute(
-            "SELECT value FROM execution_meta WHERE key='schema_version'"
-        ).fetchone()[0] == "19"
+        assert (
+            check.execute("SELECT value FROM execution_meta WHERE key='schema_version'").fetchone()[
+                0
+            ]
+            == "19"
+        )
     finally:
         check.close()
 
@@ -521,17 +537,13 @@ def test_factory_rejects_v19_without_identity_before_schema_upgrade(tmp_path) ->
 @pytest.mark.unit
 def test_factory_rejects_legacy_and_unknown_schemas_without_adding_tables(tmp_path) -> None:
     missing_path = tmp_path / "missing.sqlite3"
-    assert (
-        SqliteExecutionStore.inspect_ctp_account_store_file(missing_path).kind == "MISSING"
-    )
+    assert SqliteExecutionStore.inspect_ctp_account_store_file(missing_path).kind == "MISSING"
 
     legacy_path = tmp_path / "legacy.sqlite3"
     legacy = sqlite3.connect(legacy_path)
     try:
         legacy.execute("CREATE TABLE ctp_sim_orders (client_order_id TEXT PRIMARY KEY)")
-        legacy.execute(
-            "CREATE TABLE ctp_sim_journal_metadata (singleton INTEGER PRIMARY KEY)"
-        )
+        legacy.execute("CREATE TABLE ctp_sim_journal_metadata (singleton INTEGER PRIMARY KEY)")
         legacy.execute("CREATE TABLE ctp_sim_journal_scopes (scope_sha256 TEXT PRIMARY KEY)")
         legacy.commit()
     finally:
@@ -584,8 +596,7 @@ def test_factory_inspector_recognizes_only_empty_exact_orders_only_legacy_layout
     finally:
         valid.close()
     assert (
-        SqliteExecutionStore.inspect_ctp_account_store_file(valid_path).kind
-        == "LEGACY_CTP_JOURNAL"
+        SqliteExecutionStore.inspect_ctp_account_store_file(valid_path).kind == "LEGACY_CTP_JOURNAL"
     )
 
     scoped_empty_path = tmp_path / "empty-orders-only-with-scope.sqlite3"
@@ -616,9 +627,7 @@ def test_factory_inspector_recognizes_only_empty_exact_orders_only_legacy_layout
     extra_column_path = tmp_path / "extra-column-orders-only.sqlite3"
     extra_column = sqlite3.connect(extra_column_path)
     try:
-        extra_column.execute(
-            f"CREATE TABLE ctp_sim_orders {legacy_columns[:-1]}, surprise TEXT)"
-        )
+        extra_column.execute(f"CREATE TABLE ctp_sim_orders {legacy_columns[:-1]}, surprise TEXT)")
         extra_column.commit()
     finally:
         extra_column.close()
@@ -699,7 +708,9 @@ def test_factory_rejects_hot_journal_before_opening_existing_store(tmp_path) -> 
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("invalid_path", [":memory:", "file:memorydb?mode=memory&cache=shared", "relative.sqlite3"])
+@pytest.mark.parametrize(
+    "invalid_path", [":memory:", "file:memorydb?mode=memory&cache=shared", "relative.sqlite3"]
+)
 def test_factory_rejects_memory_uri_and_relative_paths(tmp_path, invalid_path) -> None:
     with pytest.raises(ContractValidationError):
         SqliteExecutionStore.open_ctp_account_store(invalid_path, _scope())

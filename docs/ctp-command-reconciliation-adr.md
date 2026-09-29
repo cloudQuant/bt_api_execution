@@ -63,13 +63,20 @@ illustrative and are not exported APIs yet:
 ```python
 class CtpDispatchCallbackVerifier(Protocol):
     def verify_callback(
-        self, command: CtpDispatchCommand, callback: NormalizedCtpCallback, *,
+        self,
+        command: CtpDispatchCommand,
+        callback: NormalizedCtpCallback,
+        *,
         session_generation: str,
     ) -> VerifiedCtpCallback: ...
 
+
 class CtpDispatchUnknownRecoveryVerifier(Protocol):
     def verify_recovery(
-        self, command: CtpDispatchCommand, evidence: CtpRecoveryEvidenceBundle, *,
+        self,
+        command: CtpDispatchCommand,
+        evidence: CtpRecoveryEvidenceBundle,
+        *,
         now_ns: int,
     ) -> VerifiedCtpRecovery | None: ...  # None means abstain; UNKNOWN stays fenced.
 ```

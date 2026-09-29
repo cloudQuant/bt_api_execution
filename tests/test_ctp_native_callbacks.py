@@ -50,9 +50,7 @@ def _correlation(
         approval_use_id="approval-use",
         approval_digest=_digest("approval"),
         session_binding_sha256=_digest("session-binding"),
-        session_generation_id=ctp_native_session_generation_id(
-            3, 7, session_epoch, 4, 91
-        ),
+        session_generation_id=ctp_native_session_generation_id(3, 7, session_epoch, 4, 91),
         dispatch_front_id=4,
         dispatch_session_id=91,
         native_request_id=17,
@@ -186,9 +184,7 @@ def test_native_order_return_maps_exact_scope_and_source_sequence():
         "scope_key": correlation.scope_key,
         "trading_day": "20260925",
         "session_epoch": _SESSION_EPOCH,
-        "session_generation_id": ctp_native_session_generation_id(
-            3, 7, _SESSION_EPOCH, 4, 91
-        ),
+        "session_generation_id": ctp_native_session_generation_id(3, 7, _SESSION_EPOCH, 4, 91),
         "account_fingerprint": _account_fingerprint(),
         "native_api_generation": 3,
         "connection_generation": 7,
@@ -374,9 +370,7 @@ def test_native_order_return_requires_native_identity_sequence_and_matching_sess
     different_api_generation = replace(
         session,
         native_api_generation=4,
-        session_generation_id=ctp_native_session_generation_id(
-            4, 7, session.session_epoch, 4, 91
-        ),
+        session_generation_id=ctp_native_session_generation_id(4, 7, session.session_epoch, 4, 91),
     )
     with pytest.raises(ContractValidationError, match="session does not match command"):
         map_ctp_native_order_return(correlation, different_api_generation, _order_field())

@@ -89,9 +89,7 @@ class _DurableCancelGate(_CancelGate):
         super().__init__()
         self._path = path
         self._connection = sqlite3.connect(path)
-        self._connection.execute(
-            "CREATE TABLE risk_dispatch_claims (permit_id TEXT PRIMARY KEY)"
-        )
+        self._connection.execute("CREATE TABLE risk_dispatch_claims (permit_id TEXT PRIMARY KEY)")
         self._connection.commit()
 
     def claim_before_dispatch(
@@ -185,9 +183,7 @@ def test_cancel_is_durable_idempotent_and_keeps_target_identity(tmp_path) -> Non
 
     original_claim = gate.claim_before_dispatch
 
-    def claim_before_dispatch(
-        permit_id: str, intent: CancelIntent
-    ) -> CancelDispatchClaimReceiptV1:
+    def claim_before_dispatch(permit_id: str, intent: CancelIntent) -> CancelDispatchClaimReceiptV1:
         call_order.append("risk_claim")
         return original_claim(permit_id, intent)
 
@@ -259,9 +255,7 @@ def test_cancel_pre_dispatch_guard_runs_before_risk_claim_and_provider(tmp_path)
         assert record.state is ExecutionState.BLOCKED
         assert provider_calls == []
         assert gate.claimed == []
-        assert gate.released == [
-            ("cancel-permit-cancel.1", "cancel_pre_dispatch_guard_failed")
-        ]
+        assert gate.released == [("cancel-permit-cancel.1", "cancel_pre_dispatch_guard_failed")]
     finally:
         store.close()
 
@@ -271,9 +265,7 @@ def test_cancel_risk_claim_failure_is_unknown_without_release_or_provider_retry(
     store, facade, gate = _ready_facades(tmp_path)
     provider_calls: list[str] = []
 
-    def ambiguous_claim(
-        permit_id: str, intent: CancelIntent
-    ) -> CancelDispatchClaimReceiptV1:
+    def ambiguous_claim(permit_id: str, intent: CancelIntent) -> CancelDispatchClaimReceiptV1:
         gate.claimed.append(intent.cancel_id)
         # Model a risk store commit whose acknowledgement was lost.
         raise RuntimeError("claim acknowledgement lost")
@@ -404,9 +396,7 @@ def test_configured_cancel_gate_without_dispatch_claim_method_fails_closed(tmp_p
         ManagedCancellationFacade(
             store,
             _scope(),
-            acquire_writer_lease=lambda: store.acquire_or_renew_lease(
-                _scope(), "writer.legacy"
-            ),
+            acquire_writer_lease=lambda: store.acquire_or_renew_lease(_scope(), "writer.legacy"),
             admission_gate=_LegacyGateWithoutClaim(),  # type: ignore[arg-type]
         )
     store.close()
@@ -543,9 +533,7 @@ def test_expired_cancellation_writer_cannot_project_provider_result_after_fencin
     assert entered.wait(timeout=5)
     try:
         time.sleep(0.15)
-        contender = store.acquire_or_renew_lease(
-            _scope(), "writer.contender", ttl_ns=1_000_000_000
-        )
+        contender = store.acquire_or_renew_lease(_scope(), "writer.contender", ttl_ns=1_000_000_000)
         assert contender.fencing_token > order_facade._last_writer_lease.fencing_token
         release.set()
         thread.join(timeout=5)

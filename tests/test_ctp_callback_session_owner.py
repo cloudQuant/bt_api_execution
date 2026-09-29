@@ -416,9 +416,11 @@ def test_callback_session_pins_one_exact_adapter_and_sdk_record_type(tmp_path):
         spoof_type = type(
             "CtpTraderCallbackIngressRecordV2",
             (),
-            {"to_payload": lambda self: _callback_record(
-                owner.owner_intent_id, "OnFrontConnected", 1, generation=0
-            ).to_payload()},
+            {
+                "to_payload": lambda self: _callback_record(
+                    owner.owner_intent_id, "OnFrontConnected", 1, generation=0
+                ).to_payload()
+            },
         )
         with pytest.raises(ContractValidationError, match="typed CTP callback ingress record"):
             store.append_ctp_callback_ingress(

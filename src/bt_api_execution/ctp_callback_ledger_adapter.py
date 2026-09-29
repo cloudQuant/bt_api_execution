@@ -161,9 +161,7 @@ class CtpNativeCallbackLedgerAdapter:
                 # and never clears the durable account lifecycle fence.
             raise
 
-    def apply_next(
-        self, *, timeout: float | None = 5.0
-    ) -> CtpDispatchCallbackApplyResult | None:
+    def apply_next(self, *, timeout: float | None = 5.0) -> CtpDispatchCallbackApplyResult | None:
         """Poll and durably apply one callback, or return ``None`` on timeout.
 
         The complete lifecycle-bound envelope is given to the injected

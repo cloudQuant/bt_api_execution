@@ -236,10 +236,16 @@ class CtpManagedDispatchBinding:
     def __post_init__(self) -> None:
         if self.operation not in {"submit", "cancel"}:
             raise ContractValidationError("invalid managed CTP binding operation")
-        if type(self.native_request_id) is not int or not 1 <= self.native_request_id <= 2_147_483_647:
+        if (
+            type(self.native_request_id) is not int
+            or not 1 <= self.native_request_id <= 2_147_483_647
+        ):
             raise ContractValidationError("invalid managed CTP binding RequestID")
         if self.operation == "cancel":
-            if type(self.native_action_ref) is not int or not 1 <= self.native_action_ref <= 2_147_483_647:
+            if (
+                type(self.native_action_ref) is not int
+                or not 1 <= self.native_action_ref <= 2_147_483_647
+            ):
                 raise ContractValidationError("invalid Store-issued native ActionRef")
         elif self.native_action_ref is not None:
             raise ContractValidationError("submit binding cannot carry a native ActionRef")
@@ -522,9 +528,7 @@ class CtpManagedSingleWorkerCandidate:
 
         try:
             if claimed.operation == "CANCEL":
-                self._store.require_fresh_ctp_cancel_target_for_command(
-                    self._scope, command_id
-                )
+                self._store.require_fresh_ctp_cancel_target_for_command(self._scope, command_id)
             result = sender(claimed)
             if inspect.isawaitable(result):
                 result = await result

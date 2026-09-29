@@ -80,9 +80,9 @@ def _source_session(
     )
     import hashlib
 
-    fingerprint = "acct_" + hashlib.sha256(
-        f"{broker_id}:{user_id}".encode("ascii")
-    ).hexdigest()[:16]
+    fingerprint = (
+        "acct_" + hashlib.sha256(f"{broker_id}:{user_id}".encode("ascii")).hexdigest()[:16]
+    )
     session = CtpNativeSessionContext(
         account_key=binding.account_key,
         scope_key=binding.scope_key,
@@ -243,9 +243,7 @@ class CtpCallbackSessionStoreAdapter:
         self.owner_handle = owner_handle
         self.writer_lease = writer_lease
         self._apply_lock = Lock()
-        store._register_ctp_callback_session_adapter(
-            owner_handle, self, callback_record_type
-        )
+        store._register_ctp_callback_session_adapter(owner_handle, self, callback_record_type)
         self.sink = CtpCallbackSessionIngressSink(
             store,
             owner_handle,
@@ -408,9 +406,7 @@ class CtpCallbackSessionStoreAdapter:
                     request_id=_named_arg(payload, 2)
                     if callback_name == "OnRspOrderInsert"
                     else None,
-                    is_last=_named_arg(payload, 3)
-                    if callback_name == "OnRspOrderInsert"
-                    else None,
+                    is_last=_named_arg(payload, 3) if callback_name == "OnRspOrderInsert" else None,
                 )
             elif callback_name in {"OnRspOrderAction", "OnErrRtnOrderAction"}:
                 envelope = map_ctp_native_order_action_callback(
@@ -422,9 +418,7 @@ class CtpCallbackSessionStoreAdapter:
                     request_id=_named_arg(payload, 2)
                     if callback_name == "OnRspOrderAction"
                     else None,
-                    is_last=_named_arg(payload, 3)
-                    if callback_name == "OnRspOrderAction"
-                    else None,
+                    is_last=_named_arg(payload, 3) if callback_name == "OnRspOrderAction" else None,
                 )
             else:
                 raise ContractValidationError("CTP callback has no typed native mapper")

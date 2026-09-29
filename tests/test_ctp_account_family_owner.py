@@ -81,9 +81,7 @@ def _persist_unknown_cancel(
     )
     store.admit_cancel(cancel, writer_lease=lease)
     store.activate_cancel(cancel_id, scope, writer_lease=lease)
-    _, cancel_claimed = store.claim_cancel_for_dispatch(
-        cancel_id, scope, writer_lease=lease
-    )
+    _, cancel_claimed = store.claim_cancel_for_dispatch(cancel_id, scope, writer_lease=lease)
     assert cancel_claimed
     store.mark_cancel_unknown(cancel_id, scope, writer_lease=lease)
 
@@ -101,24 +99,26 @@ def test_family_owner_reuses_only_exact_store_handle_for_sibling_scopes(tmp_path
         owner = store.acquire_ctp_account_family_owner(first_scope)
         assert owner.family_key.startswith("ctp-account-family.v1:")
         assert store.acquire_ctp_account_family_owner(sibling_scope) is owner
-        assert store.acquire_or_renew_lease(
-            first_scope,
-            "shared-actor",
-            ttl_ns=30_000_000_000,
-            ctp_account_family_owner=owner,
-        ).family_owner_intent_id == owner.owner_intent_id
-        assert store.acquire_or_renew_lease(
-            sibling_scope,
-            "shared-actor",
-            ttl_ns=30_000_000_000,
-            ctp_account_family_owner=owner,
-        ).family_owner_intent_id == owner.owner_intent_id
-        first_facade = ManagedExecutionFacade(
-            store, first_scope, writer_id="shared-actor"
+        assert (
+            store.acquire_or_renew_lease(
+                first_scope,
+                "shared-actor",
+                ttl_ns=30_000_000_000,
+                ctp_account_family_owner=owner,
+            ).family_owner_intent_id
+            == owner.owner_intent_id
         )
-        sibling_facade = ManagedExecutionFacade(
-            store, sibling_scope, writer_id="shared-actor"
+        assert (
+            store.acquire_or_renew_lease(
+                sibling_scope,
+                "shared-actor",
+                ttl_ns=30_000_000_000,
+                ctp_account_family_owner=owner,
+            ).family_owner_intent_id
+            == owner.owner_intent_id
         )
+        first_facade = ManagedExecutionFacade(store, first_scope, writer_id="shared-actor")
+        sibling_facade = ManagedExecutionFacade(store, sibling_scope, writer_id="shared-actor")
         first_facade_lease = first_facade.acquire_writer_lease()
         sibling_facade_lease = sibling_facade.acquire_writer_lease()
         assert first_facade_lease.family_owner_intent_id == owner.owner_intent_id
@@ -167,18 +167,19 @@ def test_v18_history_migrates_to_permanent_unmapped_family_fence(tmp_path) -> No
 
     connection = sqlite3.connect(path)
     try:
-        connection.execute(
-            "UPDATE execution_meta SET value = '18' WHERE key = 'schema_version'"
-        )
+        connection.execute("UPDATE execution_meta SET value = '18' WHERE key = 'schema_version'")
         connection.commit()
     finally:
         connection.close()
 
     migrated = SqliteExecutionStore(path)
     try:
-        assert migrated._connection.execute(
-            "SELECT value FROM execution_meta WHERE key = 'schema_version'"
-        ).fetchone()[0] == "20"
+        assert (
+            migrated._connection.execute(
+                "SELECT value FROM execution_meta WHERE key = 'schema_version'"
+            ).fetchone()[0]
+            == "20"
+        )
         fence = migrated._connection.execute(
             "SELECT reason_code, source_schema_version FROM ctp_account_family_legacy_fences"
         ).fetchone()
@@ -190,7 +191,9 @@ def test_v18_history_migrates_to_permanent_unmapped_family_fence(tmp_path) -> No
 
 
 @pytest.mark.unit
-def test_unknown_cancel_account_scan_and_claim_gate_are_atomic_across_strategy_day(tmp_path) -> None:
+def test_unknown_cancel_account_scan_and_claim_gate_are_atomic_across_strategy_day(
+    tmp_path,
+) -> None:
     store = SqliteExecutionStore(tmp_path / "account-cancel-gate.sqlite3")
     first_scope = ExecutionScope("fake", "offline", "same-account", "strategy.one", "20260925")
     sibling_scope = ExecutionScope("fake", "offline", "same-account", "strategy.two", "20260926")
@@ -216,16 +219,12 @@ def test_unknown_cancel_account_scan_and_claim_gate_are_atomic_across_strategy_d
             lease.expires_at_ns,
         )
         with pytest.raises(WriterLeaseUnavailable):
-            store.list_unresolved_cancellations_for_account(
-                sibling_scope, writer_lease=wrong_lease
-            )
+            store.list_unresolved_cancellations_for_account(sibling_scope, writer_lease=wrong_lease)
 
         with pytest.raises(
             InvalidStateTransition, match="account has an unresolved managed cancellation"
         ):
-            store.claim_for_dispatch(
-                second_intent.intent_id, sibling_scope, writer_lease=lease
-            )
+            store.claim_for_dispatch(second_intent.intent_id, sibling_scope, writer_lease=lease)
         row = store._connection.execute(
             "SELECT state, dispatch_attempts FROM execution_records WHERE scope_key = ? AND intent_id = ?",
             (sibling_scope.key, second_intent.intent_id),

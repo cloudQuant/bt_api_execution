@@ -229,17 +229,18 @@ def test_v10_execution_store_migrates_immutable_cancel_target_projection_tables(
 def test_v11_projection_lineage_migrates_without_inventing_callback_fence(tmp_path) -> None:
     path = tmp_path / "execution.sqlite3"
     store = SqliteExecutionStore(path)
-    store._connection.execute(
-        "DROP TABLE ctp_dispatch_callback_source_lifecycle_fences"
-    )
+    store._connection.execute("DROP TABLE ctp_dispatch_callback_source_lifecycle_fences")
     store._connection.execute("UPDATE execution_meta SET value = '11' WHERE key = 'schema_version'")
     store.close()
 
     migrated = SqliteExecutionStore(path)
     try:
-        assert migrated._connection.execute(
-            "SELECT value FROM execution_meta WHERE key = 'schema_version'"
-        ).fetchone()[0] == "20"
+        assert (
+            migrated._connection.execute(
+                "SELECT value FROM execution_meta WHERE key = 'schema_version'"
+            ).fetchone()[0]
+            == "20"
+        )
         tables = {
             str(row["name"])
             for row in migrated._connection.execute(
@@ -251,20 +252,29 @@ def test_v11_projection_lineage_migrates_without_inventing_callback_fence(tmp_pa
             "ctp_order_target_projection_consumptions",
             "ctp_dispatch_callback_source_lifecycle_fences",
         }.issubset(tables)
-        assert migrated._connection.execute(
-            "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences"
-        ).fetchone()[0] == 0
+        assert (
+            migrated._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences"
+            ).fetchone()[0]
+            == 0
+        )
     finally:
         migrated.close()
 
     reopened = SqliteExecutionStore(path)
     try:
-        assert reopened._connection.execute(
-            "SELECT value FROM execution_meta WHERE key = 'schema_version'"
-        ).fetchone()[0] == "20"
-        assert reopened._connection.execute(
-            "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences"
-        ).fetchone()[0] == 0
+        assert (
+            reopened._connection.execute(
+                "SELECT value FROM execution_meta WHERE key = 'schema_version'"
+            ).fetchone()[0]
+            == "20"
+        )
+        assert (
+            reopened._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences"
+            ).fetchone()[0]
+            == 0
+        )
     finally:
         reopened.close()
 
@@ -290,21 +300,15 @@ def test_released_writer_lease_generation_is_never_reused_after_reopen(tmp_path)
     store = SqliteExecutionStore(path)
     first = store.acquire_or_renew_lease(scope, "writer.same")
     assert first.fencing_token == 1
-    assert store.release_lease(
-        scope, "writer.same", fencing_token=first.fencing_token
-    )
+    assert store.release_lease(scope, "writer.same", fencing_token=first.fencing_token)
 
     second = store.acquire_or_renew_lease(scope, "writer.same")
     assert second.fencing_token == 2
     with pytest.raises(WriterLeaseUnavailable):
         store.assert_writer_lease(scope, first)
-    assert not store.release_lease(
-        scope, "writer.same", fencing_token=first.fencing_token
-    )
+    assert not store.release_lease(scope, "writer.same", fencing_token=first.fencing_token)
     store.assert_writer_lease(scope, second)
-    assert store.release_lease(
-        scope, "writer.same", fencing_token=second.fencing_token
-    )
+    assert store.release_lease(scope, "writer.same", fencing_token=second.fencing_token)
     store.close()
 
     reopened = SqliteExecutionStore(path)
@@ -313,9 +317,7 @@ def test_released_writer_lease_generation_is_never_reused_after_reopen(tmp_path)
         assert third.fencing_token == 3
         with pytest.raises(WriterLeaseUnavailable):
             reopened.assert_writer_lease(scope, second)
-        assert not reopened.release_lease(
-            scope, "writer.same", fencing_token=second.fencing_token
-        )
+        assert not reopened.release_lease(scope, "writer.same", fencing_token=second.fencing_token)
         reopened.assert_writer_lease(scope, third)
     finally:
         reopened.close()
@@ -394,7 +396,9 @@ def _seed_proof(scope: ExecutionScope, session: str = "test-seed-session") -> Ct
     )
 
 
-def _reserve_seeded(store, scope, managed_intent_id, runtime_order_id, *, session="test-seed-session"):
+def _reserve_seeded(
+    store, scope, managed_intent_id, runtime_order_id, *, session="test-seed-session"
+):
     lease = _lease(store, scope, "execution-store-test")
     return store.seed_ctp_order_ref_and_reserve_identity(
         scope,
@@ -441,9 +445,12 @@ def test_ctp_order_identity_reservation_is_idempotent_and_survives_restart(tmp_p
     try:
         assert reopened.read_ctp_order_identity(scope, "intent-1") == first
         assert reopened.read_ctp_order_identity(scope, "intent-2") == second
-        assert reopened.read_ctp_order_identity(
-            _ctp_scope(day="20260926", strategy="strategy.other"), "intent-1"
-        ) == third
+        assert (
+            reopened.read_ctp_order_identity(
+                _ctp_scope(day="20260926", strategy="strategy.other"), "intent-1"
+            )
+            == third
+        )
         with pytest.raises(InvalidStateTransition, match="already has a persistent owner"):
             reopened.acquire_ctp_account_family_owner(scope)
         assert reopened.read_ctp_order_identity(scope, "missing") is None
@@ -509,9 +516,12 @@ def test_ctp_order_identity_rejects_incomplete_or_invalid_scope(
     try:
         with pytest.raises(ContractValidationError):
             store.reserve_ctp_order_identity(scope, intent_id, runtime_id)
-        assert store._connection.execute(
-            "SELECT COUNT(*) FROM ctp_order_identity_reservations"
-        ).fetchone()[0] == 0
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_order_identity_reservations"
+            ).fetchone()[0]
+            == 0
+        )
     finally:
         store.close()
 
@@ -532,9 +542,12 @@ def test_ctp_order_identity_sqlite_rollback_does_not_leave_a_burned_ref(tmp_path
         )
         with pytest.raises(DurableStoreError, match="unable to persist CTP order identity"):
             _reserve_seeded(store, scope, "intent-1", _runtime_order_id("failed"))
-        assert store._connection.execute(
-            "SELECT COUNT(*) FROM ctp_order_identity_reservations"
-        ).fetchone()[0] == 0
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_order_identity_reservations"
+            ).fetchone()[0]
+            == 0
+        )
 
         store._connection.execute("DROP TRIGGER reject_ctp_identity_insert")
         reservation = _reserve_seeded(store, scope, "intent-1", _runtime_order_id("retry"))
@@ -551,6 +564,7 @@ def test_ctp_order_identity_allocation_serializes_independent_store_connections(
     lease = _lease(stores[0], scope, "execution-store-concurrency-test")
     proof = _seed_proof(scope)
     try:
+
         def reserve(index: int) -> str:
             result = stores[index].seed_ctp_order_ref_and_reserve_identity(
                 scope,

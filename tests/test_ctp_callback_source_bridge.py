@@ -479,9 +479,7 @@ def _stage_followup_ready_command(bound, store, *, writer_lease=None):
         writer_lease = bound.lease
     intent_id = "source-bridge-followup-intent"
     runtime_order_id = "bt-managed-v1:" + _sha(b"source-bridge-followup-runtime")
-    reservation = store.reserve_ctp_order_identity(
-        bound.scope, intent_id, runtime_order_id
-    )
+    reservation = store.reserve_ctp_order_identity(bound.scope, intent_id, runtime_order_id)
     original = store.read_ctp_dispatch_command(bound.scope, bound.command_id)
     assert original is not None and original.correlation_key is not None
     generation = original.correlation_key.session_generation_id
@@ -521,13 +519,9 @@ def _write_legacy_v11_resolved_guard(bound, *, correlation_digest=None):
     )
     # Recreate the guard-only schema-11 candidate shape. The final Store will
     # create projection tables after it snapshots these preexisting tables.
-    bound.store._connection.execute(
-        "DROP TABLE ctp_order_target_projection_consumptions"
-    )
+    bound.store._connection.execute("DROP TABLE ctp_order_target_projection_consumptions")
     bound.store._connection.execute("DROP TABLE ctp_order_target_projections")
-    bound.store._connection.execute(
-        "DROP TABLE ctp_dispatch_callback_source_lifecycle_fences"
-    )
+    bound.store._connection.execute("DROP TABLE ctp_dispatch_callback_source_lifecycle_fences")
     bound.store._connection.executescript(
         """
         CREATE TABLE ctp_dispatch_callback_ingestion_guards (
@@ -946,7 +940,9 @@ def test_close_wins_after_fake_sdk_dequeue_and_discards_callback(tmp_path, monke
             raise RuntimeError("test did not release the post-dequeue wait")
         return event
 
-    monkeypatch.setattr(bound.client, "_wait_native_callback_event_for_consumer", pause_after_dequeue)
+    monkeypatch.setattr(
+        bound.client, "_wait_native_callback_event_for_consumer", pause_after_dequeue
+    )
 
     def poll() -> None:
         try:
@@ -1328,9 +1324,7 @@ def test_callback_ledger_adapter_applies_same_send_event_and_keeps_unknown_fence
     bound = _stage_dispatched_command(tmp_path)
     adapter = None
     try:
-        reservation = bound.store.read_ctp_order_identity(
-            bound.scope, "source-bridge-intent"
-        )
+        reservation = bound.store.read_ctp_order_identity(bound.scope, "source-bridge-intent")
         command = bound.store.read_ctp_dispatch_command(bound.scope, bound.command_id)
         assert reservation is not None and command is not None
         assert command.status == "CLAIMED"
@@ -1384,16 +1378,22 @@ def test_callback_ledger_adapter_applies_same_send_event_and_keeps_unknown_fence
             ).fetchone()[0]
             == 1
         )
-        assert bound.store._connection.execute(
-            "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences"
-        ).fetchone()[0] == 1
-        assert bound.store._connection.execute(
-            """
+        assert (
+            bound.store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences"
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            bound.store._connection.execute(
+                """
             SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences
             WHERE account_key = ?
-            """
-            , (bound.scope.account_key,)
-        ).fetchone()[0] == 1
+            """,
+                (bound.scope.account_key,),
+            ).fetchone()[0]
+            == 1
+        )
     finally:
         if adapter is not None:
             adapter.close()
@@ -1419,9 +1419,12 @@ def test_source_lifecycle_fence_blocks_new_claim_after_queued_receipt_and_restar
                 error=RuntimeError("fake verifier rejection")
             ),
         )
-        assert bound.store._connection.execute(
-            "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences"
-        ).fetchone()[0] == 1
+        assert (
+            bound.store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences"
+            ).fetchone()[0]
+            == 1
+        )
 
         # Fake native send is complete: its local QUEUED receipt is immutable,
         # but callback ingestion is still pending.
@@ -1443,14 +1446,15 @@ def test_source_lifecycle_fence_blocks_new_claim_after_queued_receipt_and_restar
         assert reopened.read_ctp_dispatch_command(bound.scope, bound.command_id).status == (
             "COMPLETED"
         )
-        with pytest.raises(
-            ContractValidationError, match="permanent callback lifecycle fence"
-        ):
+        with pytest.raises(ContractValidationError, match="permanent callback lifecycle fence"):
             _stage_followup_ready_command(bound, reopened)
-        assert reopened._connection.execute(
-            "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences WHERE account_key = ?",
-            (bound.scope.account_key,),
-        ).fetchone()[0] == 1
+        assert (
+            reopened._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences WHERE account_key = ?",
+                (bound.scope.account_key,),
+            ).fetchone()[0]
+            == 1
+        )
     finally:
         if adapter is not None:
             adapter.close()
@@ -1473,21 +1477,33 @@ def test_callback_poll_timeout_keeps_lifecycle_fence_for_same_bridge_retry(tmp_p
             callback_verifier=_FakeCallbackLedgerVerifier(),
         )
         assert adapter.apply_next(timeout=0) is None
-        assert bound.store._connection.execute(
-            "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences"
-        ).fetchone()[0] == 1
-        assert bound.store._connection.execute(
-            "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences"
-        ).fetchone()[0] == 1
+        assert (
+            bound.store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences"
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            bound.store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences"
+            ).fetchone()[0]
+            == 1
+        )
 
         bound.client._events.put(_source_event(bound.client))
         assert adapter.apply_next(timeout=0) is not None
-        assert bound.store._connection.execute(
-            "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences"
-        ).fetchone()[0] == 1
-        assert bound.store._connection.execute(
-            "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences"
-        ).fetchone()[0] == 1
+        assert (
+            bound.store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences"
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            bound.store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences"
+            ).fetchone()[0]
+            == 1
+        )
     finally:
         if adapter is not None:
             adapter.close()
@@ -1530,14 +1546,15 @@ def test_source_lifecycle_fence_covers_event_queued_between_polls_and_restart(tm
         bound.store.close()
 
         reopened = SqliteExecutionStore(tmp_path / "execution.sqlite3")
-        with pytest.raises(
-            ContractValidationError, match="permanent callback lifecycle fence"
-        ):
+        with pytest.raises(ContractValidationError, match="permanent callback lifecycle fence"):
             _stage_followup_ready_command(bound, reopened)
-        assert reopened._connection.execute(
-            "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences WHERE account_key = ?",
-            (bound.scope.account_key,),
-        ).fetchone()[0] == 1
+        assert (
+            reopened._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences WHERE account_key = ?",
+                (bound.scope.account_key,),
+            ).fetchone()[0]
+            == 1
+        )
         assert bound.client._events.qsize() == 1
     finally:
         if adapter is not None:
@@ -1585,9 +1602,7 @@ def test_v11_resolved_guard_migrates_to_permanent_fence_and_stays_after_reopen(t
             command.correlation_key.to_payload()
         )
 
-        with pytest.raises(
-            InvalidStateTransition, match="unmapped legacy execution history"
-        ):
+        with pytest.raises(InvalidStateTransition, match="unmapped legacy execution history"):
             _stage_followup_ready_command(bound, migrated)
         migrated.close()
         migrated = None
@@ -1595,13 +1610,14 @@ def test_v11_resolved_guard_migrates_to_permanent_fence_and_stays_after_reopen(t
         # The combined v19 upgrade is idempotent and the old resolved bit never removes
         # the newly migrated account source-lifecycle fence.
         reopened = SqliteExecutionStore(tmp_path / "execution.sqlite3")
-        assert reopened._connection.execute(
-            "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences WHERE account_key = ?",
-            (bound.scope.account_key,),
-        ).fetchone()[0] == 1
-        with pytest.raises(
-            InvalidStateTransition, match="unmapped legacy execution history"
-        ):
+        assert (
+            reopened._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences WHERE account_key = ?",
+                (bound.scope.account_key,),
+            ).fetchone()[0]
+            == 1
+        )
+        with pytest.raises(InvalidStateTransition, match="unmapped legacy execution history"):
             _stage_followup_ready_command(bound, reopened)
     finally:
         if migrated is not None:
@@ -1643,22 +1659,30 @@ def test_v12_permanent_fence_and_projectionless_cancel_migrate_to_v19(tmp_path):
         try:
             connection.execute("DROP TABLE ctp_order_target_projection_consumptions")
             connection.execute("DROP TABLE ctp_order_target_projections")
-            connection.execute("UPDATE execution_meta SET value = '12' WHERE key = 'schema_version'")
+            connection.execute(
+                "UPDATE execution_meta SET value = '12' WHERE key = 'schema_version'"
+            )
             connection.commit()
         finally:
             connection.close()
 
         migrated = SqliteExecutionStore(tmp_path / "execution.sqlite3")
-        assert migrated._connection.execute(
-            "SELECT value FROM execution_meta WHERE key = 'schema_version'"
-        ).fetchone()[0] == "20"
+        assert (
+            migrated._connection.execute(
+                "SELECT value FROM execution_meta WHERE key = 'schema_version'"
+            ).fetchone()[0]
+            == "20"
+        )
         command = migrated.read_ctp_dispatch_command(bound.scope, bound.command_id)
         assert command is not None
         assert command.status == "UNKNOWN"
         assert command.unknown_reason == "schema_upgrade_requires_ctp_v2_dispatch_cutover"
-        assert migrated._connection.execute(
-            "SELECT COUNT(*) FROM ctp_order_target_projections"
-        ).fetchone()[0] == 0
+        assert (
+            migrated._connection.execute(
+                "SELECT COUNT(*) FROM ctp_order_target_projections"
+            ).fetchone()[0]
+            == 0
+        )
         persisted_fence = migrated._connection.execute(
             "SELECT source_lifecycle_fence_id FROM ctp_dispatch_callback_source_lifecycle_fences "
             "WHERE account_key = ?",
@@ -1667,9 +1691,7 @@ def test_v12_permanent_fence_and_projectionless_cancel_migrate_to_v19(tmp_path):
         assert persisted_fence is not None
         assert persisted_fence[0] == fence_id
 
-        with pytest.raises(
-            InvalidStateTransition, match="unmapped legacy execution history"
-        ):
+        with pytest.raises(InvalidStateTransition, match="unmapped legacy execution history"):
             _stage_followup_ready_command(bound, migrated)
         migrated.close()
         migrated = None
@@ -1678,14 +1700,20 @@ def test_v12_permanent_fence_and_projectionless_cancel_migrate_to_v19(tmp_path):
         assert reopened.read_ctp_dispatch_command(bound.scope, bound.command_id).status == (
             "UNKNOWN"
         )
-        assert reopened._connection.execute(
-            "SELECT source_lifecycle_fence_id FROM ctp_dispatch_callback_source_lifecycle_fences "
-            "WHERE account_key = ?",
-            (bound.scope.account_key,),
-        ).fetchone()[0] == fence_id
-        assert reopened._connection.execute(
-            "SELECT COUNT(*) FROM ctp_order_target_projections"
-        ).fetchone()[0] == 0
+        assert (
+            reopened._connection.execute(
+                "SELECT source_lifecycle_fence_id FROM ctp_dispatch_callback_source_lifecycle_fences "
+                "WHERE account_key = ?",
+                (bound.scope.account_key,),
+            ).fetchone()[0]
+            == fence_id
+        )
+        assert (
+            reopened._connection.execute(
+                "SELECT COUNT(*) FROM ctp_order_target_projections"
+            ).fetchone()[0]
+            == 0
+        )
     finally:
         if migrated is not None:
             migrated.close()
@@ -1727,15 +1755,24 @@ def test_callback_projection_failure_rolls_back_ledger_but_keeps_lifecycle_fence
 
         with pytest.raises(ContractValidationError, match="may have been consumed"):
             adapter.apply_next(timeout=0)
-        assert bound.store._connection.execute(
-            "SELECT COUNT(*) FROM ctp_dispatch_callback_ledger"
-        ).fetchone()[0] == 0
-        assert bound.store._connection.execute(
-            "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences"
-        ).fetchone()[0] == 1
-        assert bound.store._connection.execute(
-            "SELECT COUNT(*) FROM ctp_dispatch_order_projection"
-        ).fetchone()[0] == 0
+        assert (
+            bound.store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_callback_ledger"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            bound.store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences"
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            bound.store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_order_projection"
+            ).fetchone()[0]
+            == 0
+        )
     finally:
         if adapter is not None:
             adapter.close()
@@ -1771,20 +1808,24 @@ def test_callback_commit_lease_loss_leaves_durable_ingestion_fence(tmp_path):
 
         with pytest.raises(ContractValidationError, match="may have been consumed"):
             adapter.apply_next(timeout=0)
-        assert bound.store._connection.execute(
-            "SELECT COUNT(*) FROM ctp_dispatch_callback_ledger"
-        ).fetchone()[0] == 0
-        assert bound.store._connection.execute(
-            "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences"
-        ).fetchone()[0] == 1
+        assert (
+            bound.store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_callback_ledger"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            bound.store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences"
+            ).fetchone()[0]
+            == 1
+        )
         adapter.close()
         adapter = None
         bound.store.close()
 
         reopened = SqliteExecutionStore(tmp_path / "execution.sqlite3")
-        with pytest.raises(
-            InvalidStateTransition, match="already has a persistent owner"
-        ):
+        with pytest.raises(InvalidStateTransition, match="already has a persistent owner"):
             reopened.acquire_ctp_account_family_owner(bound.scope)
     finally:
         if adapter is not None:
@@ -1827,12 +1868,18 @@ def test_adapter_cleanup_failure_does_not_leak_callback_source_exception(tmp_pat
 
         rendered = "".join(traceback.format_exception(failure.value))
         assert "SENTINEL_CALLBACK_QUEUE_RELEASE_FAILURE" not in rendered
-        assert bound.store._connection.execute(
-            "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences"
-        ).fetchone()[0] == 1
-        assert bound.store._connection.execute(
-            "SELECT COUNT(*) FROM ctp_dispatch_callback_ledger"
-        ).fetchone()[0] == 0
+        assert (
+            bound.store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences"
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            bound.store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_callback_ledger"
+            ).fetchone()[0]
+            == 0
+        )
     finally:
         bound.client._revoke_native_callback_event_consumer()
         if adapter is not None:
@@ -1850,9 +1897,7 @@ def test_callback_ledger_adapter_poison_closes_on_target_or_source_mismatch(
     try:
         event = _source_event(
             bound.client,
-            overrides=(
-                {"OrderRef": "000000000099"} if mismatch == "target" else None
-            ),
+            overrides=({"OrderRef": "000000000099"} if mismatch == "target" else None),
         )
         if mismatch == "source":
             event.callback_session_matches_login = False
@@ -1877,9 +1922,12 @@ def test_callback_ledger_adapter_poison_closes_on_target_or_source_mismatch(
             ).fetchone()[0]
             == 0
         )
-        assert bound.store._connection.execute(
-            "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences"
-        ).fetchone()[0] == 1
+        assert (
+            bound.store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences"
+            ).fetchone()[0]
+            == 1
+        )
         with pytest.raises(ContractValidationError, match="adapter is closed"):
             adapter.apply_next(timeout=0)
     finally:
@@ -1982,9 +2030,12 @@ def test_callback_ledger_adapter_rechecks_reentrant_lifecycle_change(tmp_path):
         assert bound.store.read_ctp_dispatch_command(bound.scope, bound.command_id).status == (
             "CLAIMED"
         )
-        assert bound.store._connection.execute(
-            "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences"
-        ).fetchone()[0] == 1
+        assert (
+            bound.store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences"
+            ).fetchone()[0]
+            == 1
+        )
     finally:
         if adapter is not None:
             adapter.close()
@@ -2032,9 +2083,12 @@ def test_callback_ledger_commit_precedes_cross_thread_source_disconnect(tmp_path
         disconnect_thread.join(timeout=1.0)
         assert not disconnect_thread.is_alive()
         assert disconnected.is_set()
-        assert bound.store._connection.execute(
-            "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences"
-        ).fetchone()[0] == 1
+        assert (
+            bound.store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences"
+            ).fetchone()[0]
+            == 1
+        )
         assert (
             bound.store._connection.execute(
                 "SELECT COUNT(*) FROM ctp_dispatch_callback_ledger"

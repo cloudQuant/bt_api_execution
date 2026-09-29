@@ -338,9 +338,7 @@ class _FakeOrderTargetProjectionVerifier:
         return CtpVerifiedOrderTargetProjection(**values)
 
 
-def _issue_target_projection(
-    store, scope, reservation, *, verifier=None, evidence=None
-):
+def _issue_target_projection(store, scope, reservation, *, verifier=None, evidence=None):
     authority = verifier or _FakeOrderTargetProjectionVerifier()
     return store.issue_ctp_order_target_projection(
         scope,
@@ -735,9 +733,12 @@ def test_v6_staged_command_without_typed_keys_migrates_to_unknown(tmp_path):
         assert row.unknown_reason == "schema_upgrade_requires_ctp_v2_dispatch_cutover"
         with pytest.raises(InvalidStateTransition, match="already has a persistent owner"):
             migrated.acquire_ctp_account_family_owner(scope)
-        assert migrated._connection.execute(
-            "SELECT reason_code FROM ctp_account_family_legacy_fences"
-        ).fetchone()[0] == "unmapped_legacy_execution_history"
+        assert (
+            migrated._connection.execute(
+                "SELECT reason_code FROM ctp_account_family_legacy_fences"
+            ).fetchone()[0]
+            == "unmapped_legacy_execution_history"
+        )
         assert migrated.read_ctp_dispatch_command(scope, staged.command_id).status == "UNKNOWN"
     finally:
         migrated.close()
@@ -847,9 +848,12 @@ def test_v8_store_migrates_orderref_cutover_state_fail_closed(tmp_path):
         )
         with pytest.raises(InvalidStateTransition, match="already has a persistent owner"):
             migrated.acquire_ctp_account_family_owner(scope)
-        assert migrated._connection.execute(
-            "SELECT reason_code FROM ctp_account_family_legacy_fences"
-        ).fetchone()[0] == "unmapped_legacy_execution_history"
+        assert (
+            migrated._connection.execute(
+                "SELECT reason_code FROM ctp_account_family_legacy_fences"
+            ).fetchone()[0]
+            == "unmapped_legacy_execution_history"
+        )
         assert migrated.read_ctp_dispatch_command(scope, staged.command_id).status == "UNKNOWN"
     finally:
         migrated.close()
@@ -950,7 +954,9 @@ def test_initial_seed_and_first_reservation_commit_atomically(tmp_path):
             == 0
         )
         assert (
-            store._connection.execute("SELECT COUNT(*) FROM ctp_order_ref_legacy_imports").fetchone()[0]
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_order_ref_legacy_imports"
+            ).fetchone()[0]
             == 0
         )
 
@@ -1032,18 +1038,14 @@ def _prepared_managed_dispatch(reservation, *, operation="submit", receipt_id="a
 @pytest.mark.unit
 @pytest.mark.asyncio
 @pytest.mark.parametrize("operation", ["submit", "cancel"])
-async def test_single_worker_requires_persisted_queue_receipt_and_sends_once(
-    tmp_path, operation
-):
+async def test_single_worker_requires_persisted_queue_receipt_and_sends_once(tmp_path, operation):
     store = SqliteExecutionStore(tmp_path / (operation + "-single-worker.sqlite3"))
     scope = _scope()
     lease = _lease(store, scope)
     try:
         reservation = _reserve_seeded(store, scope, lease)
         prepared = _prepared_managed_dispatch(reservation, operation=operation)
-        worker = CtpManagedSingleWorkerCandidate(
-            store, scope, lease, _authority_verifier()
-        )
+        worker = CtpManagedSingleWorkerCandidate(store, scope, lease, _authority_verifier())
         target_projection = None
         if operation == "cancel":
             target_projection = _issue_target_projection(
@@ -1066,9 +1068,7 @@ async def test_single_worker_requires_persisted_queue_receipt_and_sends_once(
             )
 
         with pytest.raises(ContractValidationError, match="queue receipt is not committed"):
-            await worker.dispatch_managed_command(
-                prepared.command_id, staged_binding, fake_sender
-            )
+            await worker.dispatch_managed_command(prepared.command_id, staged_binding, fake_sender)
         assert sent == []
         with pytest.raises(ContractValidationError, match="does not match staged command"):
             worker.record_managed_queue_receipt(
@@ -1081,7 +1081,10 @@ async def test_single_worker_requires_persisted_queue_receipt_and_sends_once(
                     "queued": True,
                 },
             )
-        assert store.read_ctp_dispatch_command(scope, prepared.command_id).local_queue_receipt_queued is None
+        assert (
+            store.read_ctp_dispatch_command(scope, prepared.command_id).local_queue_receipt_queued
+            is None
+        )
 
         ready_binding = worker.record_managed_queue_receipt(
             prepared.command_id,
@@ -1111,7 +1114,10 @@ async def test_single_worker_requires_persisted_queue_receipt_and_sends_once(
         assert projection.local_dispatch_outcome == "QUEUED"
         assert projection.local_queue_receipt_id == prepared.local_queue_receipt_id
         assert projection.local_queue_receipt_queued is True
-        assert projection.submit_action is None or projection.submit_action.order_state.provider_state is None
+        assert (
+            projection.submit_action is None
+            or projection.submit_action.order_state.provider_state is None
+        )
         replay = await worker.dispatch_managed_command(
             prepared.command_id, ready_binding, fake_sender
         )
@@ -1130,12 +1136,8 @@ async def test_single_worker_rejects_orderref_mismatch_before_native_sender(tmp_
     try:
         reservation = _reserve_seeded(store, scope, lease)
         prepared = _prepared_managed_dispatch(reservation)
-        worker = CtpManagedSingleWorkerCandidate(
-            store, scope, lease, _authority_verifier()
-        )
-        wrong_source_reservation = replace(
-            reservation, created_at_ns=reservation.created_at_ns + 1
-        )
+        worker = CtpManagedSingleWorkerCandidate(store, scope, lease, _authority_verifier())
+        wrong_source_reservation = replace(reservation, created_at_ns=reservation.created_at_ns + 1)
         with pytest.raises(ContractValidationError, match="same-store reservation"):
             worker.stage_prepared_dispatch(
                 replace(prepared, order_ref_reservation=wrong_source_reservation)
@@ -1185,9 +1187,7 @@ async def test_single_worker_queue_rejection_never_calls_sender(tmp_path):
     try:
         reservation = _reserve_seeded(store, scope, lease)
         prepared = _prepared_managed_dispatch(reservation)
-        worker = CtpManagedSingleWorkerCandidate(
-            store, scope, lease, _authority_verifier()
-        )
+        worker = CtpManagedSingleWorkerCandidate(store, scope, lease, _authority_verifier())
         binding = worker.stage_prepared_dispatch(prepared)
         binding = worker.record_managed_queue_receipt(
             prepared.command_id,
@@ -1226,9 +1226,7 @@ async def test_single_worker_concurrent_duplicate_has_one_sender_invocation(tmp_
     try:
         reservation = _reserve_seeded(store, scope, lease)
         prepared = _prepared_managed_dispatch(reservation)
-        worker = CtpManagedSingleWorkerCandidate(
-            store, scope, lease, _authority_verifier()
-        )
+        worker = CtpManagedSingleWorkerCandidate(store, scope, lease, _authority_verifier())
         binding = worker.stage_prepared_dispatch(prepared)
         binding = worker.record_managed_queue_receipt(
             prepared.command_id,
@@ -1254,9 +1252,7 @@ async def test_single_worker_concurrent_duplicate_has_one_sender_invocation(tmp_
             worker.dispatch_managed_command(prepared.command_id, binding, fake_sender)
         )
         await send_started.wait()
-        duplicate = await worker.dispatch_managed_command(
-            prepared.command_id, binding, fake_sender
-        )
+        duplicate = await worker.dispatch_managed_command(prepared.command_id, binding, fake_sender)
         assert duplicate.command_status == "CLAIMED"
         assert sent == [prepared.command_id]
         release_send.set()
@@ -1276,9 +1272,7 @@ async def test_single_worker_sender_exception_persists_unknown_and_is_not_replay
     try:
         reservation = _reserve_seeded(store, scope, lease)
         prepared = _prepared_managed_dispatch(reservation)
-        worker = CtpManagedSingleWorkerCandidate(
-            store, scope, lease, _authority_verifier()
-        )
+        worker = CtpManagedSingleWorkerCandidate(store, scope, lease, _authority_verifier())
         binding = worker.stage_prepared_dispatch(prepared)
         ready_binding = worker.record_managed_queue_receipt(
             prepared.command_id,
@@ -1609,8 +1603,7 @@ def test_superseded_session_proof_cannot_reactivate_or_claim_old_session(tmp_pat
             )
 
         assert (
-            store.read_ctp_dispatch_command(scope, old_session_command.command_id).status
-            == "READY"
+            store.read_ctp_dispatch_command(scope, old_session_command.command_id).status == "READY"
         )
         active = store._connection.execute(
             """
@@ -1682,8 +1675,7 @@ def test_account_orderref_active_trading_day_never_moves_backwards(tmp_path):
             )
 
         active_day = store._connection.execute(
-            "SELECT last_trading_day FROM ctp_order_ref_account_watermarks "
-            "WHERE account_key = ?",
+            "SELECT last_trading_day FROM ctp_order_ref_account_watermarks WHERE account_key = ?",
             (first_scope.account_key,),
         ).fetchone()[0]
         assert active_day == second_scope.trading_day
@@ -1762,9 +1754,7 @@ def test_native_callback_envelope_keeps_default_store_verifier_fail_closed(tmp_p
     try:
         session_epoch = ctp_native_session_epoch()
         generation = ctp_native_session_generation_id(3, 7, session_epoch, 4, 91)
-        reservation = _reserve_seeded(
-            store, scope, lease, session_generation_id=generation
-        )
+        reservation = _reserve_seeded(store, scope, lease, session_generation_id=generation)
         command = _stage_submit(
             store,
             scope,
@@ -1806,7 +1796,9 @@ def test_native_callback_envelope_keeps_default_store_verifier_fail_closed(tmp_p
             },
         )
 
-        with pytest.raises(ContractValidationError, match="trusted CTP callback verification failed"):
+        with pytest.raises(
+            ContractValidationError, match="trusted CTP callback verification failed"
+        ):
             store.apply_ctp_verified_dispatch_callback(
                 scope,
                 command.command_id,
@@ -1815,12 +1807,18 @@ def test_native_callback_envelope_keeps_default_store_verifier_fail_closed(tmp_p
                 writer_lease=lease,
             )
         assert store.read_ctp_dispatch_command(scope, command.command_id).status == "COMPLETED"
-        assert store._connection.execute(
-            "SELECT COUNT(*) FROM ctp_dispatch_callback_ledger"
-        ).fetchone()[0] == 0
-        assert store._connection.execute(
-            "SELECT COUNT(*) FROM ctp_dispatch_order_projection"
-        ).fetchone()[0] == 0
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_callback_ledger"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_order_projection"
+            ).fetchone()[0]
+            == 0
+        )
     finally:
         store.close()
 
@@ -2368,7 +2366,9 @@ def test_cancel_callback_projects_action_without_cancelling_target_order(tmp_pat
         assert projected.cancel_action.managed_action_id == cancel.correlation_key.managed_action_id
         assert projected.cancel_action.action_state == "TERMINAL"
         assert projected.cancel_action.terminal is True
-        assert projected.cancel_action.target_order.managed_intent_id == reservation.managed_intent_id
+        assert (
+            projected.cancel_action.target_order.managed_intent_id == reservation.managed_intent_id
+        )
         assert projected.cancel_action.target_order.runtime_order_id == reservation.runtime_order_id
         assert projected.cancel_action.target_order.order_ref == reservation.order_ref
         assert projected.cancel_action.target_order.exchange_id == "SHFE"
@@ -2389,7 +2389,9 @@ def test_unknown_callback_stays_fenced_until_fresh_terminal_reconciliation(tmp_p
     store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
     scope = _scope()
     lease = _lease(store, scope)
-    other_scope = ExecutionScope("ctp", "simulation", _ctp_account_ref(), "strategy.other", "20260925")
+    other_scope = ExecutionScope(
+        "ctp", "simulation", _ctp_account_ref(), "strategy.other", "20260925"
+    )
     other_lease = _lease(store, other_scope)
     try:
         first_reservation = _reserve_seeded(store, scope, lease, "intent-unknown")
@@ -2595,11 +2597,14 @@ def test_unknown_cancel_resolution_requires_terminal_action_and_target(tmp_path)
         ).fetchone()
         assert pending_obligation is not None
         assert pending_obligation[0] == "UNMAPPABLE"
-        assert store._connection.execute(
-            "SELECT COUNT(*) FROM ctp_dispatch_cancel_postcondition_resolutions "
-            "WHERE cancel_command_id = ?",
-            (cancel.command_id,),
-        ).fetchone()[0] == 0
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_cancel_postcondition_resolutions "
+                "WHERE cancel_command_id = ?",
+                (cancel.command_id,),
+            ).fetchone()[0]
+            == 0
+        )
         assert resolved.order_terminal_state == "CANCELLED"
         assert resolved.cancel_action_terminal_state == "TERMINAL"
         order_projection = store._connection.execute(
@@ -2621,7 +2626,9 @@ def test_unknown_cancel_resolution_requires_terminal_action_and_target(tmp_path)
         assert projected.cancel_action.managed_action_id == cancel.correlation_key.managed_action_id
         assert projected.cancel_action.action_state == "TERMINAL"
         assert projected.cancel_action.source_kind == "RECONCILIATION"
-        assert projected.cancel_action.target_order.managed_intent_id == reservation.managed_intent_id
+        assert (
+            projected.cancel_action.target_order.managed_intent_id == reservation.managed_intent_id
+        )
         assert projected.cancel_action.target_order.runtime_order_id == reservation.runtime_order_id
         assert projected.cancel_action.target_order.exchange_id == "SHFE"
         assert projected.cancel_action.target_order.order_sys_id == "sys-order-17"
@@ -3046,9 +3053,12 @@ def test_schema_v15_to_v19_preserves_unknown_command_and_permanent_owner_fence(t
 
     migrated = SqliteExecutionStore(database)
     try:
-        assert migrated._connection.execute(
-            "SELECT value FROM execution_meta WHERE key = 'schema_version'"
-        ).fetchone()[0] == "20"
+        assert (
+            migrated._connection.execute(
+                "SELECT value FROM execution_meta WHERE key = 'schema_version'"
+            ).fetchone()[0]
+            == "20"
+        )
         command = migrated.read_ctp_dispatch_command(scope, staged.command_id)
         assert command.status == "UNKNOWN"
         assert command.unknown_reason == "preserved-v15-unknown"
@@ -3058,12 +3068,18 @@ def test_schema_v15_to_v19_preserves_unknown_command_and_permanent_owner_fence(t
             (owner.owner_intent_id,),
         ).fetchone()
         assert tuple(owner_row) == ("POISONED", "owner_stop")
-        assert migrated._connection.execute(
-            "SELECT COUNT(*) FROM ctp_dispatch_trade_fact_ledger"
-        ).fetchone()[0] == 0
-        assert migrated._connection.execute(
-            "SELECT COUNT(*) FROM ctp_dispatch_order_cumulative_ledger"
-        ).fetchone()[0] == 0
+        assert (
+            migrated._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_trade_fact_ledger"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            migrated._connection.execute(
+                "SELECT COUNT(*) FROM ctp_dispatch_order_cumulative_ledger"
+            ).fetchone()[0]
+            == 0
+        )
         fence_after = migrated._connection.execute(
             "SELECT account_key, scope_key, command_id, source_lifecycle_fence_id, "
             "correlation_key_sha256, session_binding_sha256 FROM "
@@ -3074,17 +3090,23 @@ def test_schema_v15_to_v19_preserves_unknown_command_and_permanent_owner_fence(t
         assert fence_after["source_lifecycle_fence_id"] == fence_id
         with pytest.raises(InvalidStateTransition, match="already has a persistent owner"):
             migrated.acquire_ctp_account_family_owner(scope)
-        assert migrated._connection.execute(
-            "SELECT reason_code FROM ctp_account_family_legacy_fences"
-        ).fetchone()[0] == "unmapped_legacy_execution_history"
+        assert (
+            migrated._connection.execute(
+                "SELECT reason_code FROM ctp_account_family_legacy_fences"
+            ).fetchone()[0]
+            == "unmapped_legacy_execution_history"
+        )
     finally:
         migrated.close()
 
     reopened = SqliteExecutionStore(database)
     try:
-        assert reopened._connection.execute(
-            "SELECT value FROM execution_meta WHERE key = 'schema_version'"
-        ).fetchone()[0] == "20"
+        assert (
+            reopened._connection.execute(
+                "SELECT value FROM execution_meta WHERE key = 'schema_version'"
+            ).fetchone()[0]
+            == "20"
+        )
         assert reopened.read_ctp_dispatch_command(scope, staged.command_id).status == "UNKNOWN"
         owner_row = reopened._connection.execute(
             "SELECT owner_state, poison_code FROM ctp_dispatch_callback_session_owners "
@@ -3104,9 +3126,7 @@ def test_schema_v16_to_v19_migrates_valid_completed_submit(tmp_path):
     lease = _lease(store, scope)
     try:
         reservation = _reserve_seeded(store, scope, lease, "valid-submit-migration")
-        staged = _stage_submit(
-            store, scope, lease, reservation, "valid-submit-migration-command"
-        )
+        staged = _stage_submit(store, scope, lease, reservation, "valid-submit-migration-command")
         completed = _dispatch_fake(store, scope, lease, staged)
         assert completed.status == "COMPLETED"
         store._connection.execute(
@@ -3117,9 +3137,12 @@ def test_schema_v16_to_v19_migrates_valid_completed_submit(tmp_path):
 
     migrated = SqliteExecutionStore(database)
     try:
-        assert migrated._connection.execute(
-            "SELECT value FROM execution_meta WHERE key = 'schema_version'"
-        ).fetchone()[0] == "20"
+        assert (
+            migrated._connection.execute(
+                "SELECT value FROM execution_meta WHERE key = 'schema_version'"
+            ).fetchone()[0]
+            == "20"
+        )
         command = migrated.read_ctp_dispatch_command(scope, staged.command_id)
         assert command is not None and command.status == "COMPLETED"
         assert command.correlation_key is not None
@@ -3169,9 +3192,12 @@ def test_schema_v16_to_v19_rejects_malformed_identity_on_terminal_submit(
 
     check = sqlite3.connect(database)
     try:
-        assert check.execute(
-            "SELECT value FROM execution_meta WHERE key = 'schema_version'"
-        ).fetchone()[0] == "16"
+        assert (
+            check.execute(
+                "SELECT value FROM execution_meta WHERE key = 'schema_version'"
+            ).fetchone()[0]
+            == "16"
+        )
         row = check.execute(
             "SELECT account_key, status FROM ctp_dispatch_commands WHERE command_id = ?",
             (staged.command_id,),
@@ -3220,9 +3246,12 @@ def test_schema_v16_to_v19_rejects_dispatch_foreign_key_mismatch(tmp_path):
 
     check = sqlite3.connect(database)
     try:
-        assert check.execute(
-            "SELECT value FROM execution_meta WHERE key = 'schema_version'"
-        ).fetchone()[0] == "16"
+        assert (
+            check.execute(
+                "SELECT value FROM execution_meta WHERE key = 'schema_version'"
+            ).fetchone()[0]
+            == "16"
+        )
         row = check.execute(
             "SELECT account_key, status FROM ctp_dispatch_commands WHERE command_id = ?",
             (staged.command_id,),
@@ -3278,9 +3307,12 @@ def test_schema_v16_to_v19_rejects_cross_account_legacy_cancel_graph(tmp_path):
 
     check = sqlite3.connect(database)
     try:
-        assert check.execute(
-            "SELECT value FROM execution_meta WHERE key = 'schema_version'"
-        ).fetchone()[0] == "16"
+        assert (
+            check.execute(
+                "SELECT value FROM execution_meta WHERE key = 'schema_version'"
+            ).fetchone()[0]
+            == "16"
+        )
         row = check.execute(
             "SELECT account_key, correlation_version, status FROM ctp_dispatch_commands "
             "WHERE command_id = ?",
@@ -3346,11 +3378,18 @@ def test_v17_action_ref_is_account_monotonic_across_scope_day_restart_and_duplic
         first = store.stage_ctp_dispatch_command(**first_args)
         repeated = store.stage_ctp_dispatch_command(**first_args)
         assert first.correlation_key is not None and repeated.correlation_key is not None
-        assert first.correlation_key.native_action_ref == repeated.correlation_key.native_action_ref == 1
-        assert store._connection.execute(
-            "SELECT COUNT(*) FROM ctp_native_action_ref_allocations WHERE account_key = ?",
-            (first_scope.account_key,),
-        ).fetchone()[0] == 1
+        assert (
+            first.correlation_key.native_action_ref
+            == repeated.correlation_key.native_action_ref
+            == 1
+        )
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_native_action_ref_allocations WHERE account_key = ?",
+                (first_scope.account_key,),
+            ).fetchone()[0]
+            == 1
+        )
         unknown = _dispatch_fake(store, first_scope, first_lease, first, outcome="UNKNOWN")
         assert unknown.status == "UNKNOWN"
         second_scope = ExecutionScope(
@@ -3431,14 +3470,20 @@ def test_v17_action_ref_allocation_rolls_back_with_failed_cancel_stage(tmp_path,
         )
 
         assert store.read_ctp_dispatch_command(scope, arguments["command_id"]) is None
-        assert store._connection.execute(
-            "SELECT COUNT(*) FROM ctp_native_action_ref_counters WHERE account_key = ?",
-            (scope.account_key,),
-        ).fetchone()[0] == 0
-        assert store._connection.execute(
-            "SELECT COUNT(*) FROM ctp_native_action_ref_allocations WHERE account_key = ?",
-            (scope.account_key,),
-        ).fetchone()[0] == 0
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_native_action_ref_counters WHERE account_key = ?",
+                (scope.account_key,),
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_native_action_ref_allocations WHERE account_key = ?",
+                (scope.account_key,),
+            ).fetchone()[0]
+            == 0
+        )
 
         staged = store.stage_ctp_dispatch_command(**arguments)
         assert staged.correlation_key is not None
@@ -3464,10 +3509,13 @@ def test_v17_action_ref_allocator_fails_closed_at_int32_max(tmp_path):
         with pytest.raises(DurableStoreError, match="ActionRef int32 sequence is exhausted"):
             store.stage_ctp_dispatch_command(**arguments)
         assert store.read_ctp_dispatch_command(scope, arguments["command_id"]) is None
-        assert store._connection.execute(
-            "SELECT COUNT(*) FROM ctp_native_action_ref_allocations WHERE account_key = ?",
-            (scope.account_key,),
-        ).fetchone()[0] == 0
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_native_action_ref_allocations WHERE account_key = ?",
+                (scope.account_key,),
+            ).fetchone()[0]
+            == 0
+        )
     finally:
         store.close()
 
@@ -3490,10 +3538,13 @@ def test_v17_prepared_cancel_cannot_choose_native_action_ref(tmp_path):
         }
         with pytest.raises(ContractValidationError, match="cannot supply native OrderActionRef"):
             store.stage_ctp_dispatch_command(**altered)
-        assert store._connection.execute(
-            "SELECT COUNT(*) FROM ctp_native_action_ref_allocations WHERE account_key = ?",
-            (scope.account_key,),
-        ).fetchone()[0] == 0
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_native_action_ref_allocations WHERE account_key = ?",
+                (scope.account_key,),
+            ).fetchone()[0]
+            == 0
+        )
     finally:
         store.close()
 
@@ -3521,9 +3572,7 @@ def test_schema_v15_source_lifecycle_fence_survives_and_blocks_stage_after_upgra
             authority_verifier=_authority_verifier(),
         )
         assert claimed is not None
-        store.complete_ctp_dispatch_command(
-            scope, _receipt(claimed), writer_lease=lease
-        )
+        store.complete_ctp_dispatch_command(scope, _receipt(claimed), writer_lease=lease)
         second_reservation = _reserve_seeded(store, scope, lease, "blocked-command-intent")
         second = _stage_submit(
             store,
@@ -3556,9 +3605,12 @@ def test_schema_v15_source_lifecycle_fence_survives_and_blocks_stage_after_upgra
         assert migrated_second is not None and migrated_second.status == "UNKNOWN"
         with pytest.raises(InvalidStateTransition, match="already has a persistent owner"):
             migrated.acquire_ctp_account_family_owner(scope)
-        assert migrated._connection.execute(
-            "SELECT reason_code FROM ctp_account_family_legacy_fences"
-        ).fetchone()[0] == "unmapped_legacy_execution_history"
+        assert (
+            migrated._connection.execute(
+                "SELECT reason_code FROM ctp_account_family_legacy_fences"
+            ).fetchone()[0]
+            == "unmapped_legacy_execution_history"
+        )
     finally:
         migrated.close()
 
@@ -3685,7 +3737,9 @@ def test_restart_recovery_marks_prior_claim_unknown_without_replay(tmp_path):
 def test_unresolved_command_fences_other_scopes_account_wide(tmp_path):
     store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
     first_scope = _scope()
-    second_scope = ExecutionScope("ctp", "simulation", _ctp_account_ref(), "strategy.other", "20260925")
+    second_scope = ExecutionScope(
+        "ctp", "simulation", _ctp_account_ref(), "strategy.other", "20260925"
+    )
     lease = _lease(store, first_scope, "account-writer-before-crash")
     try:
         first_reservation = _reserve_seeded(store, first_scope, lease, "intent-first")
@@ -3956,9 +4010,10 @@ def test_cancel_target_projection_is_immutable_persisted_and_gates_claim(tmp_pat
             """,
             (handle.projection_id,),
         ).fetchone()
-        assert payload_sha256(json.loads(persisted["projection_payload_json"])) == persisted[
-            "projection_sha256"
-        ]
+        assert (
+            payload_sha256(json.loads(persisted["projection_payload_json"]))
+            == persisted["projection_sha256"]
+        )
         with pytest.raises(sqlite3.IntegrityError, match="immutable"):
             store._connection.execute(
                 "UPDATE ctp_order_target_projections SET projection_sha256 = ? "
@@ -3966,9 +4021,7 @@ def test_cancel_target_projection_is_immutable_persisted_and_gates_claim(tmp_pat
                 ("0" * 64, handle.projection_id),
             )
 
-        duplicate_query = _FakeOrderTargetProjectionVerifier(
-            overrides={"query_request_id": 812}
-        )
+        duplicate_query = _FakeOrderTargetProjectionVerifier(overrides={"query_request_id": 812})
         _issue_target_projection(store, scope, reservation, verifier=duplicate_query)
         with pytest.raises(ContractValidationError, match="query identity is duplicate"):
             _issue_target_projection(store, scope, reservation, verifier=duplicate_query)
@@ -4060,12 +4113,8 @@ def test_cancel_stage_rolls_back_if_projection_expires_before_commit(tmp_path, m
         handle = _issue_target_projection(store, scope, reservation)
         # The transaction's initial freshness check succeeds one nanosecond
         # before expiry; the final pre-commit check observes expiry.
-        samples = iter(
-            [handle.projection.expires_at_ns - 1, handle.projection.expires_at_ns]
-        )
-        monkeypatch.setattr(
-            execution_store_module.time, "monotonic_ns", lambda: next(samples)
-        )
+        samples = iter([handle.projection.expires_at_ns - 1, handle.projection.expires_at_ns])
+        monkeypatch.setattr(execution_store_module.time, "monotonic_ns", lambda: next(samples))
 
         with pytest.raises(ContractValidationError, match="target handle is stale"):
             _stage_cancel_with_projection(
@@ -4077,12 +4126,7 @@ def test_cancel_stage_rolls_back_if_projection_expires_before_commit(tmp_path, m
                 command_id="cancel-stage-expiry-before-commit",
             )
 
-        assert (
-            store.read_ctp_dispatch_command(
-                scope, "cancel-stage-expiry-before-commit"
-            )
-            is None
-        )
+        assert store.read_ctp_dispatch_command(scope, "cancel-stage-expiry-before-commit") is None
         assert (
             store._connection.execute(
                 "SELECT COUNT(*) FROM ctp_order_target_projection_consumptions"
@@ -4094,9 +4138,7 @@ def test_cancel_stage_rolls_back_if_projection_expires_before_commit(tmp_path, m
 
 
 @pytest.mark.unit
-def test_cancel_claim_rolls_back_if_authority_verifier_crosses_target_expiry(
-    tmp_path, monkeypatch
-):
+def test_cancel_claim_rolls_back_if_authority_verifier_crosses_target_expiry(tmp_path, monkeypatch):
     store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
     scope = _scope()
     lease = _lease(store, scope)
@@ -4149,9 +4191,7 @@ def test_cancel_claim_rechecks_single_use_consumption_after_authority_verifier(t
             # verifier. Verification is outside the Store transaction; the
             # final claim transaction must observe the missing target fact and
             # reject before dispatch rather than claim against stale evidence.
-            store._connection.execute(
-                "DROP TRIGGER ctp_order_target_consumptions_immutable_delete"
-            )
+            store._connection.execute("DROP TRIGGER ctp_order_target_consumptions_immutable_delete")
             store._connection.execute(
                 "DELETE FROM ctp_order_target_projection_consumptions "
                 "WHERE account_key = ? AND projection_id = ?",
@@ -4161,9 +4201,7 @@ def test_cancel_claim_rechecks_single_use_consumption_after_authority_verifier(t
         verifier = _FakeCtpDispatchAuthorityVerifier(
             after_verify=remove_consumption_during_verification
         )
-        with pytest.raises(
-            ContractValidationError, match="no persisted target projection"
-        ):
+        with pytest.raises(ContractValidationError, match="no persisted target projection"):
             store.claim_ctp_dispatch_command(
                 scope,
                 command.command_id,
@@ -4278,9 +4316,7 @@ def test_cancel_target_projection_defaults_to_reject_and_rejects_ambiguous_stale
             store,
             scope,
             reservation,
-            verifier=_FakeOrderTargetProjectionVerifier(
-                overrides={"query_session_id": 92}
-            ),
+            verifier=_FakeOrderTargetProjectionVerifier(overrides={"query_session_id": 92}),
         )
         with pytest.raises(
             ContractValidationError, match="differs from its verified order projection"
@@ -4311,9 +4347,7 @@ def test_cancel_target_projection_defaults_to_reject_and_rejects_ambiguous_stale
                 store,
                 scope,
                 reservation,
-                verifier=_FakeOrderTargetProjectionVerifier(
-                    overrides={"trading_day": "20260926"}
-                ),
+                verifier=_FakeOrderTargetProjectionVerifier(overrides={"trading_day": "20260926"}),
             )
         with pytest.raises(ContractValidationError, match="stale or unbound"):
             _issue_target_projection(

@@ -103,8 +103,8 @@ class ManagedExecutionFacade:
         if provider_is_ctp:
             with self._ctp_family_owner_lock:
                 if self._ctp_account_family_owner is None:
-                    self._ctp_account_family_owner = (
-                        self._store.acquire_ctp_account_family_owner(self._scope)
+                    self._ctp_account_family_owner = self._store.acquire_ctp_account_family_owner(
+                        self._scope
                     )
                 lease = self._store.acquire_or_renew_lease(
                     self._scope,

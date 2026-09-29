@@ -419,10 +419,16 @@ class CtpNativeCallbackEnvelope:
         elif self.source_callback in _NO_RESPONSE_TERMINAL_SOURCES:
             if self.response_is_last is not None:
                 if self.source_callback == "OnErrRtnOrderAction":
-                    raise ContractValidationError("native CTP action error has no response terminal flag")
+                    raise ContractValidationError(
+                        "native CTP action error has no response terminal flag"
+                    )
                 if self.source_callback == "OnErrRtnOrderInsert":
-                    raise ContractValidationError("native CTP insert error has no response terminal flag")
-                raise ContractValidationError("native CTP order return has no response terminal flag")
+                    raise ContractValidationError(
+                        "native CTP insert error has no response terminal flag"
+                    )
+                raise ContractValidationError(
+                    "native CTP order return has no response terminal flag"
+                )
         else:
             raise ContractValidationError("unsupported native CTP callback source")
 
@@ -917,9 +923,7 @@ def map_ctp_native_trade_fact_v2(
         if value is not None:
             _validate_text(value, "trade " + field_name)
 
-    identity_digest = sha256(
-        f"{trading_day}:{exchange_id}:{trade_id}".encode("ascii")
-    ).hexdigest()
+    identity_digest = sha256(f"{trading_day}:{exchange_id}:{trade_id}".encode("ascii")).hexdigest()
     event_id = "ctp-trade-v2:" + identity_digest
     return CtpNativeTradeFactV2(
         source_scope=session,
