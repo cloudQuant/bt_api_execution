@@ -4363,6 +4363,72 @@ def test_cancel_target_projection_defaults_to_reject_and_rejects_ambiguous_stale
 
 
 @pytest.mark.unit
+def test_single_worker_cannot_stage_cancel_from_caller_fields_alone(tmp_path):
+    store = SqliteExecutionStore(tmp_path / "worker-no-target.sqlite3")
+    scope = _scope()
+    lease = _lease(store, scope)
+    try:
+        reservation = _reserve_seeded(store, scope, lease)
+        prepared = _prepared_managed_dispatch(reservation, operation="cancel")
+        worker = CtpManagedSingleWorkerCandidate(store, scope, lease, _authority_verifier())
+
+        with pytest.raises(
+            ContractValidationError, match="CANCEL requires a fresh verified CTP order target"
+        ):
+            worker.stage_prepared_dispatch(prepared)
+
+        assert store.read_ctp_dispatch_command(scope, prepared.command_id) is None
+        assert (
+            store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_order_target_projection_consumptions "
+                "WHERE command_id = ?",
+                (prepared.command_id,),
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+def test_single_worker_rejects_target_handle_issued_by_another_live_store(tmp_path):
+    scope = _scope()
+    issuer_store = SqliteExecutionStore(tmp_path / "issuer-target.sqlite3")
+    issuer_lease = _lease(issuer_store, scope)
+    reservation = _reserve_seeded(issuer_store, scope, issuer_lease)
+    handle = _issue_target_projection(
+        issuer_store,
+        scope,
+        reservation,
+        verifier=_FakeOrderTargetProjectionVerifier(overrides={"order_sys_id": "fake-sys-order"}),
+    )
+    consumer_store = SqliteExecutionStore(tmp_path / "consumer-target.sqlite3")
+    consumer_lease = _lease(consumer_store, scope)
+    try:
+        consumer_reservation = _reserve_seeded(consumer_store, scope, consumer_lease)
+        prepared = _prepared_managed_dispatch(consumer_reservation, operation="cancel")
+        worker = CtpManagedSingleWorkerCandidate(
+            consumer_store, scope, consumer_lease, _authority_verifier()
+        )
+
+        with pytest.raises(ContractValidationError, match="same-store CTP target handle"):
+            worker.stage_prepared_dispatch(prepared, cancel_target_projection=handle)
+
+        assert consumer_store.read_ctp_dispatch_command(scope, prepared.command_id) is None
+        assert (
+            consumer_store._connection.execute(
+                "SELECT COUNT(*) FROM ctp_order_target_projection_consumptions "
+                "WHERE command_id = ?",
+                (prepared.command_id,),
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        consumer_store.close()
+        issuer_store.close()
+
+
+@pytest.mark.unit
 def test_cancel_target_projection_requires_new_query_after_store_restart(tmp_path):
     path = tmp_path / "execution.sqlite3"
     scope = _scope()
