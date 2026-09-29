@@ -5,6 +5,7 @@ from .cancellation import (
     CancelAdmissionGate,
     CancelBeforeDispatchCallable,
     CancelDispatchCallable,
+    CancelDispatchClaimReceiptV1,
     ManagedCancellationFacade,
 )
 from .contracts import (
@@ -124,6 +125,7 @@ __all__ = [
     "AdmissionRequired",
     "CancelAdmissionGate",
     "CancelBeforeDispatchCallable",
+    "CancelDispatchClaimReceiptV1",
     "CancelDispatchCallable",
     "CancelEvent",
     "CancelIntent",

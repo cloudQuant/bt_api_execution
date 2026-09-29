@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import threading
 import time
 from dataclasses import dataclass
@@ -8,6 +9,7 @@ from decimal import Decimal
 import pytest
 
 from bt_api_execution import (
+    CancelDispatchClaimReceiptV1,
     CancelIntent,
     CancelObservation,
     ContractValidationError,
@@ -48,6 +50,7 @@ class _CancelGate:
     def __init__(self) -> None:
         self.reserved: list[str] = []
         self.validated: list[str] = []
+        self.claimed: list[str] = []
         self.settled: list[str] = []
         self.released: list[tuple[str, str]] = []
 
@@ -60,11 +63,56 @@ class _CancelGate:
         self.validated.append(intent.cancel_id)
         return _Permit(permit_id)
 
+    def claim_before_dispatch(
+        self, permit_id: str, intent: CancelIntent
+    ) -> CancelDispatchClaimReceiptV1:
+        assert permit_id == "cancel-permit-" + intent.cancel_id
+        self.claimed.append(intent.cancel_id)
+        return CancelDispatchClaimReceiptV1(
+            permit_reference=permit_id,
+            scope_key=intent.scope.key,
+            cancel_id=intent.cancel_id,
+            intent_fingerprint=intent.fingerprint,
+        )
+
     def settle(self, permit_id: str) -> None:
         self.settled.append(permit_id)
 
     def release(self, permit_id: str, reason: str) -> None:
         self.released.append((permit_id, reason))
+
+
+class _DurableCancelGate(_CancelGate):
+    """Tiny SQLite-backed risk fake for the provider-call ordering boundary."""
+
+    def __init__(self, path) -> None:
+        super().__init__()
+        self._path = path
+        self._connection = sqlite3.connect(path)
+        self._connection.execute(
+            "CREATE TABLE risk_dispatch_claims (permit_id TEXT PRIMARY KEY)"
+        )
+        self._connection.commit()
+
+    def claim_before_dispatch(
+        self, permit_id: str, intent: CancelIntent
+    ) -> CancelDispatchClaimReceiptV1:
+        receipt = super().claim_before_dispatch(permit_id, intent)
+        with self._connection:
+            self._connection.execute(
+                "INSERT INTO risk_dispatch_claims (permit_id) VALUES (?)", (permit_id,)
+            )
+        return receipt
+
+    def has_durable_claim(self, permit_id: str) -> bool:
+        with sqlite3.connect(self._path) as db:
+            row = db.execute(
+                "SELECT 1 FROM risk_dispatch_claims WHERE permit_id = ?", (permit_id,)
+            ).fetchone()
+        return row is not None
+
+    def close(self) -> None:
+        self._connection.close()
 
 
 def _scope() -> ExecutionScope:
@@ -102,7 +150,7 @@ def _cancel_intent(
     )
 
 
-def _ready_facades(tmp_path):
+def _ready_facades(tmp_path, *, cancel_gate: _CancelGate | None = None):
     store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
     order_facade = ManagedExecutionFacade(
         store, _scope(), writer_id="writer.1", admission_gate=_OrderGate()
@@ -111,7 +159,7 @@ def _ready_facades(tmp_path):
         _order_intent(),
         lambda intent: ProviderObservation.accepted(intent.intent_id, "provider.1"),
     )
-    gate = _CancelGate()
+    gate = cancel_gate if cancel_gate is not None else _CancelGate()
     cancel_facade = ManagedCancellationFacade(
         store,
         _scope(),
@@ -126,11 +174,24 @@ def test_cancel_is_durable_idempotent_and_keeps_target_identity(tmp_path) -> Non
     store, facade, gate = _ready_facades(tmp_path)
     calls: list[str] = []
 
+    call_order: list[str] = []
+
     def provider(intent: CancelIntent) -> CancelObservation:
+        call_order.append("provider")
         calls.append(intent.provider_order_id)
         return CancelObservation.accepted(
             intent.cancel_id, intent.target_intent_id, intent.provider_order_id
         )
+
+    original_claim = gate.claim_before_dispatch
+
+    def claim_before_dispatch(
+        permit_id: str, intent: CancelIntent
+    ) -> CancelDispatchClaimReceiptV1:
+        call_order.append("risk_claim")
+        return original_claim(permit_id, intent)
+
+    gate.claim_before_dispatch = claim_before_dispatch  # type: ignore[method-assign]
 
     try:
         first = facade.cancel(_cancel_intent(), provider)
@@ -143,6 +204,8 @@ def test_cancel_is_durable_idempotent_and_keeps_target_identity(tmp_path) -> Non
         assert calls == ["provider.1"]
         assert gate.reserved == ["cancel.1"]
         assert gate.validated == ["cancel.1"]
+        assert gate.claimed == ["cancel.1"]
+        assert call_order == ["risk_claim", "provider"]
         assert gate.settled == ["cancel-permit-cancel.1"]
         assert [event.event_type for event in store.read_cancel_outbox()] == [
             "cancel_intent_recorded",
@@ -151,6 +214,237 @@ def test_cancel_is_durable_idempotent_and_keeps_target_identity(tmp_path) -> Non
             "cancel_provider_observation",
         ]
     finally:
+        store.close()
+
+
+@pytest.mark.unit
+def test_provider_is_called_only_after_risk_claim_is_committed(tmp_path) -> None:
+    gate = _DurableCancelGate(tmp_path / "risk.sqlite3")
+    store, facade, gate = _ready_facades(tmp_path, cancel_gate=gate)
+    provider_calls: list[str] = []
+
+    def provider(intent: CancelIntent) -> CancelObservation:
+        assert gate.has_durable_claim("cancel-permit-" + intent.cancel_id)
+        provider_calls.append(intent.cancel_id)
+        return CancelObservation.accepted(
+            intent.cancel_id, intent.target_intent_id, intent.provider_order_id
+        )
+
+    try:
+        result = facade.cancel(_cancel_intent(), provider)
+
+        assert result.state is ExecutionState.ACKED
+        assert gate.claimed == ["cancel.1"]
+        assert provider_calls == ["cancel.1"]
+    finally:
+        gate.close()
+        store.close()
+
+
+@pytest.mark.unit
+def test_cancel_pre_dispatch_guard_runs_before_risk_claim_and_provider(tmp_path) -> None:
+    store, facade, gate = _ready_facades(tmp_path)
+    provider_calls: list[str] = []
+
+    def guard(intent: CancelIntent) -> None:
+        raise RuntimeError("guard denied")
+
+    try:
+        record = facade.cancel(
+            _cancel_intent(),
+            lambda intent: provider_calls.append(intent.cancel_id),
+            before_dispatch=guard,
+        )
+
+        assert record.state is ExecutionState.BLOCKED
+        assert provider_calls == []
+        assert gate.claimed == []
+        assert gate.released == [
+            ("cancel-permit-cancel.1", "cancel_pre_dispatch_guard_failed")
+        ]
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+def test_cancel_risk_claim_failure_is_unknown_without_release_or_provider_retry(tmp_path) -> None:
+    store, facade, gate = _ready_facades(tmp_path)
+    provider_calls: list[str] = []
+
+    def ambiguous_claim(
+        permit_id: str, intent: CancelIntent
+    ) -> CancelDispatchClaimReceiptV1:
+        gate.claimed.append(intent.cancel_id)
+        # Model a risk store commit whose acknowledgement was lost.
+        raise RuntimeError("claim acknowledgement lost")
+
+    gate.claim_before_dispatch = ambiguous_claim  # type: ignore[method-assign]
+
+    def provider(intent: CancelIntent) -> None:
+        provider_calls.append(intent.cancel_id)
+
+    try:
+        first = facade.cancel(_cancel_intent(), provider)
+        second = facade.cancel(_cancel_intent(), provider)
+
+        assert first.state is ExecutionState.UNKNOWN
+        assert first.unknown_reason == "cancel_admission_claim_outcome_unknown"
+        assert second.state is ExecutionState.UNKNOWN
+        assert gate.claimed == ["cancel.1"]
+        assert gate.released == []
+        assert provider_calls == []
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "invalid_kind",
+    [
+        "zero",
+        "empty_string",
+        "string",
+        "plain_object",
+        "wrong_permit",
+        "wrong_scope",
+        "wrong_cancel",
+        "wrong_fingerprint",
+    ],
+)
+def test_cancel_invalid_risk_claim_receipt_is_unknown_and_never_dispatches(
+    tmp_path, invalid_kind: str
+) -> None:
+    store, facade, gate = _ready_facades(tmp_path)
+    provider_calls: list[str] = []
+
+    def invalid_claim(permit_id: str, intent: CancelIntent):
+        gate.claimed.append(intent.cancel_id)
+        valid_fields = {
+            "permit_reference": permit_id,
+            "scope_key": intent.scope.key,
+            "cancel_id": intent.cancel_id,
+            "intent_fingerprint": intent.fingerprint,
+        }
+        if invalid_kind == "zero":
+            return 0
+        if invalid_kind == "empty_string":
+            return ""
+        if invalid_kind == "string":
+            return permit_id
+        if invalid_kind == "plain_object":
+            return object()
+        if invalid_kind == "wrong_permit":
+            valid_fields["permit_reference"] = "other-permit"
+        elif invalid_kind == "wrong_scope":
+            valid_fields["scope_key"] = "other-scope"
+        elif invalid_kind == "wrong_cancel":
+            valid_fields["cancel_id"] = "other-cancel"
+        elif invalid_kind == "wrong_fingerprint":
+            valid_fields["intent_fingerprint"] = "0" * 64
+        return CancelDispatchClaimReceiptV1(**valid_fields)
+
+    gate.claim_before_dispatch = invalid_claim  # type: ignore[method-assign]
+
+    def provider(intent: CancelIntent) -> None:
+        provider_calls.append(intent.cancel_id)
+
+    try:
+        result = facade.cancel(_cancel_intent(), provider)
+        replayed = facade.cancel(_cancel_intent(), provider)
+
+        assert result.state is ExecutionState.UNKNOWN
+        assert result.unknown_reason == "cancel_admission_claim_outcome_unknown"
+        assert replayed.state is ExecutionState.UNKNOWN
+        assert gate.claimed == ["cancel.1"]
+        assert gate.released == []
+        assert provider_calls == []
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+def test_cancel_provider_failure_after_risk_claim_keeps_permit_fenced(tmp_path) -> None:
+    store, facade, gate = _ready_facades(tmp_path)
+    provider_calls: list[str] = []
+
+    def provider(intent: CancelIntent) -> CancelObservation:
+        provider_calls.append(intent.cancel_id)
+        raise TimeoutError("provider outcome unknown")
+
+    try:
+        first = facade.cancel(_cancel_intent(), provider)
+        second = facade.cancel(_cancel_intent(), provider)
+
+        assert first.state is ExecutionState.UNKNOWN
+        assert second.state is ExecutionState.UNKNOWN
+        assert gate.claimed == ["cancel.1"]
+        assert gate.released == []
+        assert provider_calls == ["cancel.1"]
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+def test_configured_cancel_gate_without_dispatch_claim_method_fails_closed(tmp_path) -> None:
+    class _LegacyGateWithoutClaim:
+        def reserve(self, intent: CancelIntent) -> _Permit:
+            return _Permit("permit")
+
+        def validate(self, permit_id: str, intent: CancelIntent) -> None:
+            return None
+
+        def settle(self, permit_id: str) -> None:
+            return None
+
+        def release(self, permit_id: str, reason: str) -> None:
+            return None
+
+    store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
+    with pytest.raises(ContractValidationError, match="claim_before_dispatch"):
+        ManagedCancellationFacade(
+            store,
+            _scope(),
+            acquire_writer_lease=lambda: store.acquire_or_renew_lease(
+                _scope(), "writer.legacy"
+            ),
+            admission_gate=_LegacyGateWithoutClaim(),  # type: ignore[arg-type]
+        )
+    store.close()
+
+
+@pytest.mark.unit
+def test_explicit_unprotected_legacy_cancel_path_remains_available_without_gate(tmp_path) -> None:
+    store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
+    orders = ManagedExecutionFacade(
+        store, _scope(), writer_id="writer.legacy", admission_gate=_OrderGate()
+    )
+    orders.submit(
+        _order_intent(),
+        lambda intent: ProviderObservation.accepted(intent.intent_id, "provider.1"),
+    )
+    cancellation = ManagedCancellationFacade(
+        store,
+        _scope(),
+        acquire_writer_lease=orders.acquire_writer_lease,
+        admission_gate=None,
+        allow_unprotected=True,
+    )
+    calls: list[str] = []
+    try:
+        result = cancellation.cancel(
+            _cancel_intent(),
+            lambda intent: (
+                calls.append(intent.cancel_id)
+                or CancelObservation.accepted(
+                    intent.cancel_id, intent.target_intent_id, intent.provider_order_id
+                )
+            ),
+        )
+
+        assert result.state is ExecutionState.ACKED
+        assert calls == ["cancel.1"]
+    finally:
+        orders.close()
         store.close()
 
 

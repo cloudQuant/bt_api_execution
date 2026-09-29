@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
+import time
 
 import pytest
 
@@ -11,12 +13,297 @@ from bt_api_execution import (
     ExecutionScope,
     InvalidStateTransition,
     SqliteExecutionStore,
+    WriterLease,
 )
 
 
 def _scope(account_label: str = "account.one", *, environment: str = "simulation"):
     account_ref = "ctp-account-ref.v1:" + hashlib.sha256(account_label.encode("ascii")).hexdigest()
     return ExecutionScope("ctp", environment, account_ref, "strategy.one", "20260926")
+
+
+@pytest.mark.unit
+def test_factory_bound_store_rejects_other_account_and_provider_before_mutations(tmp_path) -> None:
+    path = tmp_path / "bound-account.sqlite3"
+    scope_a = _scope("account.one")
+    scope_a_sibling = ExecutionScope(
+        "ctp", "simulation", scope_a.account_ref, "strategy.two", "20260927"
+    )
+    scope_b = _scope("account.two")
+    generic_scope = ExecutionScope("fake", "offline", "account.one", "strategy.one")
+    store = SqliteExecutionStore.open_ctp_account_store(path, scope_a)
+    try:
+        with pytest.raises(ContractValidationError, match="immutable CTP account store identity"):
+            store.acquire_ctp_account_family_owner(scope_b)
+        with pytest.raises(ContractValidationError, match="immutable CTP account store identity"):
+            store.acquire_or_renew_lease(scope_b, "account-b", ttl_ns=30_000_000_000)
+        with pytest.raises(ContractValidationError, match="immutable CTP account store identity"):
+            store.acquire_or_renew_lease(
+                generic_scope, "generic-account", ttl_ns=30_000_000_000
+            )
+        with pytest.raises(ContractValidationError, match="immutable CTP account store identity"):
+            store.reserve_ctp_order_identity(
+                scope_b,
+                "intent.account-b",
+                "bt-managed-v1:" + "a" * 64,
+            )
+        with pytest.raises(ContractValidationError, match="immutable CTP account store identity"):
+            store.release_lease(scope_b, "account-b", fencing_token=1)
+        foreign_lease = WriterLease(
+            scope_b.account_key,
+            "forged-account-b",
+            1,
+            time.time_ns() + 30_000_000_000,
+        )
+        with pytest.raises(ContractValidationError, match="immutable CTP account store identity"):
+            store.create_ctp_callback_session_owner(
+                scope_b, writer_lease=foreign_lease
+            )
+
+        assert store._connection.execute(
+            "SELECT COUNT(*) FROM ctp_account_family_owners"
+        ).fetchone()[0] == 0
+        assert store._connection.execute(
+            "SELECT COUNT(*) FROM execution_writer_leases"
+        ).fetchone()[0] == 0
+        assert store._connection.execute(
+            "SELECT COUNT(*) FROM ctp_order_identity_reservations"
+        ).fetchone()[0] == 0
+
+        owner_a = store.acquire_ctp_account_family_owner(scope_a)
+        lease_a = store.acquire_or_renew_lease(
+            scope_a,
+            "account-a",
+            ttl_ns=30_000_000_000,
+            ctp_account_family_owner=owner_a,
+        )
+        assert lease_a.family_owner_intent_id == owner_a.owner_intent_id
+        assert store.acquire_ctp_account_family_owner(scope_a_sibling) is owner_a
+        sibling_lease = store.acquire_or_renew_lease(
+            scope_a_sibling,
+            "account-a",
+            ttl_ns=30_000_000_000,
+            ctp_account_family_owner=owner_a,
+        )
+        assert sibling_lease.fencing_token == lease_a.fencing_token
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+def test_raw_constructor_reopen_keeps_factory_identity_guard(tmp_path) -> None:
+    path = tmp_path / "raw-reopen.sqlite3"
+    scope_a = _scope("account.one")
+    scope_b = _scope("account.two")
+    factory_store = SqliteExecutionStore.open_ctp_account_store(path, scope_a)
+    factory_store.close()
+
+    raw_store = SqliteExecutionStore(path)
+    try:
+        with pytest.raises(ContractValidationError, match="immutable CTP account store identity"):
+            raw_store.acquire_ctp_account_family_owner(scope_b)
+        with pytest.raises(ContractValidationError, match="immutable CTP account store identity"):
+            raw_store.acquire_or_renew_lease(scope_b, "account-b", ttl_ns=30_000_000_000)
+        assert raw_store._connection.execute(
+            "SELECT COUNT(*) FROM ctp_account_family_owners"
+        ).fetchone()[0] == 0
+        assert raw_store._connection.execute(
+            "SELECT COUNT(*) FROM execution_writer_leases"
+        ).fetchone()[0] == 0
+
+        owner_a = raw_store.acquire_ctp_account_family_owner(scope_a)
+        lease_a = raw_store.acquire_or_renew_lease(
+            scope_a,
+            "account-a",
+            ttl_ns=30_000_000_000,
+            ctp_account_family_owner=owner_a,
+        )
+        assert lease_a.family_owner_intent_id == owner_a.owner_intent_id
+    finally:
+        raw_store.close()
+
+
+@pytest.mark.unit
+def test_factory_preflight_rejects_foreign_family_history_without_repair(tmp_path) -> None:
+    path = tmp_path / "foreign-family-history.sqlite3"
+    scope_a = _scope("account.one")
+    scope_b = _scope("account.two")
+    store = SqliteExecutionStore.open_ctp_account_store(path, scope_a)
+    store.close()
+
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            """
+            INSERT INTO ctp_account_family_owners(
+                family_key, owner_intent_id, account_key, scope_key, environment,
+                trading_day, owner_state, poison_code, created_at_ns, updated_at_ns
+            ) VALUES (?, ?, ?, ?, ?, ?, 'ACTIVE', NULL, 1, 1)
+            """,
+            (
+                SqliteExecutionStore._ctp_account_family_key(scope_b),
+                "b" * 32,
+                scope_b.account_key,
+                scope_b.key,
+                scope_b.environment,
+                scope_b.trading_day,
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with path.open("rb") as database:
+        before = database.read()
+    with pytest.raises(DurableStoreError, match="foreign account-family owner"):
+        SqliteExecutionStore.inspect_ctp_account_store_file(path, scope_a)
+    with pytest.raises(DurableStoreError, match="foreign account-family owner"):
+        SqliteExecutionStore.open_ctp_account_store(path, scope_a)
+    with path.open("rb") as database:
+        assert database.read() == before
+
+
+@pytest.mark.unit
+def test_factory_preflight_rejects_orphan_foreign_writer_lease(tmp_path) -> None:
+    path = tmp_path / "foreign-orphan-lease.sqlite3"
+    scope_a = _scope("account.one")
+    scope_b = _scope("account.two")
+    store = SqliteExecutionStore.open_ctp_account_store(path, scope_a)
+    store.close()
+
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            "INSERT INTO execution_writer_leases(scope_key, owner_id, fencing_token, expires_at_ns) "
+            "VALUES (?, 'foreign-owner', 1, 1)",
+            (scope_b.account_key,),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with path.open("rb") as database:
+        before = database.read()
+    with pytest.raises(DurableStoreError, match="writer lease for an unbound account"):
+        SqliteExecutionStore.inspect_ctp_account_store_file(path, scope_a)
+    with pytest.raises(DurableStoreError, match="writer lease for an unbound account"):
+        SqliteExecutionStore.open_ctp_account_store(path, scope_a)
+    with path.open("rb") as database:
+        assert database.read() == before
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("history_table", ["execution_records", "cancellation_records"])
+def test_factory_preflight_rejects_foreign_scoped_history_without_owner(
+    tmp_path, history_table
+) -> None:
+    path = tmp_path / f"foreign-{history_table}.sqlite3"
+    scope_a = _scope("account.one")
+    scope_b = _scope("account.two")
+    store = SqliteExecutionStore.open_ctp_account_store(path, scope_a)
+    store.close()
+
+    payload_json = json.dumps(
+        {"scope": scope_b.to_payload()},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    connection = sqlite3.connect(path)
+    try:
+        if history_table == "execution_records":
+            connection.execute(
+                """
+                INSERT INTO execution_records(
+                    scope_key, intent_id, payload_sha256, payload_json, state,
+                    filled_quantity, dispatch_attempts, review_required,
+                    created_at_ns, updated_at_ns
+                ) VALUES (?, 'foreign-intent', ?, ?, 'PENDING_ADMISSION', '0', 0, 0, 1, 1)
+                """,
+                (scope_b.key, "a" * 64, payload_json),
+            )
+        else:
+            connection.execute(
+                """
+                INSERT INTO cancellation_records(
+                    scope_key, cancel_id, target_intent_id, provider_order_id,
+                    payload_sha256, payload_json, state, dispatch_attempts,
+                    review_required, created_at_ns, updated_at_ns
+                ) VALUES (?, 'foreign-cancel', 'foreign-intent', 'provider-order',
+                          ?, ?, 'UNKNOWN', 1, 1, 1, 1)
+                """,
+                (scope_b.key, "a" * 64, payload_json),
+            )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with path.open("rb") as database:
+        before = database.read()
+    with pytest.raises(DurableStoreError, match="history for an unbound account"):
+        SqliteExecutionStore.inspect_ctp_account_store_file(path, scope_a)
+    with pytest.raises(DurableStoreError, match="history for an unbound account"):
+        SqliteExecutionStore.open_ctp_account_store(path, scope_a)
+    with path.open("rb") as database:
+        assert database.read() == before
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "history_table", ["ctp_dispatch_callback_session_owners", "ctp_dispatch_commands"]
+)
+def test_factory_preflight_rejects_foreign_ctp_dispatch_history_without_owner(
+    tmp_path, history_table
+) -> None:
+    path = tmp_path / f"foreign-{history_table}.sqlite3"
+    scope_a = _scope("account.one")
+    scope_b = _scope("account.two")
+    store = SqliteExecutionStore.open_ctp_account_store(path, scope_a)
+    store.close()
+
+    connection = sqlite3.connect(path)
+    try:
+        if history_table == "ctp_dispatch_callback_session_owners":
+            connection.execute(
+                """
+                INSERT INTO ctp_dispatch_callback_session_owners(
+                    owner_intent_id, account_key, scope_key, owner_state,
+                    writer_owner_id, writer_fencing_token, last_source_sequence,
+                    economic_query_observed, created_at_ns, updated_at_ns
+                ) VALUES ('c0000000000000000000000000000000', ?, ?, 'PREPARED',
+                          'foreign-writer', 1, 0, 0, 1, 1)
+                """,
+                (scope_b.account_key, scope_b.key),
+            )
+        else:
+            connection.execute(
+                """
+                INSERT INTO ctp_dispatch_commands(
+                    account_key, scope_key, trading_day, operation, command_id,
+                    request_payload_json, request_payload_sha256,
+                    reservation_managed_intent_id, order_ref, approval_use_id,
+                    approval_digest, session_binding_json, session_binding_sha256,
+                    status, created_at_ns, updated_at_ns
+                ) VALUES (?, ?, ?, 'SUBMIT', 'foreign-command', '{}', ?,
+                          'foreign-intent', '000000000001', 'foreign-approval', ?,
+                          '{}', ?, 'READY', 1, 1)
+                """,
+                (scope_b.account_key, scope_b.key, scope_b.trading_day,
+                 "a" * 64, "b" * 64, "c" * 64),
+            )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with path.open("rb") as database:
+        before = database.read()
+    with pytest.raises(DurableStoreError, match="history for an unbound account"):
+        SqliteExecutionStore.inspect_ctp_account_store_file(path, scope_a)
+    with pytest.raises(DurableStoreError, match="history for an unbound account"):
+        SqliteExecutionStore.open_ctp_account_store(path, scope_a)
+    with path.open("rb") as database:
+        assert database.read() == before
 
 
 @pytest.mark.unit

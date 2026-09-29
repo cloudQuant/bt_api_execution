@@ -11,6 +11,7 @@ automatically.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
 from .contracts import CancelIntent, CancelObservation, ExecutionScope, ExecutionState
@@ -29,6 +30,32 @@ CancelDispatchCallable = Callable[[CancelIntent], CancelObservation]
 CancelBeforeDispatchCallable = Callable[[CancelIntent], None]
 
 
+@dataclass(frozen=True)
+class CancelDispatchClaimReceiptV1:
+    """Trusted adapter receipt binding a committed risk claim to one cancel.
+
+    The injected adapter constructs this only after the risk store confirms
+    the exact permit and mapped intent.  It is an in-process contract, not a
+    security boundary against hostile Python code in the same process.
+    """
+
+    permit_reference: str
+    scope_key: str
+    cancel_id: str
+    intent_fingerprint: str
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "permit_reference",
+            "scope_key",
+            "cancel_id",
+            "intent_fingerprint",
+        ):
+            value = getattr(self, field_name)
+            if type(value) is not str or not value or value != value.strip():
+                raise ContractValidationError("invalid cancellation dispatch claim receipt")
+
+
 class CancelAdmissionGate(Protocol):
     """Narrow admission surface for a ``CancelIntent``.
 
@@ -41,13 +68,26 @@ class CancelAdmissionGate(Protocol):
 
     def validate(self, permit_reference: str, intent: CancelIntent) -> Any: ...
 
+    def claim_before_dispatch(
+        self, permit_reference: str, intent: CancelIntent
+    ) -> CancelDispatchClaimReceiptV1:
+        """Return only after durable claim readback matches this cancel."""
+
+        ...
+
     def settle(self, permit_reference: str) -> Any: ...
 
     def release(self, permit_reference: str, reason: str) -> None: ...
 
 
 class ManagedCancellationFacade:
-    """Durably admit, dispatch, and reconcile a single cancellation request."""
+    """Durably admit, dispatch, and reconcile a single cancellation request.
+
+    When an admission gate is configured, it must support the final durable
+    ``claim_before_dispatch`` step.  The explicit ``allow_unprotected=True``
+    path remains available for legacy callers without a gate and carries no
+    risk-permit claim.
+    """
 
     def __init__(
         self,
@@ -67,6 +107,12 @@ class ManagedCancellationFacade:
         self._acquire_writer_lease = acquire_writer_lease
         self._admission_gate = admission_gate
         self._allow_unprotected = allow_unprotected
+        if admission_gate is not None and not callable(
+            getattr(admission_gate, "claim_before_dispatch", None)
+        ):
+            raise ContractValidationError(
+                "cancellation admission gate requires claim_before_dispatch"
+            )
 
     @property
     def scope(self) -> ExecutionScope:
@@ -118,6 +164,38 @@ class ManagedCancellationFacade:
                     intent, "cancel_pre_dispatch_guard_failed", writer_lease
                 )
         self._store.assert_writer_lease(self._scope, writer_lease)
+        if self._admission_gate is not None:
+            permit_reference = record.permit_reference
+            claim = getattr(self._admission_gate, "claim_before_dispatch", None)
+            if permit_reference is None or not callable(claim):
+                return self._block_before_dispatch(
+                    intent, "cancel_admission_claim_unavailable", writer_lease
+                )
+            try:
+                claim_result = claim(permit_reference, intent)
+            except Exception:
+                return self._store.mark_cancel_unknown(
+                    intent.cancel_id,
+                    self._scope,
+                    "cancel_admission_claim_outcome_unknown",
+                    writer_lease=writer_lease,
+                )
+            expected_claim = CancelDispatchClaimReceiptV1(
+                permit_reference=permit_reference,
+                scope_key=intent.scope.key,
+                cancel_id=intent.cancel_id,
+                intent_fingerprint=intent.fingerprint,
+            )
+            if (
+                type(claim_result) is not CancelDispatchClaimReceiptV1
+                or claim_result != expected_claim
+            ):
+                return self._store.mark_cancel_unknown(
+                    intent.cancel_id,
+                    self._scope,
+                    "cancel_admission_claim_outcome_unknown",
+                    writer_lease=writer_lease,
+                )
         try:
             observation = self._dispatch(dispatcher, intent)
         except Exception:
@@ -436,6 +514,7 @@ class ManagedCancellationFacade:
 __all__ = [
     "CancelAdmissionGate",
     "CancelBeforeDispatchCallable",
+    "CancelDispatchClaimReceiptV1",
     "CancelDispatchCallable",
     "ManagedCancellationFacade",
 ]
