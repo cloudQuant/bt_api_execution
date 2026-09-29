@@ -204,7 +204,10 @@ class CtpNativeCallbackLedgerAdapter:
             # The source API/SPI generation cannot change between the final
             # source recapture, trusted verification, and SQLite commit. This
             # lock is the same lock used by the SDK callback writers/setters.
-            with self._source_state_lock:
+            source_state_lock = self._source_state_lock
+            if source_state_lock is None:
+                raise ContractValidationError("native CTP lifecycle lock is required")
+            with source_state_lock:
                 self._source_bridge._require_live_source_current()
                 applied = self._store.apply_ctp_verified_dispatch_callback(
                     self._scope,

@@ -30,7 +30,7 @@ def _text(value: str, field_name: str, *, pattern: re.Pattern[str] = _IDENTIFIER
     return value
 
 
-def _decimal(value: Decimal, field_name: str, *, positive: bool = False) -> Decimal:
+def _decimal(value: Decimal | int | str, field_name: str, *, positive: bool = False) -> Decimal:
     if isinstance(value, float):
         raise ContractValidationError(f"invalid {field_name}")
     if not isinstance(value, Decimal):
@@ -1041,13 +1041,13 @@ class ExecutionQualityRecord:
                 object.__setattr__(self, name, basis)
         object.__setattr__(self, "epoch", _optional_timestamp_ns(self.epoch, "epoch"))
         for name in ("currency", "fee_currency", "arrival_source"):
-            value = getattr(self, name)
-            if value is not None:
-                object.__setattr__(self, name, _text(value, name))
+            text_value = getattr(self, name)
+            if text_value is not None:
+                object.__setattr__(self, name, _text(text_value, name))
         for name in ("signal_id", "child_id", "order_id", "trade_id"):
-            value = getattr(self, name)
-            if value is not None:
-                object.__setattr__(self, name, _text(value, name))
+            text_value = getattr(self, name)
+            if text_value is not None:
+                object.__setattr__(self, name, _text(text_value, name))
         if (
             any(
                 basis == "TRADE"

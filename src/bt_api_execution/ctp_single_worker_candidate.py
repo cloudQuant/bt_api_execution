@@ -292,7 +292,14 @@ class CtpManagedDispatchBinding:
             or command.local_queue_receipt_id is None
         ):
             raise ContractValidationError("managed CTP command binding is incomplete")
-        operation = "submit" if command.operation == "SUBMIT" else "cancel"
+        operation: Literal["submit", "cancel"] = (
+            "submit" if command.operation == "SUBMIT" else "cancel"
+        )
+        native_action_ref = key.native_action_ref
+        if native_action_ref is not None and (
+            isinstance(native_action_ref, bool) or not isinstance(native_action_ref, int)
+        ):
+            raise ContractValidationError("managed CTP command has an invalid native ActionRef")
         return cls(
             operation=operation,
             command_id=command.command_id,
@@ -311,7 +318,7 @@ class CtpManagedDispatchBinding:
             dispatch_front_id=key.dispatch_front_id,
             dispatch_session_id=key.dispatch_session_id,
             native_request_id=key.native_request_id,
-            native_action_ref=key.native_action_ref,
+            native_action_ref=native_action_ref,
             cancel_target_exchange_id=key.cancel_target_exchange_id,
             cancel_target_order_sys_id=key.cancel_target_order_sys_id,
             cancel_target_front_id=key.cancel_target_front_id,

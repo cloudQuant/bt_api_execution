@@ -78,7 +78,7 @@ class _TraderClientSource(Protocol):
     def _claim_native_callback_event_consumer(self) -> object: ...
 
     def _wait_native_callback_event_for_consumer(
-        self, consumer_token: object, timeout: float = 5.0
+        self, consumer_token: object, timeout: float | None = 5.0
     ) -> object | None: ...
 
     def _release_native_callback_event_consumer(self, consumer_token: object) -> None: ...
@@ -551,7 +551,7 @@ class CtpNativeCallbackSourceBridge:
             raise
 
     def next_envelope(
-        self, *, timeout: float = 5.0
+        self, *, timeout: float | None = 5.0
     ) -> CtpLifecycleBoundNativeCallbackEnvelope | None:
         """Poll and map one exact source-queue event, or return ``None`` on timeout."""
 

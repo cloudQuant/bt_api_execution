@@ -390,15 +390,18 @@ class CtpCallbackSessionStoreAdapter:
                     trade_verifier=trade_fact_verifier,
                 )
 
+            correlation = command.correlation_key
+            if correlation is None:
+                raise ContractValidationError("CTP callback command lacks a correlation key")
             if callback_name == "OnRtnOrder":
                 envelope = map_ctp_native_order_return(
-                    command.correlation_key,
+                    correlation,
                     session,
                     native_field,
                 )
             elif callback_name in {"OnRspOrderInsert", "OnErrRtnOrderInsert"}:
                 envelope = map_ctp_native_order_insert_callback(
-                    command.correlation_key,
+                    correlation,
                     session,
                     callback_name,
                     native_field,
@@ -410,7 +413,7 @@ class CtpCallbackSessionStoreAdapter:
                 )
             elif callback_name in {"OnRspOrderAction", "OnErrRtnOrderAction"}:
                 envelope = map_ctp_native_order_action_callback(
-                    command.correlation_key,
+                    correlation,
                     session,
                     callback_name,
                     native_field,

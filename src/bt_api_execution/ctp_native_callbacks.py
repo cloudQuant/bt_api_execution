@@ -673,6 +673,7 @@ def map_ctp_native_order_action_callback(
         raise ContractValidationError("unsupported native CTP order action callback")
 
     field_request_id = _native_int(action_field, "RequestID", required=True)
+    assert field_request_id is not None
     if source_callback == "OnRspOrderAction":
         if type(request_id) is not int or request_id <= 0 or request_id != field_request_id:
             raise ContractValidationError("native CTP action RequestID fields do not match")
@@ -780,6 +781,7 @@ def map_ctp_native_order_insert_callback(
         raise ContractValidationError("unsupported native CTP order insert callback")
 
     field_request_id = _native_int(order_field, "RequestID", required=True)
+    assert field_request_id is not None
     if source_callback == "OnRspOrderInsert":
         if type(request_id) is not int or request_id <= 0 or request_id != field_request_id:
             raise ContractValidationError("native CTP insert RequestID fields do not match")
@@ -895,11 +897,10 @@ def map_ctp_native_trade_fact_v2(
         raise ContractValidationError("native CTP trade price is invalid") from exc
     if not price.is_finite() or price <= 0:
         raise ContractValidationError("native CTP trade price must be positive and finite")
-    if (
-        len(price.as_tuple().digits) > 32
-        or abs(price.adjusted()) > 32
-        or abs(price.as_tuple().exponent) > 32
-    ):
+    exponent = price.as_tuple().exponent
+    if not isinstance(exponent, int):
+        raise ContractValidationError("native CTP trade price is invalid")
+    if len(price.as_tuple().digits) > 32 or abs(price.adjusted()) > 32 or abs(exponent) > 32:
         raise ContractValidationError("native CTP trade price exceeds the field bound")
     price_text = format(price.normalize(), "f")
     if len(price_text) > 64:

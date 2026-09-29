@@ -3520,6 +3520,9 @@ class SqliteExecutionStore:
             raise ContractValidationError("durable CTP submit quantity is invalid")
         if native_volume_traded > order_quantity:
             raise ContractValidationError("native CTP cumulative volume exceeds submit quantity")
+        correlation = command.correlation_key
+        if correlation is None:
+            raise ContractValidationError("CTP cumulative observation lacks command correlation")
         prior_order = cursor.execute(
             """
             SELECT native_volume_traded FROM ctp_dispatch_order_cumulative_ledger
@@ -3563,7 +3566,7 @@ class SqliteExecutionStore:
                 command.scope_key,
                 command.trading_day,
                 command.command_id,
-                command.correlation_key.runtime_order_id,
+                correlation.runtime_order_id,
                 command.order_ref,
                 native_volume_traded,
                 trade_volume,
@@ -4223,7 +4226,9 @@ class SqliteExecutionStore:
         return binding
 
     @staticmethod
-    def _ctp_callback_session_generation_id(owner_row: Mapping[str, Any]) -> str:
+    def _ctp_callback_session_generation_id(
+        owner_row: Mapping[str, Any] | sqlite3.Row,
+    ) -> str:
         epoch = owner_row["native_client_epoch"]
         api_generation = owner_row["native_api_generation"]
         connection_generation = owner_row["active_connection_generation"]
@@ -4711,6 +4716,7 @@ class SqliteExecutionStore:
                         target_submit = candidate
 
             identity_state = "EXACT" if target_submit is not None else "UNMAPPABLE"
+            fields: tuple[str | int | None, ...]
             if target_submit is None:
                 correlation_digest = payload_sha256(
                     {
@@ -9291,6 +9297,17 @@ class SqliteExecutionStore:
                 cancel_action = None
             else:
                 cancel_action_state = row["cp_provider_state"]
+                target_exchange_id = correlation.cancel_target_exchange_id
+                target_order_sys_id = correlation.cancel_target_order_sys_id
+                target_front_id = correlation.cancel_target_front_id
+                target_session_id = correlation.cancel_target_session_id
+                if (
+                    target_exchange_id is None
+                    or target_order_sys_id is None
+                    or target_front_id is None
+                    or target_session_id is None
+                ):
+                    raise ValueError("CTP cancel projection lacks an exact target")
                 cancel_action = CtpCancelActionProjection(
                     managed_action_id=correlation.managed_action_id,
                     action_state=(
@@ -9307,10 +9324,10 @@ class SqliteExecutionStore:
                         managed_intent_id=correlation.reservation_managed_intent_id,
                         runtime_order_id=correlation.runtime_order_id,
                         order_ref=correlation.order_ref,
-                        exchange_id=correlation.cancel_target_exchange_id,
-                        order_sys_id=correlation.cancel_target_order_sys_id,
-                        front_id=correlation.cancel_target_front_id,
-                        session_id=correlation.cancel_target_session_id,
+                        exchange_id=target_exchange_id,
+                        order_sys_id=target_order_sys_id,
+                        front_id=target_front_id,
+                        session_id=target_session_id,
                         order_state=order_state,
                     ),
                 )
@@ -9791,6 +9808,7 @@ class SqliteExecutionStore:
             if row_after_verification is None or str(row_after_verification["status"]) != "READY":
                 return None
             if session_owner is not None:
+                assert _callback_session_owner is not None
                 fresh_owner = cursor.execute(
                     "SELECT * FROM ctp_dispatch_callback_session_owners WHERE account_key = ?",
                     (account_key,),
@@ -9838,7 +9856,9 @@ class SqliteExecutionStore:
                     claim_now_ns,
                     writer_lease.owner_id,
                     writer_lease.fencing_token,
-                    None if session_owner is None else _callback_session_owner.owner_intent_id,
+                    None
+                    if _callback_session_owner is None
+                    else _callback_session_owner.owner_intent_id,
                     0 if session_owner is None else 1,
                     account_key,
                     scope_key,
@@ -9880,7 +9900,9 @@ class SqliteExecutionStore:
                     scope,
                     claimed,
                     owner_intent_id=(
-                        None if session_owner is None else _callback_session_owner.owner_intent_id
+                        None
+                        if _callback_session_owner is None
+                        else _callback_session_owner.owner_intent_id
                     ),
                     created_at_ns=claim_now_ns,
                 )
@@ -9944,6 +9966,11 @@ class SqliteExecutionStore:
                 or command.native_request_payload_sha256 is None
             ):
                 raise ContractValidationError("claimed command lacks V2 native request payload")
+            native_action_ref = correlation.native_action_ref
+            if native_action_ref is not None and (
+                isinstance(native_action_ref, bool) or not isinstance(native_action_ref, int)
+            ):
+                raise ContractValidationError("claimed command has an invalid native ActionRef")
             binding = CtpManagedNativeCallBindingV2(
                 binding_id=uuid.uuid4().hex,
                 owner_intent_id=owner_handle.owner_intent_id,
@@ -9959,7 +9986,7 @@ class SqliteExecutionStore:
                 runtime_order_id=correlation.runtime_order_id,
                 order_ref=correlation.order_ref,
                 native_request_id=correlation.native_request_id,
-                native_action_ref=correlation.native_action_ref,
+                native_action_ref=native_action_ref,
                 native_request_payload_json=canonical_json(dict(command.native_request_payload)),
                 native_request_payload_sha256=command.native_request_payload_sha256,
                 cancel_target_order_ref=(
@@ -12449,8 +12476,11 @@ class SqliteExecutionStore:
                 identity_row["value"],
             ),
         )
+        sequence = cursor.lastrowid
+        if sequence is None:
+            raise DurableStoreError("execution outbox sequence is unavailable")
         return ExecutionEvent(
-            sequence=int(cursor.lastrowid),
+            sequence=sequence,
             event_id=event_id,
             intent_id=intent_id,
             scope_key=scope_key,
@@ -14074,13 +14104,22 @@ class SqliteExecutionStore:
                 )
             else:
                 raise WriterLeaseUnavailable()
+        family_key = None
+        family_owner_intent_id = None
+        if is_ctp_scope:
+            if ctp_account_family_owner is None:
+                raise InvalidStateTransition(
+                    "CTP account family owner must precede the writer lease"
+                )
+            family_key = ctp_account_family_owner.family_key
+            family_owner_intent_id = ctp_account_family_owner.owner_intent_id
         return WriterLease(
             scope_key,
             owner_id,
             token,
             expires_at_ns,
-            None if not is_ctp_scope else ctp_account_family_owner.family_key,
-            None if not is_ctp_scope else ctp_account_family_owner.owner_intent_id,
+            family_key,
+            family_owner_intent_id,
         )
 
     def release_lease(
