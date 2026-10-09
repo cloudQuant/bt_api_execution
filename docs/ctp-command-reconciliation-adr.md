@@ -1,4 +1,4 @@
-# CTP command callback and UNKNOWN reconciliation boundary
+﻿# CTP command callback and UNKNOWN reconciliation boundary
 
 **Status:** design-only contract; no CTP callback adapter or UNKNOWN resolver is
 implemented by this package.
