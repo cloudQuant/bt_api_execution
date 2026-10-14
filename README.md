@@ -100,6 +100,31 @@ port raises after a request may have been sent, the record becomes `UNKNOWN`.
 The facade will never replay it automatically; a caller must reconcile it with
 provider evidence.
 
+## Authenticated service boundary
+
+The `account_owner` role exposes the managed order journal to authorized SDK
+clients. `service.order_entry` serves `orders.submit` and `orders.cancel`;
+`service.order_query` serves `orders.query`. The adapter borrows an
+already-open store, a trusted provider adapter exposing `submit(intent)` and
+`cancel(intent)`, and a `WireScope -> ExecutionScope` target map from the
+composition root.
+
+A request never carries its own scope: the strategy or manual-book attribution
+comes only from the authenticated `WireScope` resolved through that map, and an
+unknown or unregistered scope is refused before any store write. Submission is
+durably admitted before the provider call and dispatched at most once per
+intent ID; repeating an identical request returns the same record, while the
+same ID with different content is rejected as a conflict. A provider failure or
+a mismatched observation leaves the record `UNKNOWN` and is never resubmitted
+automatically; resolve it with provider evidence. A cancellation must name the
+intent and the provider order ID the journal already evidenced.
+
+Without an admission gate the route fails closed with `ADMISSION_REQUIRED`
+unless the composition root explicitly assembles it as unprotected; a denied
+reservation is recorded as a durable rejection with no provider call. Replies
+always carry the durable record when one exists, so `UNKNOWN` is visible to the
+caller rather than reported as a plain failure.
+
 ## Scope of this release
 
 This package is an execution foundation, not a provider adapter, risk engine,
