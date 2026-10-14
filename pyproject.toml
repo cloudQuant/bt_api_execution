@@ -22,7 +22,7 @@ classifiers = [
     "Operating System :: Microsoft :: Windows",
     "Operating System :: MacOS",
 ]
-dependencies = []
+dependencies = ["bt_api_base>=0.15.5"]
 
 [project.optional-dependencies]
 dev = [
