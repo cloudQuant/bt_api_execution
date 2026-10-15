@@ -17,7 +17,7 @@ from collections.abc import Mapping
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, fields, is_dataclass
 from datetime import date
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
@@ -2379,6 +2379,168 @@ class SqliteExecutionStore:
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
             raise DurableStoreError("stored account financial posting is unreadable") from error
 
+    @classmethod
+    def _financial_ledger_cut_from_payload(cls, payload: Any) -> Any:
+        from .account_financial_ledger import (
+            FinancialLedgerCutV1,
+            FinancialSourceKind,
+            FinancialWatermarkV1,
+        )
+
+        try:
+            if type(payload) is not dict or type(payload["watermarks"]) is not list:
+                raise ValueError("invalid financial cut payload")
+            cut = FinancialLedgerCutV1(
+                account_key=payload["account_key"],
+                owner_directory_revision=payload["owner_directory_revision"],
+                captured_at_ns=payload["captured_at_ns"],
+                watermarks=tuple(
+                    FinancialWatermarkV1(
+                        source_kind=FinancialSourceKind(row["source_kind"]),
+                        source_ref=row["source_ref"],
+                        generation=row["generation"],
+                        cursor=row["cursor"],
+                        as_of_ns=row["as_of_ns"],
+                    )
+                    for row in payload["watermarks"]
+                    if type(row) is dict
+                ),
+            )
+            if len(cut.watermarks) != len(payload["watermarks"]):
+                raise ValueError("invalid financial watermark payload")
+            return cut
+        except (KeyError, TypeError, ValueError, ContractValidationError) as error:
+            raise DurableStoreError("stored account financial cut is unreadable") from error
+
+    @classmethod
+    def _financial_projection_from_json(cls, raw: str) -> Any:
+        from .account_financial_ledger import (
+            AccountFinancialProjectionV1,
+            CurrencyAmountV1,
+            FinancialCostMethod,
+            FinancialOwnerKind,
+            FinancialOwnerV1,
+            FinancialProductModel,
+            OwnerFinancialBookV1,
+            OwnerPositionCostV1,
+        )
+
+        def amount_rows(rows: Any) -> tuple[Any, ...]:
+            if type(rows) is not list:
+                raise ValueError("invalid financial amount rows")
+            return tuple(
+                CurrencyAmountV1(row["currency"], Decimal(row["amount"]))
+                for row in rows
+                if type(row) is dict
+            )
+
+        try:
+            payload = json.loads(raw)
+            if canonical_json(payload) != raw or type(payload) is not dict:
+                raise ValueError("noncanonical financial projection")
+            cut = cls._financial_ledger_cut_from_payload(payload["cut"])
+            if type(payload["books"]) is not list:
+                raise ValueError("invalid financial books")
+            books: list[Any] = []
+            for row in payload["books"]:
+                if type(row) is not dict or type(row["owner"]) is not dict:
+                    raise ValueError("invalid financial book")
+                owner = FinancialOwnerV1(
+                    FinancialOwnerKind(row["owner"]["kind"]),
+                    row["owner"]["owner_ref"],
+                    row["owner"]["execution_scope_key"],
+                )
+                if row["ledger_cut"] != payload["cut"]:
+                    raise ValueError("financial book has another source cut")
+                positions_payload = row["positions"]
+                if type(positions_payload) is not list:
+                    raise ValueError("invalid owner positions")
+                positions = tuple(
+                    OwnerPositionCostV1(
+                        instrument=position["instrument"],
+                        quantity=Decimal(position["quantity"]),
+                        cost_basis=(
+                            None
+                            if position["cost_basis"] is None
+                            else Decimal(position["cost_basis"])
+                        ),
+                        cost_currency=position["cost_currency"],
+                        cost_method=FinancialCostMethod(position["cost_method"]),
+                        product_model=FinancialProductModel(position["product_model"]),
+                        metadata_version=position["metadata_version"],
+                    )
+                    for position in positions_payload
+                    if type(position) is dict
+                )
+                if len(positions) != len(positions_payload):
+                    raise ValueError("invalid owner position row")
+                books.append(
+                    OwnerFinancialBookV1(
+                        owner=owner,
+                        ledger_cut=cut,
+                        cash=amount_rows(row["cash"]),
+                        positions=positions,
+                        cumulative_fees=amount_rows(row["cumulative_fees"]),
+                        realized_pnl=amount_rows(row["realized_pnl"]),
+                        cost_basis_complete=row["cost_basis_complete"],
+                    )
+                )
+            position_residual_payload = payload["unallocated_position_residual"]
+            if type(position_residual_payload) is not list:
+                raise ValueError("invalid unallocated position residual")
+            projection = AccountFinancialProjectionV1(
+                cut=cut,
+                books=tuple(books),
+                unallocated_cash_residual=amount_rows(payload["unallocated_cash_residual"]),
+                unallocated_position_residual=tuple(
+                    (row[0], Decimal(row[1]))
+                    for row in position_residual_payload
+                    if type(row) is list and len(row) == 2
+                ),
+                unallocated_fee_residual=amount_rows(payload["unallocated_fee_residual"]),
+                complete=payload["complete"],
+                state=payload["state"],
+            )
+            if (
+                len(projection.unallocated_position_residual)
+                != len(position_residual_payload)
+                or _financial_canonical_json(projection) != raw
+            ):
+                raise ValueError("financial projection is not canonical typed data")
+            return projection
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+            InvalidOperation,
+            ContractValidationError,
+            json.JSONDecodeError,
+        ) as error:
+            raise DurableStoreError("stored account financial projection is unreadable") from error
+
+    @classmethod
+    def _financial_cursor_snapshot_from_payload(cls, payload: Any) -> Any:
+        from .account_financial_ledger import FinancialExecutionCursorSnapshotV1
+
+        try:
+            if type(payload) is not dict or type(payload["orders"]) is not list:
+                raise ValueError("invalid financial cursor snapshot")
+            raw_orders = canonical_json(payload["orders"])
+            orders = cls._financial_cursor_rows_from_json(raw_orders)
+            snapshot = FinancialExecutionCursorSnapshotV1(
+                journal_generation=payload["journal_generation"],
+                cursor=payload["cursor"],
+                as_of_ns=payload["as_of_ns"],
+                orders=tuple(orders.values()),
+                page_exhausted=payload["page_exhausted"],
+                scope_filter_applied=payload["scope_filter_applied"],
+            )
+            if _financial_canonical_json(snapshot) != canonical_json(payload):
+                raise ValueError("financial cursor snapshot is not canonical")
+            return snapshot
+        except (KeyError, TypeError, ValueError, ContractValidationError) as error:
+            raise DurableStoreError("stored financial cursor snapshot is unreadable") from error
+
     @staticmethod
     def _financial_writer_is_registered(
         writer_scope: ExecutionScope,
@@ -3154,6 +3316,546 @@ class SqliteExecutionStore:
                 cursor, writer_scope, writer_lease, now_ns=precommit_now_ns
             )
             return projection
+
+    def read_account_financial_projection(
+        self,
+        account_key: str,
+        *,
+        expected_directory: Any,
+    ) -> Any:
+        """Read the last persisted account financial projection without mutation.
+
+        This validates the local SQLite projection against its immutable baseline,
+        trusted owner directory, durable execution outbox, and current execution
+        journal head.  The returned cut records the provider-account and activity
+        facts used by that projection; this method does not contact those sources
+        and does not establish that they are fresh now.
+        """
+
+        from .account_financial_ledger import (
+            FinancialDataUnavailableError,
+            FinancialEventKind,
+            FinancialExecutionCursorSnapshotV1,
+            FinancialExecutionCursorV1,
+            FinancialExecutionPostingV1,
+            FinancialOrderBaselineCursorV1,
+            FinancialOwnerDirectoryV1,
+            FinancialOwnerKind,
+            FinancialSourceKind,
+            execution_cursor_from_observation_v1,
+        )
+        from .contracts import Side
+
+        if (
+            type(account_key) is not str
+            or not account_key
+            or account_key != account_key.strip()
+            or type(expected_directory) is not FinancialOwnerDirectoryV1
+            or not expected_directory.complete
+            or expected_directory.account_key != account_key
+        ):
+            raise FinancialDataUnavailableError(
+                "read requires the complete trusted directory for this account"
+            )
+
+        expected_directory_json = _financial_canonical_json(expected_directory)
+        expected_directory_sha = hashlib.sha256(
+            expected_directory_json.encode("utf-8")
+        ).hexdigest()
+        try:
+            with self._read_transaction() as cursor:
+                generation, current_high_water, _journal_count = self._financial_journal_cut(
+                    cursor
+                )
+                head = cursor.execute(
+                    "SELECT * FROM account_financial_ledger_heads WHERE account_key = ?",
+                    (account_key,),
+                ).fetchone()
+                if head is None or head["projection_json"] is None:
+                    raise FinancialDataUnavailableError(
+                        "account financial projection has not been persisted"
+                    )
+                if (
+                    head["journal_generation"] != generation
+                    or int(head["scanned_sequence"]) != current_high_water
+                ):
+                    raise FinancialDataUnavailableError(
+                        "persisted financial projection does not cover the current execution journal"
+                    )
+                if head["directory_sha256"] != expected_directory_sha:
+                    raise FinancialDataUnavailableError(
+                        "persisted financial projection belongs to another owner directory"
+                    )
+
+                baseline = cursor.execute(
+                    """
+                    SELECT baseline_ref, version, journal_generation, execution_cursor,
+                           baseline_sha256, baseline_json, directory_sha256, directory_json
+                    FROM account_financial_baselines
+                    WHERE account_key = ? AND version = ?
+                    """,
+                    (account_key, int(head["baseline_version"])),
+                ).fetchone()
+                if baseline is None:
+                    raise FinancialDataUnavailableError(
+                        "financial projection baseline is missing"
+                    )
+                baseline_json = str(baseline["baseline_json"])
+                baseline_sha = hashlib.sha256(baseline_json.encode("utf-8")).hexdigest()
+                if (
+                    baseline_sha != baseline["baseline_sha256"]
+                    or not _is_sha256(str(baseline["baseline_sha256"]))
+                    or not _is_sha256(str(baseline["directory_sha256"]))
+                    or baseline["directory_sha256"] != expected_directory_sha
+                    or baseline["directory_json"] != expected_directory_json
+                ):
+                    raise FinancialDataUnavailableError(
+                        "financial baseline or owner directory failed its stored digest"
+                    )
+                baseline_payload = json.loads(baseline_json)
+                if (
+                    type(baseline_payload) is not dict
+                    or canonical_json(baseline_payload) != baseline_json
+                    or baseline_payload.get("account_key") != account_key
+                    or baseline_payload.get("baseline_ref") != baseline["baseline_ref"]
+                    or baseline_payload.get("version") != int(baseline["version"])
+                ):
+                    raise FinancialDataUnavailableError(
+                        "financial baseline identity is inconsistent"
+                    )
+                baseline_cut = self._financial_ledger_cut_from_payload(
+                    baseline_payload.get("cut")
+                )
+                baseline_cursor_payload = baseline_payload.get("execution_cursors")
+                baseline_cursor_snapshot = self._financial_cursor_snapshot_from_payload(
+                    baseline_cursor_payload
+                )
+                baseline_execution = baseline_cut.watermark(
+                    FinancialSourceKind.EXECUTION_OUTBOX
+                )
+                baseline_facts = baseline_cut.watermark(FinancialSourceKind.ACCOUNT_FACTS)
+                baseline_activity = baseline_cut.watermark(
+                    FinancialSourceKind.ACCOUNT_ACTIVITY
+                )
+                if (
+                    baseline_cut.account_key != account_key
+                    or baseline_cut.owner_directory_revision != expected_directory.revision
+                    or baseline_execution.generation != baseline["journal_generation"]
+                    or baseline_execution.generation != baseline_cursor_snapshot.journal_generation
+                    or baseline_execution.cursor != int(baseline["execution_cursor"])
+                    or baseline_execution.cursor != baseline_cursor_snapshot.cursor
+                    or not baseline_cursor_snapshot.complete
+                    or baseline["journal_generation"] != head["journal_generation"]
+                    or baseline_execution.cursor > int(head["scanned_sequence"])
+                    or baseline_facts.generation != head["account_facts_generation"]
+                    or baseline_facts.cursor > int(head["account_facts_cursor"])
+                    or baseline_activity.generation != head["activity_generation"]
+                    or baseline_activity.cursor > int(head["activity_cursor"])
+                ):
+                    raise FinancialDataUnavailableError(
+                        "financial baseline cut is inconsistent with the persisted head"
+                    )
+                baseline_provider = baseline_payload.get("provider_snapshot")
+                if (
+                    type(baseline_provider) is not dict
+                    or baseline_provider.get("account_key") != account_key
+                    or baseline_provider.get("source_ref") != baseline_facts.source_ref
+                    or baseline_provider.get("generation") != baseline_facts.generation
+                    or baseline_provider.get("cursor") != baseline_facts.cursor
+                    or baseline_provider.get("as_of_ns") != baseline_facts.as_of_ns
+                ):
+                    raise FinancialDataUnavailableError(
+                        "financial baseline provider cut is inconsistent"
+                    )
+                baseline_owner_rows = baseline_payload.get("owners")
+                if type(baseline_owner_rows) is not list:
+                    raise FinancialDataUnavailableError(
+                        "financial baseline owner rows are unreadable"
+                    )
+                baseline_owner_keys: set[tuple[str, str]] = set()
+                for owner_row in baseline_owner_rows:
+                    if type(owner_row) is not dict or type(owner_row.get("owner")) is not dict:
+                        raise FinancialDataUnavailableError(
+                            "financial baseline owner row is unreadable"
+                        )
+                    baseline_owner = self._financial_owner_from_payload(owner_row["owner"])
+                    baseline_owner_keys.add(baseline_owner.key)
+                if baseline_owner_keys != {item.key for item in expected_directory.owners}:
+                    raise FinancialDataUnavailableError(
+                        "financial baseline does not cover the trusted owner directory"
+                    )
+                all_intents, _record_rows = self._financial_account_intents(cursor)
+
+                for name in (
+                    "account_facts_sha256",
+                    "activity_sha256",
+                    "configuration_sha256",
+                    "projection_sha256",
+                    "input_sha256",
+                ):
+                    if not _is_sha256(head[name]):
+                        raise FinancialDataUnavailableError(
+                            "financial projection head has a missing or invalid digest"
+                        )
+                projection_json = str(head["projection_json"])
+                if hashlib.sha256(projection_json.encode("utf-8")).hexdigest() != head[
+                    "projection_sha256"
+                ]:
+                    raise FinancialDataUnavailableError(
+                        "persisted financial projection failed its stored digest"
+                    )
+                projection = self._financial_projection_from_json(projection_json)
+                execution_wm = projection.cut.watermark(FinancialSourceKind.EXECUTION_OUTBOX)
+                facts_wm = projection.cut.watermark(FinancialSourceKind.ACCOUNT_FACTS)
+                activity_wm = projection.cut.watermark(FinancialSourceKind.ACCOUNT_ACTIVITY)
+                if (
+                    projection.cut.account_key != account_key
+                    or projection.cut.owner_directory_revision != expected_directory.revision
+                    or not projection.complete
+                    or projection.state not in {"BALANCED", "RESIDUAL"}
+                    or execution_wm.generation != generation
+                    or execution_wm.cursor != current_high_water
+                    or execution_wm.generation != head["journal_generation"]
+                    or execution_wm.cursor != int(head["scanned_sequence"])
+                    or facts_wm.generation != head["account_facts_generation"]
+                    or facts_wm.cursor != int(head["account_facts_cursor"])
+                    or activity_wm.generation != head["activity_generation"]
+                    or activity_wm.cursor != int(head["activity_cursor"])
+                ):
+                    raise FinancialDataUnavailableError(
+                        "persisted projection cut differs from its ledger head"
+                    )
+                directory_owners = {item.key: item for item in expected_directory.owners}
+                expected_owners = directory_owners
+                projected_owners = [book.owner for book in projection.books]
+                if (
+                    len(projected_owners) != len(expected_owners)
+                    or {item.key for item in projected_owners} != set(expected_owners)
+                    or any(expected_owners[item.key] != item for item in projected_owners)
+                    or any(book.ledger_cut != projection.cut for book in projection.books)
+                    or any(type(book.cost_basis_complete) is not bool for book in projection.books)
+                ):
+                    raise FinancialDataUnavailableError(
+                        "persisted financial projection does not cover the trusted books"
+                    )
+                cash_residual = any(
+                    item.amount != 0 for item in projection.unallocated_cash_residual
+                )
+                position_residual = any(
+                    quantity != 0
+                    for _instrument, quantity in projection.unallocated_position_residual
+                )
+                fee_residual = any(
+                    item.amount != 0 for item in projection.unallocated_fee_residual
+                )
+                expected_state = (
+                    "RESIDUAL"
+                    if cash_residual or position_residual or fee_residual
+                    else "BALANCED"
+                )
+                if projection.state != expected_state:
+                    raise FinancialDataUnavailableError(
+                        "persisted projection state differs from its residuals"
+                    )
+
+                baseline_cursor_rows = {
+                    (item.scope_key, item.intent_id): item
+                    for item in baseline_cursor_snapshot.orders
+                }
+                for order in baseline_cursor_rows.values():
+                    owner = directory_owners.get(order.owner.key)
+                    intent_data = all_intents.get((order.scope_key, order.intent_id))
+                    if (
+                        owner != order.owner
+                        or intent_data is None
+                        or intent_data[1] != order.intent_payload_sha256
+                    ):
+                        raise FinancialDataUnavailableError(
+                            "financial baseline cursor no longer matches its immutable intent"
+                        )
+
+                baseline_sequence = baseline_cursor_snapshot.cursor
+                head_sequence = int(head["scanned_sequence"])
+                event_span = head_sequence - baseline_sequence
+                if event_span < 0 or event_span > 1_000_000:
+                    raise FinancialDataUnavailableError(
+                        "persisted financial event interval is outside its complete bound"
+                    )
+                saved_rows = cursor.execute(
+                    """
+                    SELECT sequence, event_id, scope_key, intent_id, event_type, source_state,
+                           source_payload_sha256, source_payload_json, intent_payload_sha256,
+                           cursor_json, posting_json
+                    FROM account_financial_events
+                    WHERE account_key = ? AND baseline_version = ? AND journal_generation = ?
+                    ORDER BY sequence ASC
+                    """,
+                    (account_key, int(head["baseline_version"]), generation),
+                ).fetchall()
+                source_rows = cursor.execute(
+                    """
+                    SELECT sequence, event_id, intent_id, scope_key, event_type, state,
+                           payload_json, created_at_ns, journal_incarnation_id
+                    FROM execution_outbox
+                    WHERE sequence > ? AND sequence <= ? ORDER BY sequence ASC
+                    """,
+                    (baseline_sequence, head_sequence),
+                ).fetchall()
+                if len(saved_rows) != event_span or len(source_rows) != event_span:
+                    raise FinancialDataUnavailableError(
+                        "persisted financial events do not cover the complete execution interval"
+                    )
+                cursor_rows = dict(baseline_cursor_rows)
+                for offset, (saved, source) in enumerate(
+                    zip(saved_rows, source_rows, strict=True), start=1
+                ):
+                    sequence = baseline_sequence + offset
+                    if int(saved["sequence"]) != sequence or int(source["sequence"]) != sequence:
+                        raise FinancialDataUnavailableError(
+                            "persisted financial event interval has a sequence gap"
+                        )
+                    if source["journal_incarnation_id"] != generation:
+                        raise FinancialDataUnavailableError(
+                            "execution event has a foreign journal generation"
+                        )
+                    try:
+                        payload = json.loads(str(source["payload_json"]))
+                        if canonical_json(payload) != str(source["payload_json"]):
+                            raise ValueError("noncanonical execution payload")
+                        event = ExecutionEvent(
+                            sequence=sequence,
+                            event_id=str(source["event_id"]),
+                            intent_id=str(source["intent_id"]),
+                            scope_key=str(source["scope_key"]),
+                            event_type=str(source["event_type"]),
+                            state=ExecutionState(str(source["state"])),
+                            payload=payload,
+                            created_at_ns=int(source["created_at_ns"]),
+                            journal_incarnation_id=str(source["journal_incarnation_id"]),
+                        )
+                    except (
+                        ContractValidationError,
+                        TypeError,
+                        ValueError,
+                        json.JSONDecodeError,
+                    ) as error:
+                        raise FinancialDataUnavailableError(
+                            "execution event in persisted financial interval is unreadable"
+                        ) from error
+                    event_key = (event.scope_key, event.intent_id)
+                    intent_data = all_intents.get(event_key)
+                    if intent_data is None:
+                        raise FinancialDataUnavailableError(
+                            "persisted execution event has no immutable intent"
+                        )
+                    intent, intent_sha = intent_data
+                    is_account_event = intent.scope.account_key == account_key
+                    expected_payload_sha = payload_sha256(dict(event.payload))
+                    expected_saved = (
+                        event.event_id,
+                        event.scope_key,
+                        event.intent_id,
+                        event.event_type,
+                        event.state.value,
+                        expected_payload_sha,
+                        canonical_json(dict(event.payload)),
+                        intent_sha,
+                    )
+                    actual_saved = (
+                        str(saved["event_id"]),
+                        str(saved["scope_key"]),
+                        str(saved["intent_id"]),
+                        str(saved["event_type"]),
+                        str(saved["source_state"]),
+                        str(saved["source_payload_sha256"]),
+                        str(saved["source_payload_json"]),
+                        saved["intent_payload_sha256"],
+                    )
+                    if actual_saved != expected_saved:
+                        raise FinancialDataUnavailableError(
+                            "persisted financial event differs from its durable execution source"
+                        )
+                    posting_raw = saved["posting_json"]
+                    if not is_account_event:
+                        if saved["cursor_json"] is not None or posting_raw is not None:
+                            raise FinancialDataUnavailableError(
+                                "foreign-account event carries financial allocation data"
+                            )
+                        continue
+
+                    owner = directory_owners.get(
+                        (FinancialOwnerKind.STRATEGY.value, intent.scope.strategy_id)
+                    )
+                    if owner is None or owner.execution_scope_key != event.scope_key:
+                        raise FinancialDataUnavailableError(
+                            "managed execution event is outside the trusted directory"
+                        )
+                    prior_row = cursor_rows.get(event_key)
+                    if prior_row is None:
+                        prior_cursor = FinancialExecutionCursorV1()
+                    else:
+                        if (
+                            prior_row.owner != owner
+                            or prior_row.intent_payload_sha256 != intent_sha
+                        ):
+                            raise FinancialDataUnavailableError(
+                                "execution cursor changed its trusted owner or intent"
+                            )
+                        prior_cursor = prior_row.cursor
+                    delta_quantity = Decimal("0")
+                    fee_delta = Decimal("0")
+                    next_cursor = prior_cursor
+                    if event.event_type in {
+                        "provider_observation",
+                        "reconciled_observation",
+                        "provider_commission_evidence",
+                    }:
+                        next_cursor, delta_quantity, fee_delta = execution_cursor_from_observation_v1(
+                            event, intent, prior_cursor, owner
+                        )
+                    expected_cursor = FinancialOrderBaselineCursorV1(
+                        owner=owner,
+                        scope_key=event.scope_key,
+                        intent_id=event.intent_id,
+                        intent_payload_sha256=intent_sha,
+                        cursor=next_cursor,
+                    )
+                    cursor_raw = saved["cursor_json"]
+                    parsed_cursor_rows = self._financial_cursor_rows_from_json(
+                        canonical_json([json.loads(str(cursor_raw))])
+                        if cursor_raw is not None
+                        else "[]"
+                    )
+                    if (
+                        cursor_raw is None
+                        or parsed_cursor_rows != {event_key: expected_cursor}
+                        or str(cursor_raw) != _financial_canonical_json(expected_cursor)
+                    ):
+                        raise FinancialDataUnavailableError(
+                            "persisted per-order financial cursor differs from its source event"
+                        )
+                    cursor_rows[event_key] = expected_cursor
+
+                    should_post = delta_quantity != 0 or fee_delta != 0
+                    if not should_post:
+                        if posting_raw is not None:
+                            raise FinancialDataUnavailableError(
+                                "financial event has a posting without a new cumulative fact"
+                            )
+                        continue
+                    if posting_raw is None:
+                        raise FinancialDataUnavailableError(
+                            "financial event is missing its derived posting"
+                        )
+                    posting = self._financial_posting_from_json(str(posting_raw))
+                    if type(posting) is not FinancialExecutionPostingV1:
+                        raise FinancialDataUnavailableError(
+                            "persisted execution posting has an invalid type"
+                        )
+                    side = Side(intent.side)
+                    signed_quantity = (
+                        delta_quantity if side is Side.BUY else -delta_quantity
+                    )
+                    expected_kind = (
+                        FinancialEventKind.SPOT_FILL
+                        if delta_quantity
+                        else FinancialEventKind.CASH_FLOW
+                    )
+                    notional_delta = Decimal("0")
+                    expected_price = None
+                    expected_principal_delta = Decimal("0")
+                    expected_instrument = None
+                    if delta_quantity:
+                        assert next_cursor.average_price is not None
+                        notional_delta = (
+                            next_cursor.filled_quantity * next_cursor.average_price
+                        ) - prior_cursor.filled_quantity * (
+                            prior_cursor.average_price or Decimal("0")
+                        )
+                        expected_price = notional_delta / delta_quantity
+                        expected_principal_delta = (
+                            -notional_delta if side is Side.BUY else notional_delta
+                        )
+                        expected_instrument = intent.instrument
+                    expected_fee_currency = (
+                        next_cursor.commission_currency if fee_delta else None
+                    )
+                    if (
+                        posting.event_id != event.event_id
+                        or posting.event_sequence != sequence
+                        or posting.journal_generation != generation
+                        or posting.scope_key != event.scope_key
+                        or posting.intent_id != event.intent_id
+                        or posting.provider_order_id != next_cursor.provider_order_id
+                        or posting.source_payload_sha256 != expected_payload_sha
+                        or posting.owner != owner
+                        or posting.occurred_at_ns != event.created_at_ns
+                        or posting.kind is not expected_kind
+                        or posting.instrument != expected_instrument
+                        or posting.signed_quantity != signed_quantity
+                        or posting.price != expected_price
+                        or posting.principal_cash_delta != expected_principal_delta
+                        or (delta_quantity == 0 and posting.principal_currency is not None)
+                        or posting.fee_currency != expected_fee_currency
+                        or posting.fee_delta != fee_delta
+                    ):
+                        raise FinancialDataUnavailableError(
+                            "persisted financial posting differs from its execution event"
+                        )
+
+                current_max_time = cursor.execute(
+                    "SELECT MAX(created_at_ns) AS max_created_at_ns FROM execution_outbox"
+                ).fetchone()
+                current_snapshot_as_of = max(
+                    1,
+                    0
+                    if current_max_time is None
+                    or current_max_time["max_created_at_ns"] is None
+                    else int(current_max_time["max_created_at_ns"]),
+                )
+                current_snapshot = self._capture_financial_cursor_snapshot_in_transaction(
+                    cursor,
+                    account_key=account_key,
+                    as_of_ns=current_snapshot_as_of,
+                )
+                if (
+                    type(current_snapshot) is not FinancialExecutionCursorSnapshotV1
+                    or current_snapshot.journal_generation != generation
+                    or current_snapshot.cursor != current_high_water
+                    or tuple(cursor_rows[key] for key in sorted(cursor_rows))
+                    != current_snapshot.orders
+                ):
+                    raise FinancialDataUnavailableError(
+                        "persisted financial order cursors differ from the current execution journal"
+                    )
+                stored_head_cursors = self._financial_cursor_rows_from_json(
+                    str(head["execution_cursors_json"])
+                )
+                current_cursor_map = {
+                    (item.scope_key, item.intent_id): item for item in current_snapshot.orders
+                }
+                if stored_head_cursors != current_cursor_map:
+                    raise FinancialDataUnavailableError(
+                        "financial projection head cursors differ from the current execution journal"
+                    )
+                return projection
+        except FinancialDataUnavailableError:
+            raise
+        except DurableStoreError as error:
+            raise FinancialDataUnavailableError(
+                "persisted account financial projection is unavailable"
+            ) from error
+        except (
+            KeyError,
+            IndexError,
+            TypeError,
+            ValueError,
+            InvalidOperation,
+            ContractValidationError,
+        ) as error:
+            raise FinancialDataUnavailableError(
+                "persisted account financial projection is unreadable"
+            ) from error
 
     @classmethod
     def _ctp_account_store_path(cls, path: str | Path, scope: ExecutionScope | None) -> Path:

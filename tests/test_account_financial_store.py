@@ -268,6 +268,238 @@ def _sqlite_financial_rows(path) -> tuple[int, int, str | None, str | None]:
         connection.close()
 
 
+def _persist_projection_for_read_test(path, *, include_foreign_account_event: bool = False):
+    store = SqliteExecutionStore(path)
+    facade = ManagedExecutionFacade(
+        store, _SCOPE, writer_id="financial-read-writer", admission_gate=_Admission()
+    )
+    lease = None
+    try:
+        intent = _intent()
+        facade.submit(
+            intent,
+            lambda order: ProviderObservation.accepted(order.intent_id, "venue-order-read"),
+        )
+        facade.record_provider_observation_event(
+            ProviderObservation(
+                intent.intent_id,
+                ExecutionState.PARTIALLY_FILLED,
+                provider_order_id="venue-order-read",
+                filled_quantity=Decimal("1"),
+                average_price=Decimal("10"),
+                cumulative_commission=Decimal("0.1"),
+                cumulative_commission_currency="USD",
+            )
+        )
+        lease = facade.acquire_writer_lease()
+        baseline_cursors = store.capture_account_financial_execution_cursors(_SCOPE, lease)
+        baseline = _baseline(baseline_cursors)
+        store.install_account_financial_baseline(
+            baseline,
+            _DIRECTORY,
+            writer_scope=_SCOPE,
+            writer_lease=lease,
+        )
+        if include_foreign_account_event:
+            foreign_scope = ExecutionScope(
+                "FAKE", "simulation", "acct-financial-other", "strategy.other"
+            )
+            foreign_facade = ManagedExecutionFacade(
+                store,
+                foreign_scope,
+                writer_id="foreign-financial-read-writer",
+                admission_gate=_Admission(),
+            )
+            foreign_intent = OrderIntent.limit(
+                intent_id="financial-order-foreign-account",
+                scope=foreign_scope,
+                signal_id="financial-signal-foreign-account",
+                instrument=_INSTRUMENT,
+                side=Side.BUY,
+                quantity=Decimal("1"),
+                price=Decimal("10"),
+                metadata_version="spot-meta-v1",
+            )
+            try:
+                foreign_facade.submit(
+                    foreign_intent,
+                    lambda order: ProviderObservation.accepted(
+                        order.intent_id, "venue-order-foreign-account"
+                    ),
+                )
+            finally:
+                foreign_facade.close()
+        facade.record_provider_observation_event(
+            ProviderObservation(
+                intent.intent_id,
+                ExecutionState.PARTIALLY_FILLED,
+                provider_order_id="venue-order-read",
+                filled_quantity=Decimal("1.5"),
+                average_price=Decimal("12"),
+                cumulative_commission=Decimal("0.15"),
+                cumulative_commission_currency="USD",
+            )
+        )
+        current_account, current_cut, activity, now_ns = _current_inputs(
+            store, provider_cursor=2
+        )
+        projection = store.reconcile_account_financials(
+            baseline,
+            _DIRECTORY,
+            current_account=current_account,
+            current_cut=current_cut,
+            activity_batch=activity,
+            instrument_specs={_INSTRUMENT: _INSTRUMENT_SPEC},
+            policy=_POLICY,
+            writer_scope=_SCOPE,
+            writer_lease=lease,
+            now_ns=now_ns,
+        )
+        return projection
+    finally:
+        if lease is not None:
+            store.release_lease(
+                _SCOPE,
+                lease.owner_id,
+                fencing_token=lease.fencing_token,
+            )
+        facade.close()
+        store.close()
+
+
+@pytest.mark.unit
+def test_read_financial_projection_survives_reopen_is_read_only_and_rejects_stale_head(
+    tmp_path,
+) -> None:
+    path = tmp_path / "financial-projection-read.sqlite3"
+    expected = _persist_projection_for_read_test(path)
+
+    store = SqliteExecutionStore(path)
+    try:
+        changes_before = store._connection.total_changes
+        actual = store.read_account_financial_projection(
+            _SCOPE.account_key,
+            expected_directory=_DIRECTORY,
+        )
+        assert actual == expected
+        assert store._connection.total_changes == changes_before
+        assert actual.cut.watermark(FinancialSourceKind.EXECUTION_OUTBOX).cursor > 0
+        assert actual.cut.watermark(FinancialSourceKind.ACCOUNT_FACTS).cursor == 2
+
+        wrong_directory = FinancialOwnerDirectoryV1(
+            _DIRECTORY.account_key,
+            "different-owner-directory-revision",
+            _DIRECTORY.source_ref,
+            _DIRECTORY.owners,
+        )
+        with pytest.raises(FinancialDataUnavailableError, match="another owner directory"):
+            store.read_account_financial_projection(
+                _SCOPE.account_key,
+                expected_directory=wrong_directory,
+            )
+        assert store._connection.total_changes == changes_before
+
+        facade = ManagedExecutionFacade(
+            store,
+            _SCOPE,
+            writer_id="financial-read-after-head",
+            admission_gate=_Admission(),
+        )
+        try:
+            later_intent = OrderIntent.limit(
+                intent_id="financial-order-after-projection",
+                scope=_SCOPE,
+                signal_id="financial-signal-after-projection",
+                instrument=_INSTRUMENT,
+                side=Side.BUY,
+                quantity=Decimal("1"),
+                price=Decimal("10"),
+                metadata_version="spot-meta-v1",
+            )
+            facade.submit(
+                later_intent,
+                lambda order: ProviderObservation.accepted(
+                    order.intent_id, "venue-order-after-projection"
+                ),
+            )
+        finally:
+            facade.close()
+
+        changes_before_stale_read = store._connection.total_changes
+        with pytest.raises(
+            FinancialDataUnavailableError,
+            match="does not cover the current execution journal",
+        ):
+            store.read_account_financial_projection(
+                _SCOPE.account_key,
+                expected_directory=_DIRECTORY,
+            )
+        assert store._connection.total_changes == changes_before_stale_read
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+def test_read_financial_projection_rejects_mutated_durable_execution_source(tmp_path) -> None:
+    path = tmp_path / "financial-projection-mutated-source.sqlite3"
+    _persist_projection_for_read_test(path)
+
+    connection = sqlite3.connect(path)
+    try:
+        sequence, payload_json = connection.execute(
+            "SELECT sequence, payload_json FROM execution_outbox "
+            "WHERE scope_key = ? AND intent_id = ? AND event_type IN "
+            "('provider_observation', 'reconciled_observation', "
+            "'provider_commission_evidence') ORDER BY sequence DESC LIMIT 1",
+            (_SCOPE.key, _intent().intent_id),
+        ).fetchone()
+        payload = json.loads(payload_json)
+        payload["cumulative_commission"] = "0.16"
+        connection.execute(
+            "UPDATE execution_outbox SET payload_json = ? WHERE sequence = ?",
+            (json.dumps(payload, separators=(",", ":"), sort_keys=True), sequence),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    store = SqliteExecutionStore(path)
+    try:
+        changes_before = store._connection.total_changes
+        with pytest.raises(
+            FinancialDataUnavailableError,
+            match="persisted financial event differs from its durable execution source",
+        ):
+            store.read_account_financial_projection(
+                _SCOPE.account_key,
+                expected_directory=_DIRECTORY,
+            )
+        assert store._connection.total_changes == changes_before
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+def test_read_financial_projection_accepts_foreign_account_outbox_rows(tmp_path) -> None:
+    path = tmp_path / "financial-projection-read-foreign-account.sqlite3"
+    expected = _persist_projection_for_read_test(
+        path, include_foreign_account_event=True
+    )
+
+    store = SqliteExecutionStore(path)
+    try:
+        changes_before = store._connection.total_changes
+        actual = store.read_account_financial_projection(
+            _SCOPE.account_key,
+            expected_directory=_DIRECTORY,
+        )
+        assert actual == expected
+        assert store._connection.total_changes == changes_before
+        assert actual.cut.watermark(FinancialSourceKind.EXECUTION_OUTBOX).cursor > 0
+    finally:
+        store.close()
+
+
 @pytest.mark.unit
 def test_financial_baseline_lease_expiry_during_cursor_scan_rolls_back(tmp_path) -> None:
     path = tmp_path / "financial-baseline-expired.sqlite3"
