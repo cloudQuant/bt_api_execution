@@ -93,6 +93,51 @@ class _Provider:
         )
 
 
+class _FillDuringCancelProvider(_Provider):
+    """Inject an order fill while the synthetic cancel call is in flight."""
+
+    def __init__(
+        self,
+        order_facade: ManagedExecutionFacade,
+        *,
+        fill_state: ExecutionState,
+        filled_quantity: Decimal,
+        average_price: Decimal,
+        cumulative_commission: Decimal,
+        cancel_state: ExecutionState,
+    ) -> None:
+        super().__init__()
+        self.order_facade = order_facade
+        self.fill_state = fill_state
+        self.filled_quantity = filled_quantity
+        self.average_price = average_price
+        self.cumulative_commission = cumulative_commission
+        self.cancel_state = cancel_state
+
+    def cancel(self, intent) -> CancelObservation:
+        self.cancelled.append(intent.cancel_id)
+        self.order_facade.record_provider_observation(
+            ProviderObservation(
+                intent.target_intent_id,
+                self.fill_state,
+                provider_order_id=intent.provider_order_id,
+                filled_quantity=self.filled_quantity,
+                average_price=self.average_price,
+                cumulative_commission=self.cumulative_commission,
+            )
+        )
+        if self.cancel_state is ExecutionState.CANCELLED:
+            return CancelObservation.cancelled(
+                intent.cancel_id, intent.target_intent_id, intent.provider_order_id
+            )
+        return CancelObservation.rejected(
+            intent.cancel_id,
+            intent.target_intent_id,
+            intent.provider_order_id,
+            "already_filled",
+        )
+
+
 def _execution_scope() -> ExecutionScope:
     return ExecutionScope("PAPER", "simulation", _ACCOUNT, _STRATEGY, "20261014")
 
@@ -363,6 +408,118 @@ def test_cancel_requires_an_evidenced_target_and_dispatches_once(tmp_path) -> No
         assert first["result"]["record"]["state"] == ExecutionState.ACKED.value
         assert repeat == first
         assert provider.cancelled == ["cancel-1"]
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+def test_cancel_winning_after_a_partial_fill_preserves_fill_and_fee(tmp_path) -> None:
+    scope = _execution_scope()
+    store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
+    order_facade = ManagedExecutionFacade(
+        store,
+        scope,
+        writer_id="execution-order-entry",
+        allow_unprotected=True,
+    )
+    provider = _FillDuringCancelProvider(
+        order_facade,
+        fill_state=ExecutionState.PARTIALLY_FILLED,
+        filled_quantity=Decimal("0.75"),
+        average_price=Decimal("50010"),
+        cumulative_commission=Decimal("0.25"),
+        cancel_state=ExecutionState.CANCELLED,
+    )
+    service = ExecutionOrderEntryService(
+        store,
+        {_wire_scope(run_id=None): scope},
+        provider,
+        allow_unprotected=True,
+        writer_id="execution-order-entry",
+    )
+    cancel_arguments = {
+        "cancel_id": "cancel-race-partial",
+        "target_intent_id": "intent-1",
+        "provider_order_id": "provider-order-1",
+        "metadata_version": "metadata-v1",
+        "tags": {},
+    }
+    try:
+        submitted = _call(service, SUBMIT_OPERATION, _submit_arguments())
+        cancelled = _call(service, CANCEL_OPERATION, cancel_arguments)
+        stored = store.get("intent-1", scope=scope)
+
+        assert submitted["result"]["record"]["state"] == ExecutionState.ACKED.value
+        assert cancelled["ok"] is True
+        assert cancelled["result"]["record"]["state"] == ExecutionState.CANCELLED.value
+        assert stored is not None
+        assert stored.state is ExecutionState.CANCELLED
+        assert stored.filled_quantity == Decimal("0.75")
+        assert stored.average_price == Decimal("50010")
+        assert stored.cumulative_commission == Decimal("0.25")
+
+        cancel_replay = _call(service, CANCEL_OPERATION, cancel_arguments)
+        submit_replay = _call(service, SUBMIT_OPERATION, _submit_arguments())
+        assert cancel_replay == cancelled
+        assert submit_replay["result"]["record"]["state"] == ExecutionState.CANCELLED.value
+        assert provider.submitted == ["intent-1"]
+        assert provider.cancelled == ["cancel-race-partial"]
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+def test_full_fill_during_cancel_rejects_cancel_without_downgrading_order(tmp_path) -> None:
+    scope = _execution_scope()
+    store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
+    order_facade = ManagedExecutionFacade(
+        store,
+        scope,
+        writer_id="execution-order-entry",
+        allow_unprotected=True,
+    )
+    provider = _FillDuringCancelProvider(
+        order_facade,
+        fill_state=ExecutionState.FILLED,
+        filled_quantity=Decimal("2"),
+        average_price=Decimal("50100"),
+        cumulative_commission=Decimal("0.75"),
+        cancel_state=ExecutionState.REJECTED,
+    )
+    service = ExecutionOrderEntryService(
+        store,
+        {_wire_scope(run_id=None): scope},
+        provider,
+        allow_unprotected=True,
+        writer_id="execution-order-entry",
+    )
+    cancel_arguments = {
+        "cancel_id": "cancel-race-filled",
+        "target_intent_id": "intent-1",
+        "provider_order_id": "provider-order-1",
+        "metadata_version": "metadata-v1",
+        "tags": {},
+    }
+    try:
+        submitted = _call(service, SUBMIT_OPERATION, _submit_arguments())
+        cancel_rejected = _call(service, CANCEL_OPERATION, cancel_arguments)
+        stored = store.get("intent-1", scope=scope)
+
+        assert submitted["result"]["record"]["state"] == ExecutionState.ACKED.value
+        assert cancel_rejected["ok"] is True
+        assert cancel_rejected["result"]["record"]["state"] == ExecutionState.REJECTED.value
+        assert stored is not None
+        assert stored.state is ExecutionState.FILLED
+        assert stored.filled_quantity == Decimal("2")
+        assert stored.average_price == Decimal("50100")
+        assert stored.cumulative_commission == Decimal("0.75")
+
+        cancel_replay = _call(service, CANCEL_OPERATION, cancel_arguments)
+        submit_replay = _call(service, SUBMIT_OPERATION, _submit_arguments())
+        assert cancel_replay == cancel_rejected
+        assert submit_replay["result"]["record"]["state"] == ExecutionState.FILLED.value
+        assert provider.submitted == ["intent-1"]
+        assert provider.cancelled == ["cancel-race-filled"]
     finally:
         store.close()
 
