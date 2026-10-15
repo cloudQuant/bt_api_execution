@@ -362,6 +362,29 @@ class GroupCoordinatorAuthority(Protocol):
         writer_lease: WriterLease,
     ) -> AbstractContextManager[GroupLegAuthorization]: ...
 
+    def assert_current_group_leg_authorization(
+        self,
+        *,
+        principal_ref: str,
+        identity: WireIdentity,
+        wire_scope: WireScope,
+        execution_scope: ExecutionScope,
+        intent: OrderIntent,
+        binding: GroupPermitBinding,
+        authorization: GroupLegAuthorization,
+        writer_lease: WriterLease,
+    ) -> None:
+        """Recheck the held durable generation and exact dispatch facts.
+
+        Callers invoke this after any potentially slow post-claim evidence
+        preparation and immediately before dispatch. Implementations must
+        fail closed if the current registration, active generation, durable
+        hold, intent/binding, or writer lease no longer matches. This does not
+        issue or retry a Risk claim.
+        """
+
+        ...
+
 
 __all__ = [
     "GroupCoordinatorAuthority",

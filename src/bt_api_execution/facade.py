@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from decimal import Decimal
 from threading import RLock
+from time import time_ns
 from typing import TYPE_CHECKING, Any
 
 from .admission import AccountScopedGroupAdmissionAdapter
@@ -46,6 +47,12 @@ if TYPE_CHECKING:
 
 DispatchCallable = Callable[[OrderIntent], ProviderObservation]
 BeforeDispatchCallable = Callable[[OrderIntent], None]
+AfterGroupClaimCallable = Callable[
+    [OrderIntent, GroupPermitBinding, GroupLegAuthorization, "WriterLease", object], None
+]
+CurrentGroupAuthorizationCheck = Callable[
+    [OrderIntent, GroupPermitBinding, GroupLegAuthorization, "WriterLease"], None
+]
 
 _OBSERVATION_RECORDING_STATES = frozenset(
     {
@@ -204,6 +211,8 @@ class ManagedExecutionFacade:
         *,
         writer_lease: WriterLease,
         before_dispatch: BeforeDispatchCallable | None = None,
+        after_group_claim: AfterGroupClaimCallable | None = None,
+        assert_current_group_authorization: CurrentGroupAuthorizationCheck | None = None,
     ) -> ExecutionRecord:
         """Submit one child against its already-reserved group permit.
 
@@ -228,6 +237,8 @@ class ManagedExecutionFacade:
             intent,
             dispatcher,
             before_dispatch=before_dispatch,
+            after_group_claim=after_group_claim,
+            assert_current_group_authorization=assert_current_group_authorization,
             admission_context=None,
             group_binding=binding,
             group_authorization=authorization,
@@ -240,6 +251,8 @@ class ManagedExecutionFacade:
         dispatcher: DispatchPort | DispatchCallable,
         *,
         before_dispatch: BeforeDispatchCallable | None = None,
+        after_group_claim: AfterGroupClaimCallable | None = None,
+        assert_current_group_authorization: CurrentGroupAuthorizationCheck | None = None,
         admission_context: ExecutionAdmissionContextV1 | None = None,
         group_binding: GroupPermitBinding | None,
         group_authorization: GroupLegAuthorization | None,
@@ -252,17 +265,29 @@ class ManagedExecutionFacade:
         may only resolve an unknown result through :meth:`reconcile`.
 
         The constructor-level ``pre_dispatch_guard`` runs for every submit
-        after the durable dispatch claim and final admission validation, but
-        before the injected provider port.  ``before_dispatch`` is an optional
-        per-call guard that runs after it.  A failing guard durably blocks the
-        claimed dispatch and the port is not invoked.  This provides a narrow
-        place for a composition root to persist an additional local safety
-        latch without giving this package an import edge to a risk
-        implementation.
+        after the durable dispatch claim and before final admission validation.
+        ``before_dispatch`` is an optional per-call guard that runs after it.
+        For a group leg, ``after_group_claim`` runs once after the exact
+        one-shot Risk claim has been validated. Its return value is ignored;
+        a failure leaves the durable dispatch UNKNOWN and never calls the
+        provider. The caller keeps its trusted authority guard held through
+        this method and the provider call.
         """
 
         if before_dispatch is not None and not callable(before_dispatch):
             raise ContractValidationError("invalid pre-dispatch guard")
+        if after_group_claim is not None and not callable(after_group_claim):
+            raise ContractValidationError("invalid after-group-claim hook")
+        if after_group_claim is not None and group_binding is None:
+            raise ContractValidationError("after-group-claim hook requires a group leg")
+        if (group_binding is None) != (assert_current_group_authorization is None):
+            raise ContractValidationError(
+                "current group authorization check must match group submission"
+            )
+        if assert_current_group_authorization is not None and not callable(
+            assert_current_group_authorization
+        ):
+            raise ContractValidationError("invalid current group authorization check")
         if (group_binding is None) != (group_authorization is None):
             raise ContractValidationError("group binding and authorization must be paired")
         if group_binding is not None:
@@ -377,12 +402,52 @@ class ManagedExecutionFacade:
             dispatcher,
             admission_context,
             group_binding=group_binding,
+            group_authorization=group_authorization,
+            after_group_claim=after_group_claim,
         )
         if record.state is not ExecutionState.DISPATCHING:
             return record
+        if group_authorization is not None:
+            assert group_binding is not None
+            try:
+                group_authorization.validate_binding(group_binding)
+                group_authorization.validate_writer_lease(writer_lease)
+            except Exception:
+                return self._store.mark_unknown(
+                    intent.intent_id,
+                    self._scope,
+                    "group_authorization_fence_invalid",
+                    writer_lease=writer_lease,
+                )
+            assert assert_current_group_authorization is not None
+            self._store.assert_writer_lease(self._scope, writer_lease)
+            try:
+                assert_current_group_authorization(
+                    intent,
+                    group_binding,
+                    group_authorization,
+                    writer_lease,
+                )
+            except Exception:
+                return self._store.mark_unknown(
+                    intent.intent_id,
+                    self._scope,
+                    "group_authority_fence_invalid",
+                    writer_lease=writer_lease,
+                )
         # Keep the store fence check adjacent to the provider call as well as
-        # in each admission gate's final claim.
+        # in each admission gate's final claim. For group work, the trusted
+        # authority check above validates the active generation and durable
+        # hold; the writer fence check below is repeated after that check so it
+        # remains adjacent to the provider invocation.
         self._store.assert_writer_lease(self._scope, writer_lease)
+        if group_authorization is not None and time_ns() >= group_authorization.deadline_ns:
+            return self._store.mark_unknown(
+                intent.intent_id,
+                self._scope,
+                "group_authorization_expired_after_claim",
+                writer_lease=writer_lease,
+            )
         try:
             observation = self._dispatch(dispatcher, intent, authorization=authorization)
         except Exception:
@@ -734,13 +799,19 @@ class ManagedExecutionFacade:
         admission_context: ExecutionAdmissionContextV1 | None,
         *,
         group_binding: GroupPermitBinding | None = None,
+        group_authorization: GroupLegAuthorization | None = None,
+        after_group_claim: AfterGroupClaimCallable | None = None,
     ) -> tuple[ExecutionRecord, ExecutionAdmissionAuthorizationV1 | None]:
         authorization: ExecutionAdmissionAuthorizationV1 | None = None
         gate = self._admission_gate
         if group_binding is not None:
             reference = record.permit_reference
             claimer = None if gate is None else getattr(gate, "claim_group_leg", None)
-            if reference != group_binding.permit_id or not callable(claimer):
+            if (
+                reference != group_binding.permit_id
+                or not callable(claimer)
+                or group_authorization is None
+            ):
                 return (
                     self._store.mark_unknown(
                         intent.intent_id,
@@ -782,6 +853,32 @@ class ManagedExecutionFacade:
                         intent.intent_id,
                         self._scope,
                         "group_risk_claim_mismatch",
+                        writer_lease=writer_lease,
+                    ),
+                    None,
+                )
+            # The claim is one-shot and durable. The hook may record only the
+            # exact validated claim facts needed by the provider evidence
+            # boundary; its return value is deliberately ignored. The caller's
+            # authority context remains held until this facade call returns.
+            self._store.assert_writer_lease(self._scope, writer_lease)
+            try:
+                group_authorization.validate_binding(group_binding)
+                group_authorization.validate_writer_lease(writer_lease)
+                if after_group_claim is not None:
+                    after_group_claim(
+                        intent,
+                        group_binding,
+                        group_authorization,
+                        writer_lease,
+                        receipt,
+                    )
+            except Exception:
+                return (
+                    self._store.mark_unknown(
+                        intent.intent_id,
+                        self._scope,
+                        "group_claim_hook_failed",
                         writer_lease=writer_lease,
                     ),
                     None,

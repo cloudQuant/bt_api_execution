@@ -56,6 +56,7 @@ class _RiskIntentMapper:
     def __init__(self, risk_api, scope) -> None:
         self._risk = risk_api
         self.scope = scope
+        self.wire_account_ref = _WIRE_ACCOUNT
 
     def __call__(self, intent: OrderIntent):
         return self.map_group_intent(intent)
@@ -412,6 +413,24 @@ class _GroupExecutionAuthority:
             execution_writer_lease_fingerprint=writer_lease_fingerprint(writer_lease),
             action="orders.submit_group_leg",
         )
+
+    def assert_current_group_leg_authorization(
+        self,
+        *,
+        principal_ref,
+        identity,
+        wire_scope,
+        execution_scope,
+        intent,
+        binding,
+        authorization,
+        writer_lease,
+    ):
+        assert principal_ref == identity.principal_ref == authorization.principal_ref
+        assert wire_scope.group_id == binding.group_id == authorization.group_id
+        assert execution_scope == intent.scope
+        authorization.validate_binding(binding)
+        authorization.validate_writer_lease(writer_lease)
 
 
 class _ExecutionProvider:

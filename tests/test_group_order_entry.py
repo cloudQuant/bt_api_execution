@@ -27,6 +27,7 @@ from bt_api_execution import (
     risk_account_scope_fingerprint,
     writer_lease_fingerprint,
 )
+from bt_api_execution.errors import WriterLeaseUnavailable
 from bt_api_execution.service_order_entry import (
     GROUP_SUBMIT_OPERATION,
     QUERY_OPERATION,
@@ -186,10 +187,14 @@ class _Authority:
         self.coordinator_epoch = 1
         self.account_writer_epoch = 18
         self.active_authorization: GroupLegAuthorization | None = None
+        self.persisted_generation: int | None = None
+        self.persisted_hold_id: str | None = None
         self._guard_thread_id: int | None = None
         self.risk_scope_fingerprint = _RISK_SCOPE_FINGERPRINT
         self.guard_entries = 0
         self.guard_exits = 0
+        self.final_authorization_checks = 0
+        self.final_check_observer = None
 
     @contextmanager
     def hold_group_leg_authorization(
@@ -235,6 +240,8 @@ class _Authority:
             )
             self.authorizations.append(authorization)
             self.active_authorization = authorization
+            self.persisted_generation = authorization.coordinator_epoch
+            self.persisted_hold_id = authorization.authorization_attempt_id
             self._guard_thread_id = threading.get_ident()
             self.guard_entries += 1
             try:
@@ -242,12 +249,42 @@ class _Authority:
             finally:
                 self.guard_exits += 1
                 self.active_authorization = None
+                self.persisted_generation = None
+                self.persisted_hold_id = None
                 self._guard_thread_id = None
 
     def assert_current(self) -> None:
         assert self._guard_thread_id == threading.get_ident()
         assert self.authorization_active
         assert self.active_authorization is not None
+
+    def assert_current_group_leg_authorization(
+        self,
+        *,
+        principal_ref: str,
+        identity: WireIdentity,
+        wire_scope: WireScope,
+        execution_scope: ExecutionScope,
+        intent: OrderIntent,
+        binding: GroupPermitBinding,
+        authorization: GroupLegAuthorization,
+        writer_lease: object,
+    ) -> None:
+        self.assert_current()
+        assert identity.principal_ref == principal_ref == authorization.principal_ref
+        assert wire_scope.group_id == binding.group_id == authorization.group_id
+        assert execution_scope == intent.scope
+        assert self.active_authorization is authorization
+        if (
+            self.persisted_generation != authorization.coordinator_epoch
+            or self.persisted_hold_id != authorization.authorization_attempt_id
+        ):
+            raise PermissionError("durable authorization generation or hold changed")
+        authorization.validate_binding(binding)
+        authorization.validate_writer_lease(writer_lease)
+        self.final_authorization_checks += 1
+        if self.final_check_observer is not None:
+            self.final_check_observer()
 
     def revoke(self) -> None:
         with self._lock:
@@ -398,6 +435,177 @@ def test_group_leg_uses_existing_permit_and_exposes_authorized_binding(tmp_path)
         == 18
     )
     reopened.close()
+
+
+def test_after_group_claim_hook_receives_exact_claim_before_provider(tmp_path) -> None:
+    values = _make_service(str(tmp_path / "after-claim.sqlite"))
+    service, store, risk, provider, authority, identity, group_scope, _, intent, binding = values
+    sequence: list[str] = []
+    provider_submit = provider.submit
+
+    def submit_after_hook(order_intent: OrderIntent) -> ProviderObservation:
+        sequence.append("provider")
+        return provider_submit(order_intent)
+
+    provider.submit = submit_after_hook
+    claim_facts: list[tuple[object, ...]] = []
+
+    def after_claim(
+        received_intent: OrderIntent,
+        received_binding: GroupPermitBinding,
+        authorization: GroupLegAuthorization,
+        writer_lease: object,
+        receipt: object,
+    ) -> bool:
+        sequence.append("claim_hook")
+        assert received_intent is intent
+        assert received_binding is binding
+        assert authorization is authority.authorizations[0]
+        assert authorization.execution_writer_lease_fingerprint == writer_lease_fingerprint(
+            writer_lease
+        )
+        assert type(receipt).__name__ == "RiskGroupLegClaimReceipt"
+        assert receipt.permit_reference == binding.permit_id
+        assert risk.group_claims == 1
+        assert provider.submitted == []
+        authority.assert_current()
+        claim_facts.append(
+            (received_intent, received_binding, authorization, writer_lease, receipt)
+        )
+        return False
+
+    authority.final_check_observer = lambda: sequence.append("authority_check")
+
+    result = service.submit_group_leg(
+        principal_ref=_PRINCIPAL,
+        identity=identity,
+        scope=group_scope,
+        intent=intent,
+        binding=binding,
+        after_group_claim=after_claim,
+    )
+
+    assert result["result"]["record"]["state"] == ExecutionState.ACKED.value
+    assert sequence == ["claim_hook", "authority_check", "provider"]
+    assert len(claim_facts) == 1
+    assert authority.final_authorization_checks == 1
+    assert risk.group_claims == 1
+    assert provider.submitted == [intent.intent_id]
+    store.close()
+
+
+def test_after_group_claim_hook_exception_latches_unknown_without_provider(tmp_path) -> None:
+    values = _make_service(str(tmp_path / "after-claim-failed.sqlite"))
+    service, store, risk, provider, _authority, identity, group_scope, _, intent, binding = values
+
+    def fail_after_claim(*_arguments: object) -> None:
+        raise RuntimeError("evidence attempt could not be persisted")
+
+    result = service.submit_group_leg(
+        principal_ref=_PRINCIPAL,
+        identity=identity,
+        scope=group_scope,
+        intent=intent,
+        binding=binding,
+        after_group_claim=fail_after_claim,
+    )
+
+    assert result["result"]["record"]["state"] == ExecutionState.UNKNOWN.value
+    assert result["result"]["record"]["unknown_reason"] == "group_claim_hook_failed"
+    assert risk.group_claims == 1
+    assert risk.releases == risk.settlements == 0
+    assert provider.submitted == []
+    store.close()
+
+
+def test_after_group_claim_hook_is_followed_by_final_writer_fence_check(tmp_path) -> None:
+    values = _make_service(str(tmp_path / "after-claim-fence.sqlite"))
+    service, store, risk, provider, _authority, identity, group_scope, _, intent, binding = values
+    original_assert = store.assert_writer_lease
+    hook_completed = False
+
+    def assert_until_hook_returns(scope: object, writer_lease: object) -> None:
+        if hook_completed:
+            raise WriterLeaseUnavailable("writer fence changed while hook ran")
+        original_assert(scope, writer_lease)
+
+    store.assert_writer_lease = assert_until_hook_returns
+
+    def finish_hook(*_arguments: object) -> None:
+        nonlocal hook_completed
+        hook_completed = True
+
+    result = service.submit_group_leg(
+        principal_ref=_PRINCIPAL,
+        identity=identity,
+        scope=group_scope,
+        intent=intent,
+        binding=binding,
+        after_group_claim=finish_hook,
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == "OWNER_LEASE_UNAVAILABLE"
+    assert result["result"]["record"]["state"] == ExecutionState.DISPATCHING.value
+    assert risk.group_claims == 1
+    assert provider.submitted == []
+    store.assert_writer_lease = original_assert
+    store.close()
+
+
+def test_after_group_claim_hook_rejects_changed_durable_authority_generation(tmp_path) -> None:
+    values = _make_service(str(tmp_path / "after-claim-authority-fence.sqlite"))
+    service, store, risk, provider, authority, identity, group_scope, _, intent, binding = values
+
+    def corrupt_held_generation(*_arguments: object) -> None:
+        assert authority.persisted_generation is not None
+        authority.persisted_generation += 1
+
+    result = service.submit_group_leg(
+        principal_ref=_PRINCIPAL,
+        identity=identity,
+        scope=group_scope,
+        intent=intent,
+        binding=binding,
+        after_group_claim=corrupt_held_generation,
+    )
+
+    assert result["result"]["record"]["state"] == ExecutionState.UNKNOWN.value
+    assert result["result"]["record"]["unknown_reason"] == "group_authority_fence_invalid"
+    assert risk.group_claims == 1
+    assert risk.releases == risk.settlements == 0
+    assert provider.submitted == []
+    store.close()
+
+
+def test_after_group_claim_hook_cannot_extend_group_authorization_deadline(
+    monkeypatch, tmp_path
+) -> None:
+    import bt_api_execution.facade as facade_module
+
+    values = _make_service(str(tmp_path / "after-claim-expired.sqlite"))
+    service, store, risk, provider, _authority, identity, group_scope, _, intent, binding = values
+
+    def advance_to_deadline(*_arguments: object) -> None:
+        monkeypatch.setattr(facade_module, "time_ns", lambda: binding.deadline_ns)
+
+    result = service.submit_group_leg(
+        principal_ref=_PRINCIPAL,
+        identity=identity,
+        scope=group_scope,
+        intent=intent,
+        binding=binding,
+        after_group_claim=advance_to_deadline,
+    )
+
+    assert result["result"]["record"]["state"] == ExecutionState.UNKNOWN.value
+    assert result["result"]["record"]["unknown_reason"] == (
+        "group_authorization_expired_after_claim"
+    )
+    assert risk.group_claims == 1
+    assert risk.releases == risk.settlements == 0
+    assert provider.submitted == []
+    store.close()
 
 
 def test_group_entry_rejects_unscoped_risk_adapter_before_claim_or_dispatch(tmp_path) -> None:

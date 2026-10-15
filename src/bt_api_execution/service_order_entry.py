@@ -43,7 +43,7 @@ from .errors import (
     InvalidStateTransition,
     WriterLeaseUnavailable,
 )
-from .facade import ManagedExecutionFacade
+from .facade import AfterGroupClaimCallable, ManagedExecutionFacade
 from .group_contracts import (
     GroupCoordinatorAuthority,
     GroupLegAuthorization,
@@ -179,6 +179,12 @@ class ExecutionOrderEntryService:
             raise ContractValidationError(
                 "group coordinator authority requires hold_group_leg_authorization"
             )
+        if group_coordinator_authority is not None and not callable(
+            getattr(group_coordinator_authority, "assert_current_group_leg_authorization", None)
+        ):
+            raise ContractValidationError(
+                "group coordinator authority requires a current authorization check"
+            )
 
         copied: dict[WireScope, ExecutionScope] = {}
         for template, execution_scope in targets.items():
@@ -257,6 +263,7 @@ class ExecutionOrderEntryService:
         scope: WireScope,
         intent: OrderIntent,
         binding: GroupPermitBinding,
+        after_group_claim: AfterGroupClaimCallable | None = None,
     ) -> Mapping[str, Any]:
         """Authorize and submit one explicit group leg through this owner.
 
@@ -341,12 +348,32 @@ class ExecutionOrderEntryService:
                 authorization.validate_binding(binding)
                 authorization.validate_writer_lease(writer_lease)
                 self._store.assert_writer_lease(execution_scope, writer_lease)
+
+                def assert_current_group_authorization(
+                    checked_intent: OrderIntent,
+                    checked_binding: GroupPermitBinding,
+                    checked_authorization: GroupLegAuthorization,
+                    checked_writer_lease: object,
+                ) -> None:
+                    authority.assert_current_group_leg_authorization(
+                        principal_ref=principal_ref,
+                        identity=identity,
+                        wire_scope=scope,
+                        execution_scope=execution_scope,
+                        intent=checked_intent,
+                        binding=checked_binding,
+                        authorization=checked_authorization,
+                        writer_lease=checked_writer_lease,
+                    )
+
                 record = order_facade.submit_group_leg(
                     intent,
                     binding,
                     authorization,
                     self._dispatch,
                     writer_lease=writer_lease,
+                    after_group_claim=after_group_claim,
+                    assert_current_group_authorization=assert_current_group_authorization,
                 )
         except IntentConflictError:
             return self._failure_with_record("INTENT_CONFLICT", intent.intent_id, execution_scope)
