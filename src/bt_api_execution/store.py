@@ -53,6 +53,11 @@ from .errors import (
 )
 from .group_contracts import GroupLegAuthorization, GroupPermitBinding
 
+_MAX_RECOVERY_SCOPE_COUNT = 512
+_MAX_RECOVERY_SNAPSHOT_ORDERS = 512
+_MAX_RECOVERY_SNAPSHOT_EVENTS = 20_000
+_MAX_RECOVERY_PAGE_SIZE = 128
+
 
 def _is_sha256(value: Any) -> bool:
     return (
@@ -373,6 +378,85 @@ class ExecutionRecord:
     @property
     def is_terminal(self) -> bool:
         return self.state in TERMINAL_STATES
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionRecoveryIntentV1:
+    """One immutable intent and current durable record read from one journal cut."""
+
+    record: ExecutionRecord
+    intent: OrderIntent
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionJournalCutV1:
+    """Contiguous global execution-outbox bounds from a single SQLite snapshot."""
+
+    journal_generation: str
+    row_count: int
+    first_sequence: int | None
+    last_sequence: int | None
+    high_water_sequence: int
+
+    def __post_init__(self) -> None:
+        if not _is_local_queue_receipt_id(self.journal_generation):
+            raise ContractValidationError("invalid recovery journal generation")
+        if type(self.row_count) is not int or self.row_count < 0:
+            raise ContractValidationError("invalid recovery outbox row count")
+        if type(self.high_water_sequence) is not int or self.high_water_sequence < 0:
+            raise ContractValidationError("invalid recovery outbox high-water")
+        if self.row_count == 0:
+            if self.first_sequence is not None or self.last_sequence is not None or self.high_water_sequence:
+                raise ContractValidationError("empty recovery outbox bounds are inconsistent")
+        elif (
+            type(self.first_sequence) is not int
+            or self.first_sequence != 1
+            or type(self.last_sequence) is not int
+            or self.last_sequence != self.high_water_sequence
+            or self.row_count != self.high_water_sequence
+        ):
+            raise ContractValidationError("recovery outbox is not a contiguous journal")
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionRecoveryOrderV1:
+    """Current order state tied to its latest immutable source event."""
+
+    record: ExecutionRecord
+    intent: OrderIntent
+    latest_event: ExecutionEvent
+    latest_observation_event: ExecutionEvent | None
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionRecoverySnapshotV1:
+    """One validated durable snapshot for the exact requested execution scopes."""
+
+    cut: ExecutionJournalCutV1
+    orders: tuple[ExecutionRecoveryOrderV1, ...]
+    events: tuple[ExecutionEvent, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionOutboxPageV1:
+    """A bounded selected-scope page pinned to one global journal cut."""
+
+    cut: ExecutionJournalCutV1
+    intents: tuple[ExecutionRecoveryIntentV1, ...]
+    events: tuple[ExecutionEvent, ...]
+    has_more: bool
+    scanned_through: int
+
+    def __post_init__(self) -> None:
+        if type(self.has_more) is not bool:
+            raise ContractValidationError("invalid recovery page continuation state")
+        if type(self.scanned_through) is not int or not 0 <= self.scanned_through <= self.cut.high_water_sequence:
+            raise ContractValidationError("invalid recovery page scanned cursor")
+        if self.has_more:
+            if not self.events or self.scanned_through != self.events[-1].sequence:
+                raise ContractValidationError("recovery continuation cursor is inconsistent")
+        elif self.scanned_through != self.cut.high_water_sequence:
+            raise ContractValidationError("complete recovery page did not scan to journal high-water")
 
 
 @dataclass(frozen=True, slots=True)
@@ -17413,6 +17497,234 @@ class SqliteExecutionStore:
             updated = self._fetch_record(cursor, scope.key, intent_id)
             assert updated is not None
             return self._record_from_row(updated)
+
+    @staticmethod
+    def _normalize_recovery_scopes(
+        scopes: tuple[ExecutionScope, ...],
+    ) -> tuple[tuple[ExecutionScope, ...], dict[str, ExecutionScope]]:
+        if type(scopes) is not tuple or not scopes or len(scopes) > _MAX_RECOVERY_SCOPE_COUNT:
+            raise ContractValidationError("invalid recovery scope set")
+        if any(type(scope) is not ExecutionScope for scope in scopes):
+            raise ContractValidationError("recovery scopes must be trusted ExecutionScope values")
+        ordered = tuple(sorted(scopes, key=lambda scope: scope.key))
+        by_key = {scope.key: scope for scope in ordered}
+        if len(by_key) != len(ordered) or len({scope.account_key for scope in ordered}) != 1:
+            raise ContractValidationError("recovery scope set is duplicate or crosses accounts")
+        return ordered, by_key
+
+    @staticmethod
+    def _recovery_journal_cut(cursor: sqlite3.Cursor) -> ExecutionJournalCutV1:
+        identity = cursor.execute(
+            "SELECT value FROM execution_meta WHERE key = 'journal_incarnation_id'"
+        ).fetchone()
+        if identity is None:
+            raise DurableStoreError("recovery journal identity is unavailable")
+        generation = identity["value"]
+        if not _is_local_queue_receipt_id(generation):
+            raise DurableStoreError("recovery journal identity is malformed")
+        bounds = cursor.execute(
+            "SELECT COUNT(*) AS row_count, MIN(sequence) AS first_sequence, "
+            "MAX(sequence) AS last_sequence FROM execution_outbox"
+        ).fetchone()
+        sequence = cursor.execute(
+            "SELECT seq FROM sqlite_sequence WHERE name = 'execution_outbox'"
+        ).fetchone()
+        if bounds is None:
+            raise DurableStoreError("recovery journal bounds are unavailable")
+        count = int(bounds["row_count"])
+        first = None if bounds["first_sequence"] is None else int(bounds["first_sequence"])
+        last = None if bounds["last_sequence"] is None else int(bounds["last_sequence"])
+        high_water = 0 if sequence is None else int(sequence["seq"])
+        try:
+            return ExecutionJournalCutV1(
+                journal_generation=generation,
+                row_count=count,
+                first_sequence=first,
+                last_sequence=last,
+                high_water_sequence=high_water,
+            )
+        except ContractValidationError as error:
+            raise DurableStoreError("execution outbox is not a complete contiguous journal") from error
+
+    @staticmethod
+    def _recovery_record_from_row(
+        row: sqlite3.Row,
+        *,
+        scopes_by_key: Mapping[str, ExecutionScope],
+    ) -> ExecutionRecoveryIntentV1:
+        try:
+            record = SqliteExecutionStore._record_from_row(row)
+            payload_json = str(row["payload_json"])
+            payload = json.loads(payload_json)
+            if canonical_json(payload) != payload_json:
+                raise ValueError("execution intent payload is noncanonical")
+            intent = order_intent_from_payload(payload)
+            expected_scope = scopes_by_key.get(record.scope_key)
+            if (
+                expected_scope is None
+                or intent.scope != expected_scope
+                or intent.scope.key != record.scope_key
+                or intent.intent_id != record.intent_id
+                or intent.fingerprint != record.payload_sha256
+            ):
+                raise ValueError("execution record does not match its trusted intent scope")
+            return ExecutionRecoveryIntentV1(record=record, intent=intent)
+        except (ContractValidationError, DurableStoreError, TypeError, ValueError, KeyError) as error:
+            raise DurableStoreError("stored execution recovery record is inconsistent") from error
+
+    @staticmethod
+    def _recovery_events_from_rows(
+        rows: list[sqlite3.Row], *, cut: ExecutionJournalCutV1
+    ) -> tuple[ExecutionEvent, ...]:
+        events: list[ExecutionEvent] = []
+        previous_sequence = 0
+        for row in rows:
+            event = SqliteExecutionStore._execution_event_from_row(row)
+            if (
+                event.sequence <= previous_sequence
+                or event.sequence > cut.high_water_sequence
+                or event.journal_incarnation_id != cut.journal_generation
+            ):
+                raise DurableStoreError("stored recovery event lineage or sequence is inconsistent")
+            previous_sequence = event.sequence
+            events.append(event)
+        return tuple(events)
+
+    def read_execution_recovery_snapshot(
+        self,
+        scopes: tuple[ExecutionScope, ...],
+    ) -> ExecutionRecoverySnapshotV1:
+        """Read current selected-scope records and history from one SQLite snapshot.
+
+        This is a local durable-journal view, not a provider freshness claim.
+        The caller must supply exact scopes derived from its trusted owner directory.
+        """
+
+        ordered_scopes, scopes_by_key = self._normalize_recovery_scopes(scopes)
+        scope_keys = tuple(scopes_by_key)
+        placeholders = ",".join("?" for _ in scope_keys)
+        with self._read_transaction() as cursor:
+            cut = self._recovery_journal_cut(cursor)
+            record_rows = cursor.execute(
+                f"SELECT * FROM execution_records WHERE scope_key IN ({placeholders}) "  # noqa: S608 - placeholder count is bounded; all scope values are bound parameters.
+                "ORDER BY scope_key, intent_id LIMIT ?",
+                (*scope_keys, _MAX_RECOVERY_SNAPSHOT_ORDERS + 1),
+            ).fetchall()
+            if len(record_rows) > _MAX_RECOVERY_SNAPSHOT_ORDERS:
+                raise DurableStoreError("recovery snapshot exceeds its bounded order count")
+            records = tuple(
+                self._recovery_record_from_row(row, scopes_by_key=scopes_by_key)
+                for row in record_rows
+            )
+            event_rows = cursor.execute(
+                f"SELECT sequence, event_id, intent_id, scope_key, event_type, state, payload_json, "  # noqa: S608 - placeholder count is bounded; all scope values are bound parameters.
+                f"created_at_ns, journal_incarnation_id FROM execution_outbox "
+                f"WHERE scope_key IN ({placeholders}) ORDER BY sequence LIMIT ?",
+                (*scope_keys, _MAX_RECOVERY_SNAPSHOT_EVENTS + 1),
+            ).fetchall()
+            if len(event_rows) > _MAX_RECOVERY_SNAPSHOT_EVENTS:
+                raise DurableStoreError("recovery snapshot exceeds its bounded event history")
+            events = self._recovery_events_from_rows(event_rows, cut=cut)
+
+        record_by_key = {
+            (item.record.scope_key, item.record.intent_id): item for item in records
+        }
+        history: dict[tuple[str, str], list[ExecutionEvent]] = {}
+        for event in events:
+            key = (event.scope_key, event.intent_id)
+            if key not in record_by_key:
+                raise DurableStoreError("recovery outbox row has no selected durable intent")
+            history.setdefault(key, []).append(event)
+
+        orders: list[ExecutionRecoveryOrderV1] = []
+        for key, item in record_by_key.items():
+            stream = history.get(key, [])
+            if (
+                not stream
+                or stream[0].event_type != "intent_recorded"
+                or stream[-1].state is not item.record.state
+                or stream[0].payload.get("payload_sha256") != item.intent.fingerprint
+            ):
+                raise DurableStoreError("recovery event history does not match its durable record")
+            observations = [
+                event
+                for event in stream
+                if event.event_type
+                in {
+                    "provider_observation",
+                    "reconciled_observation",
+                    "provider_commission_evidence",
+                    "cancelled_by_cancel_intent",
+                }
+            ]
+            orders.append(
+                ExecutionRecoveryOrderV1(
+                    record=item.record,
+                    intent=item.intent,
+                    latest_event=stream[-1],
+                    latest_observation_event=None if not observations else observations[-1],
+                )
+            )
+        return ExecutionRecoverySnapshotV1(
+            cut=cut,
+            orders=tuple(orders),
+            events=events,
+        )
+
+    def read_execution_outbox_page(
+        self,
+        scopes: tuple[ExecutionScope, ...],
+        *,
+        after_sequence: int,
+        limit: int,
+    ) -> ExecutionOutboxPageV1:
+        """Read and validate a bounded selected-scope event page at one journal cut."""
+
+        ordered_scopes, scopes_by_key = self._normalize_recovery_scopes(scopes)
+        if type(after_sequence) is not int or after_sequence < 0:
+            raise ContractValidationError("invalid recovery after_sequence")
+        if type(limit) is not int or not 1 <= limit <= _MAX_RECOVERY_PAGE_SIZE:
+            raise ContractValidationError("invalid recovery page limit")
+        scope_keys = tuple(scopes_by_key)
+        placeholders = ",".join("?" for _ in scope_keys)
+        with self._read_transaction() as cursor:
+            cut = self._recovery_journal_cut(cursor)
+            if after_sequence > cut.high_water_sequence:
+                raise ContractValidationError("recovery cursor exceeds journal high-water")
+            rows = cursor.execute(
+                f"SELECT sequence, event_id, intent_id, scope_key, event_type, state, payload_json, "  # noqa: S608 - placeholder count is bounded; all scope values are bound parameters.
+                f"created_at_ns, journal_incarnation_id FROM execution_outbox "
+                f"WHERE sequence > ? AND scope_key IN ({placeholders}) "
+                f"ORDER BY sequence LIMIT ?",
+                (after_sequence, *scope_keys, limit + 1),
+            ).fetchall()
+            has_more = len(rows) > limit
+            page_rows = rows[:limit]
+            events = self._recovery_events_from_rows(page_rows, cut=cut)
+            event_keys = tuple(dict.fromkeys((event.scope_key, event.intent_id) for event in events))
+            records_by_key: dict[tuple[str, str], ExecutionRecoveryIntentV1] = {}
+            if event_keys:
+                predicates = " OR ".join("(scope_key = ? AND intent_id = ?)" for _ in event_keys)
+                parameters = tuple(value for key in event_keys for value in key)
+                record_rows = cursor.execute(
+                    f"SELECT * FROM execution_records WHERE {predicates} ORDER BY scope_key, intent_id",  # noqa: S608 - predicates contain only fixed SQL placeholders; all values are bound.
+                    parameters,
+                ).fetchall()
+                for row in record_rows:
+                    item = self._recovery_record_from_row(row, scopes_by_key=scopes_by_key)
+                    records_by_key[(item.record.scope_key, item.record.intent_id)] = item
+            if any(key not in records_by_key for key in event_keys):
+                raise DurableStoreError("recovery page event has no selected durable intent")
+            scanned_through = (
+                events[-1].sequence if has_more and events else cut.high_water_sequence
+            )
+        return ExecutionOutboxPageV1(
+            cut=cut,
+            intents=tuple(records_by_key[key] for key in event_keys),
+            events=events,
+            has_more=has_more,
+            scanned_through=scanned_through,
+        )
 
     def read_outbox(
         self,
