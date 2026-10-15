@@ -16,11 +16,11 @@ evidence and never resubmitted under a new identity.
 from __future__ import annotations
 
 import threading
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager, suppress
 from sys import exc_info
 from types import MappingProxyType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from bt_api_base.service_protocol import WireIdentity, WireRole, WireScope
 
@@ -58,7 +58,10 @@ from .service_component import (
     _scope_denied,
     _stored_record_dto,
 )
-from .store import CancelRecord, ExecutionRecord, SqliteExecutionStore
+from .store import CancelRecord, ExecutionRecord, SqliteExecutionStore, WriterLease
+
+if TYPE_CHECKING:
+    from .ports import DispatchPort
 
 SUBMIT_OPERATION = "orders.submit"
 CANCEL_OPERATION = "orders.cancel"
@@ -68,6 +71,16 @@ SUPPORTED_OPERATIONS = frozenset({SUBMIT_OPERATION, CANCEL_OPERATION, QUERY_OPER
 
 class _GroupAuthorityGuardError(Exception):
     """The trusted current-authority guard could not be entered or exited."""
+
+
+class _GroupResolutionUnprovenError(Exception):
+    """A durable group result could not safely resolve its Risk claim."""
+
+
+AfterGroupResultCallable = Callable[
+    [OrderIntent, GroupPermitBinding, GroupLegAuthorization, WriterLease, object, ExecutionRecord],
+    None,
+]
 
 
 @contextmanager
@@ -264,12 +277,16 @@ class ExecutionOrderEntryService:
         intent: OrderIntent,
         binding: GroupPermitBinding,
         after_group_claim: AfterGroupClaimCallable | None = None,
+        provider_dispatcher: DispatchPort | None = None,
+        after_group_result: AfterGroupResultCallable | None = None,
     ) -> Mapping[str, Any]:
         """Authorize and submit one explicit group leg through this owner.
 
         The SDK wire adapter calls this for ``orders.submit_group_leg`` after
-        parsing the typed request. Ordinary ``handle(orders.submit, ...)``
-        never accepts a group-leg binding.
+        parsing the typed request. An evidence-aware provider dispatcher is a
+        trusted, call-local composition input. It must be paired with both
+        evidence callbacks; no wire request can select any of them. Ordinary
+        ``handle(orders.submit, ...)`` never accepts a group-leg binding.
         """
 
         if not _is_principal_ref(principal_ref):
@@ -283,6 +300,18 @@ class ExecutionOrderEntryService:
         if type(scope) is not WireScope:
             return _scope_denied()
         if type(binding) is not GroupPermitBinding or type(intent) is not OrderIntent:
+            return _reply(False, "INVALID_REQUEST", {"found": False, "record": None})
+        if after_group_claim is not None and not callable(after_group_claim):
+            return _reply(False, "INVALID_REQUEST", {"found": False, "record": None})
+        if after_group_result is not None and not callable(after_group_result):
+            return _reply(False, "INVALID_REQUEST", {"found": False, "record": None})
+        if (provider_dispatcher is None) != (after_group_result is None):
+            return _reply(False, "INVALID_REQUEST", {"found": False, "record": None})
+        if provider_dispatcher is not None and (
+            after_group_claim is None
+            or not callable(after_group_claim)
+            or not callable(getattr(provider_dispatcher, "submit", None))
+        ):
             return _reply(False, "INVALID_REQUEST", {"found": False, "record": None})
         if (
             scope.group_id != binding.group_id
@@ -366,15 +395,110 @@ class ExecutionOrderEntryService:
                         writer_lease=checked_writer_lease,
                     )
 
+                claim_receipts: list[object] = []
+
+                def capture_group_claim(
+                    checked_intent: OrderIntent,
+                    checked_binding: GroupPermitBinding,
+                    checked_authorization: GroupLegAuthorization,
+                    checked_writer_lease: WriterLease,
+                    validated_claim: object,
+                ) -> None:
+                    if (
+                        checked_intent is not intent
+                        or checked_binding is not binding
+                        or checked_authorization is not authorization
+                        or checked_writer_lease is not writer_lease
+                        or claim_receipts
+                    ):
+                        raise ContractValidationError(
+                            "group claim callback does not match this dispatch attempt"
+                        )
+                    claim_receipts.append(validated_claim)
+                    assert after_group_claim is not None
+                    after_group_claim(
+                        checked_intent,
+                        checked_binding,
+                        checked_authorization,
+                        checked_writer_lease,
+                        validated_claim,
+                    )
+
                 record = order_facade.submit_group_leg(
                     intent,
                     binding,
                     authorization,
-                    self._dispatch,
+                    self._dispatch if provider_dispatcher is None else provider_dispatcher,
                     writer_lease=writer_lease,
-                    after_group_claim=after_group_claim,
+                    after_group_claim=(
+                        capture_group_claim
+                        if provider_dispatcher is not None
+                        else after_group_claim
+                    ),
                     assert_current_group_authorization=assert_current_group_authorization,
                 )
+                if provider_dispatcher is not None:
+                    terminal_states = {
+                        ExecutionState.FILLED,
+                        ExecutionState.CANCELLED,
+                        ExecutionState.REJECTED,
+                    }
+                    if record.state in {
+                        ExecutionState.ACKED,
+                        ExecutionState.PARTIALLY_FILLED,
+                        ExecutionState.UNKNOWN,
+                        ExecutionState.DISPATCHING,
+                        ExecutionState.PENDING_ADMISSION,
+                        ExecutionState.PENDING_DISPATCH,
+                    }:
+                        # These states either remain exposed, are ambiguous, or
+                        # have not reached a terminal provider resolution.
+                        # Raise through the authority guard so neither its
+                        # dispatch hold nor the Risk latch is cleared.
+                        raise _GroupResolutionUnprovenError
+                    if claim_receipts and record.state not in terminal_states:
+                        raise _GroupResolutionUnprovenError
+                    if record.state in terminal_states and claim_receipts:
+                        if (
+                            len(claim_receipts) != 1
+                            or record.dispatch_attempts != 1
+                            or record.intent_id != intent.intent_id
+                            or record.scope_key != execution_scope.key
+                            or record.payload_sha256 != intent.fingerprint
+                            or record.group_binding != binding
+                            or record.unknown_reason is not None
+                            or record.review_required
+                        ):
+                            raise _GroupResolutionUnprovenError
+                        durable_record = self._store.get(intent.intent_id, scope=execution_scope)
+                        if type(durable_record) is not ExecutionRecord or durable_record != record:
+                            raise _GroupResolutionUnprovenError
+                        try:
+                            # The callback may write the durable Risk resolution.
+                            # Recheck both live fences immediately before it,
+                            # and check the store fence again before allowing
+                            # the authority guard's normal-exit verifier to run.
+                            self._store.assert_writer_lease(execution_scope, writer_lease)
+                            assert_current_group_authorization(
+                                intent, binding, authorization, writer_lease
+                            )
+                            assert after_group_result is not None
+                            callback_result = after_group_result(
+                                intent,
+                                binding,
+                                authorization,
+                                writer_lease,
+                                claim_receipts[0],
+                                durable_record,
+                            )
+                            if callback_result is not None:
+                                raise _GroupResolutionUnprovenError
+                            self._store.assert_writer_lease(execution_scope, writer_lease)
+                            assert_current_group_authorization(
+                                intent, binding, authorization, writer_lease
+                            )
+                        except Exception as error:
+                            raise _GroupResolutionUnprovenError from error
         except IntentConflictError:
             return self._failure_with_record("INTENT_CONFLICT", intent.intent_id, execution_scope)
         except ContractValidationError:
@@ -394,6 +518,10 @@ class ExecutionOrderEntryService:
         except _GroupAuthorityGuardError:
             return self._failure_with_record(
                 "GROUP_AUTHORIZATION_FAILED", intent.intent_id, execution_scope
+            )
+        except _GroupResolutionUnprovenError:
+            return self._failure_with_record(
+                "GROUP_RESOLUTION_UNPROVEN", intent.intent_id, execution_scope
             )
         return _reply(
             True,

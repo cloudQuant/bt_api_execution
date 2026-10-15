@@ -244,13 +244,18 @@ class _Authority:
             self.persisted_hold_id = authorization.authorization_attempt_id
             self._guard_thread_id = threading.get_ident()
             self.guard_entries += 1
+            guard_failed = False
             try:
                 yield authorization
+            except BaseException:
+                guard_failed = True
+                raise
             finally:
                 self.guard_exits += 1
                 self.active_authorization = None
-                self.persisted_generation = None
-                self.persisted_hold_id = None
+                if not guard_failed:
+                    self.persisted_generation = None
+                    self.persisted_hold_id = None
                 self._guard_thread_id = None
 
     def assert_current(self) -> None:
@@ -314,6 +319,22 @@ class _Provider:
 
     def cancel(self, intent: object) -> object:
         raise AssertionError("group acceptance test must not cancel")
+
+
+class _EvidenceDispatcher:
+    def __init__(self, observation: ProviderObservation, *, fail: bool = False) -> None:
+        self.observation = observation
+        self.fail = fail
+        self.claim_receipt: object | None = None
+        self.submitted: list[str] = []
+
+    def submit(self, intent: OrderIntent) -> ProviderObservation:
+        assert self.claim_receipt is not None
+        self.submitted.append(intent.intent_id)
+        if self.fail:
+            raise TimeoutError("provider outcome uncertain")
+        assert intent.intent_id == self.observation.intent_id
+        return self.observation
 
 
 def _make_service(store_path: str, *, claim_error: bool = False, bind_account_scope: bool = True):
@@ -491,6 +512,366 @@ def test_after_group_claim_hook_receives_exact_claim_before_provider(tmp_path) -
     assert authority.final_authorization_checks == 1
     assert risk.group_claims == 1
     assert provider.submitted == [intent.intent_id]
+    store.close()
+
+
+def test_evidence_dispatcher_result_callback_runs_after_durable_terminal_record(tmp_path) -> None:
+    values = _make_service(str(tmp_path / "group-result.sqlite"))
+    service, store, risk, provider, authority, identity, group_scope, _, intent, binding = values
+    dispatcher = _EvidenceDispatcher(
+        ProviderObservation(
+            intent.intent_id,
+            ExecutionState.FILLED,
+            provider_order_id="provider-order-filled",
+            filled_quantity=intent.quantity,
+            average_price=Decimal("60"),
+        )
+    )
+    callback_rows: list[tuple[object, object]] = []
+    events: list[str] = []
+
+    def after_claim(
+        received_intent: OrderIntent,
+        received_binding: GroupPermitBinding,
+        authorization: GroupLegAuthorization,
+        writer_lease: object,
+        validated_claim: object,
+    ) -> None:
+        events.append("claim")
+        assert received_intent is intent
+        assert received_binding is binding
+        assert authorization is authority.authorizations[-1]
+        assert writer_lease is not None
+        assert type(validated_claim).__name__ == "RiskGroupLegClaimReceipt"
+        dispatcher.claim_receipt = validated_claim
+
+    def after_result(
+        received_intent: OrderIntent,
+        received_binding: GroupPermitBinding,
+        authorization: GroupLegAuthorization,
+        writer_lease: object,
+        validated_claim: object,
+        record: object,
+    ) -> None:
+        events.append("result")
+        assert received_intent is intent
+        assert received_binding is binding
+        assert authorization is authority.authorizations[-1]
+        assert writer_lease is not None
+        assert validated_claim is dispatcher.claim_receipt
+        assert record.state is ExecutionState.FILLED
+        assert record == store.get(intent.intent_id, scope=intent.scope)
+        assert dispatcher.submitted == [intent.intent_id]
+        assert provider.submitted == []
+        callback_rows.append((validated_claim, record))
+
+    result = service.submit_group_leg(
+        principal_ref=_PRINCIPAL,
+        identity=identity,
+        scope=group_scope,
+        intent=intent,
+        binding=binding,
+        after_group_claim=after_claim,
+        provider_dispatcher=dispatcher,
+        after_group_result=after_result,
+    )
+
+    assert result["ok"] is True
+    assert result["result"]["record"]["state"] == ExecutionState.FILLED.value
+    assert events == ["claim", "result"]
+    assert len(callback_rows) == 1
+    assert risk.group_claims == risk.settlements == 1
+    assert authority.final_authorization_checks == 3
+    assert authority.persisted_hold_id is None
+
+    replay = service.submit_group_leg(
+        principal_ref=_PRINCIPAL,
+        identity=identity,
+        scope=group_scope,
+        intent=intent,
+        binding=binding,
+        after_group_claim=after_claim,
+        provider_dispatcher=dispatcher,
+        after_group_result=after_result,
+    )
+    assert replay["ok"] is True
+    assert replay["result"]["record"]["state"] == ExecutionState.FILLED.value
+    assert dispatcher.submitted == [intent.intent_id]
+    assert len(callback_rows) == 1
+    assert risk.group_claims == risk.settlements == 1
+    store.close()
+
+
+def test_after_group_result_failure_preserves_terminal_record_and_authority_hold(tmp_path) -> None:
+    values = _make_service(str(tmp_path / "group-result-failure.sqlite"))
+    service, store, risk, provider, authority, identity, group_scope, _, intent, binding = values
+    dispatcher = _EvidenceDispatcher(
+        ProviderObservation(
+            intent.intent_id,
+            ExecutionState.FILLED,
+            provider_order_id="provider-order-filled",
+            filled_quantity=intent.quantity,
+            average_price=Decimal("60"),
+        )
+    )
+
+    def after_claim(*_arguments: object) -> None:
+        dispatcher.claim_receipt = _arguments[-1]
+
+    def fail_resolution(*_arguments: object) -> None:
+        raise RuntimeError("Risk resolution receipt is unavailable")
+
+    result = service.submit_group_leg(
+        principal_ref=_PRINCIPAL,
+        identity=identity,
+        scope=group_scope,
+        intent=intent,
+        binding=binding,
+        after_group_claim=after_claim,
+        provider_dispatcher=dispatcher,
+        after_group_result=fail_resolution,
+    )
+
+    durable = store.get(intent.intent_id, scope=intent.scope)
+    assert result["ok"] is False
+    assert result["code"] == "GROUP_RESOLUTION_UNPROVEN"
+    assert result["result"]["record"]["state"] == ExecutionState.FILLED.value
+    assert durable is not None and durable.state is ExecutionState.FILLED
+    assert durable.dispatch_attempts == 1
+    assert risk.group_claims == risk.settlements == 1
+    assert dispatcher.submitted == [intent.intent_id]
+    assert authority.persisted_hold_id == authority.authorizations[-1].authorization_attempt_id
+    assert authority.persisted_generation == authority.authorizations[-1].coordinator_epoch
+    store.close()
+
+
+def test_acknowledged_group_result_is_not_treated_as_terminal_resolution(tmp_path) -> None:
+    values = _make_service(str(tmp_path / "group-result-acked.sqlite"))
+    service, store, risk, provider, authority, identity, group_scope, _, intent, binding = values
+    dispatcher = _EvidenceDispatcher(ProviderObservation.accepted(intent.intent_id, "order-1"))
+    resolution_calls: list[object] = []
+
+    def after_claim(*_arguments: object) -> None:
+        dispatcher.claim_receipt = _arguments[-1]
+
+    def after_result(*arguments: object) -> None:
+        resolution_calls.append(arguments)
+
+    result = service.submit_group_leg(
+        principal_ref=_PRINCIPAL,
+        identity=identity,
+        scope=group_scope,
+        intent=intent,
+        binding=binding,
+        after_group_claim=after_claim,
+        provider_dispatcher=dispatcher,
+        after_group_result=after_result,
+    )
+
+    durable = store.get(intent.intent_id, scope=intent.scope)
+    assert result["ok"] is False
+    assert result["code"] == "GROUP_RESOLUTION_UNPROVEN"
+    assert result["result"]["record"]["state"] == ExecutionState.ACKED.value
+    assert durable is not None and durable.state is ExecutionState.ACKED
+    assert dispatcher.submitted == [intent.intent_id]
+    assert resolution_calls == []
+    assert risk.group_claims == 1
+    assert authority.persisted_hold_id == authority.authorizations[-1].authorization_attempt_id
+    store.close()
+
+
+def test_provider_rejection_with_no_order_id_reaches_resolution_callback(tmp_path) -> None:
+    values = _make_service(str(tmp_path / "group-result-rejected.sqlite"))
+    service, store, risk, provider, authority, identity, group_scope, _, intent, binding = values
+    dispatcher = _EvidenceDispatcher(
+        ProviderObservation.rejected(intent.intent_id, "provider_reject")
+    )
+    result_rows: list[object] = []
+
+    def after_claim(*arguments: object) -> None:
+        dispatcher.claim_receipt = arguments[-1]
+
+    def after_result(*arguments: object) -> None:
+        assert arguments[-2] is dispatcher.claim_receipt
+        result_rows.append(arguments[-1])
+
+    result = service.submit_group_leg(
+        principal_ref=_PRINCIPAL,
+        identity=identity,
+        scope=group_scope,
+        intent=intent,
+        binding=binding,
+        after_group_claim=after_claim,
+        provider_dispatcher=dispatcher,
+        after_group_result=after_result,
+    )
+
+    assert result["ok"] is True, result
+    assert result["result"]["record"]["state"] == ExecutionState.REJECTED.value
+    assert result["result"]["record"]["provider_order_id"] is None
+    assert len(result_rows) == 1
+    assert result_rows[0].dispatch_attempts == 1
+    assert risk.group_claims == 1
+    assert provider.submitted == []
+    assert authority.persisted_hold_id is None
+    store.close()
+
+
+def test_evidence_override_requires_all_three_call_local_hooks(tmp_path) -> None:
+    values = _make_service(str(tmp_path / "group-result-incomplete-hooks.sqlite"))
+    service, store, risk, provider, authority, identity, group_scope, _, intent, binding = values
+    dispatcher = _EvidenceDispatcher(ProviderObservation.accepted(intent.intent_id, "order-1"))
+
+    result = service.submit_group_leg(
+        principal_ref=_PRINCIPAL,
+        identity=identity,
+        scope=group_scope,
+        intent=intent,
+        binding=binding,
+        after_group_claim=lambda *_arguments: None,
+        provider_dispatcher=dispatcher,
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == "INVALID_REQUEST"
+    assert authority.calls == []
+    assert risk.group_claims == 0
+    assert dispatcher.submitted == []
+    assert provider.submitted == []
+    store.close()
+
+
+def test_unknown_evidence_dispatch_retains_hold_and_skips_result_callback(tmp_path) -> None:
+    values = _make_service(str(tmp_path / "group-result-unknown.sqlite"))
+    service, store, risk, _provider, authority, identity, group_scope, _, intent, binding = values
+    dispatcher = _EvidenceDispatcher(
+        ProviderObservation.accepted(intent.intent_id, "unused"), fail=True
+    )
+    resolution_calls: list[object] = []
+
+    def after_claim(*_arguments: object) -> None:
+        dispatcher.claim_receipt = _arguments[-1]
+
+    def after_result(*arguments: object) -> None:
+        resolution_calls.append(arguments)
+
+    result = service.submit_group_leg(
+        principal_ref=_PRINCIPAL,
+        identity=identity,
+        scope=group_scope,
+        intent=intent,
+        binding=binding,
+        after_group_claim=after_claim,
+        provider_dispatcher=dispatcher,
+        after_group_result=after_result,
+    )
+
+    durable = store.get(intent.intent_id, scope=intent.scope)
+    assert result["ok"] is False
+    assert result["code"] == "GROUP_RESOLUTION_UNPROVEN"
+    assert result["result"]["record"]["state"] == ExecutionState.UNKNOWN.value
+    assert durable is not None and durable.state is ExecutionState.UNKNOWN
+    assert dispatcher.submitted == [intent.intent_id]
+    assert resolution_calls == []
+    assert risk.group_claims == 1
+    assert authority.persisted_hold_id == authority.authorizations[-1].authorization_attempt_id
+    store.close()
+
+
+def test_evidence_dispatchers_are_call_local_across_group_legs(tmp_path) -> None:
+    values = _make_service(str(tmp_path / "group-result-two-calls.sqlite"))
+    service, store, risk, provider, authority, identity, group_scope, _, intent, binding = values
+
+    def execute_one(
+        current_scope: WireScope,
+        current_intent: OrderIntent,
+        current_binding: GroupPermitBinding,
+    ) -> tuple[dict[str, object], _EvidenceDispatcher]:
+        dispatcher = _EvidenceDispatcher(
+            ProviderObservation(
+                current_intent.intent_id,
+                ExecutionState.FILLED,
+                provider_order_id=f"provider-{current_binding.leg_id}",
+                filled_quantity=current_intent.quantity,
+                average_price=Decimal("60"),
+            )
+        )
+
+        def after_claim(*arguments: object) -> None:
+            assert arguments[0] is current_intent
+            assert arguments[1] is current_binding
+            dispatcher.claim_receipt = arguments[-1]
+
+        def after_result(*arguments: object) -> None:
+            assert arguments[0] is current_intent
+            assert arguments[1] is current_binding
+            assert arguments[-2] is dispatcher.claim_receipt
+            assert arguments[-1].intent_id == current_intent.intent_id
+            assert arguments[-1].group_binding == current_binding
+
+        response = service.submit_group_leg(
+            principal_ref=_PRINCIPAL,
+            identity=identity,
+            scope=current_scope,
+            intent=current_intent,
+            binding=current_binding,
+            after_group_claim=after_claim,
+            provider_dispatcher=dispatcher,
+            after_group_result=after_result,
+        )
+        return response, dispatcher
+
+    first, first_dispatcher = execute_one(group_scope, intent, binding)
+    second_group = "group-43"
+    second_leg = "leg-b"
+    second_intent = OrderIntent.limit(
+        intent_id=group_leg_intent_id(second_group, second_leg),
+        scope=intent.scope,
+        signal_id="signal-b",
+        instrument=intent.instrument,
+        side=intent.side,
+        quantity=intent.quantity,
+        price=intent.price,
+        deadline_ns=intent.deadline_ns,
+    )
+    second_binding = GroupPermitBinding(
+        group_id=second_group,
+        leg_id=second_leg,
+        portfolio_ref=binding.portfolio_ref,
+        strategy_id=binding.strategy_id,
+        account_ref=binding.account_ref,
+        coordinator_principal_ref=binding.coordinator_principal_ref,
+        risk_scope_fingerprint=binding.risk_scope_fingerprint,
+        permit_id="permit-group-43-leg-b",
+        group_fingerprint=payload_sha256({"group": second_group}),
+        policy_fingerprint=binding.policy_fingerprint,
+        reserved_intent_hash=payload_sha256({"reserved": second_intent.intent_id}),
+        exposure_profile_fingerprint=binding.exposure_profile_fingerprint,
+        actual_child_intent_hash=payload_sha256({"actual": second_intent.intent_id}),
+        order_intent_hash=second_intent.fingerprint,
+        deadline_ns=second_intent.deadline_ns,
+    )
+    second_scope = WireScope(
+        execution_domain_ref=group_scope.execution_domain_ref,
+        account_ref=group_scope.account_ref,
+        strategy_ref=group_scope.strategy_ref,
+        portfolio_ref=group_scope.portfolio_ref,
+        group_id=second_group,
+        leg_id=second_leg,
+    )
+    risk.intent = second_intent
+    risk.binding = second_binding
+    second, second_dispatcher = execute_one(second_scope, second_intent, second_binding)
+
+    assert first["ok"] is second["ok"] is True
+    assert first["result"]["record"]["intent_id"] == intent.intent_id
+    assert second["result"]["record"]["intent_id"] == second_intent.intent_id
+    assert first_dispatcher.submitted == [intent.intent_id]
+    assert second_dispatcher.submitted == [second_intent.intent_id]
+    assert first_dispatcher.claim_receipt is not second_dispatcher.claim_receipt
+    assert risk.group_claims == 2
+    assert provider.submitted == []
+    assert len(authority.authorizations) == 2
     store.close()
 
 
