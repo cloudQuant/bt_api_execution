@@ -12,6 +12,8 @@ from bt_api_execution import (
     ExecutionScope,
     ExecutionState,
     GroupAccountReservationSnapshot,
+    GroupBudgetLegQuote,
+    GroupBudgetQuote,
     GroupChildOrderStatus,
     GroupDispatchResolutionReceipt,
     GroupLegClaimReceipt,
@@ -26,6 +28,7 @@ from bt_api_execution import (
     GroupRiskLegSnapshot,
     OrderIntent,
     OrderType,
+    PortfolioGroupBudgetPolicy,
     PositionEffect,
     Side,
     SqliteOrderGroupStore,
@@ -311,8 +314,10 @@ def _make_request(*, accounts: tuple[str, str] = ("account-a", "account-a")) -> 
         order_type=OrderType.LIMIT,
         quantity=Decimal("2"),
         price=Decimal("10"),
+        metadata_version="fixture-metadata-v1",
         time_in_force=TimeInForce.IOC,
         deadline_ns=_DEADLINE,
+        tags={"instrument_metadata_digest": payload_sha256({"instrument": "FOO-USD"})},
     )
     second = OrderIntent(
         intent_id=group_leg_intent_id("group-p5a", "leg-hedge"),
@@ -324,8 +329,10 @@ def _make_request(*, accounts: tuple[str, str] = ("account-a", "account-a")) -> 
         order_type=OrderType.LIMIT,
         quantity=Decimal("1.5"),
         price=Decimal("20"),
+        metadata_version="fixture-metadata-v1",
         time_in_force=TimeInForce.IOC,
         deadline_ns=_DEADLINE,
+        tags={"instrument_metadata_digest": payload_sha256({"instrument": "BAR-USD"})},
     )
     return GroupOrderIntent(
         group_id="group-p5a",
@@ -353,6 +360,7 @@ def _coordinator(
     *,
     path="groups.sqlite",
     clock_ns=None,
+    budget_policy=None,
 ):
     reservations = {}
     orders = {}
@@ -368,13 +376,56 @@ def _coordinator(
     if ports is not None:
         reservations, orders = ports
     store = SqliteOrderGroupStore(tmp_path / path)
+    policy = budget_policy or PortfolioGroupBudgetPolicy(
+        portfolio_ref=request.portfolio_ref,
+        policy_id="test-portfolio-budget",
+        policy_version=1,
+        valuation_unit="USD",
+        max_group_gross_notional=Decimal("100000"),
+        max_active_gross_notional=Decimal("100000"),
+        max_active_groups=10,
+    )
     coordinator = GroupOrderCoordinator(
         store,
         reservations=reservations,
         orders=orders,
+        portfolio_budget_policies={request.portfolio_ref: policy},
+        budget_quote_builder=_test_budget_quote,
         clock_ns=(lambda: _NOW + 1) if clock_ns is None else clock_ns,
     )
     return coordinator, store, reservations, orders
+
+
+def _test_budget_quote(request, policy, *, now_ns):
+    legs = []
+    for plan in request.legs:
+        intent = plan.maximum_intent
+        digest = intent.tags["instrument_metadata_digest"]
+        # Component tests bind a deterministic synthetic quote. Production
+        # composition uses build_instrument_risk_group_budget_quote.
+        gross = intent.quantity * intent.price + Decimal("0.5")
+        legs.append(
+            GroupBudgetLegQuote(
+                leg_id=plan.leg_id,
+                account_ref=plan.account_ref,
+                intent_fingerprint=intent.fingerprint,
+                metadata_digest=digest,
+                assessment_fingerprint=payload_sha256(
+                    {"synthetic-assessment": intent.fingerprint, "gross": format(gross, "f")}
+                ),
+                valuation_unit="USD",
+                gross_notional=gross,
+                assessed_at_ns=now_ns,
+                valid_until_ns=plan.metadata_valid_until_ns,
+            )
+        )
+    total = sum((item.gross_notional for item in legs), Decimal("0"))
+    return GroupBudgetQuote(
+        policy_fingerprint=policy.fingerprint,
+        valuation_unit="USD",
+        gross_notional=total,
+        legs=tuple(legs),
+    )
 
 
 def _install_terminal_responses(request, reservations, orders, *, lose_first=False):
@@ -419,6 +470,7 @@ def test_group_coordinator_reserves_one_vector_sizes_hedge_and_pairs(tmp_path) -
     assert paired.residual_base_units == Decimal("0")
     assert paired.legs[0].child_status.filled_quantity == Decimal("1.5")
     assert paired.legs[1].submitted_intent.quantity == Decimal("0.75")
+    assert paired.budget_reservation.state.value == "HELD"
     assert orders["account-a"].resolution_calls == [
         item.intent_id for item in orders["account-a"].submissions
     ]
@@ -433,6 +485,7 @@ def test_group_unknown_restart_queries_same_order_id_without_resubmit(tmp_path) 
     coordinator.accept(request)
     blocked = coordinator.advance_group(request.portfolio_ref, request.group_id)
     assert blocked.state is GroupOrderState.RECOVERY_REQUIRED
+    assert blocked.budget_reservation.state.value == "HELD"
     assert len(orders["account-a"].submissions) == 1
     first_id = request.ordered_legs[0].maximum_intent.intent_id
     orders["account-a"].statuses[first_id] = GroupChildOrderStatus(
@@ -446,6 +499,8 @@ def test_group_unknown_restart_queries_same_order_id_without_resubmit(tmp_path) 
     store.close()
 
     restarted_store = SqliteOrderGroupStore(tmp_path / "groups.sqlite")
+    persisted = restarted_store.get(request.portfolio_ref, request.group_id)
+    assert persisted.budget_reservation.state.value == "HELD"
     restarted = GroupOrderCoordinator(
         restarted_store,
         reservations=reservations,
@@ -454,6 +509,7 @@ def test_group_unknown_restart_queries_same_order_id_without_resubmit(tmp_path) 
     )
     result = restarted.advance_group(request.portfolio_ref, request.group_id)
     assert result.state is GroupOrderState.PAIRED
+    assert result.budget_reservation.state.value == "HELD"
     assert orders["account-a"].submissions.count(request.ordered_legs[0].maximum_intent) == 1
     assert first_id in orders["account-a"].query_ids
     assert len(orders["account-a"].submissions) == 2
@@ -505,6 +561,29 @@ def test_lost_reserve_reply_with_unknown_code_recovers_active_vector_by_query(
     assert not orders["account-a"].submissions
     assert not port.release_calls
     reopened_store.close()
+
+
+def test_trusted_portfolio_budget_denial_has_no_account_or_order_effects(tmp_path) -> None:
+    request = _make_request(accounts=("account-a", "account-b"))
+    policy = PortfolioGroupBudgetPolicy(
+        portfolio_ref=request.portfolio_ref,
+        policy_id="tight-portfolio-budget",
+        policy_version=1,
+        valuation_unit="USD",
+        max_group_gross_notional=Decimal("50"),
+        max_active_gross_notional=Decimal("100"),
+        max_active_groups=2,
+    )
+    coordinator, store, reservations, orders = _coordinator(tmp_path, request, budget_policy=policy)
+
+    denied = coordinator.accept(request)
+
+    assert denied.state is GroupOrderState.REJECTED_BEFORE_DISPATCH
+    assert denied.budget_reservation.state.value == "DENIED"
+    assert denied.error_code == "group_budget_limit_exceeded"
+    assert all(not port.query_calls and not port.reserve_calls for port in reservations.values())
+    assert all(not port.submissions and not port.query_ids for port in orders.values())
+    store.close()
 
 
 def test_expired_deadline_still_queries_unknown_hedge_by_original_id(tmp_path) -> None:

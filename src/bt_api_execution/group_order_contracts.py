@@ -11,6 +11,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import StrEnum
+from fractions import Fraction
 from typing import Any
 
 from .contracts import (
@@ -29,6 +30,7 @@ from .group_contracts import GroupPermitBinding, group_leg_intent_id
 _REFERENCE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _DECIMAL = re.compile(r"^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$")
 _SAFE_CODE = re.compile(r"^[a-z][a-z0-9_]{0,127}$")
+_NOTIONAL_UNIT = re.compile(r"^[A-Z][A-Z0-9._-]{0,15}$")
 
 
 def _reference(value: object, name: str) -> str:
@@ -64,11 +66,326 @@ class GroupReservationPhase(StrEnum):
     RELEASED = "RELEASED"
 
 
+class GroupBudgetReservationState(StrEnum):
+    """Durable state of the coordinator-local gross group-budget hold."""
+
+    RESERVED = "RESERVED"
+    HELD = "HELD"
+    RELEASED = "RELEASED"
+    DENIED = "DENIED"
+
+
 class GroupLegPhase(StrEnum):
     READY = "READY"
     REQUESTING = "REQUESTING"
     UNKNOWN = "UNKNOWN"
     OBSERVED = "OBSERVED"
+
+
+@dataclass(frozen=True, slots=True)
+class PortfolioGroupBudgetPolicy:
+    """Trusted coordinator policy for conservative gross group reservations.
+
+    Amounts are fee- and slippage-inclusive gross notionals in one exact unit.
+    This policy never nets across legs/accounts and does not replace either
+    account owner's Risk policy.
+    """
+
+    portfolio_ref: str
+    policy_id: str
+    policy_version: int
+    valuation_unit: str
+    max_group_gross_notional: Decimal
+    max_active_gross_notional: Decimal
+    max_active_groups: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "portfolio_ref", _reference(self.portfolio_ref, "portfolio_ref"))
+        object.__setattr__(self, "policy_id", _reference(self.policy_id, "policy_id"))
+        if type(self.policy_version) is not int or self.policy_version <= 0:
+            raise ContractValidationError("invalid group budget policy version")
+        if type(self.valuation_unit) is not str or not _NOTIONAL_UNIT.fullmatch(
+            self.valuation_unit
+        ):
+            raise ContractValidationError("invalid group budget valuation unit")
+        object.__setattr__(
+            self,
+            "max_group_gross_notional",
+            _positive_decimal(self.max_group_gross_notional, "max_group_gross_notional"),
+        )
+        object.__setattr__(
+            self,
+            "max_active_gross_notional",
+            _positive_decimal(self.max_active_gross_notional, "max_active_gross_notional"),
+        )
+        if self.max_group_gross_notional > self.max_active_gross_notional:
+            raise ContractValidationError("single group cap exceeds active portfolio cap")
+        if (
+            type(self.max_active_groups) is not int
+            or self.max_active_groups <= 0
+            or self.max_active_groups > 100_000
+        ):
+            raise ContractValidationError("invalid active group count limit")
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "schema": "portfolio-group-budget-policy-v1",
+            "semantics": "FEE_INCLUSIVE_GROSS_NO_FX_NO_NETTING_V1",
+            "portfolio_ref": self.portfolio_ref,
+            "policy_id": self.policy_id,
+            "policy_version": self.policy_version,
+            "valuation_unit": self.valuation_unit,
+            "max_group_gross_notional": format(self.max_group_gross_notional, "f"),
+            "max_active_gross_notional": format(self.max_active_gross_notional, "f"),
+            "max_active_groups": self.max_active_groups,
+        }
+
+    @property
+    def fingerprint(self) -> str:
+        return payload_sha256(self.to_payload())
+
+    @classmethod
+    def from_payload(cls, value: object) -> PortfolioGroupBudgetPolicy:
+        expected = {
+            "schema",
+            "semantics",
+            "portfolio_ref",
+            "policy_id",
+            "policy_version",
+            "valuation_unit",
+            "max_group_gross_notional",
+            "max_active_gross_notional",
+            "max_active_groups",
+        }
+        if (
+            not isinstance(value, Mapping)
+            or set(value) != expected
+            or value["schema"] != "portfolio-group-budget-policy-v1"
+            or value["semantics"] != "FEE_INCLUSIVE_GROSS_NO_FX_NO_NETTING_V1"
+        ):
+            raise ContractValidationError("invalid portfolio group budget policy payload")
+        return cls(
+            portfolio_ref=value["portfolio_ref"],
+            policy_id=value["policy_id"],
+            policy_version=value["policy_version"],
+            valuation_unit=value["valuation_unit"],
+            max_group_gross_notional=_parse_decimal(
+                value["max_group_gross_notional"], "max_group_gross_notional"
+            ),
+            max_active_gross_notional=_parse_decimal(
+                value["max_active_gross_notional"], "max_active_gross_notional"
+            ),
+            max_active_groups=value["max_active_groups"],
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class GroupBudgetLegQuote:
+    """Server-computed conservative gross quote for one exact maximum leg."""
+
+    leg_id: str
+    account_ref: str
+    intent_fingerprint: str
+    metadata_digest: str
+    assessment_fingerprint: str
+    valuation_unit: str
+    gross_notional: Decimal
+    assessed_at_ns: int
+    valid_until_ns: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "leg_id", _reference(self.leg_id, "leg_id"))
+        object.__setattr__(self, "account_ref", _reference(self.account_ref, "account_ref"))
+        for name in ("intent_fingerprint", "metadata_digest", "assessment_fingerprint"):
+            _require_digest(getattr(self, name), name)
+        if type(self.valuation_unit) is not str or not _NOTIONAL_UNIT.fullmatch(
+            self.valuation_unit
+        ):
+            raise ContractValidationError("invalid group leg valuation unit")
+        object.__setattr__(
+            self, "gross_notional", _positive_decimal(self.gross_notional, "gross_notional")
+        )
+        if (
+            type(self.assessed_at_ns) is not int
+            or self.assessed_at_ns <= 0
+            or type(self.valid_until_ns) is not int
+            or self.valid_until_ns <= self.assessed_at_ns
+        ):
+            raise ContractValidationError("invalid group leg assessment interval")
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "leg_id": self.leg_id,
+            "account_ref": self.account_ref,
+            "intent_fingerprint": self.intent_fingerprint,
+            "metadata_digest": self.metadata_digest,
+            "assessment_fingerprint": self.assessment_fingerprint,
+            "valuation_unit": self.valuation_unit,
+            "gross_notional": format(self.gross_notional, "f"),
+            "assessed_at_ns": self.assessed_at_ns,
+            "valid_until_ns": self.valid_until_ns,
+        }
+
+    @classmethod
+    def from_payload(cls, value: object) -> GroupBudgetLegQuote:
+        expected = {
+            "leg_id",
+            "account_ref",
+            "intent_fingerprint",
+            "metadata_digest",
+            "assessment_fingerprint",
+            "valuation_unit",
+            "gross_notional",
+            "assessed_at_ns",
+            "valid_until_ns",
+        }
+        if not isinstance(value, Mapping) or set(value) != expected:
+            raise ContractValidationError("invalid group budget leg quote payload")
+        return cls(
+            leg_id=value["leg_id"],
+            account_ref=value["account_ref"],
+            intent_fingerprint=value["intent_fingerprint"],
+            metadata_digest=value["metadata_digest"],
+            assessment_fingerprint=value["assessment_fingerprint"],
+            valuation_unit=value["valuation_unit"],
+            gross_notional=_parse_decimal(value["gross_notional"], "gross_notional"),
+            assessed_at_ns=value["assessed_at_ns"],
+            valid_until_ns=value["valid_until_ns"],
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class GroupBudgetQuote:
+    """Immutable trusted server quote bound to the exact v2 group legs."""
+
+    policy_fingerprint: str
+    valuation_unit: str
+    gross_notional: Decimal
+    legs: tuple[GroupBudgetLegQuote, GroupBudgetLegQuote]
+
+    def __post_init__(self) -> None:
+        _require_digest(self.policy_fingerprint, "policy_fingerprint")
+        if type(self.valuation_unit) is not str or not _NOTIONAL_UNIT.fullmatch(
+            self.valuation_unit
+        ):
+            raise ContractValidationError("invalid group quote valuation unit")
+        object.__setattr__(
+            self, "gross_notional", _positive_decimal(self.gross_notional, "gross_notional")
+        )
+        if (
+            type(self.legs) is not tuple
+            or len(self.legs) != 2
+            or any(type(item) is not GroupBudgetLegQuote for item in self.legs)
+        ):
+            raise ContractValidationError("P5A group quote requires exactly two leg facts")
+        if len({item.leg_id for item in self.legs}) != 2 or any(
+            item.valuation_unit != self.valuation_unit for item in self.legs
+        ):
+            raise ContractValidationError("group quote legs do not share one valuation unit")
+        if sum((Fraction(item.gross_notional) for item in self.legs), Fraction(0)) != Fraction(
+            self.gross_notional
+        ):
+            raise ContractValidationError("group gross quote does not equal its leg vector")
+
+    @property
+    def fingerprint(self) -> str:
+        return payload_sha256(self.to_payload())
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "schema": "group-budget-quote-v1",
+            "policy_fingerprint": self.policy_fingerprint,
+            "valuation_unit": self.valuation_unit,
+            "gross_notional": format(self.gross_notional, "f"),
+            "legs": [item.to_payload() for item in self.legs],
+        }
+
+    @classmethod
+    def from_payload(cls, value: object) -> GroupBudgetQuote:
+        expected = {"schema", "policy_fingerprint", "valuation_unit", "gross_notional", "legs"}
+        if (
+            not isinstance(value, Mapping)
+            or set(value) != expected
+            or value["schema"] != "group-budget-quote-v1"
+            or not isinstance(value["legs"], list)
+        ):
+            raise ContractValidationError("invalid group budget quote payload")
+        return cls(
+            policy_fingerprint=value["policy_fingerprint"],
+            valuation_unit=value["valuation_unit"],
+            gross_notional=_parse_decimal(value["gross_notional"], "gross_notional"),
+            legs=tuple(GroupBudgetLegQuote.from_payload(item) for item in value["legs"]),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class GroupBudgetReservation:
+    """Persisted local budget hold; status changes share the group transaction."""
+
+    policy_fingerprint: str
+    policy: PortfolioGroupBudgetPolicy
+    quote_fingerprint: str
+    valuation_unit: str
+    gross_notional: Decimal
+    deadline_ns: int
+    state: GroupBudgetReservationState
+
+    def __post_init__(self) -> None:
+        _require_digest(self.policy_fingerprint, "policy_fingerprint")
+        if (
+            type(self.policy) is not PortfolioGroupBudgetPolicy
+            or self.policy.fingerprint != self.policy_fingerprint
+            or self.policy.valuation_unit != self.valuation_unit
+        ):
+            raise ContractValidationError("stored group budget policy does not match its binding")
+        _require_digest(self.quote_fingerprint, "quote_fingerprint")
+        if type(self.valuation_unit) is not str or not _NOTIONAL_UNIT.fullmatch(
+            self.valuation_unit
+        ):
+            raise ContractValidationError("invalid group reservation valuation unit")
+        object.__setattr__(
+            self, "gross_notional", _positive_decimal(self.gross_notional, "gross_notional")
+        )
+        if type(self.deadline_ns) is not int or self.deadline_ns <= 0:
+            raise ContractValidationError("invalid group budget deadline")
+        try:
+            object.__setattr__(self, "state", GroupBudgetReservationState(self.state))
+        except (TypeError, ValueError) as error:
+            raise ContractValidationError("invalid group budget state") from error
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "policy_fingerprint": self.policy_fingerprint,
+            "policy": self.policy.to_payload(),
+            "quote_fingerprint": self.quote_fingerprint,
+            "valuation_unit": self.valuation_unit,
+            "gross_notional": format(self.gross_notional, "f"),
+            "deadline_ns": self.deadline_ns,
+            "state": self.state.value,
+        }
+
+    @classmethod
+    def from_payload(cls, value: object) -> GroupBudgetReservation:
+        expected = {
+            "policy_fingerprint",
+            "policy",
+            "quote_fingerprint",
+            "valuation_unit",
+            "gross_notional",
+            "deadline_ns",
+            "state",
+        }
+        if not isinstance(value, Mapping) or set(value) != expected:
+            raise ContractValidationError("invalid group budget reservation payload")
+        return cls(
+            policy_fingerprint=value["policy_fingerprint"],
+            policy=PortfolioGroupBudgetPolicy.from_payload(value["policy"]),
+            quote_fingerprint=value["quote_fingerprint"],
+            valuation_unit=value["valuation_unit"],
+            gross_notional=_parse_decimal(value["gross_notional"], "gross_notional"),
+            deadline_ns=value["deadline_ns"],
+            state=value["state"],
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,6 +462,7 @@ class GroupOrderIntent:
     deadline_ns: int
     first_leg_id: str
     legs: tuple[GroupOrderLegPlan, GroupOrderLegPlan]
+    budget_quote: GroupBudgetQuote | None = None
     recovery_policy: str = "HOLD_AND_QUERY_ORIGINAL_IDS"
     version: int = 1
 
@@ -164,7 +482,7 @@ class GroupOrderIntent:
             raise ContractValidationError("invalid received_at_ns")
         if type(self.deadline_ns) is not int or self.deadline_ns <= self.received_at_ns:
             raise ContractValidationError("invalid absolute group deadline")
-        if type(self.version) is not int or self.version != 1:
+        if type(self.version) is not int or self.version not in {1, 2}:
             raise ContractValidationError("unsupported group order contract version")
         if not isinstance(self.legs, tuple) or len(self.legs) != 2:
             raise ContractValidationError("P5A requires exactly two legs")
@@ -187,6 +505,27 @@ class GroupOrderIntent:
                 or leg.metadata_valid_until_ns < self.deadline_ns
             ):
                 raise ContractValidationError("group leg violates the normalized P5A policy")
+        if self.version == 1:
+            if self.budget_quote is not None:
+                raise ContractValidationError("legacy group intent cannot carry a budget quote")
+        else:
+            quote = self.budget_quote
+            if type(quote) is not GroupBudgetQuote:
+                raise ContractValidationError("new group intent requires a trusted budget quote")
+            plans = {plan.leg_id: plan for plan in self.legs}
+            if {item.leg_id for item in quote.legs} != set(plans):
+                raise ContractValidationError("group budget quote membership mismatch")
+            for item in quote.legs:
+                plan = plans[item.leg_id]
+                if (
+                    item.account_ref != plan.account_ref
+                    or item.intent_fingerprint != plan.maximum_intent.fingerprint
+                    or item.metadata_digest
+                    != plan.maximum_intent.tags.get("instrument_metadata_digest")
+                    or item.valuation_unit != quote.valuation_unit
+                    or item.valid_until_ns < self.deadline_ns
+                ):
+                    raise ContractValidationError("group budget quote is not bound to its leg")
         first, second = self.ordered_legs
         if first.maximum_intent.side is second.maximum_intent.side:
             raise ContractValidationError("P5A legs must have opposing sides")
@@ -194,6 +533,15 @@ class GroupOrderIntent:
     @property
     def fingerprint(self) -> str:
         return payload_sha256(self.to_payload())
+
+    @property
+    def unquoted_fingerprint(self) -> str:
+        """Fingerprint request content independently of trusted quote facts."""
+
+        payload = self.to_payload()
+        payload["version"] = 1
+        payload.pop("budget_quote", None)
+        return payload_sha256(payload)
 
     @property
     def ordered_legs(self) -> tuple[GroupOrderLegPlan, GroupOrderLegPlan]:
@@ -215,7 +563,7 @@ class GroupOrderIntent:
         return tuple(leg for leg in self.legs if leg.account_ref == account_ref)
 
     def to_payload(self) -> dict[str, Any]:
-        return {
+        payload = {
             "version": self.version,
             "group_id": self.group_id,
             "portfolio_ref": self.portfolio_ref,
@@ -227,10 +575,14 @@ class GroupOrderIntent:
             "legs": [leg.to_payload() for leg in self.legs],
             "recovery_policy": self.recovery_policy,
         }
+        if self.version == 2:
+            assert self.budget_quote is not None
+            payload["budget_quote"] = self.budget_quote.to_payload()
+        return payload
 
     @classmethod
     def from_payload(cls, value: object) -> GroupOrderIntent:
-        if not isinstance(value, Mapping) or set(value) != {
+        legacy_keys = {
             "version",
             "group_id",
             "portfolio_ref",
@@ -241,6 +593,11 @@ class GroupOrderIntent:
             "first_leg_id",
             "legs",
             "recovery_policy",
+        }
+        current_keys = legacy_keys | {"budget_quote"}
+        if not isinstance(value, Mapping) or frozenset(value) not in {
+            frozenset(legacy_keys),
+            frozenset(current_keys),
         }:
             raise ContractValidationError("invalid group order intent payload")
         if not isinstance(value["legs"], list):
@@ -255,6 +612,9 @@ class GroupOrderIntent:
             deadline_ns=value["deadline_ns"],
             first_leg_id=value["first_leg_id"],
             legs=tuple(GroupOrderLegPlan.from_payload(leg) for leg in value["legs"]),
+            budget_quote=None
+            if "budget_quote" not in value
+            else GroupBudgetQuote.from_payload(value["budget_quote"]),
             recovery_policy=value["recovery_policy"],
         )
 
@@ -954,6 +1314,7 @@ class GroupOrderSnapshot:
     error_code: str | None
     created_at_ns: int
     updated_at_ns: int
+    budget_reservation: GroupBudgetReservation | None = None
 
     def __post_init__(self) -> None:
         if type(self.request) is not GroupOrderIntent:
@@ -986,9 +1347,51 @@ class GroupOrderSnapshot:
         for name in ("created_at_ns", "updated_at_ns"):
             if type(getattr(self, name)) is not int or getattr(self, name) <= 0:
                 raise ContractValidationError(f"invalid {name}")
+        if self.request.version == 1:
+            if self.budget_reservation is not None:
+                raise ContractValidationError("legacy group snapshot cannot carry a budget hold")
+        else:
+            reservation = self.budget_reservation
+            quote = self.request.budget_quote
+            if (
+                type(reservation) is not GroupBudgetReservation
+                or type(quote) is not GroupBudgetQuote
+            ):
+                raise ContractValidationError("version-2 group snapshot requires a budget receipt")
+            if (
+                reservation.policy_fingerprint != quote.policy_fingerprint
+                or reservation.policy.portfolio_ref != self.request.portfolio_ref
+                or reservation.policy.valuation_unit != quote.valuation_unit
+                or reservation.quote_fingerprint != quote.fingerprint
+                or reservation.valuation_unit != quote.valuation_unit
+                or reservation.gross_notional != quote.gross_notional
+                or reservation.deadline_ns != self.request.deadline_ns
+            ):
+                raise ContractValidationError("stored group budget receipt does not match request")
+            if self.state is GroupOrderState.PAIRED and (
+                reservation.state is not GroupBudgetReservationState.HELD
+            ):
+                raise ContractValidationError("paired group must retain its gross budget")
+            if self.state is GroupOrderState.CLOSED and (
+                reservation.state is not GroupBudgetReservationState.RELEASED
+            ):
+                raise ContractValidationError("closed group must have released budget evidence")
+            if self.state is GroupOrderState.REJECTED_BEFORE_DISPATCH and reservation.state not in {
+                GroupBudgetReservationState.DENIED,
+                GroupBudgetReservationState.RELEASED,
+            }:
+                raise ContractValidationError("rejected group has an active budget hold")
+            if self.state not in {
+                GroupOrderState.CLOSED,
+                GroupOrderState.REJECTED_BEFORE_DISPATCH,
+            } and reservation.state in {
+                GroupBudgetReservationState.RELEASED,
+                GroupBudgetReservationState.DENIED,
+            }:
+                raise ContractValidationError("active group does not have an active budget hold")
 
     def to_payload(self) -> dict[str, Any]:
-        return {
+        payload = {
             "request": self.request.to_payload(),
             "state": self.state.value,
             "revision": self.revision,
@@ -1001,10 +1404,14 @@ class GroupOrderSnapshot:
             "created_at_ns": self.created_at_ns,
             "updated_at_ns": self.updated_at_ns,
         }
+        if self.request.version == 2:
+            assert self.budget_reservation is not None
+            payload["budget_reservation"] = self.budget_reservation.to_payload()
+        return payload
 
     @classmethod
     def from_payload(cls, value: object) -> GroupOrderSnapshot:
-        if not isinstance(value, Mapping) or set(value) != {
+        legacy_keys = {
             "request",
             "state",
             "revision",
@@ -1014,6 +1421,11 @@ class GroupOrderSnapshot:
             "error_code",
             "created_at_ns",
             "updated_at_ns",
+        }
+        current_keys = legacy_keys | {"budget_reservation"}
+        if not isinstance(value, Mapping) or frozenset(value) not in {
+            frozenset(legacy_keys),
+            frozenset(current_keys),
         }:
             raise ContractValidationError("invalid group snapshot payload")
         if not isinstance(value["reservations"], list) or not isinstance(value["legs"], list):
@@ -1032,6 +1444,9 @@ class GroupOrderSnapshot:
             error_code=value["error_code"],
             created_at_ns=value["created_at_ns"],
             updated_at_ns=value["updated_at_ns"],
+            budget_reservation=None
+            if "budget_reservation" not in value
+            else GroupBudgetReservation.from_payload(value["budget_reservation"]),
         )
 
 
@@ -1067,6 +1482,10 @@ def _parse_decimal(value: object, name: str) -> Decimal:
 
 __all__ = [
     "GroupAccountReservationSnapshot",
+    "GroupBudgetLegQuote",
+    "GroupBudgetQuote",
+    "GroupBudgetReservation",
+    "GroupBudgetReservationState",
     "GroupChildOrderStatus",
     "GroupDispatchResolutionReceipt",
     "GroupLegClaimReceipt",
@@ -1079,6 +1498,7 @@ __all__ = [
     "GroupOrderLegPlan",
     "GroupOrderSnapshot",
     "GroupOrderState",
+    "PortfolioGroupBudgetPolicy",
     "GroupReservationPhase",
     "GroupRiskLegSnapshot",
 ]

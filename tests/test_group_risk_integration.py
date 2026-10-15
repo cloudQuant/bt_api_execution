@@ -28,12 +28,14 @@ from bt_api_execution import (
     GroupRiskLegSnapshot,
     OrderIntent,
     OrderType,
+    PortfolioGroupBudgetPolicy,
     PositionEffect,
     ProviderObservation,
     Side,
     SqliteExecutionStore,
     SqliteOrderGroupStore,
     TimeInForce,
+    build_instrument_risk_group_budget_quote,
     group_leg_intent_id,
     payload_sha256,
     risk_account_scope_fingerprint,
@@ -445,7 +447,28 @@ class _ExecutionProvider:
         raise AssertionError("group-submit integration test must not cancel")
 
 
-def _request() -> GroupOrderIntent:
+def _instrument_registry(risk):
+    records = {}
+    for instrument in ("FOO-USD", "BAR-USD"):
+        records[instrument] = risk.InstrumentRiskMetadata(
+            instrument=instrument,
+            metadata_version="instrument-v1",
+            as_of_ns=_NOW_NS - 1_000_000,
+            expires_at_ns=_DEADLINE_NS,
+            tick_size=Decimal("0.01"),
+            quantity_step=Decimal("0.25"),
+            contract_multiplier=Decimal("1"),
+            max_gross_notional=Decimal("1000000"),
+            taker_fee_bps=Decimal("10"),
+            fixed_fee=Decimal("0.1"),
+            max_slippage_bps=Decimal("100"),
+            quantity_unit="contract",
+            valuation_unit="USD",
+        )
+    return records, risk.InstrumentRiskRegistry(records.values())
+
+
+def _request(records) -> GroupOrderIntent:
     scopes = (
         ExecutionScope("fixture", "sandbox", _WIRE_ACCOUNT, "strategy-p5a"),
         ExecutionScope("fixture", "sandbox", _WIRE_ACCOUNT, "strategy-p5a"),
@@ -460,8 +483,10 @@ def _request() -> GroupOrderIntent:
         order_type=OrderType.LIMIT,
         quantity=Decimal("2"),
         price=Decimal("10"),
+        metadata_version=records["FOO-USD"].metadata_version,
         time_in_force=TimeInForce.IOC,
         deadline_ns=_DEADLINE_NS,
+        tags={"instrument_metadata_digest": records["FOO-USD"].digest},
     )
     second = OrderIntent(
         intent_id=group_leg_intent_id("risk-backed-group", "leg-hedge"),
@@ -473,8 +498,10 @@ def _request() -> GroupOrderIntent:
         order_type=OrderType.LIMIT,
         quantity=Decimal("1.5"),
         price=Decimal("20"),
+        metadata_version=records["BAR-USD"].metadata_version,
         time_in_force=TimeInForce.IOC,
         deadline_ns=_DEADLINE_NS,
+        tags={"instrument_metadata_digest": records["BAR-USD"].digest},
     )
     return GroupOrderIntent(
         group_id="risk-backed-group",
@@ -499,6 +526,7 @@ def test_real_risk_group_submit_uses_account_scope_through_order_entry(tmp_path)
     """Exercise the actual facade call path, not a coordinator-side Risk call."""
 
     risk = pytest.importorskip("bt_api_risk")
+    records, _ = _instrument_registry(risk)
     trusted_scope = risk.AccountScope("fixture", "mapped-risk-account-a", "sandbox")
     mapper = _RiskIntentMapper(risk, trusted_scope)
     resolution_authority = _SyntheticExposureAuthority(risk)
@@ -523,7 +551,7 @@ def test_real_risk_group_submit_uses_account_scope_through_order_entry(tmp_path)
         notional_unit="USD",
     )
     adapter = risk.DurableRiskAdmissionAdapter(gate, mapper)
-    request = _request()
+    request = _request(records)
     first_plan = request.ordered_legs[0]
     reservation = adapter.reserve_group_vector(
         trusted_scope,
@@ -556,6 +584,12 @@ def test_real_risk_group_submit_uses_account_scope_through_order_entry(tmp_path)
         account_ref=_WIRE_ACCOUNT,
         strategy_ref=request.strategy_id,
     )
+    group_base_scope = WireScope(
+        execution_domain_ref="fixture-sandbox",
+        account_ref=_WIRE_ACCOUNT,
+        strategy_ref=request.strategy_id,
+        portfolio_ref=request.portfolio_ref,
+    )
     group_scope = WireScope(
         execution_domain_ref="fixture-sandbox",
         account_ref=_WIRE_ACCOUNT,
@@ -573,7 +607,10 @@ def test_real_risk_group_submit_uses_account_scope_through_order_entry(tmp_path)
     execution_store = SqliteExecutionStore(tmp_path / "service-path-execution.sqlite3")
     service = ExecutionOrderEntryService(
         execution_store,
-        {base_scope: first_plan.maximum_intent.scope},
+        {
+            base_scope: first_plan.maximum_intent.scope,
+            group_base_scope: first_plan.maximum_intent.scope,
+        },
         provider,
         admission_gate=AccountScopedGroupAdmissionAdapter(adapter, account_scope=trusted_scope),
         group_coordinator_authority=_GroupExecutionAuthority(),
@@ -602,6 +639,7 @@ def test_real_risk_group_submit_uses_account_scope_through_order_entry(tmp_path)
 
 def test_real_risk_vector_partial_fill_resolution_then_hedge(tmp_path) -> None:
     risk = pytest.importorskip("bt_api_risk")
+    records, instrument_registry = _instrument_registry(risk)
     scope = risk.AccountScope("fixture", "mapped-risk-account-a", "sandbox")
     mapper = _RiskIntentMapper(risk, scope)
     authority = _SyntheticExposureAuthority(risk)
@@ -628,12 +666,27 @@ def test_real_risk_vector_partial_fill_resolution_then_hedge(tmp_path) -> None:
     adapter = risk.DurableRiskAdmissionAdapter(gate, mapper)
     reservations = _RiskReservationOwner(_WIRE_ACCOUNT, scope, adapter)
     orders = _RiskBackedOrdersOwner(risk, scope, adapter, reservations)
-    request = _request()
+    request = _request(records)
     store = SqliteOrderGroupStore(tmp_path / "groups.sqlite")
+    budget_policy = PortfolioGroupBudgetPolicy(
+        portfolio_ref=request.portfolio_ref,
+        policy_id="synthetic-p5a-budget",
+        policy_version=1,
+        valuation_unit="USD",
+        max_group_gross_notional=Decimal("1000"),
+        max_active_gross_notional=Decimal("1000"),
+        max_active_groups=3,
+    )
     coordinator = GroupOrderCoordinator(
         store,
         reservations={_WIRE_ACCOUNT: reservations},
         orders={_WIRE_ACCOUNT: orders},
+        portfolio_budget_policies={request.portfolio_ref: budget_policy},
+        budget_quote_builder=lambda group, policy, *, now_ns: (
+            build_instrument_risk_group_budget_quote(
+                group, policy, instrument_registry, now_ns=now_ns
+            )
+        ),
         clock_ns=lambda: _NOW_NS + 1,
     )
 
@@ -663,6 +716,7 @@ def test_real_risk_vector_partial_fill_resolution_then_hedge(tmp_path) -> None:
 
 def test_real_risk_unknown_response_recovers_original_intent_without_reclaim(tmp_path) -> None:
     risk = pytest.importorskip("bt_api_risk")
+    records, instrument_registry = _instrument_registry(risk)
     scope = risk.AccountScope("fixture", "mapped-risk-account-a", "sandbox")
     mapper = _RiskIntentMapper(risk, scope)
     authority = _SyntheticExposureAuthority(risk)
@@ -689,13 +743,28 @@ def test_real_risk_unknown_response_recovers_original_intent_without_reclaim(tmp
     adapter = risk.DurableRiskAdmissionAdapter(gate, mapper)
     reservations = _RiskReservationOwner(_WIRE_ACCOUNT, scope, adapter)
     orders = _RiskBackedOrdersOwner(risk, scope, adapter, reservations, lose_first_response=True)
-    request = _request()
+    request = _request(records)
     store_path = tmp_path / "groups-recovery.sqlite"
     store = SqliteOrderGroupStore(store_path)
+    budget_policy = PortfolioGroupBudgetPolicy(
+        portfolio_ref=request.portfolio_ref,
+        policy_id="synthetic-p5a-budget-recovery",
+        policy_version=1,
+        valuation_unit="USD",
+        max_group_gross_notional=Decimal("1000"),
+        max_active_gross_notional=Decimal("1000"),
+        max_active_groups=3,
+    )
     coordinator = GroupOrderCoordinator(
         store,
         reservations={_WIRE_ACCOUNT: reservations},
         orders={_WIRE_ACCOUNT: orders},
+        portfolio_budget_policies={request.portfolio_ref: budget_policy},
+        budget_quote_builder=lambda group, policy, *, now_ns: (
+            build_instrument_risk_group_budget_quote(
+                group, policy, instrument_registry, now_ns=now_ns
+            )
+        ),
         clock_ns=lambda: _NOW_NS + 1,
     )
 
@@ -714,6 +783,12 @@ def test_real_risk_unknown_response_recovers_original_intent_without_reclaim(tmp
         reopened_store,
         reservations={_WIRE_ACCOUNT: reservations},
         orders={_WIRE_ACCOUNT: orders},
+        portfolio_budget_policies={request.portfolio_ref: budget_policy},
+        budget_quote_builder=lambda group, policy, *, now_ns: (
+            build_instrument_risk_group_budget_quote(
+                group, policy, instrument_registry, now_ns=now_ns
+            )
+        ),
         clock_ns=lambda: _NOW_NS + 2,
     )
     result = recovered.advance_group(request.portfolio_ref, request.group_id)

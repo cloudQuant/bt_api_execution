@@ -16,9 +16,10 @@ from fractions import Fraction
 from typing import TYPE_CHECKING, Any, Protocol
 
 from .contracts import TERMINAL_STATES, ExecutionState, OrderIntent
-from .errors import ContractValidationError
+from .errors import ContractValidationError, IntentConflictError
 from .group_order_contracts import (
     GroupAccountReservationSnapshot,
+    GroupBudgetQuote,
     GroupChildOrderStatus,
     GroupDispatchResolutionReceipt,
     GroupLegClaimReceipt,
@@ -30,6 +31,7 @@ from .group_order_contracts import (
     GroupOrderSnapshot,
     GroupOrderState,
     GroupReservationPhase,
+    PortfolioGroupBudgetPolicy,
 )
 from .group_store import SqliteOrderGroupStore
 
@@ -79,6 +81,18 @@ class GroupOrderEntryPort(Protocol):
     ) -> GroupDispatchResolutionReceipt: ...
 
 
+class GroupBudgetQuoteBuilder(Protocol):
+    """Trusted local assessor; it must use current server-owned instrument facts."""
+
+    def __call__(
+        self,
+        request: GroupOrderIntent,
+        policy: PortfolioGroupBudgetPolicy,
+        *,
+        now_ns: int,
+    ) -> GroupBudgetQuote: ...
+
+
 class GroupReservationDeniedError(PermissionError):
     """A coded, known denial from the account reservation owner."""
 
@@ -103,6 +117,8 @@ class GroupOrderCoordinator:
         *,
         reservations: Mapping[str, AccountReservationsPort],
         orders: Mapping[str, GroupOrderEntryPort],
+        portfolio_budget_policies: Mapping[str, PortfolioGroupBudgetPolicy] | None = None,
+        budget_quote_builder: GroupBudgetQuoteBuilder | None = None,
         clock_ns: Callable[[], int] = time.time_ns,
     ) -> None:
         if type(store) is not SqliteOrderGroupStore or not callable(clock_ns):
@@ -127,10 +143,20 @@ class GroupOrderCoordinator:
                 for name in ("submit_group_leg", "query", "resolve_group_leg")
             ):
                 raise ContractValidationError("account group order port is incomplete")
+        policies = {} if portfolio_budget_policies is None else dict(portfolio_budget_policies)
+        if any(
+            type(policy) is not PortfolioGroupBudgetPolicy or portfolio_ref != policy.portfolio_ref
+            for portfolio_ref, policy in policies.items()
+        ):
+            raise ContractValidationError("portfolio budget policies must use exact portfolio keys")
+        if policies and not callable(budget_quote_builder):
+            raise ContractValidationError("trusted group budget quote builder is required")
         self._store = store
         self._scope_fingerprints = fingerprints
         self._reservations = dict(reservations)
         self._orders = dict(orders)
+        self._budget_policies = policies
+        self._budget_quote_builder = budget_quote_builder
         self._clock_ns = clock_ns
         self._lock = threading.RLock()
 
@@ -141,11 +167,29 @@ class GroupOrderCoordinator:
             raise ContractValidationError("normalized group order intent is required")
         if any(account not in self._reservations for account in request.account_refs):
             raise ContractValidationError("group references an unconfigured account target")
-        now = self._now()
         existing = self._store.get(request.portfolio_ref, request.group_id)
-        if existing is None and request.deadline_ns <= now:
+        if existing is not None:
+            if existing.request.unquoted_fingerprint != request.unquoted_fingerprint:
+                raise IntentConflictError()
+            return existing
+        if request.version != 1 or request.budget_quote is not None:
+            raise ContractValidationError("new group budget quotes are built by the trusted owner")
+        policy = self._budget_policies.get(request.portfolio_ref)
+        if policy is None or self._budget_quote_builder is None:
+            raise ContractValidationError("trusted portfolio group budget is not configured")
+        now = self._now()
+        if request.deadline_ns <= now:
             raise ContractValidationError("group deadline has elapsed")
-        snapshot = self._store.create_or_get(request, now_ns=now)
+        quote = self._budget_quote_builder(request, policy, now_ns=now)
+        if type(quote) is not GroupBudgetQuote or quote.policy_fingerprint != policy.fingerprint:
+            raise ContractValidationError("trusted quote builder returned an unbound group quote")
+        accepted_request = replace(request, version=2, budget_quote=quote)
+        snapshot = self._store.create_or_get(
+            accepted_request,
+            budget_policy=policy,
+            now_ns=now,
+            clock_ns=self._clock_ns,
+        )
         return self._store.bind_account_scopes(snapshot, self._scope_fingerprints, now_ns=now)
 
     def query(self, portfolio_ref: str, group_id: str) -> GroupOrderSnapshot | None:
@@ -164,6 +208,10 @@ class GroupOrderCoordinator:
                 GroupOrderState.REJECTED_BEFORE_DISPATCH,
             }:
                 return snapshot
+            if snapshot.request.version == 1:
+                # Migrated legacy groups remain queryable, but there is no
+                # trusted budget estimate to authorize a new provider write.
+                return self._mark_recovery(snapshot, "LEGACY_GROUP_BUDGET_UNAVAILABLE")
             snapshot = self._store.bind_account_scopes(
                 snapshot, self._scope_fingerprints, now_ns=self._now()
             )
@@ -1320,6 +1368,7 @@ def _fraction_to_decimal(value: Fraction) -> Decimal:
 
 __all__ = [
     "AccountReservationsPort",
+    "GroupBudgetQuoteBuilder",
     "GroupOrderCoordinator",
     "GroupOrderEntryPort",
     "GroupReservationDeniedError",
