@@ -1252,7 +1252,11 @@ class StrategyCheckpoint:
 
 @dataclass(frozen=True, slots=True)
 class ProviderObservation:
-    """Normalized provider evidence applied after dispatch or reconciliation."""
+    """Normalized provider evidence applied after dispatch or reconciliation.
+
+    ``average_price`` is the cumulative average over ``filled_quantity``; it
+    is not the price of only the most recent partial fill.
+    """
 
     intent_id: str
     state: ExecutionState
@@ -1261,6 +1265,7 @@ class ProviderObservation:
     average_price: Decimal | None = None
     reason_code: str | None = None
     cumulative_commission: Decimal | None = None
+    cumulative_commission_currency: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "intent_id", _text(self.intent_id, "intent_id"))
@@ -1293,6 +1298,14 @@ class ProviderObservation:
                 self,
                 "cumulative_commission",
                 _decimal(self.cumulative_commission, "cumulative_commission"),
+            )
+        if self.cumulative_commission_currency is not None:
+            if self.cumulative_commission is None:
+                raise ContractValidationError("commission currency requires cumulative commission")
+            object.__setattr__(
+                self,
+                "cumulative_commission_currency",
+                _text(self.cumulative_commission_currency, "commission currency"),
             )
         if self.provider_order_id is not None:
             object.__setattr__(

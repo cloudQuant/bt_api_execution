@@ -1983,6 +1983,39 @@ class SqliteExecutionStore:
             raise DurableStoreError("execution journal identity is invalid")
         return {"generation_kind": "EXECUTION_JOURNAL", "generation": value, "epoch": 1}
 
+    def execution_outbox_bounds(self) -> tuple[int, int | None, int | None, int]:
+        """Return the durable outbox row count and sequence bounds.
+
+        Consumers can detect journal gaps without reading events outside their
+        registered scopes.  A complete AUTOINCREMENT journal starts at one
+        and has ``count == last_sequence``; an empty journal returns
+        ``(0, None, None, 0)``. The final value is SQLite's AUTOINCREMENT
+        high-water mark, so deletion of the newest rows is visible too.
+        """
+
+        with self._lock:
+            try:
+                row = self._connection.execute(
+                    "SELECT COUNT(*) AS row_count, MIN(sequence) AS first_sequence, "
+                    "MAX(sequence) AS last_sequence FROM execution_outbox"
+                ).fetchone()
+                sequence_row = self._connection.execute(
+                    "SELECT seq FROM sqlite_sequence WHERE name = 'execution_outbox'"
+                ).fetchone()
+            except sqlite3.Error as error:
+                raise DurableStoreError("unable to inspect execution outbox bounds") from error
+        if row is None:
+            raise DurableStoreError("execution outbox bounds are unavailable")
+        count = int(row["row_count"])
+        first = None if row["first_sequence"] is None else int(row["first_sequence"])
+        last = None if row["last_sequence"] is None else int(row["last_sequence"])
+        high_water = 0 if sequence_row is None else int(sequence_row["seq"])
+        if (count == 0) != (first is None and last is None):
+            raise DurableStoreError("execution outbox bounds are inconsistent")
+        if high_water < (last or 0):
+            raise DurableStoreError("execution outbox sequence high-water mark regressed")
+        return count, first, last, high_water
+
     @classmethod
     def _ctp_account_store_path(cls, path: str | Path, scope: ExecutionScope | None) -> Path:
         if scope is not None:
@@ -13969,7 +14002,39 @@ class SqliteExecutionStore:
                 if observation.cumulative_commission is None:
                     return record, None
                 if record.cumulative_commission == observation.cumulative_commission:
-                    return record, None
+                    previous_currency = self._previous_observed_commission_currency(
+                        cursor, scope.key, observation.intent_id
+                    )
+                    incoming_currency = observation.cumulative_commission_currency
+                    if (
+                        previous_currency is not None
+                        and incoming_currency is not None
+                        and previous_currency != incoming_currency
+                    ):
+                        raise InvalidStateTransition("provider commission currency changed")
+                    if incoming_currency is None or previous_currency == incoming_currency:
+                        return record, None
+                    appended_event = self._append_event(
+                        cursor,
+                        intent_id=observation.intent_id,
+                        scope_key=scope.key,
+                        event_type="provider_commission_evidence",
+                        state=target,
+                        payload={
+                            "provider_order_id": record.provider_order_id,
+                            "filled_quantity": format(record.filled_quantity, "f"),
+                            "average_price": (
+                                None
+                                if record.average_price is None
+                                else format(record.average_price, "f")
+                            ),
+                            "cumulative_commission": format(observation.cumulative_commission, "f"),
+                            "source": source,
+                            "cumulative_commission_currency": incoming_currency,
+                        },
+                        now_ns=now_ns,
+                    )
+                    return record, appended_event
                 if record.cumulative_commission is not None:
                     raise InvalidStateTransition("conflicting duplicate provider commission")
                 cursor.execute(
@@ -14001,6 +14066,15 @@ class SqliteExecutionStore:
                         ),
                         "cumulative_commission": format(observation.cumulative_commission, "f"),
                         "source": source,
+                        **(
+                            {
+                                "cumulative_commission_currency": (
+                                    observation.cumulative_commission_currency
+                                )
+                            }
+                            if observation.cumulative_commission_currency is not None
+                            else {}
+                        ),
                     },
                     now_ns=now_ns,
                 )
@@ -14023,6 +14097,16 @@ class SqliteExecutionStore:
             ):
                 raise InvalidStateTransition("provider order identity changed")
             provider_order_id = observation.provider_order_id or record.provider_order_id
+            if observation.cumulative_commission is not None:
+                previous_currency = self._previous_observed_commission_currency(
+                    cursor, scope.key, observation.intent_id
+                )
+                if (
+                    previous_currency is not None
+                    and observation.cumulative_commission_currency is not None
+                    and previous_currency != observation.cumulative_commission_currency
+                ):
+                    raise InvalidStateTransition("provider commission currency changed")
             cursor.execute(
                 """
                 UPDATE execution_records
@@ -14053,6 +14137,26 @@ class SqliteExecutionStore:
                     observation.intent_id,
                 ),
             )
+            observation_payload: dict[str, Any] = {
+                "provider_order_id": provider_order_id,
+                "filled_quantity": format(observation.filled_quantity, "f"),
+                "average_price": (
+                    None
+                    if observation.average_price is None
+                    else format(observation.average_price, "f")
+                ),
+                "cumulative_commission": (
+                    None
+                    if observation.cumulative_commission is None
+                    else format(observation.cumulative_commission, "f")
+                ),
+                "reason_code": observation.reason_code,
+                "source": source,
+            }
+            if observation.cumulative_commission_currency is not None:
+                observation_payload["cumulative_commission_currency"] = (
+                    observation.cumulative_commission_currency
+                )
             appended_event = self._append_event(
                 cursor,
                 intent_id=observation.intent_id,
@@ -14061,22 +14165,7 @@ class SqliteExecutionStore:
                 if source == "provider"
                 else "reconciled_observation",
                 state=target,
-                payload={
-                    "provider_order_id": provider_order_id,
-                    "filled_quantity": format(observation.filled_quantity, "f"),
-                    "average_price": (
-                        None
-                        if observation.average_price is None
-                        else format(observation.average_price, "f")
-                    ),
-                    "cumulative_commission": (
-                        None
-                        if observation.cumulative_commission is None
-                        else format(observation.cumulative_commission, "f")
-                    ),
-                    "reason_code": observation.reason_code,
-                    "source": source,
-                },
+                payload=observation_payload,
                 now_ns=now_ns,
             )
             updated = self._fetch_record(cursor, scope.key, observation.intent_id)
@@ -14102,6 +14191,35 @@ class SqliteExecutionStore:
             raise InvalidStateTransition("filled quantity must equal intent quantity")
         if observation.state is ExecutionState.REJECTED and filled != 0:
             raise InvalidStateTransition("rejected order cannot include fills")
+
+    @staticmethod
+    def _previous_observed_commission_currency(
+        cursor: sqlite3.Cursor, scope_key: str, intent_id: str
+    ) -> str | None:
+        """Return the last explicit fee currency for this durable intent."""
+
+        rows = cursor.execute(
+            """
+            SELECT payload_json FROM execution_outbox
+            WHERE scope_key = ? AND intent_id = ?
+              AND event_type IN (
+                  'provider_observation', 'reconciled_observation',
+                  'provider_commission_evidence'
+              )
+            ORDER BY sequence DESC
+            """,
+            (scope_key, intent_id),
+        )
+        for row in rows:
+            try:
+                payload = json.loads(row["payload_json"])
+            except (TypeError, json.JSONDecodeError) as error:
+                raise DurableStoreError("stored commission observation is unreadable") from error
+            if payload.get("cumulative_commission") is not None:
+                currency = payload.get("cumulative_commission_currency")
+                if currency is not None:
+                    return str(currency)
+        return None
 
     def mark_review_required(
         self,
