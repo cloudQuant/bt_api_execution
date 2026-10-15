@@ -118,6 +118,12 @@ class AccountScopedGroupAdmissionAdapter:
     def risk_scope_fingerprint(self) -> str:
         return self._scope_fingerprint
 
+    def require_admission_gate(self, expected: Any) -> None:
+        """Require this adapter to wrap the exact trusted admission gate."""
+
+        if self._admission_gate is not expected:
+            raise ContractValidationError("account-scoped adapter wraps a different admission gate")
+
     def reserve(self, intent: Any) -> Any:
         return self._admission_gate.reserve(intent)
 
