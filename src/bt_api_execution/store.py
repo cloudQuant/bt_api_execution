@@ -2058,6 +2058,1025 @@ class SqliteExecutionStore:
         return count, first, last, high_water
 
     @staticmethod
+    def _ensure_paper_schema(cursor: sqlite3.Cursor, *, create: bool) -> None:
+        """Create or verify the separately versioned, opt-in paper tables."""
+
+        expected_objects = {
+            "paper_owner_domains",
+            "paper_match_receipts",
+            "paper_owner_domains_immutable_update",
+            "paper_owner_domains_immutable_delete",
+            "paper_match_receipts_immutable_update",
+            "paper_match_receipts_immutable_delete",
+        }
+        version_row = cursor.execute(
+            "SELECT value FROM execution_meta WHERE key = 'paper_schema_version'"
+        ).fetchone()
+        existing_objects = {
+            str(row["name"])
+            for row in cursor.execute(
+                "SELECT name FROM sqlite_master WHERE name LIKE 'paper_%' "
+                "AND type IN ('table', 'trigger')"
+            ).fetchall()
+        }
+        if version_row is None:
+            if existing_objects:
+                raise DurableStoreError("paper execution schema is partial or unversioned")
+            if not create:
+                raise DurableStoreError("paper execution owner is not registered")
+            SqliteExecutionStore._execute_schema_statements(
+                cursor,
+                """
+                CREATE TABLE paper_owner_domains (
+                    scope_key TEXT PRIMARY KEY,
+                    account_key TEXT NOT NULL UNIQUE,
+                    execution_domain_ref TEXT NOT NULL,
+                    simulation_account_ref TEXT NOT NULL,
+                    experiment_ref TEXT NOT NULL,
+                    strategy_ref TEXT NOT NULL,
+                    model_ref TEXT NOT NULL,
+                    model_version TEXT NOT NULL,
+                    domain_sha256 TEXT NOT NULL CHECK(length(domain_sha256) = 64),
+                    domain_json TEXT NOT NULL,
+                    registered_at_ns INTEGER NOT NULL CHECK(registered_at_ns > 0),
+                    writer_scope_key TEXT NOT NULL,
+                    writer_owner_id TEXT NOT NULL,
+                    writer_fencing_token INTEGER NOT NULL CHECK(writer_fencing_token > 0)
+                );
+                CREATE TRIGGER paper_owner_domains_immutable_update
+                BEFORE UPDATE ON paper_owner_domains
+                BEGIN
+                    SELECT RAISE(ABORT, 'paper owner domains are immutable');
+                END;
+                CREATE TRIGGER paper_owner_domains_immutable_delete
+                BEFORE DELETE ON paper_owner_domains
+                BEGIN
+                    SELECT RAISE(ABORT, 'paper owner domains are immutable');
+                END;
+                CREATE TABLE paper_match_receipts (
+                    scope_key TEXT NOT NULL,
+                    account_key TEXT NOT NULL,
+                    intent_id TEXT NOT NULL,
+                    intent_sha256 TEXT NOT NULL CHECK(length(intent_sha256) = 64),
+                    event_id TEXT NOT NULL UNIQUE,
+                    event_sequence INTEGER NOT NULL CHECK(event_sequence > 0),
+                    journal_generation TEXT NOT NULL,
+                    receipt_sha256 TEXT NOT NULL CHECK(length(receipt_sha256) = 64),
+                    receipt_json TEXT NOT NULL,
+                    recorded_at_ns INTEGER NOT NULL CHECK(recorded_at_ns > 0),
+                    writer_scope_key TEXT NOT NULL,
+                    writer_owner_id TEXT NOT NULL,
+                    writer_fencing_token INTEGER NOT NULL CHECK(writer_fencing_token > 0),
+                    PRIMARY KEY(scope_key, intent_id),
+                    UNIQUE(scope_key, event_sequence),
+                    FOREIGN KEY(scope_key, intent_id)
+                        REFERENCES execution_records(scope_key, intent_id),
+                    FOREIGN KEY(event_id)
+                        REFERENCES execution_outbox(event_id)
+                );
+                CREATE TRIGGER paper_match_receipts_immutable_update
+                BEFORE UPDATE ON paper_match_receipts
+                BEGIN
+                    SELECT RAISE(ABORT, 'paper match receipts are immutable');
+                END;
+                CREATE TRIGGER paper_match_receipts_immutable_delete
+                BEFORE DELETE ON paper_match_receipts
+                BEGIN
+                    SELECT RAISE(ABORT, 'paper match receipts are immutable');
+                END;
+                """,
+            )
+            cursor.execute(
+                "INSERT INTO execution_meta(key, value) VALUES ('paper_schema_version', '1')"
+            )
+        elif str(version_row["value"]) != "1":
+            raise DurableStoreError("unsupported paper execution schema version")
+        existing_objects = {
+            str(row["name"])
+            for row in cursor.execute(
+                "SELECT name FROM sqlite_master WHERE name LIKE 'paper_%' "
+                "AND type IN ('table', 'trigger')"
+            ).fetchall()
+        }
+        if existing_objects != expected_objects:
+            raise DurableStoreError("paper execution schema objects are incomplete or unknown")
+        expected_columns = {
+            "paper_owner_domains": (
+                "scope_key",
+                "account_key",
+                "execution_domain_ref",
+                "simulation_account_ref",
+                "experiment_ref",
+                "strategy_ref",
+                "model_ref",
+                "model_version",
+                "domain_sha256",
+                "domain_json",
+                "registered_at_ns",
+                "writer_scope_key",
+                "writer_owner_id",
+                "writer_fencing_token",
+            ),
+            "paper_match_receipts": (
+                "scope_key",
+                "account_key",
+                "intent_id",
+                "intent_sha256",
+                "event_id",
+                "event_sequence",
+                "journal_generation",
+                "receipt_sha256",
+                "receipt_json",
+                "recorded_at_ns",
+                "writer_scope_key",
+                "writer_owner_id",
+                "writer_fencing_token",
+            ),
+        }
+        for table_name, expected in expected_columns.items():
+            columns = tuple(
+                str(row["name"])
+                for row in cursor.execute(f"PRAGMA table_info({table_name})").fetchall()
+            )
+            if columns != expected:
+                raise DurableStoreError("paper execution table shape is unknown")
+
+    def register_paper_owner_domain(
+        self,
+        scope: ExecutionScope,
+        domain: Any,
+        *,
+        writer_lease: WriterLease,
+    ) -> str:
+        """Persist one immutable code-owned paper owner under its current fence."""
+
+        from .paper_execution import PAPER_ENVIRONMENT, PAPER_PROVIDER, PaperOwnerDomainV1
+
+        if (
+            type(scope) is not ExecutionScope
+            or type(domain) is not PaperOwnerDomainV1
+            or type(writer_lease) is not WriterLease
+            or scope.provider != PAPER_PROVIDER
+            or scope.environment != PAPER_ENVIRONMENT
+            or scope.account_ref != domain.simulation_account_ref
+            or scope.strategy_id != domain.strategy_ref
+        ):
+            raise ContractValidationError("paper owner and durable execution scope do not match")
+        domain_json = canonical_json(domain.to_payload())
+        domain_sha = hashlib.sha256(domain_json.encode("utf-8")).hexdigest()
+        with self._transaction() as cursor:
+            transaction_now_ns = time.time_ns()
+            self._assert_active_writer_lease(cursor, scope, writer_lease, now_ns=transaction_now_ns)
+            self._ensure_paper_schema(cursor, create=True)
+            existing = cursor.execute(
+                "SELECT * FROM paper_owner_domains WHERE scope_key = ?", (scope.key,)
+            ).fetchone()
+            if existing is not None:
+                if (
+                    str(existing["account_key"]) != scope.account_key
+                    or str(existing["domain_sha256"]) != domain_sha
+                    or str(existing["domain_json"]) != domain_json
+                    or str(existing["execution_domain_ref"]) != domain.execution_domain_ref
+                    or str(existing["simulation_account_ref"]) != domain.simulation_account_ref
+                    or str(existing["experiment_ref"]) != domain.experiment_ref
+                    or str(existing["strategy_ref"]) != domain.strategy_ref
+                    or str(existing["model_ref"]) != domain.model_ref
+                    or str(existing["model_version"]) != domain.model_version
+                ):
+                    raise DurableStoreError(
+                        "paper owner scope is already bound to other domain facts"
+                    )
+                now_ns = time.time_ns()
+                self._assert_active_writer_lease(cursor, scope, writer_lease, now_ns=now_ns)
+                return domain_sha
+            if (
+                cursor.execute(
+                    "SELECT 1 FROM paper_owner_domains WHERE account_key = ?",
+                    (scope.account_key,),
+                ).fetchone()
+                is not None
+            ):
+                raise DurableStoreError("paper simulation account already has a different owner")
+            if (
+                cursor.execute(
+                    "SELECT 1 FROM execution_records WHERE scope_key = ? LIMIT 1", (scope.key,)
+                ).fetchone()
+                is not None
+            ):
+                raise DurableStoreError("paper owner cannot adopt pre-existing execution history")
+            cursor.execute(
+                """
+                INSERT INTO paper_owner_domains(
+                    scope_key, account_key, execution_domain_ref, simulation_account_ref,
+                    experiment_ref, strategy_ref, model_ref, model_version, domain_sha256,
+                    domain_json, registered_at_ns, writer_scope_key, writer_owner_id,
+                    writer_fencing_token
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    scope.key,
+                    scope.account_key,
+                    domain.execution_domain_ref,
+                    domain.simulation_account_ref,
+                    domain.experiment_ref,
+                    domain.strategy_ref,
+                    domain.model_ref,
+                    domain.model_version,
+                    domain_sha,
+                    domain_json,
+                    transaction_now_ns,
+                    scope.key,
+                    writer_lease.owner_id,
+                    writer_lease.fencing_token,
+                ),
+            )
+            final_now_ns = time.time_ns()
+            self._assert_active_writer_lease(cursor, scope, writer_lease, now_ns=final_now_ns)
+        return domain_sha
+
+    @staticmethod
+    def _paper_domain_in_transaction(cursor: sqlite3.Cursor, scope: ExecutionScope) -> Any:
+        from .paper_execution import PaperOwnerDomainV1
+
+        row = cursor.execute(
+            "SELECT * FROM paper_owner_domains WHERE scope_key = ?", (scope.key,)
+        ).fetchone()
+        if row is None:
+            raise DurableStoreError("paper owner domain is not registered")
+        try:
+            payload_json = str(row["domain_json"])
+            payload = json.loads(payload_json)
+            if canonical_json(payload) != payload_json:
+                raise ValueError("noncanonical owner domain")
+            domain = PaperOwnerDomainV1.from_payload(payload)
+            if (
+                domain.fingerprint != str(row["domain_sha256"])
+                or str(row["account_key"]) != scope.account_key
+                or str(row["execution_domain_ref"]) != domain.execution_domain_ref
+                or str(row["simulation_account_ref"]) != domain.simulation_account_ref
+                or str(row["experiment_ref"]) != domain.experiment_ref
+                or str(row["strategy_ref"]) != domain.strategy_ref
+                or str(row["model_ref"]) != domain.model_ref
+                or str(row["model_version"]) != domain.model_version
+                or scope.provider != "paper"
+                or scope.environment != "paper"
+                or scope.account_ref != domain.simulation_account_ref
+                or scope.strategy_id != domain.strategy_ref
+            ):
+                raise ValueError("paper domain binding changed")
+        except (ContractValidationError, TypeError, ValueError, json.JSONDecodeError):
+            raise DurableStoreError("stored paper owner domain is unreadable") from None
+        return domain
+
+    @staticmethod
+    def _paper_journal_generation(cursor: sqlite3.Cursor) -> tuple[str, int]:
+        generation_row = cursor.execute(
+            "SELECT value FROM execution_meta WHERE key = 'journal_incarnation_id'"
+        ).fetchone()
+        bounds = cursor.execute(
+            "SELECT COUNT(*) AS row_count, MIN(sequence) AS first_sequence, "
+            "MAX(sequence) AS last_sequence FROM execution_outbox"
+        ).fetchone()
+        sequence_row = cursor.execute(
+            "SELECT seq FROM sqlite_sequence WHERE name = 'execution_outbox'"
+        ).fetchone()
+        if generation_row is None or bounds is None:
+            raise DurableStoreError("paper execution journal cut is unavailable")
+        generation = str(generation_row["value"])
+        count = int(bounds["row_count"])
+        first = None if bounds["first_sequence"] is None else int(bounds["first_sequence"])
+        last = None if bounds["last_sequence"] is None else int(bounds["last_sequence"])
+        high_water = 0 if sequence_row is None else int(sequence_row["seq"])
+        if (
+            len(generation) != 32
+            or any(character not in "0123456789abcdef" for character in generation)
+            or count != high_water
+            or last != (high_water or None)
+            or first != (1 if high_water else None)
+        ):
+            raise DurableStoreError("paper execution journal cut is incomplete")
+        return generation, high_water
+
+    @staticmethod
+    def _paper_receipt_from_row(row: sqlite3.Row) -> Any:
+        from .paper_execution import PaperMatchReceiptV1
+
+        try:
+            receipt_json = str(row["receipt_json"])
+            payload = json.loads(receipt_json)
+            if canonical_json(payload) != receipt_json:
+                raise ValueError("noncanonical receipt")
+            receipt = PaperMatchReceiptV1.from_payload(payload)
+            if (
+                receipt.receipt_sha256 != str(row["receipt_sha256"])
+                or receipt.event_id != str(row["event_id"])
+                or receipt.event_sequence != int(row["event_sequence"])
+                or receipt.journal_generation != str(row["journal_generation"])
+                or receipt.intent_id != str(row["intent_id"])
+                or receipt.intent_fingerprint != str(row["intent_sha256"])
+                or receipt.scope_key != str(row["scope_key"])
+                or receipt.account_key != str(row["account_key"])
+            ):
+                raise ValueError("receipt row binding changed")
+        except (ContractValidationError, TypeError, ValueError, json.JSONDecodeError, KeyError):
+            raise DurableStoreError("stored paper match receipt is unreadable") from None
+        return receipt
+
+    @staticmethod
+    def _paper_quote_cursor_refusal(
+        domain: Any,
+        quote: Any,
+        watermarks: dict[tuple[str, str, str], tuple[int, str, int]],
+    ) -> str | None:
+        from .paper_execution import PaperQuoteV1
+
+        if type(quote) is not PaperQuoteV1:
+            return None
+        if (
+            quote.source_ref != domain.quote_source_ref
+            or quote.instrument not in {spec.instrument for spec in domain.instruments}
+            or quote.metadata_version != domain.instrument(quote.instrument).metadata_version
+        ):
+            return None
+        key = (quote.source_ref, quote.generation, quote.instrument)
+        previous = watermarks.get(key)
+        if previous is None:
+            return None
+        quote_sha = payload_sha256(quote.to_payload())
+        if quote.cursor < previous[0]:
+            return "paper_quote_cursor_regressed"
+        if quote.cursor == previous[0]:
+            if quote_sha != previous[1]:
+                return "paper_quote_cursor_conflict"
+            return "paper_quote_cursor_reused"
+        return None
+
+    @staticmethod
+    def _paper_event_matches_receipt(
+        event_row: sqlite3.Row,
+        receipt: Any,
+    ) -> None:
+
+        try:
+            payload_json = str(event_row["payload_json"])
+            payload = json.loads(payload_json)
+            if canonical_json(payload) != payload_json:
+                raise ValueError("noncanonical event")
+            expected_payload: dict[str, Any] = {
+                "provider_order_id": (
+                    "paper-"
+                    + payload_sha256(
+                        {
+                            "execution_domain_ref": receipt.execution_domain_ref,
+                            "simulation_account_ref": receipt.simulation_account_ref,
+                            "intent_id": receipt.intent_id,
+                        }
+                    )[:32]
+                    if receipt.state is ExecutionState.FILLED
+                    else None
+                ),
+                "filled_quantity": format(receipt.quantity, "f"),
+                "average_price": (
+                    None if receipt.fill_price is None else format(receipt.fill_price, "f")
+                ),
+                "cumulative_commission": (
+                    format(receipt.fee_amount, "f")
+                    if receipt.state is ExecutionState.FILLED
+                    else None
+                ),
+                "reason_code": receipt.reason_code,
+                "source": "provider",
+            }
+            if receipt.state is ExecutionState.FILLED:
+                expected_payload["cumulative_commission_currency"] = receipt.fee_currency
+            if (
+                str(event_row["event_id"]) != receipt.event_id
+                or int(event_row["sequence"]) != receipt.event_sequence
+                or str(event_row["intent_id"]) != receipt.intent_id
+                or str(event_row["scope_key"]) != receipt.scope_key
+                or str(event_row["event_type"]) != "provider_observation"
+                or str(event_row["state"]) != receipt.state.value
+                or str(event_row["journal_incarnation_id"]) != receipt.journal_generation
+                or int(event_row["created_at_ns"]) != receipt.evaluated_at_ns
+                or payload != expected_payload
+            ):
+                raise ValueError("receipt does not match its execution event")
+        except (TypeError, ValueError, json.JSONDecodeError, KeyError):
+            raise DurableStoreError("paper receipt execution event binding is invalid") from None
+
+    def _paper_replay_receipts(
+        self,
+        cursor: sqlite3.Cursor,
+        scope: ExecutionScope,
+        domain: Any,
+        *,
+        generation: str,
+        high_water: int,
+    ) -> tuple[Any, dict[tuple[str, str, str], tuple[int, str, int]], tuple[Any, ...]]:
+        from .paper_execution import (
+            PaperDispatchResultV1,
+            apply_paper_decision,
+            evaluate_paper_match,
+            initial_paper_state,
+            paper_state_digest,
+        )
+
+        receipts: list[Any] = []
+        state = initial_paper_state(domain)
+        watermarks: dict[tuple[str, str, str], tuple[int, str, int]] = {}
+        rows = cursor.execute(
+            "SELECT * FROM paper_match_receipts WHERE scope_key = ? ORDER BY event_sequence",
+            (scope.key,),
+        ).fetchall()
+        last_sequence = 0
+        for receipt_row in rows:
+            receipt = self._paper_receipt_from_row(receipt_row)
+            if (
+                receipt.account_key != scope.account_key
+                or receipt.scope_key != scope.key
+                or receipt.execution_domain_ref != domain.execution_domain_ref
+                or receipt.simulation_account_ref != domain.simulation_account_ref
+                or receipt.experiment_ref != domain.experiment_ref
+                or receipt.model_ref != domain.model_ref
+                or receipt.model_version != domain.model_version
+                or receipt.fee_currency != domain.cash_currency
+                or receipt.event_sequence <= last_sequence
+                or receipt.journal_generation != generation
+            ):
+                raise DurableStoreError("paper receipt chain is outside its owner cut")
+            event_row = cursor.execute(
+                "SELECT * FROM execution_outbox WHERE event_id = ?",
+                (receipt.event_id,),
+            ).fetchone()
+            if event_row is None:
+                raise DurableStoreError("paper receipt has no execution event")
+            self._paper_event_matches_receipt(event_row, receipt)
+            if receipt.event_sequence > high_water:
+                raise DurableStoreError("paper receipt is beyond the current execution cut")
+
+            record_row = self._fetch_record(cursor, scope.key, receipt.intent_id)
+            if record_row is None:
+                raise DurableStoreError("paper receipt has no durable order")
+            record = self._record_from_row(record_row)
+            try:
+                payload_json = str(record_row["payload_json"])
+                intent_payload = json.loads(payload_json)
+                if canonical_json(intent_payload) != payload_json:
+                    raise ValueError("noncanonical intent")
+                intent = order_intent_from_payload(intent_payload)
+            except (ContractValidationError, TypeError, ValueError, json.JSONDecodeError):
+                raise DurableStoreError("paper receipt intent is unreadable") from None
+            if (
+                intent.fingerprint != receipt.intent_fingerprint
+                or str(record_row["payload_sha256"]) != receipt.intent_fingerprint
+                or intent.scope != scope
+                or intent.instrument != receipt.instrument
+                or intent.side is not receipt.side
+            ):
+                raise DurableStoreError("paper receipt intent binding changed")
+            before_sha = paper_state_digest(domain, state)
+            if receipt.before_book_sha256 != before_sha:
+                raise DurableStoreError("paper receipt book chain does not join")
+            cursor_refusal = self._paper_quote_cursor_refusal(domain, receipt.quote, watermarks)
+            proposal = PaperDispatchResultV1(
+                intent_id=intent.intent_id,
+                intent_fingerprint=intent.fingerprint,
+                quote=receipt.quote,
+                refusal_code=(receipt.reason_code if receipt.quote is None else None),
+            )
+            decision = evaluate_paper_match(
+                domain,
+                intent,
+                proposal,
+                state,
+                now_ns=receipt.evaluated_at_ns,
+                cursor_refusal=cursor_refusal,
+                authorization_expired=receipt.reason_code == "paper_admission_expired",
+            )
+            if (
+                decision.observation.state is not receipt.state
+                or decision.reason_code != receipt.reason_code
+                or decision.filled_quantity != receipt.quantity
+                or decision.fill_price != receipt.fill_price
+                or decision.fee_amount != receipt.fee_amount
+                or decision.cash_delta != receipt.cash_delta
+                or decision.position_delta != receipt.position_delta
+                or decision.quote != receipt.quote
+                or record.state is not receipt.state
+                or record.provider_order_id != decision.observation.provider_order_id
+                or record.filled_quantity != decision.observation.filled_quantity
+                or record.average_price != decision.observation.average_price
+                or record.cumulative_commission != decision.observation.cumulative_commission
+                or record.unknown_reason is not None
+                or record.review_required
+                or record.dispatch_attempts != 1
+            ):
+                raise DurableStoreError("paper receipt does not reproduce from trusted facts")
+            state = apply_paper_decision(domain, state, decision)
+            after_sha = paper_state_digest(domain, state)
+            if receipt.after_book_sha256 != after_sha:
+                raise DurableStoreError("paper receipt post-state digest is invalid")
+            if receipt.quote is not None and cursor_refusal is None:
+                quote = receipt.quote
+                if (
+                    quote.source_ref == domain.quote_source_ref
+                    and domain.instrument(quote.instrument) is not None
+                    and quote.metadata_version
+                    == domain.instrument(quote.instrument).metadata_version
+                ):
+                    key = (quote.source_ref, quote.generation, quote.instrument)
+                    prior = watermarks.get(key)
+                    quote_sha = payload_sha256(quote.to_payload())
+                    if prior is None or quote.cursor > prior[0]:
+                        watermarks[key] = (quote.cursor, quote_sha, quote.as_of_ns)
+                    elif quote.cursor == prior[0] and quote_sha != prior[1]:
+                        raise DurableStoreError("paper quote watermark conflicts with its history")
+            receipts.append(receipt)
+            last_sequence = receipt.event_sequence
+
+        return state, watermarks, tuple(receipts)
+
+    def _validate_paper_book_in_transaction(
+        self,
+        cursor: sqlite3.Cursor,
+        scope: ExecutionScope,
+        *,
+        allow_dispatching_intent_id: str | None = None,
+    ) -> tuple[Any, str, int, Any, Any, tuple[Any, ...]]:
+        """Validate the complete paper cut before reading or adding a match.
+
+        Settlement may exempt only the one clean dispatch claim that is being
+        written by this same atomic transaction. Other unresolved intents and
+        unreceipted provider facts always stop the paper book.
+        """
+
+        if allow_dispatching_intent_id is not None and (
+            type(allow_dispatching_intent_id) is not str or not allow_dispatching_intent_id
+        ):
+            raise ContractValidationError("invalid paper dispatch integrity exception")
+        self._ensure_paper_schema(cursor, create=False)
+        domain = self._paper_domain_in_transaction(cursor, scope)
+        generation, high_water = self._paper_journal_generation(cursor)
+        outbox_rows = cursor.execute(
+            "SELECT journal_incarnation_id FROM execution_outbox WHERE scope_key = ?",
+            (scope.key,),
+        ).fetchall()
+        if any(str(row["journal_incarnation_id"]) != generation for row in outbox_rows):
+            raise DurableStoreError("paper execution rows cross journal generations")
+        state, watermarks, receipts = self._paper_replay_receipts(
+            cursor, scope, domain, generation=generation, high_water=high_water
+        )
+        receipted = {receipt.intent_id for receipt in receipts}
+        receipt_event_ids = {receipt.event_id for receipt in receipts}
+        provider_event_rows = cursor.execute(
+            "SELECT event_id FROM execution_outbox WHERE scope_key = ? "
+            "AND event_type IN ('provider_observation', 'provider_commission_evidence')",
+            (scope.key,),
+        ).fetchall()
+        if any(str(row["event_id"]) not in receipt_event_ids for row in provider_event_rows):
+            raise DurableStoreError("paper provider event has no immutable match receipt")
+        execution_rows = cursor.execute(
+            "SELECT * FROM execution_records WHERE scope_key = ? ORDER BY intent_id", (scope.key,)
+        ).fetchall()
+        allowed_claim_found = False
+        for row in execution_rows:
+            record = self._record_from_row(row)
+            if record.intent_id in receipted:
+                continue
+            if record.intent_id == allow_dispatching_intent_id:
+                if (
+                    record.state is not ExecutionState.DISPATCHING
+                    or record.dispatch_attempts != 1
+                    or record.provider_order_id is not None
+                    or record.filled_quantity != Decimal("0")
+                    or record.average_price is not None
+                    or record.cumulative_commission is not None
+                    or record.unknown_reason is not None
+                    or record.review_required
+                ):
+                    raise DurableStoreError("paper settlement claim is not a clean active dispatch")
+                allowed_claim_found = True
+                continue
+            if record.dispatch_attempts == 1 and record.state is ExecutionState.BLOCKED:
+                if (
+                    record.provider_order_id is not None
+                    or record.filled_quantity != Decimal("0")
+                    or record.average_price is not None
+                    or record.cumulative_commission is not None
+                ):
+                    raise DurableStoreError(
+                        "blocked paper order has provider evidence without receipt"
+                    )
+                continue
+            if record.dispatch_attempts == 0 and record.state in {
+                ExecutionState.REJECTED,
+                ExecutionState.BLOCKED,
+                ExecutionState.CANCELLED,
+            }:
+                continue
+            raise DurableStoreError("paper book has an unresolved order without a match receipt")
+        if allow_dispatching_intent_id is not None and not allowed_claim_found:
+            raise DurableStoreError("paper settlement claim is absent from its owner cut")
+        return domain, generation, high_water, state, watermarks, receipts
+
+    def _read_paper_book_in_transaction(
+        self,
+        cursor: sqlite3.Cursor,
+        scope: ExecutionScope,
+    ) -> Any:
+        from .paper_execution import PaperBookSnapshotV1
+
+        domain, generation, high_water, state, watermarks, receipts = (
+            self._validate_paper_book_in_transaction(cursor, scope)
+        )
+        return PaperBookSnapshotV1(
+            account_key=scope.account_key,
+            scope_key=scope.key,
+            execution_domain_ref=domain.execution_domain_ref,
+            simulation_account_ref=domain.simulation_account_ref,
+            experiment_ref=domain.experiment_ref,
+            model_ref=domain.model_ref,
+            model_version=domain.model_version,
+            cash_currency=domain.cash_currency,
+            cash=state.cash,
+            cumulative_fees=state.cumulative_fees,
+            positions=state.positions,
+            execution_journal_generation=generation,
+            execution_cursor=high_water,
+            receipt_count=len(receipts),
+            quote_watermarks=tuple(
+                sorted(
+                    (source, quote_generation, instrument, cursor_value, as_of_ns)
+                    for (source, quote_generation, instrument), (
+                        cursor_value,
+                        _quote_sha,
+                        as_of_ns,
+                    ) in watermarks.items()
+                )
+            ),
+        )
+
+    def read_paper_book(self, scope: ExecutionScope) -> Any:
+        """Replay the immutable paper receipt chain at the current local journal cut.
+
+        This is a local accounting snapshot only. It does not claim that the
+        last quote remains fresh or that any external source is complete.
+        """
+
+        if type(scope) is not ExecutionScope or scope.provider != "paper":
+            raise ContractValidationError("paper book reads require a paper execution scope")
+        try:
+            with self._read_transaction() as cursor:
+                snapshot = self._read_paper_book_in_transaction(cursor, scope)
+        except DurableStoreError:
+            raise
+        except (sqlite3.Error, ContractValidationError, TypeError, ValueError) as error:
+            raise DurableStoreError("unable to read paper book") from error
+        return snapshot
+
+    def get_paper_match_receipt(self, intent_id: str, *, scope: ExecutionScope) -> Any | None:
+        """Return one receipt only after validating the entire local owner chain."""
+
+        if type(scope) is not ExecutionScope or scope.provider != "paper":
+            raise ContractValidationError("paper receipt reads require a paper execution scope")
+        self.read_paper_book(scope)
+        with self._lock:
+            try:
+                row = self._connection.execute(
+                    "SELECT * FROM paper_match_receipts WHERE scope_key = ? AND intent_id = ?",
+                    (scope.key, intent_id),
+                ).fetchone()
+            except sqlite3.Error as error:
+                raise DurableStoreError("unable to read paper match receipt") from error
+        return None if row is None else self._paper_receipt_from_row(row)
+
+    def record_paper_match_with_event(
+        self,
+        proposal: Any,
+        *,
+        scope: ExecutionScope,
+        writer_lease: WriterLease,
+    ) -> tuple[ExecutionRecord, ExecutionEvent, Any]:
+        """Atomically settle one paper dispatch into event, receipt and book chain."""
+
+        from .basic_admission import (
+            ExecutionAdmissionAuthorizationV1,
+            ExecutionProviderOrderParametersV1,
+        )
+        from .paper_execution import (
+            PAPER_ENVIRONMENT,
+            PAPER_PROVIDER,
+            PaperDispatchResultV1,
+            PaperMatchReceiptV1,
+            apply_paper_decision,
+            evaluate_paper_match,
+            paper_state_digest,
+        )
+
+        if (
+            type(proposal) is not PaperDispatchResultV1
+            or type(scope) is not ExecutionScope
+            or scope.provider != PAPER_PROVIDER
+            or scope.environment != PAPER_ENVIRONMENT
+            or type(writer_lease) is not WriterLease
+        ):
+            raise ContractValidationError("typed paper proposal and writer scope are required")
+        authorization = proposal.authorization
+        if type(authorization) is not ExecutionAdmissionAuthorizationV1:
+            raise ContractValidationError("paper matching requires final basic admission")
+
+        with self._transaction() as cursor:
+            transaction_now_ns = time.time_ns()
+            self._assert_active_writer_lease(cursor, scope, writer_lease, now_ns=transaction_now_ns)
+            self._ensure_paper_schema(cursor, create=False)
+            existing_receipt_row = cursor.execute(
+                "SELECT * FROM paper_match_receipts WHERE scope_key = ? AND intent_id = ?",
+                (scope.key, proposal.intent_id),
+            ).fetchone()
+            (
+                domain,
+                _generation,
+                _high_water,
+                current_state,
+                watermarks,
+                _receipts,
+            ) = self._validate_paper_book_in_transaction(
+                cursor,
+                scope,
+                allow_dispatching_intent_id=(
+                    None if existing_receipt_row is not None else proposal.intent_id
+                ),
+            )
+            row = self._fetch_record(cursor, scope.key, proposal.intent_id)
+            if row is None:
+                raise ContractValidationError("paper proposal has no durable execution intent")
+            record = self._record_from_row(row)
+            if (
+                proposal.intent_fingerprint != record.payload_sha256
+                or str(row["payload_sha256"]) != proposal.intent_fingerprint
+            ):
+                raise IntentConflictError("paper proposal differs from durable order payload")
+            if existing_receipt_row is not None:
+                receipt = self._paper_receipt_from_row(existing_receipt_row)
+                event_row = cursor.execute(
+                    "SELECT * FROM execution_outbox WHERE event_id = ?", (receipt.event_id,)
+                ).fetchone()
+                if event_row is None:
+                    raise DurableStoreError("persisted paper receipt event is missing")
+                self._paper_event_matches_receipt(event_row, receipt)
+                return record, self._execution_event_from_row(event_row), receipt
+            if record.state is not ExecutionState.DISPATCHING or record.dispatch_attempts != 1:
+                raise InvalidStateTransition(
+                    "paper match requires the single active dispatch claim"
+                )
+            if (
+                record.basic_admission_reference != authorization.permit_reference
+                or record.admission_context_sha256 != authorization.context_fingerprint
+                or record.review_required
+            ):
+                raise ContractValidationError("paper admission is not bound to the durable claim")
+            try:
+                payload_json = str(row["payload_json"])
+                intent_payload = json.loads(payload_json)
+                if canonical_json(intent_payload) != payload_json:
+                    raise ValueError("noncanonical intent")
+                intent = order_intent_from_payload(intent_payload)
+            except (ContractValidationError, TypeError, ValueError, json.JSONDecodeError):
+                raise DurableStoreError("stored paper intent is unreadable") from None
+            if (
+                intent.fingerprint != proposal.intent_fingerprint
+                or intent.scope != scope
+                or intent.intent_id != proposal.intent_id
+            ):
+                raise ContractValidationError("paper proposal intent scope changed")
+            if (
+                proposal.authorization is not authorization
+                or proposal.quote is None
+                and proposal.refusal_code is None
+                or proposal.quote is not None
+                and proposal.refusal_code is not None
+            ):
+                raise ContractValidationError("paper proposal contents are malformed")
+
+            # This timestamp is sampled after SQLite acquired BEGIN IMMEDIATE.
+            # The same value is committed on both the execution event and the
+            # immutable paper receipt.
+            now_ns = time.time_ns()
+            self._assert_active_writer_lease(cursor, scope, writer_lease, now_ns=now_ns)
+            parameters = authorization.parameters
+            if (
+                type(parameters) is not ExecutionProviderOrderParametersV1
+                or authorization.intent_fingerprint != intent.fingerprint
+                or authorization.owner_id != writer_lease.owner_id
+                or authorization.fencing_token != writer_lease.fencing_token
+                or authorization.issued_at_ns > now_ns
+                or authorization.expires_at_ns <= now_ns
+                or authorization.context_fingerprint != record.admission_context_sha256
+                or not _is_sha256(authorization.context_fingerprint)
+                or not _is_sha256(authorization.capability_fingerprint)
+                or parameters.provider_id != PAPER_PROVIDER
+                or parameters.environment != PAPER_ENVIRONMENT
+                or parameters.provider_instrument != intent.instrument
+                or parameters.account_ref != domain.simulation_account_ref
+                or parameters.strategy_id != domain.strategy_ref
+                or parameters.trading_day != scope.trading_day
+                or parameters.intent_id != intent.intent_id
+                or parameters.signal_id != intent.signal_id
+                or parameters.intent_fingerprint != intent.fingerprint
+                or parameters.side is not intent.side
+                or parameters.position_effect is not intent.position_effect
+                or parameters.order_type is not intent.order_type
+                or parameters.quantity != intent.quantity
+                or parameters.price != intent.price
+                or parameters.time_in_force is not intent.time_in_force
+                or parameters.reduce_only is not intent.reduce_only
+                or parameters.metadata_version != intent.metadata_version
+                or parameters.deadline_ns != intent.deadline_ns
+                or dict(parameters.tags) != dict(intent.tags)
+            ):
+                raise ContractValidationError("paper admission facts do not match the active claim")
+
+            cursor_refusal = self._paper_quote_cursor_refusal(domain, proposal.quote, watermarks)
+            expired = now_ns >= authorization.expires_at_ns
+            decision = evaluate_paper_match(
+                domain,
+                intent,
+                proposal,
+                current_state,
+                now_ns=now_ns,
+                cursor_refusal=cursor_refusal,
+                authorization_expired=expired,
+            )
+            observation = decision.observation
+            if observation.intent_id != intent.intent_id:
+                raise ContractValidationError("paper observation changed intent identity")
+            if not can_transition(record.state, observation.state):
+                raise InvalidStateTransition("paper outcome is not valid from dispatching")
+            self._validate_fill_progress(record, observation, intent.quantity)
+            before_sha = paper_state_digest(domain, current_state)
+            after_state = apply_paper_decision(domain, current_state, decision)
+            after_sha = paper_state_digest(domain, after_state)
+            provider_order_id = observation.provider_order_id or record.provider_order_id
+            now_ns = time.time_ns()
+            self._assert_active_writer_lease(cursor, scope, writer_lease, now_ns=now_ns)
+            if now_ns >= authorization.expires_at_ns:
+                # The one-shot claim is now consumed. Leave the durable row
+                # DISPATCHING so the facade latches UNKNOWN; a quote is never
+                # silently re-evaluated or matched on a later replay.
+                raise DurableStoreError("paper admission expired before atomic commit")
+            if (
+                observation.state is ExecutionState.FILLED
+                and proposal.quote is not None
+                and (
+                    now_ns < proposal.quote.as_of_ns
+                    or now_ns - proposal.quote.as_of_ns > domain.max_quote_age_ns
+                )
+            ):
+                decision = evaluate_paper_match(
+                    domain,
+                    intent,
+                    proposal,
+                    current_state,
+                    now_ns=now_ns,
+                    cursor_refusal=cursor_refusal,
+                )
+                observation = decision.observation
+                if observation.state is not ExecutionState.REJECTED:
+                    raise DurableStoreError("paper quote changed during atomic evaluation")
+                after_state = apply_paper_decision(domain, current_state, decision)
+                after_sha = paper_state_digest(domain, after_state)
+                provider_order_id = observation.provider_order_id or record.provider_order_id
+            cursor.execute(
+                """
+                UPDATE execution_records
+                SET state = ?, provider_order_id = ?, filled_quantity = ?, average_price = ?,
+                    cumulative_commission = ?, unknown_reason = NULL, review_required = 0,
+                    updated_at_ns = ?
+                WHERE scope_key = ? AND intent_id = ? AND state = ? AND dispatch_attempts = 1
+                """,
+                (
+                    observation.state.value,
+                    provider_order_id,
+                    format(observation.filled_quantity, "f"),
+                    None
+                    if observation.average_price is None
+                    else format(observation.average_price, "f"),
+                    (
+                        None
+                        if observation.cumulative_commission is None
+                        else format(observation.cumulative_commission, "f")
+                    ),
+                    now_ns,
+                    scope.key,
+                    intent.intent_id,
+                    ExecutionState.DISPATCHING.value,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise InvalidStateTransition("paper dispatch claim changed before commit")
+            event_payload: dict[str, Any] = {
+                "provider_order_id": provider_order_id,
+                "filled_quantity": format(observation.filled_quantity, "f"),
+                "average_price": (
+                    None
+                    if observation.average_price is None
+                    else format(observation.average_price, "f")
+                ),
+                "cumulative_commission": (
+                    None
+                    if observation.cumulative_commission is None
+                    else format(observation.cumulative_commission, "f")
+                ),
+                "reason_code": observation.reason_code,
+                "source": "provider",
+            }
+            if observation.cumulative_commission_currency is not None:
+                event_payload["cumulative_commission_currency"] = (
+                    observation.cumulative_commission_currency
+                )
+            event = self._append_event(
+                cursor,
+                intent_id=intent.intent_id,
+                scope_key=scope.key,
+                event_type="provider_observation",
+                state=observation.state,
+                payload=event_payload,
+                now_ns=now_ns,
+            )
+            journal_generation = event.journal_incarnation_id
+            if journal_generation is None:
+                raise DurableStoreError("paper execution event lacks journal generation")
+            receipt = PaperMatchReceiptV1.create(
+                account_key=scope.account_key,
+                scope_key=scope.key,
+                journal_generation=journal_generation,
+                execution_domain_ref=domain.execution_domain_ref,
+                simulation_account_ref=domain.simulation_account_ref,
+                experiment_ref=domain.experiment_ref,
+                model_ref=domain.model_ref,
+                model_version=domain.model_version,
+                intent_id=intent.intent_id,
+                intent_fingerprint=intent.fingerprint,
+                event_id=event.event_id,
+                event_sequence=event.sequence,
+                state=observation.state,
+                reason_code=decision.reason_code,
+                evaluated_at_ns=now_ns,
+                instrument=intent.instrument,
+                side=intent.side,
+                quantity=decision.filled_quantity,
+                fill_price=decision.fill_price,
+                fee_amount=decision.fee_amount,
+                fee_currency=domain.cash_currency,
+                quote=decision.quote,
+                cash_delta=decision.cash_delta,
+                position_delta=decision.position_delta,
+                before_book_sha256=before_sha,
+                after_book_sha256=after_sha,
+            )
+            receipt_json = canonical_json(receipt.to_payload())
+            recorded_at_ns = time.time_ns()
+            cursor.execute(
+                """
+                INSERT INTO paper_match_receipts(
+                    scope_key, account_key, intent_id, intent_sha256, event_id,
+                    event_sequence, journal_generation, receipt_sha256, receipt_json,
+                    recorded_at_ns, writer_scope_key, writer_owner_id, writer_fencing_token
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    scope.key,
+                    scope.account_key,
+                    intent.intent_id,
+                    intent.fingerprint,
+                    event.event_id,
+                    event.sequence,
+                    journal_generation,
+                    receipt.receipt_sha256,
+                    receipt_json,
+                    recorded_at_ns,
+                    scope.key,
+                    writer_lease.owner_id,
+                    writer_lease.fencing_token,
+                ),
+            )
+            final_now_ns = time.time_ns()
+            self._assert_active_writer_lease(cursor, scope, writer_lease, now_ns=final_now_ns)
+            if final_now_ns >= authorization.expires_at_ns or (
+                observation.state is ExecutionState.FILLED
+                and proposal.quote is not None
+                and (
+                    final_now_ns < proposal.quote.as_of_ns
+                    or final_now_ns - proposal.quote.as_of_ns > domain.max_quote_age_ns
+                )
+            ):
+                raise DurableStoreError("paper quote or admission expired at atomic commit")
+            updated_row = self._fetch_record(cursor, scope.key, intent.intent_id)
+            assert updated_row is not None
+            updated_record = self._record_from_row(updated_row)
+        return updated_record, event, receipt
+
+    @staticmethod
     def _financial_journal_cut(cursor: sqlite3.Cursor) -> tuple[str, int, int]:
         from .account_financial_ledger import FinancialDataUnavailableError
 
@@ -2502,8 +3521,7 @@ class SqliteExecutionStore:
                 state=payload["state"],
             )
             if (
-                len(projection.unallocated_position_residual)
-                != len(position_residual_payload)
+                len(projection.unallocated_position_residual) != len(position_residual_payload)
                 or _financial_canonical_json(projection) != raw
             ):
                 raise ValueError("financial projection is not canonical typed data")
@@ -3359,14 +4377,10 @@ class SqliteExecutionStore:
             )
 
         expected_directory_json = _financial_canonical_json(expected_directory)
-        expected_directory_sha = hashlib.sha256(
-            expected_directory_json.encode("utf-8")
-        ).hexdigest()
+        expected_directory_sha = hashlib.sha256(expected_directory_json.encode("utf-8")).hexdigest()
         try:
             with self._read_transaction() as cursor:
-                generation, current_high_water, _journal_count = self._financial_journal_cut(
-                    cursor
-                )
+                generation, current_high_water, _journal_count = self._financial_journal_cut(cursor)
                 head = cursor.execute(
                     "SELECT * FROM account_financial_ledger_heads WHERE account_key = ?",
                     (account_key,),
@@ -3397,9 +4411,7 @@ class SqliteExecutionStore:
                     (account_key, int(head["baseline_version"])),
                 ).fetchone()
                 if baseline is None:
-                    raise FinancialDataUnavailableError(
-                        "financial projection baseline is missing"
-                    )
+                    raise FinancialDataUnavailableError("financial projection baseline is missing")
                 baseline_json = str(baseline["baseline_json"])
                 baseline_sha = hashlib.sha256(baseline_json.encode("utf-8")).hexdigest()
                 if (
@@ -3423,20 +4435,14 @@ class SqliteExecutionStore:
                     raise FinancialDataUnavailableError(
                         "financial baseline identity is inconsistent"
                     )
-                baseline_cut = self._financial_ledger_cut_from_payload(
-                    baseline_payload.get("cut")
-                )
+                baseline_cut = self._financial_ledger_cut_from_payload(baseline_payload.get("cut"))
                 baseline_cursor_payload = baseline_payload.get("execution_cursors")
                 baseline_cursor_snapshot = self._financial_cursor_snapshot_from_payload(
                     baseline_cursor_payload
                 )
-                baseline_execution = baseline_cut.watermark(
-                    FinancialSourceKind.EXECUTION_OUTBOX
-                )
+                baseline_execution = baseline_cut.watermark(FinancialSourceKind.EXECUTION_OUTBOX)
                 baseline_facts = baseline_cut.watermark(FinancialSourceKind.ACCOUNT_FACTS)
-                baseline_activity = baseline_cut.watermark(
-                    FinancialSourceKind.ACCOUNT_ACTIVITY
-                )
+                baseline_activity = baseline_cut.watermark(FinancialSourceKind.ACCOUNT_ACTIVITY)
                 if (
                     baseline_cut.account_key != account_key
                     or baseline_cut.owner_directory_revision != expected_directory.revision
@@ -3498,9 +4504,10 @@ class SqliteExecutionStore:
                             "financial projection head has a missing or invalid digest"
                         )
                 projection_json = str(head["projection_json"])
-                if hashlib.sha256(projection_json.encode("utf-8")).hexdigest() != head[
-                    "projection_sha256"
-                ]:
+                if (
+                    hashlib.sha256(projection_json.encode("utf-8")).hexdigest()
+                    != head["projection_sha256"]
+                ):
                     raise FinancialDataUnavailableError(
                         "persisted financial projection failed its stored digest"
                     )
@@ -3545,13 +4552,9 @@ class SqliteExecutionStore:
                     quantity != 0
                     for _instrument, quantity in projection.unallocated_position_residual
                 )
-                fee_residual = any(
-                    item.amount != 0 for item in projection.unallocated_fee_residual
-                )
+                fee_residual = any(item.amount != 0 for item in projection.unallocated_fee_residual)
                 expected_state = (
-                    "RESIDUAL"
-                    if cash_residual or position_residual or fee_residual
-                    else "BALANCED"
+                    "RESIDUAL" if cash_residual or position_residual or fee_residual else "BALANCED"
                 )
                 if projection.state != expected_state:
                     raise FinancialDataUnavailableError(
@@ -3710,8 +4713,8 @@ class SqliteExecutionStore:
                         "reconciled_observation",
                         "provider_commission_evidence",
                     }:
-                        next_cursor, delta_quantity, fee_delta = execution_cursor_from_observation_v1(
-                            event, intent, prior_cursor, owner
+                        next_cursor, delta_quantity, fee_delta = (
+                            execution_cursor_from_observation_v1(event, intent, prior_cursor, owner)
                         )
                     expected_cursor = FinancialOrderBaselineCursorV1(
                         owner=owner,
@@ -3753,9 +4756,7 @@ class SqliteExecutionStore:
                             "persisted execution posting has an invalid type"
                         )
                     side = Side(intent.side)
-                    signed_quantity = (
-                        delta_quantity if side is Side.BUY else -delta_quantity
-                    )
+                    signed_quantity = delta_quantity if side is Side.BUY else -delta_quantity
                     expected_kind = (
                         FinancialEventKind.SPOT_FILL
                         if delta_quantity
@@ -3777,9 +4778,7 @@ class SqliteExecutionStore:
                             -notional_delta if side is Side.BUY else notional_delta
                         )
                         expected_instrument = intent.instrument
-                    expected_fee_currency = (
-                        next_cursor.commission_currency if fee_delta else None
-                    )
+                    expected_fee_currency = next_cursor.commission_currency if fee_delta else None
                     if (
                         posting.event_id != event.event_id
                         or posting.event_sequence != sequence
@@ -3809,8 +4808,7 @@ class SqliteExecutionStore:
                 current_snapshot_as_of = max(
                     1,
                     0
-                    if current_max_time is None
-                    or current_max_time["max_created_at_ns"] is None
+                    if current_max_time is None or current_max_time["max_created_at_ns"] is None
                     else int(current_max_time["max_created_at_ns"]),
                 )
                 current_snapshot = self._capture_financial_cursor_snapshot_in_transaction(
@@ -14476,6 +15474,27 @@ class SqliteExecutionStore:
     def _event_payload(**values: Any) -> str:
         return canonical_json(values)
 
+    @staticmethod
+    def _execution_event_from_row(row: sqlite3.Row) -> ExecutionEvent:
+        try:
+            payload_json = str(row["payload_json"])
+            payload = json.loads(payload_json)
+            if canonical_json(payload) != payload_json:
+                raise ValueError("noncanonical execution event")
+            return ExecutionEvent(
+                sequence=int(row["sequence"]),
+                event_id=str(row["event_id"]),
+                intent_id=str(row["intent_id"]),
+                scope_key=str(row["scope_key"]),
+                event_type=str(row["event_type"]),
+                state=ExecutionState(row["state"]),
+                payload=payload,
+                created_at_ns=int(row["created_at_ns"]),
+                journal_incarnation_id=row["journal_incarnation_id"],
+            )
+        except (ContractValidationError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise DurableStoreError("stored execution event is unreadable") from error
+
     def _append_event(
         self,
         cursor: sqlite3.Cursor,
@@ -16103,6 +17122,10 @@ class SqliteExecutionStore:
 
         if source not in {"provider", "reconcile"}:
             raise ContractValidationError("invalid observation source")
+        if getattr(scope, "provider", None) == "paper":
+            raise ContractValidationError(
+                "paper outcomes must be persisted with their atomic match receipt"
+            )
         now_ns = time.time_ns()
         with self._transaction() as cursor:
             self._assert_active_writer_lease(cursor, scope, writer_lease)

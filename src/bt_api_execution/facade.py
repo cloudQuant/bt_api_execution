@@ -449,11 +449,65 @@ class ManagedExecutionFacade:
                 writer_lease=writer_lease,
             )
         try:
-            observation = self._dispatch(dispatcher, intent, authorization=authorization)
+            dispatch_result = self._dispatch(dispatcher, intent, authorization=authorization)
         except Exception:
             return self._store.mark_unknown(
                 intent.intent_id, self._scope, writer_lease=writer_lease
             )
+        from .paper_execution import PaperDispatchResultV1
+
+        if self._scope.provider == "paper":
+            if type(dispatch_result) is not PaperDispatchResultV1:
+                return self._store.mark_unknown(
+                    intent.intent_id,
+                    self._scope,
+                    "paper_dispatch_result_invalid",
+                    writer_lease=writer_lease,
+                )
+            try:
+                record, _event, _receipt = self._store.record_paper_match_with_event(
+                    dispatch_result,
+                    scope=self._scope,
+                    writer_lease=writer_lease,
+                )
+            except WriterLeaseUnavailable:
+                raise
+            except Exception:
+                # The commit may have completed before a local error surfaced.
+                # Only an exact durable receipt plus terminal execution record
+                # resolves that ambiguity; otherwise this ID stays UNKNOWN.
+                record = None
+                receipt = None
+                try:
+                    record = self._store.get(intent.intent_id, scope=self._scope)
+                    receipt = self._store.get_paper_match_receipt(
+                        intent.intent_id, scope=self._scope
+                    )
+                except Exception:
+                    record = None
+                    receipt = None
+                if (
+                    record is None
+                    or receipt is None
+                    or record.state is not receipt.state
+                    or receipt.intent_fingerprint != intent.fingerprint
+                    or receipt.intent_id != intent.intent_id
+                ):
+                    return self._store.mark_unknown(
+                        intent.intent_id,
+                        self._scope,
+                        "paper_match_commit_ambiguous",
+                        writer_lease=writer_lease,
+                    )
+            return self._settle_after_evidenced_outcome(record, writer_lease=writer_lease)
+        if type(dispatch_result) is PaperDispatchResultV1:
+            return self._store.mark_unknown(
+                intent.intent_id,
+                self._scope,
+                "paper_dispatch_outside_paper_scope",
+                writer_lease=writer_lease,
+            )
+        observation = dispatch_result
         if observation.intent_id != intent.intent_id:
             return self._store.mark_unknown(
                 intent.intent_id,
@@ -543,6 +597,10 @@ class ManagedExecutionFacade:
     def _record_provider_observation_with_event(
         self, observation: ProviderObservation
     ) -> tuple[ExecutionRecord, ExecutionEvent | None, bool]:
+        if self._scope.provider == "paper":
+            raise ContractValidationError(
+                "paper outcomes must be persisted with their atomic match receipt"
+            )
         writer_lease = self.acquire_writer_lease()
         record = self._require_owned_record(observation.intent_id)
         if record.state not in _OBSERVATION_RECORDING_STATES:
@@ -580,6 +638,10 @@ class ManagedExecutionFacade:
     ) -> ExecutionRecord:
         """Query an injected evidence port without dispatching another provider order."""
 
+        if self._scope.provider == "paper":
+            raise ContractValidationError(
+                "paper outcomes must be persisted with their atomic match receipt"
+            )
         writer_lease = self.acquire_writer_lease()
         record = self._require_owned_record(intent_id)
         if record.state not in _OBSERVATION_RECORDING_STATES:
@@ -1084,7 +1146,7 @@ class ManagedExecutionFacade:
         intent: OrderIntent,
         *,
         authorization: ExecutionAdmissionAuthorizationV1 | None = None,
-    ) -> ProviderObservation:
+    ) -> ProviderObservation | object:
         if authorization is not None:
             method = getattr(dispatcher, "submit_authorized", None)
             if not callable(method):
@@ -1098,6 +1160,10 @@ class ManagedExecutionFacade:
                 result = dispatcher(intent)
             else:
                 raise ContractValidationError("invalid dispatch port")
+        from .paper_execution import PaperDispatchResultV1
+
+        if isinstance(result, PaperDispatchResultV1):
+            return result
         if not isinstance(result, ProviderObservation):
             raise ContractValidationError("dispatch port returned invalid observation")
         return result

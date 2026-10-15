@@ -50,6 +50,7 @@ from .group_contracts import (
     GroupPermitBinding,
     is_group_leg_intent_id,
 )
+from .paper_execution import PAPER_PROVIDER, PaperMatchingPort, PaperOwnerDomainV1
 from .service_component import (
     ExecutionReadService,
     _is_principal_ref,
@@ -145,6 +146,7 @@ class ExecutionOrderEntryService:
         basic_admission_gate: ExecutionBasicAdmissionGate | None = None,
         cancel_admission_gate: object | None = None,
         group_coordinator_authority: GroupCoordinatorAuthority | None = None,
+        paper_owner_domain: PaperOwnerDomainV1 | None = None,
         allow_unprotected: bool = False,
         writer_id: str = _DEFAULT_WRITER_ID,
         lease_ttl_ns: int = _DEFAULT_LEASE_TTL_NS,
@@ -207,6 +209,25 @@ class ExecutionOrderEntryService:
                 raise ContractValidationError("targets must map to ExecutionScope values")
             copied[template] = execution_scope
 
+        if paper_owner_domain is not None:
+            if (
+                type(paper_owner_domain) is not PaperOwnerDomainV1
+                or type(dispatch) is not PaperMatchingPort
+                or dispatch.owner_domain is not paper_owner_domain
+                or basic_admission_gate is None
+                or admission_gate is not None
+                or allow_unprotected
+            ):
+                raise ContractValidationError(
+                    "paper execution requires its exact trusted port and basic-admission gate"
+                )
+            for wire_scope, execution_scope in copied.items():
+                paper_owner_domain.validate_binding(wire_scope, execution_scope)
+        elif type(dispatch) is PaperMatchingPort or any(
+            execution_scope.provider == PAPER_PROVIDER for execution_scope in copied.values()
+        ):
+            raise ContractValidationError("paper execution requires an explicit owner domain")
+
         self._store = store
         self._targets = MappingProxyType(copied)
         self._dispatch = dispatch
@@ -214,6 +235,8 @@ class ExecutionOrderEntryService:
         self._basic_admission_gate = basic_admission_gate
         self._cancel_admission_gate = cancel_admission_gate
         self._group_coordinator_authority = group_coordinator_authority
+        self._paper_owner_domain = paper_owner_domain
+        self._paper_ready_scope_keys: set[str] = set()
         self._allow_unprotected = allow_unprotected
         self._writer_id = writer_id
         self._lease_ttl_ns = lease_ttl_ns
@@ -251,6 +274,11 @@ class ExecutionOrderEntryService:
         execution_scope = self._resolve_scope(scope)
         if execution_scope is None:
             return _scope_denied()
+        if (
+            execution_scope.provider == PAPER_PROVIDER
+            and execution_scope.key not in self._paper_ready_scope_keys
+        ):
+            return _reply(False, "SERVICE_NOT_READY", {"found": False, "record": None})
 
         if operation == SUBMIT_OPERATION:
             admission_context = None
@@ -540,11 +568,19 @@ class ExecutionOrderEntryService:
 
         recovered: list[ExecutionRecord] = []
         seen_scope_keys: set[str] = set()
+        ready_scope_keys: set[str] = set()
         for execution_scope in self._targets.values():
             if execution_scope.key in seen_scope_keys:
                 continue
             seen_scope_keys.add(execution_scope.key)
             order_facade, _ = self._facade_pair(execution_scope)
+            if self._paper_owner_domain is not None:
+                writer_lease = order_facade.acquire_writer_lease()
+                self._store.register_paper_owner_domain(
+                    execution_scope,
+                    self._paper_owner_domain,
+                    writer_lease=writer_lease,
+                )
             records = order_facade.recover_interrupted_dispatches()
             if type(records) is not tuple or any(
                 type(record) is not ExecutionRecord
@@ -556,6 +592,10 @@ class ExecutionOrderEntryService:
                     "execution order recovery returned invalid persisted evidence"
                 )
             recovered.extend(records)
+            if self._paper_owner_domain is not None:
+                ready_scope_keys.add(execution_scope.key)
+        if self._paper_owner_domain is not None:
+            self._paper_ready_scope_keys.update(ready_scope_keys)
         return tuple(recovered)
 
     def _submit(
