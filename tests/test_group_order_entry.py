@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import threading
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
@@ -337,7 +337,13 @@ class _EvidenceDispatcher:
         return self.observation
 
 
-def _make_service(store_path: str, *, claim_error: bool = False, bind_account_scope: bool = True):
+def _make_service(
+    store_path: str,
+    *,
+    claim_error: bool = False,
+    bind_account_scope: bool = True,
+    run_id: str | None = None,
+):
     execution_scope = ExecutionScope("paper", "demo", _ACCOUNT, _STRATEGY)
     intent = OrderIntent.limit(
         intent_id=group_leg_intent_id(_GROUP, _LEG),
@@ -370,11 +376,13 @@ def _make_service(store_path: str, *, claim_error: bool = False, bind_account_sc
         execution_domain_ref="paper-demo",
         account_ref=_ACCOUNT,
         strategy_ref=_STRATEGY,
+        portfolio_ref=_PORTFOLIO,
     )
     group_scope = WireScope(
         execution_domain_ref="paper-demo",
         account_ref=_ACCOUNT,
         strategy_ref=_STRATEGY,
+        run_id=run_id,
         portfolio_ref=_PORTFOLIO,
         group_id=_GROUP,
         leg_id=_LEG,
@@ -456,6 +464,69 @@ def test_group_leg_uses_existing_permit_and_exposes_authorized_binding(tmp_path)
         == 18
     )
     reopened.close()
+
+
+def test_group_leg_target_resolution_preserves_portfolio_with_same_run_scope(tmp_path) -> None:
+    values = _make_service(str(tmp_path / "portfolio-scope.sqlite"), run_id="run-a")
+    (
+        service,
+        store,
+        risk,
+        provider,
+        authority,
+        identity,
+        group_scope,
+        base_scope,
+        intent,
+        binding,
+    ) = values
+    other_portfolio_scope = replace(group_scope, portfolio_ref="portfolio-b")
+    other_portfolio_binding = replace(binding, portfolio_ref="portfolio-b")
+
+    assert len(service._targets) == 1
+    assert next(iter(service._targets)) == base_scope
+    assert base_scope.account_ref == other_portfolio_scope.account_ref == _ACCOUNT
+    assert base_scope.strategy_ref == other_portfolio_scope.strategy_ref == _STRATEGY
+    assert group_scope.run_id == other_portfolio_scope.run_id == "run-a"
+    assert base_scope.run_id is None
+    assert base_scope.portfolio_ref == _PORTFOLIO
+    assert (
+        other_portfolio_scope.portfolio_ref
+        == other_portfolio_binding.portfolio_ref
+        == "portfolio-b"
+    )
+
+    denied = service.submit_group_leg(
+        principal_ref=_PRINCIPAL,
+        identity=identity,
+        scope=other_portfolio_scope,
+        intent=intent,
+        binding=other_portfolio_binding,
+    )
+
+    assert denied["ok"] is False
+    assert denied["code"] == "SCOPE_DENIED"
+    assert denied["result"] == {"found": False, "record": None}
+    assert risk.group_claims == risk.single_claims == risk.reserves == risk.releases == 0
+    assert risk.settlements == 0
+    assert authority.calls == []
+    assert provider.submitted == []
+    assert store.get(intent.intent_id, scope=intent.scope) is None
+
+    allowed = service.submit_group_leg(
+        principal_ref=_PRINCIPAL,
+        identity=identity,
+        scope=group_scope,
+        intent=intent,
+        binding=binding,
+    )
+
+    assert allowed["ok"] is True
+    assert allowed["result"]["record"]["state"] == ExecutionState.ACKED.value
+    assert risk.group_claims == 1
+    assert authority.calls == [(_PRINCIPAL, 1)]
+    assert provider.submitted == [intent.intent_id]
+    store.close()
 
 
 def test_after_group_claim_hook_receives_exact_claim_before_provider(tmp_path) -> None:

@@ -342,6 +342,7 @@ class ExecutionOrderEntryService:
             strategy_ref=scope.strategy_ref,
             run_id=scope.run_id,
             manual_book_ref=scope.manual_book_ref,
+            portfolio_ref=scope.portfolio_ref,
         )
         execution_scope = self._resolve_scope(account_scope)
         if execution_scope is None or execution_scope != intent.scope:
