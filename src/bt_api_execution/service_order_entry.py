@@ -25,6 +25,13 @@ from typing import TYPE_CHECKING, Any
 from bt_api_base.service_protocol import WireIdentity, WireRole, WireScope
 
 from .admission import AccountScopedGroupAdmissionAdapter
+from .approved_target import (
+    APPROVED_TARGET_OPERATION,
+    ApprovedTargetAuthorityError,
+    ApprovedTargetAuthorityV1,
+    ApprovedTargetSubmitRequestV1,
+    has_reserved_approval_tags,
+)
 from .basic_admission import ExecutionAdmissionContextV1, ExecutionBasicAdmissionGate
 from .cancellation import ManagedCancellationFacade
 from .contracts import (
@@ -147,6 +154,7 @@ class ExecutionOrderEntryService:
         cancel_admission_gate: object | None = None,
         group_coordinator_authority: GroupCoordinatorAuthority | None = None,
         paper_owner_domain: PaperOwnerDomainV1 | None = None,
+        approved_target_authority: ApprovedTargetAuthorityV1 | None = None,
         allow_unprotected: bool = False,
         writer_id: str = _DEFAULT_WRITER_ID,
         lease_ttl_ns: int = _DEFAULT_LEASE_TTL_NS,
@@ -173,6 +181,18 @@ class ExecutionOrderEntryService:
             raise ContractValidationError(
                 "basic admission cannot be combined with unprotected dispatch"
             )
+        if approved_target_authority is not None:
+            if type(approved_target_authority) is not ApprovedTargetAuthorityV1:
+                raise ContractValidationError("invalid approved-target authority")
+            if (
+                admission_gate is None
+                or not callable(getattr(admission_gate, "claim_for_dispatch", None))
+                or basic_admission_gate is None
+                or allow_unprotected
+            ):
+                raise ContractValidationError(
+                    "approved targets require Basic and atomic Risk admission"
+                )
         if type(writer_id) is not str or not writer_id or writer_id != writer_id.strip():
             raise ContractValidationError("invalid writer_id")
         if len(writer_id) > 128:
@@ -236,6 +256,7 @@ class ExecutionOrderEntryService:
         self._cancel_admission_gate = cancel_admission_gate
         self._group_coordinator_authority = group_coordinator_authority
         self._paper_owner_domain = paper_owner_domain
+        self._approved_target_authority = approved_target_authority
         self._paper_ready_scope_keys: set[str] = set()
         self._allow_unprotected = allow_unprotected
         self._writer_id = writer_id
@@ -243,6 +264,11 @@ class ExecutionOrderEntryService:
         self._read_service = ExecutionReadService(store, copied)
         self._lock = threading.RLock()
         self._facades: dict[str, tuple[ManagedExecutionFacade, ManagedCancellationFacade]] = {}
+        self.supported_operations = (
+            SUPPORTED_OPERATIONS
+            if approved_target_authority is None
+            else SUPPORTED_OPERATIONS | {APPROVED_TARGET_OPERATION}
+        )
 
     def handle(
         self,
@@ -257,7 +283,7 @@ class ExecutionOrderEntryService:
 
         if not _is_principal_ref(principal_ref):
             raise ContractValidationError("invalid trusted principal_ref")
-        if type(operation) is not str or operation not in SUPPORTED_OPERATIONS:
+        if type(operation) is not str or operation not in self.supported_operations:
             return _reply(False, "UNSUPPORTED_OPERATION", {})
 
         if operation == QUERY_OPERATION:
@@ -280,7 +306,7 @@ class ExecutionOrderEntryService:
         ):
             return _reply(False, "SERVICE_NOT_READY", {"found": False, "record": None})
 
-        if operation == SUBMIT_OPERATION:
+        if operation in {SUBMIT_OPERATION, APPROVED_TARGET_OPERATION}:
             admission_context = None
             if self._basic_admission_gate is not None:
                 try:
@@ -293,6 +319,20 @@ class ExecutionOrderEntryService:
                     )
                 except ContractValidationError:
                     return _reply(False, "INVALID_REQUEST", {"found": False, "record": None})
+            if operation == APPROVED_TARGET_OPERATION:
+                return self._submit_approved_target(
+                    arguments,
+                    principal_ref=principal_ref,
+                    identity=identity,
+                    wire_scope=scope,
+                    execution_scope=execution_scope,
+                    admission_context=admission_context,
+                )
+            if (
+                self._approved_target_authority is not None
+                and self._approved_target_authority.requires_approval(scope)
+            ):
+                return _reply(False, "APPROVAL_REQUIRED", {"found": False, "record": None})
             return self._submit(arguments, execution_scope, admission_context)
         return self._cancel(arguments, execution_scope)
 
@@ -328,6 +368,8 @@ class ExecutionOrderEntryService:
         if type(scope) is not WireScope:
             return _scope_denied()
         if type(binding) is not GroupPermitBinding or type(intent) is not OrderIntent:
+            return _reply(False, "INVALID_REQUEST", {"found": False, "record": None})
+        if has_reserved_approval_tags(intent.tags):
             return _reply(False, "INVALID_REQUEST", {"found": False, "record": None})
         if after_group_claim is not None and not callable(after_group_claim):
             return _reply(False, "INVALID_REQUEST", {"found": False, "record": None})
@@ -640,6 +682,103 @@ class ExecutionOrderEntryService:
             {"found": True, "record": _stored_record_dto(self._store, record, execution_scope)},
         )
 
+    def _submit_approved_target(
+        self,
+        arguments: Mapping[str, Any],
+        *,
+        principal_ref: str,
+        identity: WireIdentity,
+        wire_scope: WireScope,
+        execution_scope: ExecutionScope,
+        admission_context: ExecutionAdmissionContextV1 | None,
+    ) -> Mapping[str, Any]:
+        authority = self._approved_target_authority
+        if authority is None:
+            return _reply(False, "UNSUPPORTED_OPERATION", {})
+        if admission_context is None:
+            return _reply(False, "INVALID_REQUEST", {"found": False, "record": None})
+        if not authority.requires_approval(wire_scope):
+            return _reply(False, "APPROVED_TARGET_SCOPE_NOT_PROTECTED", {"found": False, "record": None})
+        try:
+            request = ApprovedTargetSubmitRequestV1.from_arguments(arguments)
+        except ContractValidationError:
+            return _reply(False, "INVALID_REQUEST", {"found": False, "record": None})
+        if is_group_leg_intent_id(request.intent_id):
+            return _reply(False, "INVALID_REQUEST", {"found": False, "record": None})
+        binding = authority.binding_for(principal_ref, identity, wire_scope)
+        if binding is None:
+            return _reply(
+                False,
+                "APPROVAL_OWNER_BINDING_MISMATCH",
+                {"found": False, "record": None},
+            )
+        try:
+            # Reserve and resolve happen before Execution admission or any Risk
+            # call. A lost reservation reply therefore cannot leave an E/Risk
+            # record whose approval binding is unknown.
+            authority.reserve(request, binding)
+            target = authority.resolve_target(request, binding)
+            intent = target.to_order_intent(
+                intent_id=request.intent_id,
+                execution_scope=execution_scope,
+                request=request,
+            )
+        except ApprovedTargetAuthorityError as error:
+            return _reply(False, error.code, {"found": False, "record": None})
+        except ContractValidationError:
+            return _reply(False, "APPROVAL_TARGET_INVALID", {"found": False, "record": None})
+        except Exception:
+            return _reply(
+                False,
+                "APPROVAL_STORE_UNAVAILABLE",
+                {"found": False, "record": None},
+            )
+
+        order_facade, _ = self._facade_pair(execution_scope)
+        try:
+            record = order_facade.submit_approved_target(
+                intent,
+                self._dispatch,
+                admission_context=admission_context,
+                consume_authorization=lambda checked_intent: authority.consume(
+                    request,
+                    binding,
+                    target,
+                    intent_sha256=checked_intent.fingerprint,
+                ),
+            )
+        except IntentConflictError:
+            return self._failure_with_record("INTENT_CONFLICT", intent.intent_id, execution_scope)
+        except ContractValidationError:
+            return _reply(False, "INVALID_REQUEST", {"found": False, "record": None})
+        except AdmissionRequired:
+            return self._failure_with_record(
+                "ADMISSION_REQUIRED", intent.intent_id, execution_scope
+            )
+        except WriterLeaseUnavailable:
+            return self._failure_with_record(
+                "OWNER_LEASE_UNAVAILABLE", intent.intent_id, execution_scope
+            )
+        except InvalidStateTransition:
+            return self._failure_with_record("STATE_CONFLICT", intent.intent_id, execution_scope)
+        except DurableStoreError:
+            return _reply(False, "STORE_UNAVAILABLE", {"found": False, "record": None})
+
+        result = {
+            "found": True,
+            "record": _stored_record_dto(self._store, record, execution_scope),
+        }
+        if record.state is ExecutionState.BLOCKED:
+            reason = record.unknown_reason
+            return _reply(
+                False,
+                reason if reason and reason.startswith("APPROVAL_") else "APPROVAL_NOT_DISPATCHED",
+                result,
+            )
+        if record.state is ExecutionState.UNKNOWN:
+            return _reply(False, "APPROVAL_OUTCOME_UNKNOWN", result)
+        return _reply(True, "OK", result)
+
     def _cancel(
         self, arguments: Mapping[str, Any], execution_scope: ExecutionScope
     ) -> Mapping[str, Any]:
@@ -755,6 +894,8 @@ def _has_dispatch(dispatch: object, method_name: str) -> bool:
 
 
 def _order_intent(arguments: Mapping[str, Any], execution_scope: ExecutionScope) -> OrderIntent:
+    if isinstance(arguments, Mapping) and has_reserved_approval_tags(arguments.get("tags")):
+        raise ContractValidationError("ordinary orders cannot set approved-target audit tags")
     payload = _scopeless_payload(arguments, "orders.submit")
     payload["scope"] = execution_scope.to_payload()
     return order_intent_from_payload(payload)

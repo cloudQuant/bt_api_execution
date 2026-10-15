@@ -9,6 +9,12 @@ from time import time_ns
 from typing import TYPE_CHECKING, Any
 
 from .admission import AccountScopedGroupAdmissionAdapter
+from .approved_target import (
+    APPROVED_TARGET_OPERATION,
+    ApprovedTargetConsumeDisposition,
+    ApprovedTargetConsumeResultV1,
+    has_reserved_approval_tags,
+)
 from .basic_admission import (
     ExecutionAdmissionAuthorizationV1,
     ExecutionAdmissionContextV1,
@@ -47,6 +53,7 @@ if TYPE_CHECKING:
 
 DispatchCallable = Callable[[OrderIntent], ProviderObservation]
 BeforeDispatchCallable = Callable[[OrderIntent], None]
+ApprovedTargetConsumeCallable = Callable[[OrderIntent], ApprovedTargetConsumeResultV1]
 AfterGroupClaimCallable = Callable[
     [OrderIntent, GroupPermitBinding, GroupLegAuthorization, "WriterLease", object], None
 ]
@@ -63,6 +70,28 @@ _OBSERVATION_RECORDING_STATES = frozenset(
     }
 )
 _PERMIT_SETTLEMENT_SOURCE_STATES = frozenset({ExecutionState.DISPATCHING, ExecutionState.UNKNOWN})
+
+
+def _is_typed_risk_admission_denial(error: BaseException) -> bool:
+    """Recognize the optional Risk adapter's exact pre-effect denial type.
+
+    Execution must stay importable without Risk. The configured gate is trusted
+    composition, so this narrow public exception identity distinguishes the
+    Risk adapter's deterministic policy denial from an ambiguous claim failure.
+    """
+
+    error_type = type(error)
+    code = getattr(error, "code", None)
+    return (
+        isinstance(error, PermissionError)
+        and error_type.__module__ == "bt_api_risk.order_admission"
+        and error_type.__name__ == "RiskAdmissionDeniedError"
+        and type(code) is str
+        and 1 <= len(code) <= 96
+        and code[0].isupper()
+        and code.replace("_", "").isalnum()
+        and code == code.upper()
+    )
 
 
 class ManagedExecutionFacade:
@@ -202,6 +231,48 @@ class ManagedExecutionFacade:
             writer_lease=None,
         )
 
+    def submit_approved_target(
+        self,
+        intent: OrderIntent,
+        dispatcher: DispatchPort | DispatchCallable,
+        *,
+        admission_context: ExecutionAdmissionContextV1,
+        consume_authorization: ApprovedTargetConsumeCallable,
+        before_dispatch: BeforeDispatchCallable | None = None,
+    ) -> ExecutionRecord:
+        """Submit one code-bound target after a one-use AFI consume decision.
+
+        ``consume_authorization`` runs only after the exact intent has a durable
+        dispatch claim, and before either final Basic or Risk claim. Its typed
+        result distinguishes a definitive pre-claim denial from an uncertain
+        consume; neither path calls the provider.
+        """
+
+        if not has_reserved_approval_tags(getattr(intent, "tags", None)):
+            raise ContractValidationError("approved target audit tags are required")
+        if (
+            type(admission_context) is not ExecutionAdmissionContextV1
+            or admission_context.action != APPROVED_TARGET_OPERATION
+            or admission_context.execution_scope != getattr(intent, "scope", None)
+        ):
+            raise ContractValidationError("approved-target admission context is required")
+        if not callable(consume_authorization):
+            raise ContractValidationError("approved-target consume hook is required")
+        if self._basic_admission_gate is None or self._admission_gate is None:
+            raise AdmissionRequired("approved targets require Basic and Risk admission")
+        if is_group_leg_intent_id(getattr(intent, "intent_id", None)):
+            raise ContractValidationError("approved target cannot be a group leg")
+        return self._submit(
+            intent,
+            dispatcher,
+            before_dispatch=before_dispatch,
+            admission_context=admission_context,
+            group_binding=None,
+            group_authorization=None,
+            writer_lease=None,
+            approved_target_consume=consume_authorization,
+        )
+
     def submit_group_leg(
         self,
         intent: OrderIntent,
@@ -257,6 +328,7 @@ class ManagedExecutionFacade:
         group_binding: GroupPermitBinding | None,
         group_authorization: GroupLegAuthorization | None,
         writer_lease: WriterLease | None,
+        approved_target_consume: ApprovedTargetConsumeCallable | None = None,
     ) -> ExecutionRecord:
         """Durably admit and dispatch an intent at most once.
 
@@ -276,6 +348,16 @@ class ManagedExecutionFacade:
 
         if before_dispatch is not None and not callable(before_dispatch):
             raise ContractValidationError("invalid pre-dispatch guard")
+        if approved_target_consume is not None and not callable(approved_target_consume):
+            raise ContractValidationError("invalid approved-target consume hook")
+        approved_target_path = approved_target_consume is not None
+        if approved_target_path and (
+            group_binding is not None
+            or admission_context is None
+            or admission_context.action != APPROVED_TARGET_OPERATION
+            or not has_reserved_approval_tags(getattr(intent, "tags", None))
+        ):
+            raise ContractValidationError("invalid approved-target dispatch binding")
         if after_group_claim is not None and not callable(after_group_claim):
             raise ContractValidationError("invalid after-group-claim hook")
         if after_group_claim is not None and group_binding is None:
@@ -392,6 +474,42 @@ class ManagedExecutionFacade:
                 return self._block_before_dispatch(
                     intent, "pre_dispatch_guard_failed", writer_lease
                 )
+        if approved_target_consume is not None:
+            try:
+                consume_result = approved_target_consume(intent)
+            except Exception:
+                consume_result = ApprovedTargetConsumeResultV1(
+                    ApprovedTargetConsumeDisposition.AMBIGUOUS,
+                    "APPROVAL_CONSUME_OUTCOME_UNKNOWN",
+                )
+            if type(consume_result) is not ApprovedTargetConsumeResultV1:
+                return self._store.mark_unknown(
+                    intent.intent_id,
+                    self._scope,
+                    "approved_target_consume_unknown",
+                    writer_lease=writer_lease,
+                )
+            if consume_result.disposition is ApprovedTargetConsumeDisposition.DEFINITIVE_DENIAL:
+                assert consume_result.reason_code is not None
+                return self._block_before_dispatch(
+                    intent, consume_result.reason_code, writer_lease
+                )
+            if consume_result.disposition is not ApprovedTargetConsumeDisposition.CONSUMED_NEW:
+                reason = (
+                    "approved_target_already_consumed"
+                    if consume_result.disposition
+                    is ApprovedTargetConsumeDisposition.ALREADY_CONSUMED
+                    else "approved_target_consume_unknown"
+                )
+                return self._store.mark_unknown(
+                    intent.intent_id,
+                    self._scope,
+                    reason,
+                    writer_lease=writer_lease,
+                )
+            # The approval consume is now irreversible. Reassert the current
+            # execution owner before either one-shot admission claim.
+            self._store.assert_writer_lease(self._scope, writer_lease)
         # Admission is the final application check after potentially slow
         # coordinator hooks. In particular, BasicAdmission expiry and owner
         # fencing are revalidated immediately before the authorized port.
@@ -404,6 +522,7 @@ class ManagedExecutionFacade:
             group_binding=group_binding,
             group_authorization=group_authorization,
             after_group_claim=after_group_claim,
+            approved_target_path=approved_target_path,
         )
         if record.state is not ExecutionState.DISPATCHING:
             return record
@@ -863,6 +982,7 @@ class ManagedExecutionFacade:
         group_binding: GroupPermitBinding | None = None,
         group_authorization: GroupLegAuthorization | None = None,
         after_group_claim: AfterGroupClaimCallable | None = None,
+        approved_target_path: bool = False,
     ) -> tuple[ExecutionRecord, ExecutionAdmissionAuthorizationV1 | None]:
         authorization: ExecutionAdmissionAuthorizationV1 | None = None
         gate = self._admission_gate
@@ -946,21 +1066,77 @@ class ManagedExecutionFacade:
                     None,
                 )
             return record, None
+        if approved_target_path:
+            record, authorization = self._claim_basic_admission(
+                intent,
+                record,
+                writer_lease,
+                dispatcher,
+                admission_context,
+                blocked_reason="APPROVAL_USED_NOT_DISPATCHED",
+            )
+            if record.state is not ExecutionState.DISPATCHING:
+                return record, None
         if gate is not None:
             reference = record.permit_reference
             if reference is None:
                 return (
                     self._block_before_dispatch(
-                        intent, "admission_validation_unavailable", writer_lease
+                        intent,
+                        "APPROVAL_USED_NOT_DISPATCHED"
+                        if approved_target_path
+                        else "admission_validation_unavailable",
+                        writer_lease,
                     ),
                     None,
                 )
             claimer = getattr(gate, "claim_for_dispatch", None)
+            if approved_target_path and not callable(claimer):
+                return (
+                    self._block_before_dispatch(
+                        intent, "APPROVAL_USED_NOT_DISPATCHED", writer_lease
+                    ),
+                    None,
+                )
             if callable(claimer):
                 try:
                     self._store.assert_writer_lease(self._scope, writer_lease)
                     claimer(reference, intent)
-                except Exception:
+                except WriterLeaseUnavailable:
+                    raise
+                except AdmissionDenied:
+                    if approved_target_path:
+                        return (
+                            self._block_before_dispatch(
+                                intent, "APPROVAL_USED_NOT_DISPATCHED", writer_lease
+                            ),
+                            None,
+                        )
+                    return (
+                        self._block_before_dispatch(intent, "admission_claim_failed", writer_lease),
+                        None,
+                    )
+                except Exception as error:
+                    if approved_target_path:
+                        # The Risk adapter's exact typed policy denial proves
+                        # its claim had no effect. Other exceptions may follow
+                        # a committed claim and must remain unresolved.
+                        if _is_typed_risk_admission_denial(error):
+                            return (
+                                self._block_before_dispatch(
+                                    intent, "APPROVAL_USED_NOT_DISPATCHED", writer_lease
+                                ),
+                                None,
+                            )
+                        return (
+                            self._store.mark_unknown(
+                                intent.intent_id,
+                                self._scope,
+                                "approved_risk_claim_unknown",
+                                writer_lease=writer_lease,
+                            ),
+                            None,
+                        )
                     return (
                         self._block_before_dispatch(intent, "admission_claim_failed", writer_lease),
                         None,
@@ -985,6 +1161,28 @@ class ManagedExecutionFacade:
                         None,
                     )
 
+        if approved_target_path:
+            return record, authorization
+        return self._claim_basic_admission(
+            intent,
+            record,
+            writer_lease,
+            dispatcher,
+            admission_context,
+            blocked_reason="basic_admission_claim_failed",
+        )
+
+    def _claim_basic_admission(
+        self,
+        intent: OrderIntent,
+        record: ExecutionRecord,
+        writer_lease: WriterLease,
+        dispatcher: DispatchPort | DispatchCallable,
+        admission_context: ExecutionAdmissionContextV1 | None,
+        *,
+        blocked_reason: str,
+    ) -> tuple[ExecutionRecord, ExecutionAdmissionAuthorizationV1 | None]:
+        authorization: ExecutionAdmissionAuthorizationV1 | None = None
         basic_gate = self._basic_admission_gate
         if basic_gate is not None:
             reference = record.basic_admission_reference
@@ -995,7 +1193,7 @@ class ManagedExecutionFacade:
             ):
                 return (
                     self._block_before_dispatch(
-                        intent, "basic_admission_validation_unavailable", writer_lease
+                        intent, blocked_reason, writer_lease
                     ),
                     None,
                 )
@@ -1011,7 +1209,7 @@ class ManagedExecutionFacade:
             except Exception:
                 return (
                     self._block_before_dispatch(
-                        intent, "basic_admission_claim_failed", writer_lease
+                        intent, blocked_reason, writer_lease
                     ),
                     None,
                 )

@@ -38,6 +38,8 @@ _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _INSTRUMENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,191}$")
 _REFERENCE = re.compile(r"^[0-9a-f]{32}$")
 _SUPPORTED_OPERATION = "orders.submit"
+_APPROVED_TARGET_OPERATION = "orders.submit_approved_target"
+_SUPPORTED_OPERATIONS = frozenset({_SUPPORTED_OPERATION, _APPROVED_TARGET_OPERATION})
 
 
 def _text(value: object, field_name: str, *, pattern: re.Pattern[str] = _IDENTIFIER) -> str:
@@ -80,7 +82,7 @@ class ExecutionAdmissionContextV1:
             or type(self.execution_scope) is not ExecutionScope
         ):
             raise ContractValidationError("admission scopes are required")
-        if type(self.action) is not str or self.action != _SUPPORTED_OPERATION:
+        if type(self.action) is not str or self.action not in _SUPPORTED_OPERATIONS:
             raise ContractValidationError("unsupported execution admission action")
         if (
             self.wire_scope.account_ref is not None

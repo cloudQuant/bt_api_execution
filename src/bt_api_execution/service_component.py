@@ -43,7 +43,7 @@ _WIRE_SCOPE_FIELDS = (
 
 def validate_service_options(
     options: Mapping[str, object], bind_ports: tuple[str, ...]
-) -> Mapping[str, str]:
+) -> Mapping[str, object]:
     """Validate the closed execution component role/port configuration.
 
     The accepted role and port pairs mirror the parent SDK service registry.
@@ -66,16 +66,25 @@ def validate_service_options(
         raise ContractValidationError("execution service role is required")
 
     if role == "account_owner":
-        if set(keys) - {"role", "provider_session_ref"}:
+        if set(keys) - {"role", "provider_session_ref", "approved_target_required"}:
             raise ContractValidationError("unknown account_owner service option")
         if any(port not in _ACCOUNT_OWNER_PORTS for port in bind_ports):
             raise ContractValidationError("account_owner cannot bind the requested port")
-        result = {"role": role}
+        result: dict[str, object] = {"role": role}
         if "provider_session_ref" in options:
             provider_session_ref = options["provider_session_ref"]
             if not _is_reference(provider_session_ref):
                 raise ContractValidationError("invalid provider_session_ref")
             result["provider_session_ref"] = provider_session_ref
+        if "approved_target_required" in options:
+            approved_target_required = options["approved_target_required"]
+            if type(approved_target_required) is not bool:
+                raise ContractValidationError("approved_target_required must be a bool")
+            if approved_target_required and "service.order_entry" not in bind_ports:
+                raise ContractValidationError(
+                    "approved_target_required requires service.order_entry"
+                )
+            result["approved_target_required"] = approved_target_required
         return MappingProxyType(result)
 
     if role == "group_coordinator":

@@ -123,6 +123,33 @@ def test_validate_service_options_rejects_unknown_keys_missing_refs_and_role_por
 
 
 @pytest.mark.unit
+def test_approved_target_required_is_strict_server_option_and_write_only() -> None:
+    enabled = validate_service_options(
+        {"role": "account_owner", "approved_target_required": True},
+        ("service.order_entry",),
+    )
+    disabled = validate_service_options(
+        {"role": "account_owner", "approved_target_required": False},
+        ("service.order_query",),
+    )
+    assert enabled["approved_target_required"] is True
+    assert disabled["approved_target_required"] is False
+
+    for invalid in (1, "true", None):
+        with pytest.raises(ContractValidationError):
+            validate_service_options(
+                {"role": "account_owner", "approved_target_required": invalid},
+                ("service.order_entry",),
+            )
+
+    with pytest.raises(ContractValidationError):
+        validate_service_options(
+            {"role": "account_owner", "approved_target_required": True},
+            ("service.order_query",),
+        )
+
+
+@pytest.mark.unit
 def test_orders_query_reads_json_dto_and_preserves_unknown_state_without_writes(tmp_path) -> None:
     store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
     execution_scope = _execution_scope()
