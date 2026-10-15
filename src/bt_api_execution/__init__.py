@@ -1,6 +1,15 @@
 """Public provider-neutral contracts and durable managed execution facade."""
 
 from .admission import SharedRiskAdmissionAdapter, SharedRiskGatePort
+from .basic_admission import (
+    ExecutionAdmissionAuthorizationV1,
+    ExecutionAdmissionContextV1,
+    ExecutionAdmissionValidatorRegistry,
+    ExecutionAuthorizedDispatchPort,
+    ExecutionBasicAdmissionGate,
+    ExecutionProviderOrderParametersV1,
+    ExecutionProviderValidatorV1,
+)
 from .cancellation import (
     CancelAdmissionGate,
     CancelBeforeDispatchCallable,
@@ -62,6 +71,7 @@ from .errors import (
     AdmissionRequired,
     ContractValidationError,
     DurableStoreError,
+    ExecutionBasicAdmissionDenied,
     ExecutionError,
     ExecutionUnknown,
     IntentConflictError,
@@ -185,10 +195,18 @@ __all__ = [
     "DispatchPort",
     "DurableStoreError",
     "ExecutionError",
+    "ExecutionAdmissionAuthorizationV1",
+    "ExecutionAdmissionContextV1",
+    "ExecutionAdmissionValidatorRegistry",
+    "ExecutionAuthorizedDispatchPort",
+    "ExecutionBasicAdmissionDenied",
+    "ExecutionBasicAdmissionGate",
     "ExecutionEvent",
     "ExecutionPlan",
     "ExecutionQualityRecord",
     "ExecutionRecord",
+    "ExecutionProviderOrderParametersV1",
+    "ExecutionProviderValidatorV1",
     "ExecutionScope",
     "ExecutionState",
     "ExecutionUnknown",

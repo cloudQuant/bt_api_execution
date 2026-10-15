@@ -326,6 +326,10 @@ class ExecutionRecord:
     # Kept last with a default so existing callers that construct the public
     # record positionally retain their v2 call shape.
     cumulative_commission: Decimal | None = None
+    # Execution-only admission is stored separately from a shared Risk permit.
+    # These nullable fields preserve legacy rows and Risk-only compositions.
+    basic_admission_reference: str | None = None
+    admission_context_sha256: str | None = None
 
     @property
     def is_terminal(self) -> bool:
@@ -1918,7 +1922,9 @@ class SqliteExecutionStore:
     # Version 20 adds immutable exact account identity for the code-owned CTP
     # journal factory. Existing V19 databases without this identity are not
     # implicitly bound by migration.
-    _SCHEMA_VERSION = 20
+    # Version 21 adds execution-only admission references and the trusted
+    # caller-context digest used for safe PENDING_DISPATCH reauthorization.
+    _SCHEMA_VERSION = 21
 
     def __init__(self, path: str | Path, *, busy_timeout_ms: int = 5_000) -> None:
         if type(busy_timeout_ms) is not int or busy_timeout_ms <= 0:
@@ -4901,6 +4907,8 @@ class SqliteExecutionStore:
                     average_price TEXT,
                     cumulative_commission TEXT,
                     permit_reference TEXT,
+                    basic_admission_reference TEXT,
+                    admission_context_sha256 TEXT,
                     dispatch_attempts INTEGER NOT NULL DEFAULT 0,
                     unknown_reason TEXT,
                     review_required INTEGER NOT NULL DEFAULT 0,
@@ -5941,6 +5949,13 @@ class SqliteExecutionStore:
                 version = str(self._SCHEMA_VERSION)
             else:
                 version = str(row["value"])
+            execution_columns = {
+                str(item["name"])
+                for item in cursor.execute("PRAGMA table_info(execution_records)").fetchall()
+            }
+            for name in ("basic_admission_reference", "admission_context_sha256"):
+                if name not in execution_columns:
+                    cursor.execute(f"ALTER TABLE execution_records ADD COLUMN {name} TEXT")
             outbox_columns = {
                 str(item["name"])
                 for item in cursor.execute("PRAGMA table_info(execution_outbox)").fetchall()
@@ -6080,6 +6095,7 @@ class SqliteExecutionStore:
                 "16",
                 "17",
                 "18",
+                "20",
                 str(self._SCHEMA_VERSION),
             }:
                 raise DurableStoreError("unsupported execution store schema")
@@ -6125,28 +6141,33 @@ class SqliteExecutionStore:
                         f"ALTER TABLE ctp_dispatch_commands ADD COLUMN {name} {declaration}"
                     )
             if version != str(self._SCHEMA_VERSION):
-                self._migrate_ctp_account_family_legacy_fence(
-                    cursor,
-                    previous_tables=previous_tables,
-                    previous_version=version,
-                )
-                self._migrate_legacy_ctp_callback_source_lifecycle_fences(
-                    cursor, previous_tables=previous_tables
-                )
-                self._migrate_legacy_ctp_action_ref_accounts(cursor)
-                self._migrate_ctp_cancel_postconditions(cursor)
-                # Old rows have no exact OrderRef cutover-session evidence.
-                # Never let migration make those commands dispatchable.
-                cursor.execute(
-                    """
-                    UPDATE ctp_dispatch_commands
-                    SET status = 'UNKNOWN', unknown_at_ns = COALESCE(unknown_at_ns, updated_at_ns),
-                        unknown_reason = COALESCE(
-                            unknown_reason, 'schema_upgrade_requires_ctp_v2_dispatch_cutover'
-                        )
-                    WHERE status IN ('READY', 'CLAIMED')
-                    """
-                )
+                # V20 already contains the complete CTP schema and its safety
+                # migrations. V21 only adds nullable BasicAdmission fields to
+                # execution_records; do not rerun historical CTP cutover
+                # migrations or downgrade existing READY/CLAIMED commands.
+                if version != "20":
+                    self._migrate_ctp_account_family_legacy_fence(
+                        cursor,
+                        previous_tables=previous_tables,
+                        previous_version=version,
+                    )
+                    self._migrate_legacy_ctp_callback_source_lifecycle_fences(
+                        cursor, previous_tables=previous_tables
+                    )
+                    self._migrate_legacy_ctp_action_ref_accounts(cursor)
+                    self._migrate_ctp_cancel_postconditions(cursor)
+                    # Old rows have no exact OrderRef cutover-session evidence.
+                    # Never let migration make those commands dispatchable.
+                    cursor.execute(
+                        """
+                        UPDATE ctp_dispatch_commands
+                        SET status = 'UNKNOWN', unknown_at_ns = COALESCE(unknown_at_ns, updated_at_ns),
+                            unknown_reason = COALESCE(
+                                unknown_reason, 'schema_upgrade_requires_ctp_v2_dispatch_cutover'
+                            )
+                        WHERE status IN ('READY', 'CLAIMED')
+                        """
+                    )
                 cursor.execute(
                     "UPDATE execution_meta SET value = ? WHERE key = ?",
                     (str(self._SCHEMA_VERSION), "schema_version"),
@@ -12416,6 +12437,8 @@ class SqliteExecutionStore:
             review_required=bool(row["review_required"]),
             created_at_ns=row["created_at_ns"],
             updated_at_ns=row["updated_at_ns"],
+            basic_admission_reference=row["basic_admission_reference"],
+            admission_context_sha256=row["admission_context_sha256"],
         )
 
     @staticmethod
@@ -13528,9 +13551,26 @@ class SqliteExecutionStore:
         scope: ExecutionScope,
         permit_reference: str | None = None,
         *,
+        basic_admission_reference: str | None = None,
+        admission_context_sha256: str | None = None,
         writer_lease: WriterLease | None = None,
     ) -> ExecutionRecord:
         """Record that a durable intent is eligible for a single dispatch claim."""
+
+        if (basic_admission_reference is None) != (admission_context_sha256 is None):
+            raise ContractValidationError("basic admission reference and context must be paired")
+        if basic_admission_reference is not None and (
+            type(basic_admission_reference) is not str
+            or len(basic_admission_reference) != 32
+            or any(character not in "0123456789abcdef" for character in basic_admission_reference)
+        ):
+            raise ContractValidationError("invalid basic admission reference")
+        if admission_context_sha256 is not None and (
+            type(admission_context_sha256) is not str
+            or len(admission_context_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in admission_context_sha256)
+        ):
+            raise ContractValidationError("invalid admission context fingerprint")
 
         now_ns = time.time_ns()
         with self._transaction() as cursor:
@@ -13544,12 +13584,15 @@ class SqliteExecutionStore:
             cursor.execute(
                 """
                 UPDATE execution_records
-                SET state = ?, permit_reference = ?, updated_at_ns = ?
+                SET state = ?, permit_reference = ?, basic_admission_reference = ?,
+                    admission_context_sha256 = ?, updated_at_ns = ?
                 WHERE scope_key = ? AND intent_id = ?
                 """,
                 (
                     ExecutionState.PENDING_DISPATCH.value,
                     permit_reference,
+                    basic_admission_reference,
+                    admission_context_sha256,
                     now_ns,
                     scope.key,
                     intent_id,
@@ -13561,12 +13604,119 @@ class SqliteExecutionStore:
                 scope_key=scope.key,
                 event_type="intent_admitted",
                 state=ExecutionState.PENDING_DISPATCH,
-                payload={"permit_reference": permit_reference},
+                payload=(
+                    {"permit_reference": permit_reference}
+                    if basic_admission_reference is None
+                    else {
+                        "permit_reference": permit_reference,
+                        "basic_admission_issued": True,
+                        "admission_context_sha256": admission_context_sha256,
+                    }
+                ),
                 now_ns=now_ns,
             )
             activated = self._fetch_record(cursor, scope.key, intent_id)
             assert activated is not None
             return self._record_from_row(activated)
+
+    def replace_pending_basic_admission_reference(
+        self,
+        intent_id: str,
+        scope: ExecutionScope,
+        *,
+        expected_reference: str | None,
+        new_reference: str,
+        expected_context_sha256: str,
+        writer_lease: WriterLease | None = None,
+    ) -> tuple[ExecutionRecord, bool]:
+        """CAS a fresh server permit onto a never-claimed pending intent.
+
+        This is the only recovery path for an in-memory BasicAdmission permit
+        lost to process restart. The same transaction proves the current writer
+        generation, exact caller-context digest, unchanged old permit reference,
+        PENDING_DISPATCH state, zero dispatch attempts, and absence of provider
+        evidence. DISPATCHING/UNKNOWN rows can never be reauthorized here.
+        """
+
+        if (
+            type(new_reference) is not str
+            or len(new_reference) != 32
+            or any(character not in "0123456789abcdef" for character in new_reference)
+        ):
+            raise ContractValidationError("invalid replacement admission reference")
+        if expected_reference is not None and (
+            type(expected_reference) is not str
+            or len(expected_reference) != 32
+            or any(character not in "0123456789abcdef" for character in expected_reference)
+        ):
+            raise ContractValidationError("invalid expected admission reference")
+        if (
+            type(expected_context_sha256) is not str
+            or len(expected_context_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in expected_context_sha256)
+        ):
+            raise ContractValidationError("invalid admission context fingerprint")
+        if expected_reference == new_reference:
+            raise ContractValidationError("replacement admission reference must be fresh")
+
+        now_ns = time.time_ns()
+        with self._transaction() as cursor:
+            self._assert_active_writer_lease(cursor, scope, writer_lease, now_ns=now_ns)
+            row = self._fetch_record(cursor, scope.key, intent_id)
+            if row is None:
+                raise ContractValidationError("unknown intent_id")
+            record = self._record_from_row(row)
+            if (
+                record.state is not ExecutionState.PENDING_DISPATCH
+                or record.dispatch_attempts != 0
+                or record.provider_order_id is not None
+                or record.filled_quantity != Decimal("0")
+                or record.average_price is not None
+                or record.cumulative_commission is not None
+                or record.review_required
+                or record.unknown_reason is not None
+                or record.basic_admission_reference != expected_reference
+                or record.admission_context_sha256 != expected_context_sha256
+            ):
+                return record, False
+            cursor.execute(
+                """
+                UPDATE execution_records
+                SET basic_admission_reference = ?, updated_at_ns = ?
+                WHERE scope_key = ? AND intent_id = ? AND state = ?
+                    AND dispatch_attempts = 0
+                    AND basic_admission_reference IS ?
+                    AND admission_context_sha256 = ?
+                """,
+                (
+                    new_reference,
+                    now_ns,
+                    scope.key,
+                    intent_id,
+                    ExecutionState.PENDING_DISPATCH.value,
+                    expected_reference,
+                    expected_context_sha256,
+                ),
+            )
+            if cursor.rowcount != 1:
+                current = self._fetch_record(cursor, scope.key, intent_id)
+                assert current is not None
+                return self._record_from_row(current), False
+            self._append_event(
+                cursor,
+                intent_id=intent_id,
+                scope_key=scope.key,
+                event_type="pending_admission_reference_reauthorized",
+                state=ExecutionState.PENDING_DISPATCH,
+                payload={
+                    "basic_admission_reference_replaced": True,
+                    "admission_context_sha256": expected_context_sha256,
+                },
+                now_ns=now_ns,
+            )
+            updated = self._fetch_record(cursor, scope.key, intent_id)
+            assert updated is not None
+            return self._record_from_row(updated), True
 
     def reject_intent(
         self,

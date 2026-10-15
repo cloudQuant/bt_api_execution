@@ -6,6 +6,11 @@ from collections.abc import Callable, Mapping
 from threading import RLock
 from typing import TYPE_CHECKING, Any
 
+from .basic_admission import (
+    ExecutionAdmissionAuthorizationV1,
+    ExecutionAdmissionContextV1,
+    ExecutionBasicAdmissionGate,
+)
 from .contracts import (
     ExecutionEvent,
     ExecutionScope,
@@ -17,6 +22,7 @@ from .errors import (
     AdmissionDenied,
     AdmissionRequired,
     ContractValidationError,
+    ExecutionBasicAdmissionDenied,
     InvalidStateTransition,
     WriterLeaseUnavailable,
 )
@@ -66,6 +72,7 @@ class ManagedExecutionFacade:
         *,
         writer_id: str,
         admission_gate: AdmissionGate | None = None,
+        basic_admission_gate: ExecutionBasicAdmissionGate | None = None,
         lease_ttl_ns: int = 5_000_000_000,
         allow_unprotected: bool = False,
         pre_dispatch_guard: BeforeDispatchCallable | None = None,
@@ -74,12 +81,22 @@ class ManagedExecutionFacade:
             raise ContractValidationError("invalid writer_id")
         if type(allow_unprotected) is not bool:
             raise ContractValidationError("invalid allow_unprotected")
+        if (
+            basic_admission_gate is not None
+            and type(basic_admission_gate) is not ExecutionBasicAdmissionGate
+        ):
+            raise ContractValidationError("invalid execution basic admission gate")
+        if basic_admission_gate is not None and allow_unprotected:
+            raise ContractValidationError(
+                "basic admission cannot be combined with unprotected dispatch"
+            )
         if pre_dispatch_guard is not None and not callable(pre_dispatch_guard):
             raise ContractValidationError("invalid pre-dispatch guard")
         self._store = store
         self._scope = scope
         self._writer_id = writer_id
         self._admission_gate = admission_gate
+        self._basic_admission_gate = basic_admission_gate
         self._lease_ttl_ns = lease_ttl_ns
         self._allow_unprotected = allow_unprotected
         self._pre_dispatch_guard = pre_dispatch_guard
@@ -154,6 +171,7 @@ class ManagedExecutionFacade:
         dispatcher: DispatchPort | DispatchCallable,
         *,
         before_dispatch: BeforeDispatchCallable | None = None,
+        admission_context: ExecutionAdmissionContextV1 | None = None,
     ) -> ExecutionRecord:
         """Durably admit and dispatch an intent at most once.
 
@@ -173,20 +191,75 @@ class ManagedExecutionFacade:
 
         if before_dispatch is not None and not callable(before_dispatch):
             raise ContractValidationError("invalid pre-dispatch guard")
+        if (
+            self._basic_admission_gate is not None
+            and type(admission_context) is not ExecutionAdmissionContextV1
+        ):
+            raise AdmissionRequired("trusted execution admission context is required")
+        if (
+            self._basic_admission_gate is not None
+            and admission_context.execution_scope != intent.scope
+        ):
+            raise ContractValidationError("admission context scope does not match intent")
         self._require_scope(intent)
         writer_lease = self.acquire_writer_lease()
         record = self._store.admit_intent(intent, writer_lease=writer_lease)
         if record.state is ExecutionState.PENDING_ADMISSION:
-            record = self._admit(intent, writer_lease)
+            record = self._admit(
+                intent,
+                writer_lease,
+                dispatcher,
+                admission_context,
+            )
         if record.state is not ExecutionState.PENDING_DISPATCH:
             return record
+        if self._basic_admission_gate is not None:
+            assert admission_context is not None
+            if record.admission_context_sha256 == admission_context.fingerprint and (
+                self._basic_admission_gate.needs_reauthorization(
+                    record.basic_admission_reference,
+                    admission_context,
+                    intent,
+                    dispatcher,
+                    writer_lease,
+                )
+            ):
+                replacement = None
+                try:
+                    replacement = self._basic_admission_gate.reauthorize_pending_dispatch(
+                        admission_context, intent, dispatcher, writer_lease
+                    )
+                    record, replaced = self._store.replace_pending_basic_admission_reference(
+                        intent.intent_id,
+                        self._scope,
+                        expected_reference=record.basic_admission_reference,
+                        new_reference=replacement,
+                        expected_context_sha256=admission_context.fingerprint,
+                        writer_lease=writer_lease,
+                    )
+                except WriterLeaseUnavailable:
+                    if replacement is not None:
+                        self._basic_admission_gate.revoke(replacement)
+                    raise
+                except Exception:
+                    if replacement is not None:
+                        self._basic_admission_gate.revoke(replacement)
+                    # Continue through the one-shot final claim. The lost or
+                    # rejected reference then fails closed and blocks before
+                    # the provider; it is never reconstructed from SQLite.
+                else:
+                    if not replaced:
+                        self._basic_admission_gate.revoke(replacement)
+                        return record
+            elif record.admission_context_sha256 is None:
+                # Legacy pending rows have no original principal binding. A
+                # new BasicGate cannot safely adopt them under a different
+                # admission contract.
+                pass
         record, claimed = self._store.claim_for_dispatch(
             intent.intent_id, self._scope, writer_lease=writer_lease
         )
         if not claimed:
-            return record
-        record = self._validate_and_claim_before_dispatch(intent, record, writer_lease)
-        if record.state is not ExecutionState.DISPATCHING:
             return record
         for guard in (self._pre_dispatch_guard, before_dispatch):
             if guard is None:
@@ -197,11 +270,19 @@ class ManagedExecutionFacade:
                 return self._block_before_dispatch(
                     intent, "pre_dispatch_guard_failed", writer_lease
                 )
-        # A slow coordinator hook must not let an expired owner invoke the
-        # provider with an old writer generation.
+        # Admission is the final application check after potentially slow
+        # coordinator hooks. In particular, BasicAdmission expiry and owner
+        # fencing are revalidated immediately before the authorized port.
+        record, authorization = self._validate_and_claim_before_dispatch(
+            intent, record, writer_lease, dispatcher, admission_context
+        )
+        if record.state is not ExecutionState.DISPATCHING:
+            return record
+        # Keep the store fence check adjacent to the provider call as well as
+        # in each admission gate's final claim.
         self._store.assert_writer_lease(self._scope, writer_lease)
         try:
-            observation = self._dispatch(dispatcher, intent)
+            observation = self._dispatch(dispatcher, intent, authorization=authorization)
         except Exception:
             return self._store.mark_unknown(
                 intent.intent_id, self._scope, writer_lease=writer_lease
@@ -354,26 +435,65 @@ class ManagedExecutionFacade:
             raise ContractValidationError("intent_id belongs to a different execution scope")
         return record
 
-    def _admit(self, intent: OrderIntent, writer_lease: WriterLease) -> ExecutionRecord:
+    def _admit(
+        self,
+        intent: OrderIntent,
+        writer_lease: WriterLease,
+        dispatcher: DispatchPort | DispatchCallable,
+        admission_context: ExecutionAdmissionContextV1 | None,
+    ) -> ExecutionRecord:
         gate = self._admission_gate
-        if gate is None:
+        basic_gate = self._basic_admission_gate
+        if gate is None and basic_gate is None:
             if not self._allow_unprotected:
                 raise AdmissionRequired()
             return self._store.activate_intent(
                 intent.intent_id, self._scope, writer_lease=writer_lease
             )
+        basic_reference: str | None = None
+        context_fingerprint: str | None = None
+        risk_reference: str | None = None
+        risk_permit: Any = None
         try:
             self._store.assert_writer_lease(self._scope, writer_lease)
-            permit = gate.reserve(intent)
+            if basic_gate is not None:
+                if type(admission_context) is not ExecutionAdmissionContextV1:
+                    raise AdmissionRequired("trusted execution admission context is required")
+                basic_reference = basic_gate.reserve_for_dispatch(
+                    admission_context, intent, dispatcher, writer_lease
+                )
+                context_fingerprint = admission_context.fingerprint
+            if gate is not None:
+                risk_permit = gate.reserve(intent)
+        except ExecutionBasicAdmissionDenied:
+            if basic_reference is not None and basic_gate is not None:
+                basic_gate.revoke(basic_reference)
+            return self._store.reject_intent(
+                intent.intent_id,
+                self._scope,
+                "basic_admission_denied",
+                blocked=True,
+                writer_lease=writer_lease,
+            )
         except AdmissionDenied:
+            if basic_reference is not None and basic_gate is not None:
+                basic_gate.revoke(basic_reference)
             return self._store.reject_intent(
                 intent.intent_id, self._scope, AdmissionDenied.code, writer_lease=writer_lease
             )
         except PermissionError:
+            if basic_reference is not None and basic_gate is not None:
+                basic_gate.revoke(basic_reference)
             return self._store.reject_intent(
                 intent.intent_id, self._scope, AdmissionDenied.code, writer_lease=writer_lease
             )
+        except WriterLeaseUnavailable:
+            if basic_reference is not None and basic_gate is not None:
+                basic_gate.revoke(basic_reference)
+            raise
         except Exception:
+            if basic_reference is not None and basic_gate is not None:
+                basic_gate.revoke(basic_reference)
             return self._store.reject_intent(
                 intent.intent_id,
                 self._scope,
@@ -381,29 +501,38 @@ class ManagedExecutionFacade:
                 blocked=True,
                 writer_lease=writer_lease,
             )
-        if permit is None:
-            return self._store.reject_intent(
-                intent.intent_id,
-                self._scope,
-                "invalid_admission_permit",
-                blocked=True,
-                writer_lease=writer_lease,
-            )
-        try:
-            permit_reference = self._permit_reference(permit)
-        except ContractValidationError:
-            return self._reject_after_permit_reference_failure(
-                intent.intent_id, "invalid_admission_permit_reference", writer_lease
-            )
-        if permit_reference is None:
-            return self._reject_after_permit_reference_failure(
-                intent.intent_id, "admission_permit_reference_required", writer_lease
-            )
+        if gate is not None:
+            if risk_permit is None:
+                if basic_reference is not None and basic_gate is not None:
+                    basic_gate.revoke(basic_reference)
+                return self._store.reject_intent(
+                    intent.intent_id,
+                    self._scope,
+                    "invalid_admission_permit",
+                    blocked=True,
+                    writer_lease=writer_lease,
+                )
+            try:
+                risk_reference = self._permit_reference(risk_permit)
+            except ContractValidationError:
+                if basic_reference is not None and basic_gate is not None:
+                    basic_gate.revoke(basic_reference)
+                return self._reject_after_permit_reference_failure(
+                    intent.intent_id, "invalid_admission_permit_reference", writer_lease
+                )
+            if risk_reference is None:
+                if basic_reference is not None and basic_gate is not None:
+                    basic_gate.revoke(basic_reference)
+                return self._reject_after_permit_reference_failure(
+                    intent.intent_id, "admission_permit_reference_required", writer_lease
+                )
         try:
             record = self._store.activate_intent(
                 intent.intent_id,
                 self._scope,
-                permit_reference,
+                risk_reference,
+                basic_admission_reference=basic_reference,
+                admission_context_sha256=context_fingerprint,
                 writer_lease=writer_lease,
             )
         except WriterLeaseUnavailable:
@@ -411,7 +540,10 @@ class ManagedExecutionFacade:
             # newer writer acquired the execution authority.
             raise
         except Exception:
-            self._release_permit(permit_reference, "admission_activation_failed", writer_lease)
+            if risk_reference is not None:
+                self._release_permit(risk_reference, "admission_activation_failed", writer_lease)
+            if basic_reference is not None and basic_gate is not None:
+                basic_gate.revoke(basic_reference)
             raise
         return record
 
@@ -470,42 +602,91 @@ class ManagedExecutionFacade:
             return False
         return True
 
+    def _release_basic_permit(self, permit_reference: str) -> None:
+        gate = self._basic_admission_gate
+        if gate is not None:
+            gate.revoke(permit_reference)
+
     def _validate_and_claim_before_dispatch(
         self,
         intent: OrderIntent,
         record: ExecutionRecord,
         writer_lease: WriterLease,
-    ) -> ExecutionRecord:
+        dispatcher: DispatchPort | DispatchCallable,
+        admission_context: ExecutionAdmissionContextV1 | None,
+    ) -> tuple[ExecutionRecord, ExecutionAdmissionAuthorizationV1 | None]:
+        authorization: ExecutionAdmissionAuthorizationV1 | None = None
         gate = self._admission_gate
-        if gate is None:
-            # This path is intentionally reachable only for an explicitly
-            # isolated local fixture; runtime preset resolution must not expose
-            # it for any provider-capable route.
-            return record
-        reference = record.permit_reference
-        if reference is None:
-            return self._block_before_dispatch(
-                intent, "admission_validation_unavailable", writer_lease
-            )
-        claimer = getattr(gate, "claim_for_dispatch", None)
-        if callable(claimer):
+        if gate is not None:
+            reference = record.permit_reference
+            if reference is None:
+                return (
+                    self._block_before_dispatch(
+                        intent, "admission_validation_unavailable", writer_lease
+                    ),
+                    None,
+                )
+            claimer = getattr(gate, "claim_for_dispatch", None)
+            if callable(claimer):
+                try:
+                    self._store.assert_writer_lease(self._scope, writer_lease)
+                    claimer(reference, intent)
+                except Exception:
+                    return (
+                        self._block_before_dispatch(intent, "admission_claim_failed", writer_lease),
+                        None,
+                    )
+            else:
+                validator = getattr(gate, "validate", None)
+                if not callable(validator):
+                    return (
+                        self._block_before_dispatch(
+                            intent, "admission_validation_unavailable", writer_lease
+                        ),
+                        None,
+                    )
+                try:
+                    self._store.assert_writer_lease(self._scope, writer_lease)
+                    validator(reference, intent)
+                except Exception:
+                    return (
+                        self._block_before_dispatch(
+                            intent, "admission_validation_failed", writer_lease
+                        ),
+                        None,
+                    )
+
+        basic_gate = self._basic_admission_gate
+        if basic_gate is not None:
+            reference = record.basic_admission_reference
+            if (
+                reference is None
+                or type(admission_context) is not ExecutionAdmissionContextV1
+                or record.admission_context_sha256 != admission_context.fingerprint
+            ):
+                return (
+                    self._block_before_dispatch(
+                        intent, "basic_admission_validation_unavailable", writer_lease
+                    ),
+                    None,
+                )
             try:
                 self._store.assert_writer_lease(self._scope, writer_lease)
-                claimer(reference, intent)
+                authorization = basic_gate.claim_for_dispatch(
+                    reference,
+                    intent,
+                    admission_context,
+                    dispatcher,
+                    writer_lease,
+                )
             except Exception:
-                return self._block_before_dispatch(intent, "admission_claim_failed", writer_lease)
-            return record
-        validator = getattr(gate, "validate", None)
-        if not callable(validator):
-            return self._block_before_dispatch(
-                intent, "admission_validation_unavailable", writer_lease
-            )
-        try:
-            self._store.assert_writer_lease(self._scope, writer_lease)
-            validator(reference, intent)
-        except Exception:
-            return self._block_before_dispatch(intent, "admission_validation_failed", writer_lease)
-        return record
+                return (
+                    self._block_before_dispatch(
+                        intent, "basic_admission_claim_failed", writer_lease
+                    ),
+                    None,
+                )
+        return record, authorization
 
     def _block_before_dispatch(
         self, intent: OrderIntent, reason_code: str, writer_lease: WriterLease
@@ -513,6 +694,8 @@ class ManagedExecutionFacade:
         record = self._store.block_claimed_dispatch(
             intent.intent_id, self._scope, reason_code, writer_lease=writer_lease
         )
+        if record.basic_admission_reference is not None:
+            self._release_basic_permit(record.basic_admission_reference)
         reference = record.permit_reference
         if reference is None or self._release_permit(reference, reason_code, writer_lease):
             return record
@@ -586,14 +769,22 @@ class ManagedExecutionFacade:
     def _dispatch(
         dispatcher: DispatchPort | DispatchCallable,
         intent: OrderIntent,
+        *,
+        authorization: ExecutionAdmissionAuthorizationV1 | None = None,
     ) -> ProviderObservation:
-        method = getattr(dispatcher, "submit", None)
-        if callable(method):
-            result = method(intent)
-        elif callable(dispatcher):
-            result = dispatcher(intent)
+        if authorization is not None:
+            method = getattr(dispatcher, "submit_authorized", None)
+            if not callable(method):
+                raise ContractValidationError("authorized dispatch port is unavailable")
+            result = method(intent, authorization)
         else:
-            raise ContractValidationError("invalid dispatch port")
+            method = getattr(dispatcher, "submit", None)
+            if callable(method):
+                result = method(intent)
+            elif callable(dispatcher):
+                result = dispatcher(intent)
+            else:
+                raise ContractValidationError("invalid dispatch port")
         if not isinstance(result, ProviderObservation):
             raise ContractValidationError("dispatch port returned invalid observation")
         return result

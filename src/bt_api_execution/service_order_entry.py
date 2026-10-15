@@ -22,6 +22,7 @@ from typing import Any
 
 from bt_api_base.service_protocol import WireIdentity, WireRole, WireScope
 
+from .basic_admission import ExecutionAdmissionContextV1, ExecutionBasicAdmissionGate
 from .cancellation import ManagedCancellationFacade
 from .contracts import (
     CancelIntent,
@@ -85,6 +86,7 @@ class ExecutionOrderEntryService:
         dispatch: object,
         *,
         admission_gate: object | None = None,
+        basic_admission_gate: ExecutionBasicAdmissionGate | None = None,
         cancel_admission_gate: object | None = None,
         allow_unprotected: bool = False,
         writer_id: str = _DEFAULT_WRITER_ID,
@@ -94,12 +96,24 @@ class ExecutionOrderEntryService:
             raise ContractValidationError("execution order entry requires a borrowed SQLite store")
         if not isinstance(targets, Mapping) or not targets:
             raise ContractValidationError("execution order entry targets are required")
-        if not _has_dispatch(dispatch, "submit"):
+        if not _has_dispatch(dispatch, "submit") and not (
+            basic_admission_gate is not None
+            and callable(getattr(dispatch, "submit_authorized", None))
+        ):
             raise ContractValidationError("execution order entry requires a dispatch port")
         if not _has_dispatch(dispatch, "cancel"):
             raise ContractValidationError("execution order entry requires a cancel dispatch port")
         if type(allow_unprotected) is not bool:
             raise ContractValidationError("invalid allow_unprotected")
+        if (
+            basic_admission_gate is not None
+            and type(basic_admission_gate) is not ExecutionBasicAdmissionGate
+        ):
+            raise ContractValidationError("invalid execution basic admission gate")
+        if basic_admission_gate is not None and allow_unprotected:
+            raise ContractValidationError(
+                "basic admission cannot be combined with unprotected dispatch"
+            )
         if type(writer_id) is not str or not writer_id or writer_id != writer_id.strip():
             raise ContractValidationError("invalid writer_id")
         if len(writer_id) > 128:
@@ -128,6 +142,7 @@ class ExecutionOrderEntryService:
         self._targets = MappingProxyType(copied)
         self._dispatch = dispatch
         self._admission_gate = admission_gate
+        self._basic_admission_gate = basic_admission_gate
         self._cancel_admission_gate = cancel_admission_gate
         self._allow_unprotected = allow_unprotected
         self._writer_id = writer_id
@@ -168,7 +183,19 @@ class ExecutionOrderEntryService:
             return _scope_denied()
 
         if operation == SUBMIT_OPERATION:
-            return self._submit(arguments, execution_scope)
+            admission_context = None
+            if self._basic_admission_gate is not None:
+                try:
+                    admission_context = ExecutionAdmissionContextV1(
+                        principal_ref=principal_ref,
+                        identity=identity,
+                        wire_scope=scope,
+                        execution_scope=execution_scope,
+                        action=operation,
+                    )
+                except ContractValidationError:
+                    return _reply(False, "INVALID_REQUEST", {"found": False, "record": None})
+            return self._submit(arguments, execution_scope, admission_context)
         return self._cancel(arguments, execution_scope)
 
     def recover_interrupted_dispatches(self) -> tuple[ExecutionRecord, ...]:
@@ -200,7 +227,10 @@ class ExecutionOrderEntryService:
         return tuple(recovered)
 
     def _submit(
-        self, arguments: Mapping[str, Any], execution_scope: ExecutionScope
+        self,
+        arguments: Mapping[str, Any],
+        execution_scope: ExecutionScope,
+        admission_context: ExecutionAdmissionContextV1 | None,
     ) -> Mapping[str, Any]:
         try:
             intent = _order_intent(arguments, execution_scope)
@@ -209,7 +239,11 @@ class ExecutionOrderEntryService:
 
         order_facade, _ = self._facade_pair(execution_scope)
         try:
-            record = order_facade.submit(intent, self._dispatch)
+            record = order_facade.submit(
+                intent,
+                self._dispatch,
+                admission_context=admission_context,
+            )
         except IntentConflictError:
             return self._failure_with_record("INTENT_CONFLICT", intent.intent_id, execution_scope)
         except ContractValidationError:
@@ -298,6 +332,7 @@ class ExecutionOrderEntryService:
                 execution_scope,
                 writer_id=self._writer_id,
                 admission_gate=self._admission_gate,
+                basic_admission_gate=self._basic_admission_gate,
                 lease_ttl_ns=self._lease_ttl_ns,
                 allow_unprotected=self._allow_unprotected,
             )

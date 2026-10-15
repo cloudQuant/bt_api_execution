@@ -25,3 +25,13 @@ authorize provider I/O.
 Consumers that pin this package by exact version must review the `0.2.0`
 artifact and update their code-owned pin and artifact digest together. Broad
 version ranges do not document or review the changed constructor contract.
+
+## Execution SQLite schema `20` to `21`
+
+Schema 21 adds nullable `basic_admission_reference` and
+`admission_context_sha256` columns to `execution_records`. Existing rows and
+Risk permit references remain unchanged; this migration does not authorize or
+adopt legacy pending rows that lack the trusted caller-context digest. When an
+Execution BasicAdmission gate is enabled, such rows fail closed before provider
+dispatch. The schema-20 upgrade does not rerun historical CTP cutover
+migrations or change CTP command states.

@@ -49,6 +49,12 @@ class AdmissionDeniedError(ExecutionError):
     code = "admission_denied"
 
 
+class ExecutionBasicAdmissionDeniedError(AdmissionDeniedError):
+    """Execution-owned identity, provider-capability, or order-policy denial."""
+
+    code = "execution_basic_admission_denied"
+
+
 class ExecutionUnknownError(ExecutionError):
     """A prior dispatch is uncertain and must be reconciled, never replayed."""
 
@@ -67,4 +73,5 @@ InvalidStateTransition = InvalidStateTransitionError
 WriterLeaseUnavailable = WriterLeaseUnavailableError
 AdmissionRequired = AdmissionRequiredError
 AdmissionDenied = AdmissionDeniedError
+ExecutionBasicAdmissionDenied = ExecutionBasicAdmissionDeniedError
 ExecutionUnknown = ExecutionUnknownError
