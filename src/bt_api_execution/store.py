@@ -2443,14 +2443,19 @@ class SqliteExecutionStore:
 
     @staticmethod
     def _paper_receipt_from_row(row: sqlite3.Row) -> Any:
-        from .paper_execution import PaperMatchReceiptV1
+        from .paper_execution import PaperMatchReceiptV1, PaperMatchReceiptV2
 
         try:
             receipt_json = str(row["receipt_json"])
             payload = json.loads(receipt_json)
             if canonical_json(payload) != receipt_json:
                 raise ValueError("noncanonical receipt")
-            receipt = PaperMatchReceiptV1.from_payload(payload)
+            receipt_type = (
+                PaperMatchReceiptV2
+                if type(payload) is dict and payload.get("schema") == "managed_paper_fill.v2"
+                else PaperMatchReceiptV1
+            )
+            receipt = receipt_type.from_payload(payload)
             if (
                 receipt.receipt_sha256 != str(row["receipt_sha256"])
                 or receipt.event_id != str(row["event_id"])
@@ -2500,6 +2505,7 @@ class SqliteExecutionStore:
         event_row: sqlite3.Row,
         receipt: Any,
     ) -> None:
+        from .paper_execution import PaperMatchReceiptV2
 
         try:
             payload_json = str(event_row["payload_json"])
@@ -2533,6 +2539,11 @@ class SqliteExecutionStore:
             }
             if receipt.state is ExecutionState.FILLED:
                 expected_payload["cumulative_commission_currency"] = receipt.fee_currency
+            expected_event_created_at_ns = (
+                receipt.event_created_at_ns
+                if type(receipt) is PaperMatchReceiptV2
+                else receipt.evaluated_at_ns
+            )
             if (
                 str(event_row["event_id"]) != receipt.event_id
                 or int(event_row["sequence"]) != receipt.event_sequence
@@ -2541,7 +2552,7 @@ class SqliteExecutionStore:
                 or str(event_row["event_type"]) != "provider_observation"
                 or str(event_row["state"]) != receipt.state.value
                 or str(event_row["journal_incarnation_id"]) != receipt.journal_generation
-                or int(event_row["created_at_ns"]) != receipt.evaluated_at_ns
+                or int(event_row["created_at_ns"]) != expected_event_created_at_ns
                 or payload != expected_payload
             ):
                 raise ValueError("receipt does not match its execution event")
@@ -2559,6 +2570,7 @@ class SqliteExecutionStore:
     ) -> tuple[Any, dict[tuple[str, str, str], tuple[int, str, int]], tuple[Any, ...]]:
         from .paper_execution import (
             PaperDispatchResultV1,
+            PaperMatchReceiptV2,
             apply_paper_decision,
             evaluate_paper_match,
             initial_paper_state,
@@ -2584,6 +2596,14 @@ class SqliteExecutionStore:
                 or receipt.model_ref != domain.model_ref
                 or receipt.model_version != domain.model_version
                 or receipt.fee_currency != domain.cash_currency
+                or (
+                    type(receipt) is PaperMatchReceiptV2
+                    and (
+                        receipt.strategy_ref != domain.strategy_ref
+                        or receipt.commission_model_id != "quote_notional_rate"
+                        or receipt.commission_model_version != "1"
+                    )
+                )
                 or receipt.event_sequence <= last_sequence
                 or receipt.journal_generation != generation
             ):
@@ -2633,7 +2653,11 @@ class SqliteExecutionStore:
                 intent,
                 proposal,
                 state,
-                now_ns=receipt.evaluated_at_ns,
+                now_ns=(
+                    receipt.match_time_ns
+                    if type(receipt) is PaperMatchReceiptV2
+                    else receipt.evaluated_at_ns
+                ),
                 cursor_refusal=cursor_refusal,
                 authorization_expired=receipt.reason_code == "paper_admission_expired",
             )
@@ -2834,6 +2858,68 @@ class SqliteExecutionStore:
                 raise DurableStoreError("unable to read paper match receipt") from error
         return None if row is None else self._paper_receipt_from_row(row)
 
+    def get_managed_paper_fill_v2_for_event(
+        self,
+        event_id: str,
+        *,
+        event_sequence: int,
+        journal_generation: str,
+        scope: ExecutionScope,
+    ) -> Any | None:
+        """Read an exact V2 fill receipt after validating one SQLite snapshot.
+
+        Legacy V1 receipts and events without a managed-paper fill return
+        ``None``; their timestamps are never promoted to match time. Receipt,
+        quote, order, event, and current paper-chain validation all happen in
+        the same read-only SQLite transaction. A caller-provided event key
+        that disagrees with a stored receipt fails closed.
+        """
+
+        from .paper_execution import PaperMatchReceiptV2
+
+        if (
+            type(scope) is not ExecutionScope
+            or scope.provider != "paper"
+            or type(event_id) is not str
+            or not event_id
+            or type(event_sequence) is not int
+            or event_sequence <= 0
+            or type(journal_generation) is not str
+            or len(journal_generation) != 32
+            or any(character not in "0123456789abcdef" for character in journal_generation)
+        ):
+            raise ContractValidationError("managed-paper V2 fill lookup key is invalid")
+        try:
+            with self._read_transaction() as cursor:
+                self._validate_paper_book_in_transaction(cursor, scope)
+                row = cursor.execute(
+                    "SELECT * FROM paper_match_receipts WHERE scope_key = ? AND event_id = ?",
+                    (scope.key, event_id),
+                ).fetchone()
+                if row is None:
+                    return None
+                receipt = self._paper_receipt_from_row(row)
+                if (
+                    receipt.event_id != event_id
+                    or receipt.event_sequence != event_sequence
+                    or receipt.journal_generation != journal_generation
+                ):
+                    raise DurableStoreError("managed-paper fill lookup event binding changed")
+                if type(receipt) is not PaperMatchReceiptV2:
+                    return None
+                event_row = cursor.execute(
+                    "SELECT * FROM execution_outbox WHERE event_id = ? AND scope_key = ?",
+                    (event_id, scope.key),
+                ).fetchone()
+                if event_row is None:
+                    raise DurableStoreError("managed-paper V2 fill event is missing")
+                self._paper_event_matches_receipt(event_row, receipt)
+                return receipt
+        except DurableStoreError:
+            raise
+        except (sqlite3.Error, ContractValidationError, TypeError, ValueError) as error:
+            raise DurableStoreError("unable to read managed-paper V2 fill") from error
+
     def record_paper_match_with_event(
         self,
         proposal: Any,
@@ -2849,9 +2935,14 @@ class SqliteExecutionStore:
         )
         from .paper_execution import (
             PAPER_ENVIRONMENT,
+            PAPER_FEE_MODEL_REF,
+            PAPER_FEE_MODEL_VERSION,
+            PAPER_MATCH_RECEIPT_SCHEMA_V2,
+            PAPER_MATCH_TIME_SOURCE_V2,
             PAPER_PROVIDER,
             PaperDispatchResultV1,
             PaperMatchReceiptV1,
+            PaperMatchReceiptV2,
             apply_paper_decision,
             evaluate_paper_match,
             paper_state_digest,
@@ -2942,19 +3033,21 @@ class SqliteExecutionStore:
             ):
                 raise ContractValidationError("paper proposal contents are malformed")
 
-            # This timestamp is sampled after SQLite acquired BEGIN IMMEDIATE.
-            # The same value is committed on both the execution event and the
-            # immutable paper receipt.
-            now_ns = time.time_ns()
-            self._assert_active_writer_lease(cursor, scope, writer_lease, now_ns=now_ns)
+            # This one timestamp is the synthetic managed-paper match time.
+            # Evaluation and V2 replay use this exact sample. Event creation
+            # gets its own later local journal timestamp below.
+            match_time_ns = time.time_ns()
+            self._assert_active_writer_lease(
+                cursor, scope, writer_lease, now_ns=match_time_ns
+            )
             parameters = authorization.parameters
             if (
                 type(parameters) is not ExecutionProviderOrderParametersV1
                 or authorization.intent_fingerprint != intent.fingerprint
                 or authorization.owner_id != writer_lease.owner_id
                 or authorization.fencing_token != writer_lease.fencing_token
-                or authorization.issued_at_ns > now_ns
-                or authorization.expires_at_ns <= now_ns
+                or authorization.issued_at_ns > match_time_ns
+                or authorization.expires_at_ns <= match_time_ns
                 or authorization.context_fingerprint != record.admission_context_sha256
                 or not _is_sha256(authorization.context_fingerprint)
                 or not _is_sha256(authorization.capability_fingerprint)
@@ -2981,13 +3074,13 @@ class SqliteExecutionStore:
                 raise ContractValidationError("paper admission facts do not match the active claim")
 
             cursor_refusal = self._paper_quote_cursor_refusal(domain, proposal.quote, watermarks)
-            expired = now_ns >= authorization.expires_at_ns
+            expired = match_time_ns >= authorization.expires_at_ns
             decision = evaluate_paper_match(
                 domain,
                 intent,
                 proposal,
                 current_state,
-                now_ns=now_ns,
+                now_ns=match_time_ns,
                 cursor_refusal=cursor_refusal,
                 authorization_expired=expired,
             )
@@ -3001,9 +3094,11 @@ class SqliteExecutionStore:
             after_state = apply_paper_decision(domain, current_state, decision)
             after_sha = paper_state_digest(domain, after_state)
             provider_order_id = observation.provider_order_id or record.provider_order_id
-            now_ns = time.time_ns()
-            self._assert_active_writer_lease(cursor, scope, writer_lease, now_ns=now_ns)
-            if now_ns >= authorization.expires_at_ns:
+            event_created_at_ns = time.time_ns()
+            self._assert_active_writer_lease(
+                cursor, scope, writer_lease, now_ns=event_created_at_ns
+            )
+            if event_created_at_ns >= authorization.expires_at_ns:
                 # The one-shot claim is now consumed. Leave the durable row
                 # DISPATCHING so the facade latches UNKNOWN; a quote is never
                 # silently re-evaluated or matched on a later replay.
@@ -3012,24 +3107,15 @@ class SqliteExecutionStore:
                 observation.state is ExecutionState.FILLED
                 and proposal.quote is not None
                 and (
-                    now_ns < proposal.quote.as_of_ns
-                    or now_ns - proposal.quote.as_of_ns > domain.max_quote_age_ns
+                    event_created_at_ns < proposal.quote.as_of_ns
+                    or event_created_at_ns - proposal.quote.as_of_ns > domain.max_quote_age_ns
                 )
             ):
-                decision = evaluate_paper_match(
-                    domain,
-                    intent,
-                    proposal,
-                    current_state,
-                    now_ns=now_ns,
-                    cursor_refusal=cursor_refusal,
-                )
-                observation = decision.observation
-                if observation.state is not ExecutionState.REJECTED:
-                    raise DurableStoreError("paper quote changed during atomic evaluation")
-                after_state = apply_paper_decision(domain, current_state, decision)
-                after_sha = paper_state_digest(domain, after_state)
-                provider_order_id = observation.provider_order_id or record.provider_order_id
+                # A fill's match decision is immutable. If the quote becomes
+                # too old before its event can commit, fail the one-shot
+                # transaction closed instead of changing the match time or
+                # manufacturing a second decision at commit time.
+                raise DurableStoreError("paper quote expired before atomic event commit")
             cursor.execute(
                 """
                 UPDATE execution_records
@@ -3050,7 +3136,7 @@ class SqliteExecutionStore:
                         if observation.cumulative_commission is None
                         else format(observation.cumulative_commission, "f")
                     ),
-                    now_ns,
+                    event_created_at_ns,
                     scope.key,
                     intent.intent_id,
                     ExecutionState.DISPATCHING.value,
@@ -3085,39 +3171,56 @@ class SqliteExecutionStore:
                 event_type="provider_observation",
                 state=observation.state,
                 payload=event_payload,
-                now_ns=now_ns,
+                now_ns=event_created_at_ns,
             )
             journal_generation = event.journal_incarnation_id
             if journal_generation is None:
                 raise DurableStoreError("paper execution event lacks journal generation")
-            receipt = PaperMatchReceiptV1.create(
-                account_key=scope.account_key,
-                scope_key=scope.key,
-                journal_generation=journal_generation,
-                execution_domain_ref=domain.execution_domain_ref,
-                simulation_account_ref=domain.simulation_account_ref,
-                experiment_ref=domain.experiment_ref,
-                model_ref=domain.model_ref,
-                model_version=domain.model_version,
-                intent_id=intent.intent_id,
-                intent_fingerprint=intent.fingerprint,
-                event_id=event.event_id,
-                event_sequence=event.sequence,
-                state=observation.state,
-                reason_code=decision.reason_code,
-                evaluated_at_ns=now_ns,
-                instrument=intent.instrument,
-                side=intent.side,
-                quantity=decision.filled_quantity,
-                fill_price=decision.fill_price,
-                fee_amount=decision.fee_amount,
-                fee_currency=domain.cash_currency,
-                quote=decision.quote,
-                cash_delta=decision.cash_delta,
-                position_delta=decision.position_delta,
-                before_book_sha256=before_sha,
-                after_book_sha256=after_sha,
-            )
+            receipt_values = {
+                "account_key": scope.account_key,
+                "scope_key": scope.key,
+                "journal_generation": journal_generation,
+                "execution_domain_ref": domain.execution_domain_ref,
+                "simulation_account_ref": domain.simulation_account_ref,
+                "experiment_ref": domain.experiment_ref,
+                "model_ref": domain.model_ref,
+                "model_version": domain.model_version,
+                "intent_id": intent.intent_id,
+                "intent_fingerprint": intent.fingerprint,
+                "event_id": event.event_id,
+                "event_sequence": event.sequence,
+                "state": observation.state,
+                "reason_code": decision.reason_code,
+                "instrument": intent.instrument,
+                "side": intent.side,
+                "quantity": decision.filled_quantity,
+                "fill_price": decision.fill_price,
+                "fee_amount": decision.fee_amount,
+                "fee_currency": domain.cash_currency,
+                "quote": decision.quote,
+                "cash_delta": decision.cash_delta,
+                "position_delta": decision.position_delta,
+                "before_book_sha256": before_sha,
+                "after_book_sha256": after_sha,
+            }
+            if observation.state is ExecutionState.FILLED:
+                receipt = PaperMatchReceiptV2.create(
+                    **receipt_values,
+                    evaluated_at_ns=match_time_ns,
+                    schema=PAPER_MATCH_RECEIPT_SCHEMA_V2,
+                    time_source=PAPER_MATCH_TIME_SOURCE_V2,
+                    match_time_ns=match_time_ns,
+                    event_created_at_ns=event_created_at_ns,
+                    fill_id=f"paper:{journal_generation}:{event.event_id}",
+                    strategy_ref=domain.strategy_ref,
+                    commission_model_id=PAPER_FEE_MODEL_REF,
+                    commission_model_version=PAPER_FEE_MODEL_VERSION,
+                )
+            else:
+                receipt = PaperMatchReceiptV1.create(
+                    **receipt_values,
+                    evaluated_at_ns=event_created_at_ns,
+                )
             receipt_json = canonical_json(receipt.to_payload())
             recorded_at_ns = time.time_ns()
             cursor.execute(

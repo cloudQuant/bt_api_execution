@@ -42,6 +42,8 @@ PAPER_MODEL_REF = "spot_market_top_of_book"
 PAPER_MODEL_VERSION = "1"
 PAPER_FEE_MODEL_REF = "quote_notional_rate"
 PAPER_FEE_MODEL_VERSION = "1"
+PAPER_MATCH_RECEIPT_SCHEMA_V2 = "managed_paper_fill.v2"
+PAPER_MATCH_TIME_SOURCE_V2 = "MANAGED_PAPER_MATCH"
 
 _PAPER_REFUSALS = frozenset(
     {
@@ -1132,6 +1134,160 @@ class PaperMatchReceiptV1:
 
 
 @dataclass(frozen=True, slots=True)
+class PaperMatchReceiptV2(PaperMatchReceiptV1):
+    """One durable synthetic managed-paper fill with an explicit match clock.
+
+    V2 is emitted only for a successful managed-paper MARKET/FOK full fill.
+    Its match timestamp is the single clock sample used to evaluate and replay
+    the synthetic match. ``event_created_at_ns`` remains local journal commit
+    metadata and is never an execution-time fallback.
+    """
+
+    schema: str
+    time_source: str
+    match_time_ns: int
+    event_created_at_ns: int
+    fill_id: str
+    strategy_ref: str
+    commission_model_id: str
+    commission_model_version: str
+
+    def __post_init__(self) -> None:
+        PaperMatchReceiptV1.__post_init__(self)
+        for name in (
+            "schema",
+            "time_source",
+            "fill_id",
+            "strategy_ref",
+            "commission_model_id",
+            "commission_model_version",
+        ):
+            object.__setattr__(self, name, _text(getattr(self, name), name.replace("_", " ")))
+        if (
+            self.schema != PAPER_MATCH_RECEIPT_SCHEMA_V2
+            or self.time_source != PAPER_MATCH_TIME_SOURCE_V2
+            or type(self.match_time_ns) is not int
+            or self.match_time_ns <= 0
+            or self.match_time_ns != self.evaluated_at_ns
+            or type(self.event_created_at_ns) is not int
+            or self.event_created_at_ns <= 0
+            or self.state is not ExecutionState.FILLED
+            or self.fill_id != f"paper:{self.journal_generation}:{self.event_id}"
+            or self.commission_model_id != PAPER_FEE_MODEL_REF
+            or self.commission_model_version != PAPER_FEE_MODEL_VERSION
+        ):
+            raise ContractValidationError("managed-paper V2 fill facts are invalid")
+
+    def payload_without_digest(self) -> dict[str, object]:
+        return {
+            **PaperMatchReceiptV1.payload_without_digest(self),
+            "schema": self.schema,
+            "time_source": self.time_source,
+            "match_time_ns": self.match_time_ns,
+            "event_created_at_ns": self.event_created_at_ns,
+            "fill_id": self.fill_id,
+            "strategy_ref": self.strategy_ref,
+            "commission_model_id": self.commission_model_id,
+            "commission_model_version": self.commission_model_version,
+        }
+
+    def to_fill_fact_payload(self) -> dict[str, object]:
+        """Return the strict wire projection for one verified V2 paper fill."""
+
+        if self.quote is None or self.fill_price is None or self.state is not ExecutionState.FILLED:
+            raise ContractValidationError("managed-paper V2 receipt has no fill fact")
+        return {
+            "schema": self.schema,
+            "time_source": self.time_source,
+            "fill_id": self.fill_id,
+            "match_time_ns": self.match_time_ns,
+            "event_created_at_ns": self.event_created_at_ns,
+            "quantity": format(self.quantity, "f"),
+            "price": format(self.fill_price, "f"),
+            "commission": format(self.fee_amount, "f"),
+            "commission_currency": self.fee_currency,
+            "commission_model_id": self.commission_model_id,
+            "commission_model_version": self.commission_model_version,
+            "event_id": self.event_id,
+            "event_sequence": self.event_sequence,
+            "journal_generation": self.journal_generation,
+            "scope_key": self.scope_key,
+            "intent_id": self.intent_id,
+            "intent_fingerprint": self.intent_fingerprint,
+            "account_ref": self.simulation_account_ref,
+            "strategy_ref": self.strategy_ref,
+            "quote_source_ref": self.quote.source_ref,
+            "quote_generation": self.quote.generation,
+            "quote_cursor": self.quote.cursor,
+            "quote_instrument": self.quote.instrument,
+            "receipt_sha256": self.receipt_sha256,
+        }
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, object]) -> PaperMatchReceiptV2:
+        extra_fields = {
+            "schema",
+            "time_source",
+            "match_time_ns",
+            "event_created_at_ns",
+            "fill_id",
+            "strategy_ref",
+            "commission_model_id",
+            "commission_model_version",
+        }
+        if type(payload) is not dict or "schema" not in payload:
+            raise ContractValidationError("stored managed-paper V2 receipt is malformed")
+        base_payload = {key: value for key, value in payload.items() if key not in extra_fields}
+        if set(payload) != set(base_payload) | extra_fields:
+            raise ContractValidationError("stored managed-paper V2 receipt has an invalid shape")
+        # Reuse the strict V1 parser for all shared receipt and quote fields;
+        # the temporary digest is only for parsing, while this V2 instance
+        # verifies the original V2 digest over the complete payload below.
+        base_without_digest = {
+            key: value for key, value in base_payload.items() if key != "receipt_sha256"
+        }
+        base_payload["receipt_sha256"] = payload_sha256(base_without_digest)
+        base = PaperMatchReceiptV1.from_payload(base_payload)
+        return cls(
+            account_key=base.account_key,
+            scope_key=base.scope_key,
+            journal_generation=base.journal_generation,
+            execution_domain_ref=base.execution_domain_ref,
+            simulation_account_ref=base.simulation_account_ref,
+            experiment_ref=base.experiment_ref,
+            model_ref=base.model_ref,
+            model_version=base.model_version,
+            intent_id=base.intent_id,
+            intent_fingerprint=base.intent_fingerprint,
+            event_id=base.event_id,
+            event_sequence=base.event_sequence,
+            state=base.state,
+            reason_code=base.reason_code,
+            evaluated_at_ns=base.evaluated_at_ns,
+            instrument=base.instrument,
+            side=base.side,
+            quantity=base.quantity,
+            fill_price=base.fill_price,
+            fee_amount=base.fee_amount,
+            fee_currency=base.fee_currency,
+            quote=base.quote,
+            cash_delta=base.cash_delta,
+            position_delta=base.position_delta,
+            before_book_sha256=base.before_book_sha256,
+            after_book_sha256=base.after_book_sha256,
+            schema=payload["schema"],
+            time_source=payload["time_source"],
+            match_time_ns=payload["match_time_ns"],
+            event_created_at_ns=payload["event_created_at_ns"],
+            fill_id=payload["fill_id"],
+            strategy_ref=payload["strategy_ref"],
+            commission_model_id=payload["commission_model_id"],
+            commission_model_version=payload["commission_model_version"],
+            receipt_sha256=payload["receipt_sha256"],
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class PaperPositionBalanceV1:
     instrument: str
     quantity: Decimal
@@ -1208,6 +1364,8 @@ __all__ = (
     "PAPER_MODEL_VERSION",
     "PAPER_FEE_MODEL_REF",
     "PAPER_FEE_MODEL_VERSION",
+    "PAPER_MATCH_RECEIPT_SCHEMA_V2",
+    "PAPER_MATCH_TIME_SOURCE_V2",
     "PaperInstrumentV1",
     "PaperOpeningPositionV1",
     "PaperOwnerDomainV1",
@@ -1218,6 +1376,7 @@ __all__ = (
     "PaperEconomicStateV1",
     "PaperMatchDecisionV1",
     "PaperMatchReceiptV1",
+    "PaperMatchReceiptV2",
     "PaperPositionBalanceV1",
     "PaperBookSnapshotV1",
     "initial_paper_state",
