@@ -11,13 +11,16 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 from types import MappingProxyType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from bt_api_base.service_protocol import WireScope
 
 from .contracts import ExecutionScope
 from .errors import ContractValidationError
 from .store import ExecutionRecord, SqliteExecutionStore
+
+if TYPE_CHECKING:
+    from .group_contracts import GroupLegAuthorization
 
 SUPPORTED_OPERATIONS = frozenset({"orders.query"})
 
@@ -149,7 +152,11 @@ class ExecutionReadService:
             raise ContractValidationError(
                 "execution store returned a record outside the query scope"
             )
-        return _reply(True, "OK", {"found": True, "record": _record_dto(record)})
+        return _reply(
+            True,
+            "OK",
+            {"found": True, "record": _stored_record_dto(self._store, record, execution_scope)},
+        )
 
     def _resolve_scope(self, requested: WireScope) -> ExecutionScope | None:
         exact = self._targets.get(requested)
@@ -216,10 +223,14 @@ def _is_principal_ref(value: object) -> bool:
     )
 
 
-def _record_dto(record: ExecutionRecord) -> dict[str, object]:
+def _record_dto(
+    record: ExecutionRecord,
+    *,
+    group_authorization_attempts: tuple[GroupLegAuthorization, ...] = (),
+) -> dict[str, object]:
     """Project the public immutable record fields to transport-safe scalars."""
 
-    return {
+    result: dict[str, object] = {
         "intent_id": record.intent_id,
         "scope_key": record.scope_key,
         "payload_sha256": record.payload_sha256,
@@ -242,6 +253,25 @@ def _record_dto(record: ExecutionRecord) -> dict[str, object]:
         "updated_at_ns": record.updated_at_ns,
         "is_terminal": record.is_terminal,
     }
+    if record.group_binding is not None:
+        result["group_binding"] = record.group_binding.to_payload()
+        result["group_authorization_attempts"] = [
+            authorization.to_payload() for authorization in group_authorization_attempts
+        ]
+    return result
+
+
+def _stored_record_dto(
+    store: SqliteExecutionStore, record: ExecutionRecord, scope: ExecutionScope
+) -> dict[str, object]:
+    """Include the append-only current-fence audit for a grouped order."""
+
+    attempts = (
+        store.list_group_authorization_attempts(record.intent_id, scope=scope)
+        if record.group_binding is not None
+        else ()
+    )
+    return _record_dto(record, group_authorization_attempts=attempts)
 
 
 def _scope_denied() -> Mapping[str, Any]:

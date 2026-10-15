@@ -50,6 +50,7 @@ from .errors import (
     InvalidStateTransition,
     WriterLeaseUnavailable,
 )
+from .group_contracts import GroupLegAuthorization, GroupPermitBinding
 
 
 def _is_sha256(value: Any) -> bool:
@@ -80,6 +81,7 @@ _CTP_ACCOUNT_STORE_TABLES = frozenset(
         "execution_meta",
         "execution_records",
         "execution_outbox",
+        "group_authorization_attempts",
         "cancellation_records",
         "cancellation_outbox",
         "execution_writer_leases",
@@ -137,6 +139,8 @@ _CTP_ACCOUNT_STORE_INDEXES = frozenset(
 )
 _CTP_ACCOUNT_STORE_TRIGGERS = frozenset(
     {
+        "group_authorization_attempts_immutable_update",
+        "group_authorization_attempts_immutable_delete",
         "ctp_account_family_owner_immutable_identity",
         "ctp_account_family_owner_no_delete",
         "ctp_account_store_identity_immutable_update",
@@ -330,6 +334,10 @@ class ExecutionRecord:
     # These nullable fields preserve legacy rows and Risk-only compositions.
     basic_admission_reference: str | None = None
     admission_context_sha256: str | None = None
+    # Coordinator metadata is a separate immutable binding, not part of the
+    # provider-neutral order payload. Its fingerprint is included in the
+    # durable business identity for group-leg rows.
+    group_binding: GroupPermitBinding | None = None
 
     @property
     def is_terminal(self) -> bool:
@@ -1924,7 +1932,8 @@ class SqliteExecutionStore:
     # implicitly bound by migration.
     # Version 21 adds execution-only admission references and the trusted
     # caller-context digest used for safe PENDING_DISPATCH reauthorization.
-    _SCHEMA_VERSION = 21
+    # Version 22 adds the immutable group-permit binding to execution rows.
+    _SCHEMA_VERSION = 22
 
     def __init__(self, path: str | Path, *, busy_timeout_ms: int = 5_000) -> None:
         if type(busy_timeout_ms) is not int or busy_timeout_ms <= 0:
@@ -4942,6 +4951,9 @@ class SqliteExecutionStore:
                     permit_reference TEXT,
                     basic_admission_reference TEXT,
                     admission_context_sha256 TEXT,
+                    group_binding_json TEXT,
+                    group_binding_sha256 TEXT
+                        CHECK(group_binding_sha256 IS NULL OR length(group_binding_sha256) = 64),
                     dispatch_attempts INTEGER NOT NULL DEFAULT 0,
                     unknown_reason TEXT,
                     review_required INTEGER NOT NULL DEFAULT 0,
@@ -4964,6 +4976,28 @@ class SqliteExecutionStore:
                 );
                 CREATE INDEX IF NOT EXISTS execution_outbox_intent_sequence
                     ON execution_outbox(scope_key, intent_id, sequence);
+                CREATE TABLE IF NOT EXISTS group_authorization_attempts (
+                    scope_key TEXT NOT NULL,
+                    intent_id TEXT NOT NULL,
+                    authorization_attempt_id TEXT NOT NULL,
+                    group_binding_sha256 TEXT NOT NULL CHECK(length(group_binding_sha256) = 64),
+                    authorization_json TEXT NOT NULL,
+                    authorization_sha256 TEXT NOT NULL CHECK(length(authorization_sha256) = 64),
+                    created_at_ns INTEGER NOT NULL,
+                    PRIMARY KEY(scope_key, intent_id, authorization_attempt_id),
+                    FOREIGN KEY(scope_key, intent_id)
+                        REFERENCES execution_records(scope_key, intent_id)
+                );
+                CREATE TRIGGER IF NOT EXISTS group_authorization_attempts_immutable_update
+                BEFORE UPDATE ON group_authorization_attempts
+                BEGIN
+                    SELECT RAISE(ABORT, 'group authorization attempts are immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS group_authorization_attempts_immutable_delete
+                BEFORE DELETE ON group_authorization_attempts
+                BEGIN
+                    SELECT RAISE(ABORT, 'group authorization attempts are immutable');
+                END;
                 CREATE TABLE IF NOT EXISTS cancellation_records (
                     scope_key TEXT NOT NULL,
                     cancel_id TEXT NOT NULL,
@@ -5986,7 +6020,12 @@ class SqliteExecutionStore:
                 str(item["name"])
                 for item in cursor.execute("PRAGMA table_info(execution_records)").fetchall()
             }
-            for name in ("basic_admission_reference", "admission_context_sha256"):
+            for name in (
+                "basic_admission_reference",
+                "admission_context_sha256",
+                "group_binding_json",
+                "group_binding_sha256",
+            ):
                 if name not in execution_columns:
                     cursor.execute(f"ALTER TABLE execution_records ADD COLUMN {name} TEXT")
             outbox_columns = {
@@ -6129,6 +6168,7 @@ class SqliteExecutionStore:
                 "17",
                 "18",
                 "20",
+                "21",
                 str(self._SCHEMA_VERSION),
             }:
                 raise DurableStoreError("unsupported execution store schema")
@@ -6175,10 +6215,10 @@ class SqliteExecutionStore:
                     )
             if version != str(self._SCHEMA_VERSION):
                 # V20 already contains the complete CTP schema and its safety
-                # migrations. V21 only adds nullable BasicAdmission fields to
-                # execution_records; do not rerun historical CTP cutover
+                # migrations. V21/V22 only add nullable admission/group fields
+                # and the group authorization audit table; do not rerun historical CTP cutover
                 # migrations or downgrade existing READY/CLAIMED commands.
-                if version != "20":
+                if version not in {"20", "21"}:
                     self._migrate_ctp_account_family_legacy_fence(
                         cursor,
                         previous_tables=previous_tables,
@@ -12451,6 +12491,26 @@ class SqliteExecutionStore:
 
     @staticmethod
     def _record_from_row(row: sqlite3.Row) -> ExecutionRecord:
+        group_binding_json = row["group_binding_json"]
+        group_binding_sha256 = row["group_binding_sha256"]
+        group_binding: GroupPermitBinding | None = None
+        if (group_binding_json is None) != (group_binding_sha256 is None):
+            raise DurableStoreError("stored group permit binding is incomplete")
+        if group_binding_json is not None:
+            try:
+                binding_payload = json.loads(str(group_binding_json))
+                if canonical_json(binding_payload) != str(group_binding_json):
+                    raise ValueError("noncanonical binding")
+                group_binding = GroupPermitBinding.from_payload(binding_payload)
+                intent_payload = json.loads(str(row["payload_json"]))
+                intent = order_intent_from_payload(intent_payload)
+                group_binding.validate_order(intent)
+                if group_binding.fingerprint != str(
+                    group_binding_sha256
+                ) or intent.fingerprint != str(row["payload_sha256"]):
+                    raise ValueError("group order identity does not match its binding")
+            except (ContractValidationError, TypeError, ValueError, json.JSONDecodeError):
+                raise DurableStoreError("stored group permit binding is unreadable") from None
         return ExecutionRecord(
             intent_id=row["intent_id"],
             scope_key=row["scope_key"],
@@ -12472,6 +12532,7 @@ class SqliteExecutionStore:
             updated_at_ns=row["updated_at_ns"],
             basic_admission_reference=row["basic_admission_reference"],
             admission_context_sha256=row["admission_context_sha256"],
+            group_binding=group_binding,
         )
 
     @staticmethod
@@ -12788,14 +12849,14 @@ class SqliteExecutionStore:
                 if scope is not None:
                     row = self._connection.execute(
                         """
-                        SELECT payload_json FROM execution_records
+                        SELECT * FROM execution_records
                         WHERE scope_key = ? AND intent_id = ?
                         """,
                         (scope.key, intent_id),
                     ).fetchone()
                 else:
                     rows = self._connection.execute(
-                        "SELECT payload_json FROM execution_records WHERE intent_id = ? LIMIT 2",
+                        "SELECT * FROM execution_records WHERE intent_id = ? LIMIT 2",
                         (intent_id,),
                     ).fetchall()
                     if len(rows) > 1:
@@ -12806,10 +12867,101 @@ class SqliteExecutionStore:
         if row is None:
             return None
         try:
+            self._record_from_row(row)
             payload = json.loads(row["payload_json"])
         except (TypeError, json.JSONDecodeError) as error:
             raise DurableStoreError("stored intent payload is unreadable") from error
         return order_intent_from_payload(payload)
+
+    def list_group_authorization_attempts(
+        self, intent_id: str, *, scope: ExecutionScope
+    ) -> tuple[GroupLegAuthorization, ...]:
+        """Read immutable group-owner epoch facts bound to one durable leg."""
+
+        if not isinstance(scope, ExecutionScope):
+            raise ContractValidationError("execution scope is required")
+        record = self.get(intent_id, scope=scope)
+        if record is None:
+            return ()
+        if record.group_binding is None:
+            return ()
+        with self._lock:
+            try:
+                rows = self._connection.execute(
+                    """
+                    SELECT authorization_json, authorization_sha256,
+                           group_binding_sha256
+                    FROM group_authorization_attempts
+                    WHERE scope_key = ? AND intent_id = ?
+                    ORDER BY created_at_ns, authorization_attempt_id
+                    """,
+                    (scope.key, intent_id),
+                ).fetchall()
+            except sqlite3.Error as error:
+                raise DurableStoreError("unable to read group authorization attempts") from error
+        attempts: list[GroupLegAuthorization] = []
+        for row in rows:
+            try:
+                authorization_json = str(row["authorization_json"])
+                payload = json.loads(authorization_json)
+                if canonical_json(payload) != authorization_json:
+                    raise ValueError("noncanonical authorization")
+                authorization = GroupLegAuthorization.from_payload(payload)
+                authorization.validate_binding(record.group_binding)
+                if authorization.fingerprint != str(
+                    row["authorization_sha256"]
+                ) or record.group_binding.fingerprint != str(row["group_binding_sha256"]):
+                    raise ValueError("authorization digest mismatch")
+            except (ContractValidationError, TypeError, ValueError, json.JSONDecodeError):
+                raise DurableStoreError("stored group authorization is unreadable") from None
+            attempts.append(authorization)
+        return tuple(attempts)
+
+    @staticmethod
+    def _record_group_authorization_attempt(
+        cursor: sqlite3.Cursor,
+        *,
+        scope_key: str,
+        intent_id: str,
+        binding: GroupPermitBinding,
+        authorization: GroupLegAuthorization,
+        now_ns: int,
+    ) -> None:
+        authorization.validate_binding(binding)
+        authorization_json = canonical_json(authorization.to_payload())
+        existing = cursor.execute(
+            """
+            SELECT group_binding_sha256, authorization_json, authorization_sha256
+            FROM group_authorization_attempts
+            WHERE scope_key = ? AND intent_id = ? AND authorization_attempt_id = ?
+            """,
+            (scope_key, intent_id, authorization.authorization_attempt_id),
+        ).fetchone()
+        if existing is not None:
+            if (
+                str(existing["group_binding_sha256"]) != binding.fingerprint
+                or str(existing["authorization_json"]) != authorization_json
+                or str(existing["authorization_sha256"]) != authorization.fingerprint
+            ):
+                raise IntentConflictError()
+            return
+        cursor.execute(
+            """
+            INSERT INTO group_authorization_attempts(
+                scope_key, intent_id, authorization_attempt_id, group_binding_sha256,
+                authorization_json, authorization_sha256, created_at_ns
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                scope_key,
+                intent_id,
+                authorization.authorization_attempt_id,
+                binding.fingerprint,
+                authorization_json,
+                authorization.fingerprint,
+                now_ns,
+            ),
+        )
 
     def get_cancel(
         self, cancel_id: str, *, scope: ExecutionScope | None = None
@@ -13527,7 +13679,12 @@ class SqliteExecutionStore:
             return self._cancel_record_from_row(updated)
 
     def admit_intent(
-        self, intent: OrderIntent, *, writer_lease: WriterLease | None = None
+        self,
+        intent: OrderIntent,
+        *,
+        writer_lease: WriterLease | None = None,
+        group_binding: GroupPermitBinding | None = None,
+        group_authorization: GroupLegAuthorization | None = None,
     ) -> ExecutionRecord:
         """Persist an immutable intent before admission or provider dispatch.
 
@@ -13535,6 +13692,28 @@ class SqliteExecutionStore:
         with a different payload is a terminal local contract error.
         """
 
+        if (group_binding is None) != (group_authorization is None):
+            raise ContractValidationError("group binding and attempt authorization must be paired")
+        if group_binding is not None:
+            if type(group_binding) is not GroupPermitBinding:
+                raise ContractValidationError("invalid group permit binding")
+            if type(group_authorization) is not GroupLegAuthorization:
+                raise ContractValidationError("invalid group leg authorization")
+            if writer_lease is None:
+                raise ContractValidationError("group authorization requires its writer lease")
+            group_binding.validate_order(intent)
+            group_authorization.validate_binding(group_binding)
+            group_authorization.validate_writer_lease(writer_lease)
+            group_binding_json = canonical_json(group_binding.to_payload())
+            group_binding_sha256 = group_binding.fingerprint
+            # Preserve the v1 execution-payload hash semantics. The immutable
+            # business identity for a grouped leg is the pair of this hash and
+            # the separately persisted binding fingerprint.
+            business_fingerprint = intent.fingerprint
+        else:
+            group_binding_json = None
+            group_binding_sha256 = None
+            business_fingerprint = intent.fingerprint
         now_ns = time.time_ns()
         payload_json = canonical_json(intent.to_payload())
         with self._transaction() as cursor:
@@ -13542,23 +13721,41 @@ class SqliteExecutionStore:
             existing = self._fetch_record(cursor, intent.scope.key, intent.intent_id)
             if existing is not None:
                 if (
-                    existing["payload_sha256"] != intent.fingerprint
+                    existing["payload_sha256"] != business_fingerprint
+                    or existing["group_binding_sha256"] != group_binding_sha256
+                    or existing["group_binding_json"] != group_binding_json
                     or existing["scope_key"] != intent.scope.key
                 ):
                     raise IntentConflictError()
+                if group_binding is not None and ExecutionState(existing["state"]) in {
+                    ExecutionState.PENDING_ADMISSION,
+                    ExecutionState.PENDING_DISPATCH,
+                }:
+                    assert group_authorization is not None
+                    self._record_group_authorization_attempt(
+                        cursor,
+                        scope_key=intent.scope.key,
+                        intent_id=intent.intent_id,
+                        binding=group_binding,
+                        authorization=group_authorization,
+                        now_ns=now_ns,
+                    )
                 return self._record_from_row(existing)
             cursor.execute(
                 """
                 INSERT INTO execution_records(
-                    scope_key, intent_id, payload_sha256, payload_json, state, filled_quantity,
+                    scope_key, intent_id, payload_sha256, payload_json, group_binding_json,
+                    group_binding_sha256, state, filled_quantity,
                     created_at_ns, updated_at_ns
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     intent.scope.key,
                     intent.intent_id,
-                    intent.fingerprint,
+                    business_fingerprint,
                     payload_json,
+                    group_binding_json,
+                    group_binding_sha256,
                     ExecutionState.PENDING_ADMISSION.value,
                     "0",
                     now_ns,
@@ -13571,9 +13768,22 @@ class SqliteExecutionStore:
                 scope_key=intent.scope.key,
                 event_type="intent_recorded",
                 state=ExecutionState.PENDING_ADMISSION,
-                payload={"payload_sha256": intent.fingerprint},
+                payload={
+                    "payload_sha256": business_fingerprint,
+                    "group_binding_sha256": group_binding_sha256,
+                },
                 now_ns=now_ns,
             )
+            if group_binding is not None:
+                assert group_authorization is not None
+                self._record_group_authorization_attempt(
+                    cursor,
+                    scope_key=intent.scope.key,
+                    intent_id=intent.intent_id,
+                    binding=group_binding,
+                    authorization=group_authorization,
+                    now_ns=now_ns,
+                )
             inserted = self._fetch_record(cursor, intent.scope.key, intent.intent_id)
             assert inserted is not None
             return self._record_from_row(inserted)

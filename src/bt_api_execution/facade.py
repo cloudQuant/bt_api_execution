@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from decimal import Decimal
 from threading import RLock
 from typing import TYPE_CHECKING, Any
 
@@ -25,6 +26,12 @@ from .errors import (
     ExecutionBasicAdmissionDenied,
     InvalidStateTransition,
     WriterLeaseUnavailable,
+)
+from .group_contracts import (
+    GroupLegAuthorization,
+    GroupPermitBinding,
+    is_group_leg_intent_id,
+    risk_account_scope_fingerprint,
 )
 
 if TYPE_CHECKING:
@@ -173,6 +180,72 @@ class ManagedExecutionFacade:
         before_dispatch: BeforeDispatchCallable | None = None,
         admission_context: ExecutionAdmissionContextV1 | None = None,
     ) -> ExecutionRecord:
+        """Submit an ordinary intent; group namespace IDs require the group path."""
+
+        if is_group_leg_intent_id(getattr(intent, "intent_id", None)):
+            raise ContractValidationError("group leg intent requires coordinator authorization")
+        return self._submit(
+            intent,
+            dispatcher,
+            before_dispatch=before_dispatch,
+            admission_context=admission_context,
+            group_binding=None,
+            group_authorization=None,
+            writer_lease=None,
+        )
+
+    def submit_group_leg(
+        self,
+        intent: OrderIntent,
+        binding: GroupPermitBinding,
+        authorization: GroupLegAuthorization,
+        dispatcher: DispatchPort | DispatchCallable,
+        *,
+        writer_lease: WriterLease,
+        before_dispatch: BeforeDispatchCallable | None = None,
+    ) -> ExecutionRecord:
+        """Submit one child against its already-reserved group permit.
+
+        This path deliberately does not call singleton ``reserve`` or
+        ``claim_for_dispatch``. The account-owner admission adapter must
+        implement the group-aware one-shot claim. A failed or ambiguous Risk
+        claim is latched UNKNOWN and is never retried through provider I/O.
+        """
+
+        if type(binding) is not GroupPermitBinding:
+            raise ContractValidationError("group permit binding is required")
+        if type(authorization) is not GroupLegAuthorization:
+            raise ContractValidationError("current group authorization is required")
+        binding.validate_order(intent)
+        authorization.validate_binding(binding)
+        authorization.validate_writer_lease(writer_lease)
+        if self._admission_gate is None or not callable(
+            getattr(self._admission_gate, "claim_group_leg", None)
+        ):
+            raise AdmissionRequired("group-aware Risk claim is required")
+        if self._basic_admission_gate is not None:
+            raise AdmissionRequired("group legs require the pre-reserved group Risk path")
+        return self._submit(
+            intent,
+            dispatcher,
+            before_dispatch=before_dispatch,
+            admission_context=None,
+            group_binding=binding,
+            group_authorization=authorization,
+            writer_lease=writer_lease,
+        )
+
+    def _submit(
+        self,
+        intent: OrderIntent,
+        dispatcher: DispatchPort | DispatchCallable,
+        *,
+        before_dispatch: BeforeDispatchCallable | None = None,
+        admission_context: ExecutionAdmissionContextV1 | None = None,
+        group_binding: GroupPermitBinding | None,
+        group_authorization: GroupLegAuthorization | None,
+        writer_lease: WriterLease | None,
+    ) -> ExecutionRecord:
         """Durably admit and dispatch an intent at most once.
 
         Repeating a durable `PENDING_DISPATCH`, `DISPATCHING`, terminal, or
@@ -191,6 +264,14 @@ class ManagedExecutionFacade:
 
         if before_dispatch is not None and not callable(before_dispatch):
             raise ContractValidationError("invalid pre-dispatch guard")
+        if (group_binding is None) != (group_authorization is None):
+            raise ContractValidationError("group binding and authorization must be paired")
+        if group_binding is not None:
+            group_binding.validate_order(intent)
+            assert group_authorization is not None
+            group_authorization.validate_binding(group_binding)
+        elif is_group_leg_intent_id(getattr(intent, "intent_id", None)):
+            raise ContractValidationError("group leg intent requires coordinator authorization")
         if (
             self._basic_admission_gate is not None
             and type(admission_context) is not ExecutionAdmissionContextV1
@@ -202,15 +283,32 @@ class ManagedExecutionFacade:
         ):
             raise ContractValidationError("admission context scope does not match intent")
         self._require_scope(intent)
-        writer_lease = self.acquire_writer_lease()
-        record = self._store.admit_intent(intent, writer_lease=writer_lease)
+        if writer_lease is None:
+            if group_binding is not None:
+                raise ContractValidationError("group leg requires a held writer lease")
+            writer_lease = self.acquire_writer_lease()
+        else:
+            self._store.assert_writer_lease(self._scope, writer_lease)
+        if group_authorization is not None:
+            assert group_binding is not None
+            group_authorization.validate_binding(group_binding)
+            group_authorization.validate_writer_lease(writer_lease)
+        record = self._store.admit_intent(
+            intent,
+            writer_lease=writer_lease,
+            group_binding=group_binding,
+            group_authorization=group_authorization,
+        )
         if record.state is ExecutionState.PENDING_ADMISSION:
-            record = self._admit(
-                intent,
-                writer_lease,
-                dispatcher,
-                admission_context,
-            )
+            if group_binding is None:
+                record = self._admit(
+                    intent,
+                    writer_lease,
+                    dispatcher,
+                    admission_context,
+                )
+            else:
+                record = self._admit_group_leg(intent, group_binding, writer_lease)
         if record.state is not ExecutionState.PENDING_DISPATCH:
             return record
         if self._basic_admission_gate is not None:
@@ -274,7 +372,12 @@ class ManagedExecutionFacade:
         # coordinator hooks. In particular, BasicAdmission expiry and owner
         # fencing are revalidated immediately before the authorized port.
         record, authorization = self._validate_and_claim_before_dispatch(
-            intent, record, writer_lease, dispatcher, admission_context
+            intent,
+            record,
+            writer_lease,
+            dispatcher,
+            admission_context,
+            group_binding=group_binding,
         )
         if record.state is not ExecutionState.DISPATCHING:
             return record
@@ -338,6 +441,22 @@ class ManagedExecutionFacade:
 
         record, _event, _review_required = self._record_provider_observation_with_event(observation)
         return record
+
+    def _admit_group_leg(
+        self,
+        intent: OrderIntent,
+        binding: GroupPermitBinding,
+        writer_lease: WriterLease,
+    ) -> ExecutionRecord:
+        """Activate from the coordinator's durable vector permit, never reserve anew."""
+
+        self._store.assert_writer_lease(self._scope, writer_lease)
+        return self._store.activate_intent(
+            intent.intent_id,
+            self._scope,
+            binding.permit_id,
+            writer_lease=writer_lease,
+        )
 
     def record_provider_observation_event(
         self, observation: ProviderObservation
@@ -614,9 +733,60 @@ class ManagedExecutionFacade:
         writer_lease: WriterLease,
         dispatcher: DispatchPort | DispatchCallable,
         admission_context: ExecutionAdmissionContextV1 | None,
+        *,
+        group_binding: GroupPermitBinding | None = None,
     ) -> tuple[ExecutionRecord, ExecutionAdmissionAuthorizationV1 | None]:
         authorization: ExecutionAdmissionAuthorizationV1 | None = None
         gate = self._admission_gate
+        if group_binding is not None:
+            reference = record.permit_reference
+            claimer = None if gate is None else getattr(gate, "claim_group_leg", None)
+            if reference != group_binding.permit_id or not callable(claimer):
+                return (
+                    self._store.mark_unknown(
+                        intent.intent_id,
+                        self._scope,
+                        "group_risk_claim_unavailable",
+                        writer_lease=writer_lease,
+                    ),
+                    None,
+                )
+            try:
+                self._store.assert_writer_lease(self._scope, writer_lease)
+                receipt = claimer(
+                    intent,
+                    group_id=group_binding.group_id,
+                    leg_id=group_binding.leg_id,
+                    permit_reference=group_binding.permit_id,
+                    group_fingerprint=group_binding.group_fingerprint,
+                    deadline_ns=group_binding.deadline_ns,
+                )
+            except WriterLeaseUnavailable:
+                raise
+            except Exception:
+                # The account Risk owner may have committed the one-shot claim
+                # before a response was lost. Preserve both ledgers for same-ID
+                # reconciliation; neither this path nor recovery may retry it.
+                return (
+                    self._store.mark_unknown(
+                        intent.intent_id,
+                        self._scope,
+                        "group_risk_claim_unknown",
+                        writer_lease=writer_lease,
+                    ),
+                    None,
+                )
+            if not self._group_claim_receipt_matches(receipt, intent, group_binding):
+                return (
+                    self._store.mark_unknown(
+                        intent.intent_id,
+                        self._scope,
+                        "group_risk_claim_mismatch",
+                        writer_lease=writer_lease,
+                    ),
+                    None,
+                )
+            return record, None
         if gate is not None:
             reference = record.permit_reference
             if reference is None:
@@ -688,6 +858,48 @@ class ManagedExecutionFacade:
                 )
         return record, authorization
 
+    @staticmethod
+    def _group_claim_receipt_matches(
+        receipt: object, intent: OrderIntent, binding: GroupPermitBinding
+    ) -> bool:
+        """Verify the account Risk adapter's immutable one-shot claim receipt."""
+
+        try:
+            scope = receipt.scope
+            permit = receipt.permit
+            claim = receipt.claim
+            quantity = receipt.actual_quantity
+            notional = receipt.actual_notional
+            return (
+                type(receipt).__name__ == "RiskGroupLegClaimReceipt"
+                and receipt.group_id == binding.group_id
+                and receipt.leg_id == binding.leg_id
+                and receipt.group_fingerprint == binding.group_fingerprint
+                and receipt.policy_fingerprint == binding.policy_fingerprint
+                and receipt.deadline_ns == binding.deadline_ns
+                and receipt.permit_reference == binding.permit_id
+                and receipt.reserved_intent_hash == binding.reserved_intent_hash
+                and receipt.actual_intent_hash == binding.actual_child_intent_hash
+                and receipt.exposure_profile_fingerprint == binding.exposure_profile_fingerprint
+                and type(quantity) is Decimal
+                and quantity == intent.quantity
+                and type(notional) is Decimal
+                and notional.is_finite()
+                and notional > 0
+                and scope.provider == intent.scope.provider
+                and scope.environment == intent.scope.environment
+                and risk_account_scope_fingerprint(scope.key) == binding.risk_scope_fingerprint
+                and permit.permit_id == binding.permit_id
+                and permit.intent_id == intent.intent_id
+                and permit.scope == scope
+                and claim.scope == scope
+                and claim.permit_id == binding.permit_id
+                and claim.intent_id == intent.intent_id
+                and claim.intent_hash == binding.reserved_intent_hash
+            )
+        except (AttributeError, TypeError, ValueError):
+            return False
+
     def _block_before_dispatch(
         self, intent: OrderIntent, reason_code: str, writer_lease: WriterLease
     ) -> ExecutionRecord:
@@ -697,6 +909,10 @@ class ManagedExecutionFacade:
         if record.basic_admission_reference is not None:
             self._release_basic_permit(record.basic_admission_reference)
         reference = record.permit_reference
+        if record.group_binding is not None:
+            # Only the group vector owner can release an unclaimed reservation;
+            # a singleton release would break its paired-leg accounting.
+            return record
         if reference is None or self._release_permit(reference, reason_code, writer_lease):
             return record
         return self._store.mark_review_required(

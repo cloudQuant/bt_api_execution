@@ -16,7 +16,9 @@ evidence and never resubmitted under a new identity.
 from __future__ import annotations
 
 import threading
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager, suppress
+from sys import exc_info
 from types import MappingProxyType
 from typing import Any
 
@@ -41,13 +43,19 @@ from .errors import (
     WriterLeaseUnavailable,
 )
 from .facade import ManagedExecutionFacade
+from .group_contracts import (
+    GroupCoordinatorAuthority,
+    GroupLegAuthorization,
+    GroupPermitBinding,
+    is_group_leg_intent_id,
+)
 from .service_component import (
     ExecutionReadService,
     _is_principal_ref,
     _matches_run_wildcard,
-    _record_dto,
     _reply,
     _scope_denied,
+    _stored_record_dto,
 )
 from .store import CancelRecord, ExecutionRecord, SqliteExecutionStore
 
@@ -56,12 +64,46 @@ CANCEL_OPERATION = "orders.cancel"
 QUERY_OPERATION = "orders.query"
 SUPPORTED_OPERATIONS = frozenset({SUBMIT_OPERATION, CANCEL_OPERATION, QUERY_OPERATION})
 
+
+class _GroupAuthorityGuardError(Exception):
+    """The trusted current-authority guard could not be entered or exited."""
+
+
+@contextmanager
+def _held_group_authority(
+    authority: GroupCoordinatorAuthority, **arguments: Any
+) -> Iterator[GroupLegAuthorization]:
+    try:
+        guard = authority.hold_group_leg_authorization(**arguments)
+        if not callable(getattr(guard, "__enter__", None)) or not callable(
+            getattr(guard, "__exit__", None)
+        ):
+            raise ContractValidationError("group authority must return a held guard")
+        authorization = guard.__enter__()
+    except Exception as error:
+        raise _GroupAuthorityGuardError from error
+    try:
+        yield authorization
+    except BaseException:
+        with suppress(Exception):
+            guard.__exit__(*exc_info())
+            # Preserve the original execution failure. The caller reports its
+            # durable state and never retries the group leg automatically.
+        raise
+    else:
+        try:
+            guard.__exit__(None, None, None)
+        except Exception as error:
+            raise _GroupAuthorityGuardError from error
+
+
 #: Roles allowed to reach the write path.  The registry grant, not this set,
 #: decides whether a concrete principal may actually submit or cancel.
 _WRITE_ROLES = frozenset({WireRole.STRATEGY_CLIENT, WireRole.APPLICATION_CLIENT, WireRole.SERVICE})
 
 _DEFAULT_WRITER_ID = "execution-order-entry"
 _DEFAULT_LEASE_TTL_NS = 5_000_000_000
+GROUP_SUBMIT_OPERATION = "orders.submit_group_leg"
 
 
 class ExecutionOrderEntryService:
@@ -88,6 +130,7 @@ class ExecutionOrderEntryService:
         admission_gate: object | None = None,
         basic_admission_gate: ExecutionBasicAdmissionGate | None = None,
         cancel_admission_gate: object | None = None,
+        group_coordinator_authority: GroupCoordinatorAuthority | None = None,
         allow_unprotected: bool = False,
         writer_id: str = _DEFAULT_WRITER_ID,
         lease_ttl_ns: int = _DEFAULT_LEASE_TTL_NS,
@@ -129,6 +172,12 @@ class ExecutionOrderEntryService:
             raise ContractValidationError(
                 "cancellation admission gate requires claim_before_dispatch"
             )
+        if group_coordinator_authority is not None and not callable(
+            getattr(group_coordinator_authority, "hold_group_leg_authorization", None)
+        ):
+            raise ContractValidationError(
+                "group coordinator authority requires hold_group_leg_authorization"
+            )
 
         copied: dict[WireScope, ExecutionScope] = {}
         for template, execution_scope in targets.items():
@@ -144,6 +193,7 @@ class ExecutionOrderEntryService:
         self._admission_gate = admission_gate
         self._basic_admission_gate = basic_admission_gate
         self._cancel_admission_gate = cancel_admission_gate
+        self._group_coordinator_authority = group_coordinator_authority
         self._allow_unprotected = allow_unprotected
         self._writer_id = writer_id
         self._lease_ttl_ns = lease_ttl_ns
@@ -197,6 +247,121 @@ class ExecutionOrderEntryService:
                     return _reply(False, "INVALID_REQUEST", {"found": False, "record": None})
             return self._submit(arguments, execution_scope, admission_context)
         return self._cancel(arguments, execution_scope)
+
+    def submit_group_leg(
+        self,
+        *,
+        principal_ref: str,
+        identity: WireIdentity,
+        scope: WireScope,
+        intent: OrderIntent,
+        binding: GroupPermitBinding,
+    ) -> Mapping[str, Any]:
+        """Authorize and submit one explicit group leg through this owner.
+
+        The SDK wire adapter calls this for ``orders.submit_group_leg`` after
+        parsing the typed request. Ordinary ``handle(orders.submit, ...)``
+        never accepts a group-leg binding.
+        """
+
+        if not _is_principal_ref(principal_ref):
+            raise ContractValidationError("invalid trusted principal_ref")
+        if (
+            type(identity) is not WireIdentity
+            or identity.principal_ref != principal_ref
+            or identity.role is not WireRole.SERVICE
+        ):
+            return _reply(False, "ROLE_NOT_AUTHORIZED", {"found": False, "record": None})
+        if type(scope) is not WireScope:
+            return _scope_denied()
+        if type(binding) is not GroupPermitBinding or type(intent) is not OrderIntent:
+            return _reply(False, "INVALID_REQUEST", {"found": False, "record": None})
+        if (
+            scope.group_id != binding.group_id
+            or scope.leg_id != binding.leg_id
+            or scope.portfolio_ref != binding.portfolio_ref
+            or scope.account_ref != binding.account_ref
+            or scope.strategy_ref != binding.strategy_id
+            or principal_ref != binding.coordinator_principal_ref
+        ):
+            return _reply(False, "SCOPE_DENIED", {"found": False, "record": None})
+
+        # Group routing claims are resolved through the same trusted account
+        # target after removing only the explicit group envelope.
+        account_scope = WireScope(
+            execution_domain_ref=scope.execution_domain_ref,
+            account_ref=scope.account_ref,
+            account_refs=scope.account_refs,
+            strategy_ref=scope.strategy_ref,
+            run_id=scope.run_id,
+            manual_book_ref=scope.manual_book_ref,
+        )
+        execution_scope = self._resolve_scope(account_scope)
+        if execution_scope is None or execution_scope != intent.scope:
+            return _scope_denied()
+        try:
+            binding.validate_order(intent)
+        except ContractValidationError:
+            return _reply(False, "INVALID_REQUEST", {"found": False, "record": None})
+
+        authority = self._group_coordinator_authority
+        if authority is None:
+            return _reply(False, "GROUP_AUTHORITY_UNAVAILABLE", {"found": False, "record": None})
+        order_facade, _ = self._facade_pair(execution_scope)
+        try:
+            # Acquire and verify the real execution writer lease before
+            # entering trusted coordinator authority. Its guard remains held
+            # across durable admission, the one-shot Risk claim, and provider
+            # dispatch, so revocation cannot race the authorization boundary.
+            writer_lease = order_facade.acquire_writer_lease()
+            self._store.assert_writer_lease(execution_scope, writer_lease)
+            with _held_group_authority(
+                authority,
+                principal_ref=principal_ref,
+                identity=identity,
+                wire_scope=scope,
+                execution_scope=execution_scope,
+                intent=intent,
+                binding=binding,
+                writer_lease=writer_lease,
+            ) as authorization:
+                if type(authorization) is not GroupLegAuthorization:
+                    raise ContractValidationError("group guard did not yield typed authorization")
+                authorization.validate_binding(binding)
+                authorization.validate_writer_lease(writer_lease)
+                self._store.assert_writer_lease(execution_scope, writer_lease)
+                record = order_facade.submit_group_leg(
+                    intent,
+                    binding,
+                    authorization,
+                    self._dispatch,
+                    writer_lease=writer_lease,
+                )
+        except IntentConflictError:
+            return self._failure_with_record("INTENT_CONFLICT", intent.intent_id, execution_scope)
+        except ContractValidationError:
+            return _reply(False, "INVALID_REQUEST", {"found": False, "record": None})
+        except AdmissionRequired:
+            return self._failure_with_record(
+                "GROUP_ADMISSION_REQUIRED", intent.intent_id, execution_scope
+            )
+        except WriterLeaseUnavailable:
+            return self._failure_with_record(
+                "OWNER_LEASE_UNAVAILABLE", intent.intent_id, execution_scope
+            )
+        except InvalidStateTransition:
+            return self._failure_with_record("STATE_CONFLICT", intent.intent_id, execution_scope)
+        except DurableStoreError:
+            return _reply(False, "STORE_UNAVAILABLE", {"found": False, "record": None})
+        except _GroupAuthorityGuardError:
+            return self._failure_with_record(
+                "GROUP_AUTHORIZATION_FAILED", intent.intent_id, execution_scope
+            )
+        return _reply(
+            True,
+            "OK",
+            {"found": True, "record": _stored_record_dto(self._store, record, execution_scope)},
+        )
 
     def recover_interrupted_dispatches(self) -> tuple[ExecutionRecord, ...]:
         """Recover configured scopes before this service accepts writes.
@@ -262,7 +427,11 @@ class ExecutionOrderEntryService:
             return self._failure_with_record("STATE_CONFLICT", intent.intent_id, execution_scope)
         except DurableStoreError:
             return _reply(False, "STORE_UNAVAILABLE", {"found": False, "record": None})
-        return _reply(True, "OK", {"found": True, "record": _record_dto(record)})
+        return _reply(
+            True,
+            "OK",
+            {"found": True, "record": _stored_record_dto(self._store, record, execution_scope)},
+        )
 
     def _cancel(
         self, arguments: Mapping[str, Any], execution_scope: ExecutionScope
@@ -270,6 +439,10 @@ class ExecutionOrderEntryService:
         try:
             intent = _cancel_intent(arguments, execution_scope)
         except ContractValidationError:
+            return _reply(False, "INVALID_REQUEST", {"found": False, "record": None})
+        if is_group_leg_intent_id(intent.cancel_id) or is_group_leg_intent_id(
+            intent.target_intent_id
+        ):
             return _reply(False, "INVALID_REQUEST", {"found": False, "record": None})
 
         # A cancellation is only meaningful for an order this journal already
@@ -310,7 +483,11 @@ class ExecutionOrderEntryService:
         record = self._store.get(intent_id, scope=execution_scope)
         if type(record) is not ExecutionRecord or record.scope_key != execution_scope.key:
             return _reply(False, code, {"found": False, "record": None})
-        return _reply(False, code, {"found": True, "record": _record_dto(record)})
+        return _reply(
+            False,
+            code,
+            {"found": True, "record": _stored_record_dto(self._store, record, execution_scope)},
+        )
 
     def _cancel_failure_with_record(
         self, code: str, cancel_id: str, execution_scope: ExecutionScope
@@ -418,6 +595,7 @@ def _cancel_record_dto(record: CancelRecord) -> dict[str, object]:
 __all__ = [
     "CANCEL_OPERATION",
     "ExecutionOrderEntryService",
+    "GROUP_SUBMIT_OPERATION",
     "QUERY_OPERATION",
     "SUBMIT_OPERATION",
     "SUPPORTED_OPERATIONS",

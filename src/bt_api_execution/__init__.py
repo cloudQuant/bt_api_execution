@@ -101,6 +101,15 @@ from .errors import (
     WriterLeaseUnavailable,
 )
 from .facade import ManagedExecutionFacade
+from .group_contracts import (
+    GroupCoordinatorAuthority,
+    GroupLegAuthorization,
+    GroupPermitBinding,
+    group_leg_intent_id,
+    is_group_leg_intent_id,
+    risk_account_scope_fingerprint,
+    writer_lease_fingerprint,
+)
 from .ports import AdmissionGate, DispatchPort, ReconciliationPort
 from .store import (
     CancelRecord,
@@ -227,6 +236,9 @@ __all__ = [
     "ExecutionAuthorizedDispatchPort",
     "ExecutionBasicAdmissionDenied",
     "ExecutionBasicAdmissionGate",
+    "GroupCoordinatorAuthority",
+    "GroupLegAuthorization",
+    "GroupPermitBinding",
     "ExecutionAccountBookService",
     "ExecutionAccountSnapshot",
     "ExecutionAllocationBaseline",
@@ -284,5 +296,9 @@ __all__ = [
     "map_ctp_native_trade_fact_v2",
     "order_intent_from_payload",
     "payload_sha256",
+    "group_leg_intent_id",
+    "is_group_leg_intent_id",
+    "risk_account_scope_fingerprint",
+    "writer_lease_fingerprint",
     "require_ctp_dispatch_callback_match",
 ]
