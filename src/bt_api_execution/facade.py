@@ -7,6 +7,7 @@ from decimal import Decimal
 from threading import RLock
 from typing import TYPE_CHECKING, Any
 
+from .admission import AccountScopedGroupAdmissionAdapter
 from .basic_admission import (
     ExecutionAdmissionAuthorizationV1,
     ExecutionAdmissionContextV1,
@@ -219,10 +220,8 @@ class ManagedExecutionFacade:
         binding.validate_order(intent)
         authorization.validate_binding(binding)
         authorization.validate_writer_lease(writer_lease)
-        if self._admission_gate is None or not callable(
-            getattr(self._admission_gate, "claim_group_leg", None)
-        ):
-            raise AdmissionRequired("group-aware Risk claim is required")
+        if not isinstance(self._admission_gate, AccountScopedGroupAdmissionAdapter):
+            raise AdmissionRequired("trusted account-scoped group Risk adapter is required")
         if self._basic_admission_gate is not None:
             raise AdmissionRequired("group legs require the pre-reserved group Risk path")
         return self._submit(
@@ -755,6 +754,7 @@ class ManagedExecutionFacade:
                 self._store.assert_writer_lease(self._scope, writer_lease)
                 receipt = claimer(
                     intent,
+                    risk_scope_fingerprint=group_binding.risk_scope_fingerprint,
                     group_id=group_binding.group_id,
                     leg_id=group_binding.leg_id,
                     permit_reference=group_binding.permit_id,

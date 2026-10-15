@@ -24,6 +24,7 @@ from typing import Any
 
 from bt_api_base.service_protocol import WireIdentity, WireRole, WireScope
 
+from .admission import AccountScopedGroupAdmissionAdapter
 from .basic_admission import ExecutionAdmissionContextV1, ExecutionBasicAdmissionGate
 from .cancellation import ManagedCancellationFacade
 from .contracts import (
@@ -285,6 +286,16 @@ class ExecutionOrderEntryService:
             or principal_ref != binding.coordinator_principal_ref
         ):
             return _reply(False, "SCOPE_DENIED", {"found": False, "record": None})
+        if not isinstance(self._admission_gate, AccountScopedGroupAdmissionAdapter):
+            # A raw Risk adapter requires a trusted AccountScope argument.
+            # Reject this composition before creating an intent or entering
+            # the provider path instead of turning a signature error into an
+            # ambiguous Risk claim/UNKNOWN result.
+            return _reply(
+                False,
+                "GROUP_ACCOUNT_SCOPE_ADAPTER_REQUIRED",
+                {"found": False, "record": None},
+            )
 
         # Group routing claims are resolved through the same trusted account
         # target after removing only the explicit group envelope.

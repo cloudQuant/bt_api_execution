@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 from bt_api_base.service_protocol import WireIdentity, WireRole, WireScope
 
 from bt_api_execution import (
+    AccountScopedGroupAdmissionAdapter,
     ExecutionScope,
     ExecutionState,
     GroupLegAuthorization,
@@ -94,6 +95,7 @@ class _GroupRiskAdapter:
             account_id="mapped-a",
             key=_RISK_SCOPE_KEY,
         )
+        self.receipt_scope_override = None
         self.authority: _Authority | None = None
         self.group_claims = 0
         self.single_claims = 0
@@ -130,6 +132,7 @@ class _GroupRiskAdapter:
         self.authority.assert_current()
         self.group_claims += 1
         assert kwargs == {
+            "scope": self.scope,
             "group_id": self.binding.group_id,
             "leg_id": self.binding.leg_id,
             "permit_reference": self.binding.permit_id,
@@ -139,19 +142,22 @@ class _GroupRiskAdapter:
         if self.claim_error:
             raise TimeoutError("claim response lost after Risk commit")
         claim = _DispatchClaim(
-            self.scope,
+            self.scope if self.receipt_scope_override is None else self.receipt_scope_override,
             self.binding.permit_id,
             self.intent.intent_id,
             self.binding.reserved_intent_hash,
         )
+        receipt_scope = (
+            self.scope if self.receipt_scope_override is None else self.receipt_scope_override
+        )
         return RiskGroupLegClaimReceipt(
-            scope=self.scope,
+            scope=receipt_scope,
             group_id=self.binding.group_id,
             group_fingerprint=self.binding.group_fingerprint,
             policy_fingerprint=self.binding.policy_fingerprint,
             deadline_ns=self.binding.deadline_ns,
             leg_id=self.binding.leg_id,
-            permit=_RiskPermit(self.binding.permit_id, self.intent.intent_id, self.scope),
+            permit=_RiskPermit(self.binding.permit_id, self.intent.intent_id, receipt_scope),
             permit_reference=self.binding.permit_id,
             reserved_intent_hash=self.binding.reserved_intent_hash,
             actual_intent_hash=self.binding.actual_child_intent_hash,
@@ -273,7 +279,7 @@ class _Provider:
         raise AssertionError("group acceptance test must not cancel")
 
 
-def _make_service(store_path: str, *, claim_error: bool = False):
+def _make_service(store_path: str, *, claim_error: bool = False, bind_account_scope: bool = True):
     execution_scope = ExecutionScope("paper", "demo", _ACCOUNT, _STRATEGY)
     intent = OrderIntent.limit(
         intent_id=group_leg_intent_id(_GROUP, _LEG),
@@ -327,7 +333,11 @@ def _make_service(store_path: str, *, claim_error: bool = False):
         store,
         {base_scope: execution_scope},
         provider,
-        admission_gate=risk,
+        admission_gate=(
+            AccountScopedGroupAdmissionAdapter(risk, account_scope=risk.scope)
+            if bind_account_scope
+            else risk
+        ),
         group_coordinator_authority=authority,
     )
     return (
@@ -388,6 +398,26 @@ def test_group_leg_uses_existing_permit_and_exposes_authorized_binding(tmp_path)
         == 18
     )
     reopened.close()
+
+
+def test_group_entry_rejects_unscoped_risk_adapter_before_claim_or_dispatch(tmp_path) -> None:
+    values = _make_service(str(tmp_path / "unscoped.sqlite"), bind_account_scope=False)
+    service, store, risk, provider, authority, identity, group_scope, _, intent, binding = values
+
+    result = service.submit_group_leg(
+        principal_ref=_PRINCIPAL,
+        identity=identity,
+        scope=group_scope,
+        intent=intent,
+        binding=binding,
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == "GROUP_ACCOUNT_SCOPE_ADAPTER_REQUIRED"
+    assert risk.group_claims == risk.single_claims == risk.reserves == risk.releases == 0
+    assert provider.submitted == []
+    assert authority.calls == []
+    store.close()
 
 
 def test_unknown_group_claim_never_retries_or_releases_permit(tmp_path) -> None:
@@ -583,10 +613,15 @@ def test_group_claim_receipt_must_match_trusted_risk_scope(tmp_path) -> None:
         intent,
         _binding,
     ) = values
-    risk.scope.key = json.dumps(
-        {"account_id": "mapped-b", "environment": "demo", "provider": "paper"},
-        sort_keys=True,
-        separators=(",", ":"),
+    risk.receipt_scope_override = SimpleNamespace(
+        provider="paper",
+        environment="demo",
+        account_id="mapped-b",
+        key=json.dumps(
+            {"account_id": "mapped-b", "environment": "demo", "provider": "paper"},
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
     )
 
     result = service.submit_group_leg(
