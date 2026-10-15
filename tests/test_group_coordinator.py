@@ -47,6 +47,10 @@ class _Clock:
         return self.now_ns
 
 
+class _BusinessOutcomeUnknownError(RuntimeError):
+    code = "BUSINESS_OUTCOME_UNKNOWN"
+
+
 @dataclass(frozen=True)
 class _Scope:
     key: str
@@ -82,6 +86,7 @@ class _ReservationPort:
         self.query_calls: list[str] = []
         self.release_calls: list[str] = []
         self.lose_release_response = False
+        self.lose_reserve_response = False
 
     @property
     def risk_scope_fingerprint(self) -> str:
@@ -125,6 +130,9 @@ class _ReservationPort:
             deadline_ns=deadline_ns,
             legs=legs,
         )
+        if self.lose_reserve_response:
+            self.lose_reserve_response = False
+            raise _BusinessOutcomeUnknownError("reservation committed but reply was lost")
         return self._receipt(group_id)
 
     def release_group_unclaimed(
@@ -451,6 +459,52 @@ def test_group_unknown_restart_queries_same_order_id_without_resubmit(tmp_path) 
     assert len(orders["account-a"].submissions) == 2
     assert len(orders["account-a"].statuses) == 2
     restarted_store.close()
+
+
+def test_lost_reserve_reply_with_unknown_code_recovers_active_vector_by_query(
+    tmp_path,
+) -> None:
+    request = _make_request()
+    coordinator, store, reservations, orders = _coordinator(tmp_path, request)
+    port = reservations["account-a"]
+    port.lose_reserve_response = True
+    coordinator.accept(request)
+
+    interrupted = coordinator.advance_group(request.portfolio_ref, request.group_id)
+
+    assert interrupted.state is GroupOrderState.RECOVERY_REQUIRED
+    assert interrupted.reservations[0].phase is GroupReservationPhase.UNKNOWN
+    assert port.groups[request.group_id].legs
+    assert all(
+        leg["state"] == "ACTIVE" and not leg["claimed"]
+        for leg in port.groups[request.group_id].legs.values()
+    )
+    # The initial GROUP_NOT_FOUND query is still classified as absence, after
+    # which the remote reservation commits and its unknown-code reply is lost.
+    assert port.query_calls == [request.group_id]
+    assert len(port.reserve_calls) == 1
+    assert not orders["account-a"].submissions
+    assert not port.release_calls
+    store.close()
+
+    reopened_store = SqliteOrderGroupStore(tmp_path / "groups.sqlite")
+    recovered_coordinator = GroupOrderCoordinator(
+        reopened_store,
+        reservations=reservations,
+        orders=orders,
+        clock_ns=lambda: _NOW + 2,
+    )
+    recovered = recovered_coordinator._advance_reservations(
+        recovered_coordinator._required(request.portfolio_ref, request.group_id)
+    )
+
+    assert recovered.state is GroupOrderState.RECOVERY_REQUIRED
+    assert recovered.reservations[0].phase is GroupReservationPhase.ACTIVE
+    assert port.query_calls == [request.group_id, request.group_id]
+    assert len(port.reserve_calls) == 1
+    assert not orders["account-a"].submissions
+    assert not port.release_calls
+    reopened_store.close()
 
 
 def test_expired_deadline_still_queries_unknown_hedge_by_original_id(tmp_path) -> None:

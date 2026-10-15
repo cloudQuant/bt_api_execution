@@ -336,9 +336,13 @@ class GroupOrderCoordinator:
                     deadline_ns=request.deadline_ns,
                 )
             except Exception as error:
-                code = _error_code(error)
                 snapshot = self._required(request.portfolio_ref, request.group_id)
-                if code is not None:
+                # A reservation call can commit remotely before its reply is
+                # lost. Only the neutral, typed denial contract proves that
+                # the operation had no effect; an arbitrary ``.code`` field
+                # is diagnostic data, not evidence of a deterministic reject.
+                if isinstance(error, GroupReservationDeniedError):
+                    code = error.code
                     snapshot = self._set_reservation_phase(
                         snapshot,
                         account_ref,
