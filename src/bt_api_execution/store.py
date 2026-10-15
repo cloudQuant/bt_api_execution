@@ -15,9 +15,10 @@ import time
 import uuid
 from collections.abc import Mapping
 from contextlib import contextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from datetime import date
 from decimal import Decimal
+from enum import Enum
 from functools import lru_cache
 from pathlib import Path
 from threading import RLock
@@ -71,6 +72,36 @@ def _is_local_queue_receipt_id(value: Any) -> bool:
 
 def _is_prefixed_digest(value: Any, prefix: str) -> bool:
     return type(value) is str and value.startswith(prefix) and _is_sha256(value[len(prefix) :])
+
+
+def _financial_json_value(value: Any) -> Any:
+    """Convert trusted financial dataclasses to deterministic JSON primitives."""
+
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, Decimal):
+        return str(value)
+    if is_dataclass(value) and not isinstance(value, type):
+        return {
+            item.name: _financial_json_value(getattr(value, item.name)) for item in fields(value)
+        }
+    if isinstance(value, Mapping):
+        if any(type(key) is not str for key in value):
+            raise ContractValidationError("financial JSON mapping keys must be strings")
+        return {key: _financial_json_value(value[key]) for key in sorted(value)}
+    if isinstance(value, (tuple, list)):
+        return [_financial_json_value(item) for item in value]
+    if value is None or type(value) in {str, int, bool}:
+        return value
+    raise ContractValidationError("financial fact cannot be encoded canonically")
+
+
+def _financial_canonical_json(value: Any) -> str:
+    return canonical_json(_financial_json_value(value))
+
+
+def _financial_sha256(value: Any) -> str:
+    return hashlib.sha256(_financial_canonical_json(value).encode("utf-8")).hexdigest()
 
 
 _CTP_ACCOUNT_REF_PREFIX = "ctp-account-ref.v1:"
@@ -1933,7 +1964,8 @@ class SqliteExecutionStore:
     # Version 21 adds execution-only admission references and the trusted
     # caller-context digest used for safe PENDING_DISPATCH reauthorization.
     # Version 22 adds the immutable group-permit binding to execution rows.
-    _SCHEMA_VERSION = 22
+    # Version 23 adds a fenced append-only financial baseline/event ledger.
+    _SCHEMA_VERSION = 23
 
     def __init__(self, path: str | Path, *, busy_timeout_ms: int = 5_000) -> None:
         if type(busy_timeout_ms) is not int or busy_timeout_ms <= 0:
@@ -2024,6 +2056,1104 @@ class SqliteExecutionStore:
         if high_water < (last or 0):
             raise DurableStoreError("execution outbox sequence high-water mark regressed")
         return count, first, last, high_water
+
+    @staticmethod
+    def _financial_journal_cut(cursor: sqlite3.Cursor) -> tuple[str, int, int]:
+        from .account_financial_ledger import FinancialDataUnavailableError
+
+        identity_row = cursor.execute(
+            "SELECT value FROM execution_meta WHERE key = ?", ("journal_incarnation_id",)
+        ).fetchone()
+        bounds = cursor.execute(
+            "SELECT COUNT(*) AS row_count, MIN(sequence) AS first_sequence, "
+            "MAX(sequence) AS last_sequence FROM execution_outbox"
+        ).fetchone()
+        sequence_row = cursor.execute(
+            "SELECT seq FROM sqlite_sequence WHERE name = 'execution_outbox'"
+        ).fetchone()
+        if identity_row is None or bounds is None:
+            raise DurableStoreError("execution journal cut is unavailable")
+        generation = str(identity_row["value"])
+        count = int(bounds["row_count"])
+        first = None if bounds["first_sequence"] is None else int(bounds["first_sequence"])
+        last = None if bounds["last_sequence"] is None else int(bounds["last_sequence"])
+        high_water = 0 if sequence_row is None else int(sequence_row["seq"])
+        if (
+            len(generation) != 32
+            or any(char not in "0123456789abcdef" for char in generation)
+            or count != high_water
+            or last != (high_water or None)
+            or first != (1 if high_water else None)
+        ):
+            raise FinancialDataUnavailableError(
+                "execution outbox is not one complete contiguous journal generation"
+            )
+        return generation, high_water, count
+
+    @staticmethod
+    def _financial_account_intents(
+        cursor: sqlite3.Cursor,
+    ) -> tuple[
+        dict[tuple[str, str], tuple[OrderIntent, str]],
+        dict[tuple[str, str], dict[str, Any]],
+    ]:
+        all_intents: dict[tuple[str, str], tuple[OrderIntent, str]] = {}
+        record_rows: dict[tuple[str, str], dict[str, Any]] = {}
+        try:
+            rows = cursor.execute(
+                "SELECT scope_key, intent_id, payload_sha256, payload_json, provider_order_id, "
+                "filled_quantity, average_price, cumulative_commission FROM execution_records"
+            ).fetchall()
+            for row in rows:
+                payload_json = str(row["payload_json"])
+                payload = json.loads(payload_json)
+                if canonical_json(payload) != payload_json:
+                    raise ValueError("noncanonical execution intent")
+                intent = order_intent_from_payload(payload)
+                key = (str(row["scope_key"]), str(row["intent_id"]))
+                fingerprint = str(row["payload_sha256"])
+                if (
+                    intent.scope.key != key[0]
+                    or intent.intent_id != key[1]
+                    or intent.fingerprint != fingerprint
+                    or key in all_intents
+                ):
+                    raise ValueError("execution intent identity differs from its durable row")
+                all_intents[key] = (intent, fingerprint)
+                record_rows[key] = {
+                    name: row[name]
+                    for name in (
+                        "provider_order_id",
+                        "filled_quantity",
+                        "average_price",
+                        "cumulative_commission",
+                    )
+                }
+        except (ContractValidationError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise DurableStoreError("stored execution intent identity is unreadable") from error
+        return all_intents, record_rows
+
+    @classmethod
+    def _capture_financial_cursor_snapshot_in_transaction(
+        cls,
+        cursor: sqlite3.Cursor,
+        *,
+        account_key: str,
+        as_of_ns: int,
+    ) -> Any:
+        from .account_financial_ledger import (
+            FinancialDataUnavailableError,
+            FinancialExecutionCursorSnapshotV1,
+            FinancialExecutionCursorV1,
+            FinancialOrderBaselineCursorV1,
+            FinancialOwnerKind,
+            FinancialOwnerV1,
+            execution_cursor_from_observation_v1,
+        )
+
+        if type(as_of_ns) is not int or as_of_ns <= 0:
+            raise ContractValidationError("invalid financial execution cursor snapshot time")
+        generation, high_water, _count = cls._financial_journal_cut(cursor)
+        all_intents, record_rows = cls._financial_account_intents(cursor)
+        account_intents = {
+            key: (intent, fingerprint)
+            for key, (intent, fingerprint) in all_intents.items()
+            if intent.scope.account_key == account_key
+        }
+        cursor_by_intent: dict[tuple[str, str], FinancialExecutionCursorV1] = {
+            key: FinancialExecutionCursorV1() for key in account_intents
+        }
+        rows = cursor.execute(
+            """
+            SELECT sequence, event_id, intent_id, scope_key, event_type, state, payload_json,
+                   created_at_ns, journal_incarnation_id
+            FROM execution_outbox ORDER BY sequence ASC
+            """
+        ).fetchall()
+        if len(rows) != high_water:
+            raise FinancialDataUnavailableError("execution cursor snapshot scan is truncated")
+        for row in rows:
+            if row["journal_incarnation_id"] != generation:
+                raise FinancialDataUnavailableError(
+                    "execution cursor snapshot contains missing or foreign journal lineage"
+                )
+            if int(row["created_at_ns"]) > as_of_ns:
+                raise FinancialDataUnavailableError(
+                    "execution cursor snapshot precedes an included outbox event"
+                )
+            event_key = (str(row["scope_key"]), str(row["intent_id"]))
+            intent_data = all_intents.get(event_key)
+            if intent_data is None:
+                raise DurableStoreError("execution outbox event has no immutable intent")
+            intent, _fingerprint = intent_data
+            try:
+                payload = json.loads(str(row["payload_json"]))
+                if canonical_json(payload) != str(row["payload_json"]):
+                    raise ValueError("noncanonical outbox event")
+                event = ExecutionEvent(
+                    sequence=int(row["sequence"]),
+                    event_id=str(row["event_id"]),
+                    intent_id=str(row["intent_id"]),
+                    scope_key=str(row["scope_key"]),
+                    event_type=str(row["event_type"]),
+                    state=ExecutionState(str(row["state"])),
+                    payload=payload,
+                    created_at_ns=int(row["created_at_ns"]),
+                    journal_incarnation_id=str(row["journal_incarnation_id"]),
+                )
+            except (ContractValidationError, TypeError, ValueError, json.JSONDecodeError) as error:
+                raise DurableStoreError("stored execution outbox event is unreadable") from error
+            if intent.scope.account_key != account_key or event.event_type not in {
+                "provider_observation",
+                "reconciled_observation",
+                "provider_commission_evidence",
+            }:
+                continue
+            owner = FinancialOwnerV1(
+                FinancialOwnerKind.STRATEGY, intent.scope.strategy_id, intent.scope.key
+            )
+            next_cursor, _delta_quantity, _fee_delta = execution_cursor_from_observation_v1(
+                event, intent, cursor_by_intent[event_key], owner
+            )
+            cursor_by_intent[event_key] = next_cursor
+        orders = tuple(
+            FinancialOrderBaselineCursorV1(
+                owner=FinancialOwnerV1(
+                    FinancialOwnerKind.STRATEGY, intent.scope.strategy_id, intent.scope.key
+                ),
+                scope_key=key[0],
+                intent_id=key[1],
+                intent_payload_sha256=fingerprint,
+                cursor=cursor_by_intent[key],
+            )
+            for key, (intent, fingerprint) in sorted(account_intents.items())
+        )
+        for key in account_intents:
+            current = cursor_by_intent[key]
+            persisted = record_rows[key]
+            if (
+                Decimal(str(persisted["filled_quantity"])) != current.filled_quantity
+                or (
+                    None
+                    if persisted["average_price"] is None
+                    else Decimal(str(persisted["average_price"]))
+                )
+                != current.average_price
+                or (
+                    None
+                    if persisted["cumulative_commission"] is None
+                    else Decimal(str(persisted["cumulative_commission"]))
+                )
+                != current.cumulative_commission
+                or persisted["provider_order_id"] != current.provider_order_id
+            ):
+                raise FinancialDataUnavailableError(
+                    "execution outbox cursor differs from the durable intent projection"
+                )
+        return FinancialExecutionCursorSnapshotV1(
+            journal_generation=generation,
+            cursor=high_water,
+            as_of_ns=as_of_ns,
+            orders=orders,
+        )
+
+    def capture_account_financial_execution_cursors(
+        self,
+        writer_scope: ExecutionScope,
+        writer_lease: WriterLease,
+    ) -> Any:
+        """Return the complete current durable per-order baseline cursor set."""
+
+        from .account_financial_ledger import FinancialExecutionCursorSnapshotV1
+
+        if not isinstance(writer_scope, ExecutionScope) or not isinstance(
+            writer_lease, WriterLease
+        ):
+            raise ContractValidationError("account writer scope and lease are required")
+        with self._transaction() as cursor:
+            captured_at_ns = time.time_ns()
+            self._assert_active_writer_lease(
+                cursor, writer_scope, writer_lease, now_ns=captured_at_ns
+            )
+            snapshot = self._capture_financial_cursor_snapshot_in_transaction(
+                cursor, account_key=writer_scope.account_key, as_of_ns=captured_at_ns
+            )
+            if type(snapshot) is not FinancialExecutionCursorSnapshotV1:
+                raise DurableStoreError("financial cursor snapshot construction failed")
+            return snapshot
+
+    @staticmethod
+    def _financial_cursor_rows_payload(rows: tuple[Any, ...]) -> list[dict[str, Any]]:
+        return [_financial_json_value(row) for row in rows]
+
+    @staticmethod
+    def _financial_cursor_rows_from_json(raw: str) -> dict[tuple[str, str], Any]:
+        from .account_financial_ledger import (
+            FinancialExecutionCursorV1,
+            FinancialOrderBaselineCursorV1,
+            FinancialOwnerKind,
+            FinancialOwnerV1,
+        )
+
+        try:
+            rows = json.loads(raw)
+            if canonical_json(rows) != raw or not isinstance(rows, list):
+                raise ValueError("noncanonical financial cursor state")
+            output: dict[tuple[str, str], Any] = {}
+            for row in rows:
+                owner_row = row["owner"]
+                cursor_row = row["cursor"]
+                owner = FinancialOwnerV1(
+                    FinancialOwnerKind(owner_row["kind"]),
+                    owner_row["owner_ref"],
+                    owner_row["execution_scope_key"],
+                )
+                order = FinancialOrderBaselineCursorV1(
+                    owner=owner,
+                    scope_key=row["scope_key"],
+                    intent_id=row["intent_id"],
+                    intent_payload_sha256=row["intent_payload_sha256"],
+                    cursor=FinancialExecutionCursorV1(
+                        filled_quantity=Decimal(cursor_row["filled_quantity"]),
+                        average_price=(
+                            None
+                            if cursor_row["average_price"] is None
+                            else Decimal(cursor_row["average_price"])
+                        ),
+                        cumulative_commission=(
+                            None
+                            if cursor_row["cumulative_commission"] is None
+                            else Decimal(cursor_row["cumulative_commission"])
+                        ),
+                        commission_currency=cursor_row["commission_currency"],
+                        provider_order_id=cursor_row["provider_order_id"],
+                    ),
+                )
+                key = (order.scope_key, order.intent_id)
+                if key in output:
+                    raise ValueError("duplicate financial order cursor")
+                output[key] = order
+            return output
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise DurableStoreError(
+                "stored account financial cursor state is unreadable"
+            ) from error
+
+    @staticmethod
+    def _financial_owner_from_payload(payload: Mapping[str, Any]) -> Any:
+        from .account_financial_ledger import FinancialOwnerKind, FinancialOwnerV1
+
+        return FinancialOwnerV1(
+            FinancialOwnerKind(payload["kind"]),
+            payload["owner_ref"],
+            payload["execution_scope_key"],
+        )
+
+    @classmethod
+    def _financial_posting_from_json(cls, raw: str) -> Any:
+        from .account_financial_ledger import FinancialEventKind, FinancialExecutionPostingV1
+
+        try:
+            row = json.loads(raw)
+            if canonical_json(row) != raw or not isinstance(row, dict):
+                raise ValueError("noncanonical financial posting")
+            return FinancialExecutionPostingV1(
+                event_id=row["event_id"],
+                event_sequence=row["event_sequence"],
+                journal_generation=row["journal_generation"],
+                scope_key=row["scope_key"],
+                intent_id=row["intent_id"],
+                provider_order_id=row["provider_order_id"],
+                source_payload_sha256=row["source_payload_sha256"],
+                owner=cls._financial_owner_from_payload(row["owner"]),
+                occurred_at_ns=row["occurred_at_ns"],
+                kind=FinancialEventKind(row["kind"]),
+                instrument=row["instrument"],
+                signed_quantity=Decimal(row["signed_quantity"]),
+                price=None if row["price"] is None else Decimal(row["price"]),
+                principal_currency=row["principal_currency"],
+                principal_cash_delta=Decimal(row["principal_cash_delta"]),
+                fee_currency=row["fee_currency"],
+                fee_delta=Decimal(row["fee_delta"]),
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise DurableStoreError("stored account financial posting is unreadable") from error
+
+    @staticmethod
+    def _financial_writer_is_registered(
+        writer_scope: ExecutionScope,
+        account_key: str,
+        directory: Any,
+    ) -> bool:
+        from .account_financial_ledger import FinancialOwnerKind
+
+        return (
+            type(writer_scope) is ExecutionScope
+            and writer_scope.account_key == account_key
+            and any(
+                owner.kind is FinancialOwnerKind.STRATEGY
+                and owner.owner_ref == writer_scope.strategy_id
+                and owner.execution_scope_key == writer_scope.key
+                for owner in directory.owners
+            )
+        )
+
+    @staticmethod
+    def _financial_account_snapshot_digest(snapshot: Any) -> str:
+        return _financial_sha256(
+            {
+                "account_key": snapshot.account_key,
+                "source_ref": snapshot.source_ref,
+                "generation": snapshot.generation,
+                "cursor": snapshot.cursor,
+                "cash": snapshot.cash,
+                "positions": snapshot.positions,
+                "cumulative_fees": snapshot.cumulative_fees,
+                "cash_universe_complete": snapshot.cash_universe_complete,
+                "positions_complete": snapshot.positions_complete,
+                "fees_complete": snapshot.fees_complete,
+            }
+        )
+
+    @staticmethod
+    def _financial_activity_digest(batch: Any) -> str:
+        return _financial_sha256(
+            {
+                "source_ref": batch.source_ref,
+                "generation": batch.generation,
+                "from_cursor": batch.from_cursor,
+                "through_cursor": batch.through_cursor,
+                "events": batch.events,
+                "page_exhausted": batch.page_exhausted,
+                "filters_applied": batch.filters_applied,
+            }
+        )
+
+    def install_account_financial_baseline(
+        self,
+        baseline: Any,
+        directory: Any,
+        *,
+        writer_scope: ExecutionScope,
+        writer_lease: WriterLease,
+    ) -> str:
+        """Persist one immutable authorized baseline at the exact local outbox cut."""
+
+        from .account_financial_ledger import (
+            AccountFinancialBaselineV1,
+            FinancialDataUnavailableError,
+            FinancialOwnerDirectoryV1,
+            FinancialSourceKind,
+        )
+
+        if (
+            type(baseline) is not AccountFinancialBaselineV1
+            or type(directory) is not FinancialOwnerDirectoryV1
+            or not isinstance(writer_scope, ExecutionScope)
+            or not isinstance(writer_lease, WriterLease)
+        ):
+            raise ContractValidationError(
+                "typed financial baseline and account writer are required"
+            )
+        baseline.validate_against_directory(directory)
+        if not self._financial_writer_is_registered(writer_scope, baseline.account_key, directory):
+            raise FinancialDataUnavailableError(
+                "account writer is not in the complete owner directory"
+            )
+        execution_wm = baseline.cut.watermark(FinancialSourceKind.EXECUTION_OUTBOX)
+        baseline_json = _financial_canonical_json(baseline)
+        directory_json = _financial_canonical_json(directory)
+        baseline_sha = hashlib.sha256(baseline_json.encode("utf-8")).hexdigest()
+        directory_sha = hashlib.sha256(directory_json.encode("utf-8")).hexdigest()
+        with self._transaction() as cursor:
+            transaction_now_ns = time.time_ns()
+            self._assert_active_writer_lease(
+                cursor, writer_scope, writer_lease, now_ns=transaction_now_ns
+            )
+            existing = cursor.execute(
+                """
+                SELECT baseline_ref, baseline_sha256, baseline_json,
+                       directory_sha256, directory_json
+                FROM account_financial_baselines WHERE account_key = ? AND version = ?
+                """,
+                (baseline.account_key, baseline.version),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["baseline_ref"] != baseline.baseline_ref
+                    or existing["baseline_sha256"] != baseline_sha
+                    or existing["baseline_json"] != baseline_json
+                    or existing["directory_sha256"] != directory_sha
+                    or existing["directory_json"] != directory_json
+                ):
+                    raise FinancialDataUnavailableError(
+                        "financial baseline version is already bound to different facts"
+                    )
+                return baseline_sha
+            duplicate_ref = cursor.execute(
+                "SELECT version FROM account_financial_baselines WHERE account_key = ? AND baseline_ref = ?",
+                (baseline.account_key, baseline.baseline_ref),
+            ).fetchone()
+            if duplicate_ref is not None:
+                raise FinancialDataUnavailableError("financial baseline reference was already used")
+            head = cursor.execute(
+                "SELECT * FROM account_financial_ledger_heads WHERE account_key = ?",
+                (baseline.account_key,),
+            ).fetchone()
+            if head is not None and baseline.version <= int(head["baseline_version"]):
+                raise FinancialDataUnavailableError("financial baseline version did not advance")
+            generation, high_water, _count = self._financial_journal_cut(cursor)
+            if generation != execution_wm.generation or high_water != execution_wm.cursor:
+                raise FinancialDataUnavailableError(
+                    "financial baseline does not bind the current execution journal cut"
+                )
+            cursor_snapshot = self._capture_financial_cursor_snapshot_in_transaction(
+                cursor,
+                account_key=baseline.account_key,
+                as_of_ns=execution_wm.as_of_ns,
+            )
+            if cursor_snapshot != baseline.execution_cursors:
+                raise FinancialDataUnavailableError(
+                    "baseline cumulative cursors differ from the durable execution journal"
+                )
+            facts_wm = baseline.cut.watermark(FinancialSourceKind.ACCOUNT_FACTS)
+            activity_wm = baseline.cut.watermark(FinancialSourceKind.ACCOUNT_ACTIVITY)
+            facts_sha = self._financial_account_snapshot_digest(baseline.provider_snapshot)
+            if head is not None and (
+                generation != head["journal_generation"]
+                or high_water < int(head["scanned_sequence"])
+                or facts_wm.generation != head["account_facts_generation"]
+                or facts_wm.cursor < int(head["account_facts_cursor"])
+                or activity_wm.generation != head["activity_generation"]
+                or activity_wm.cursor < int(head["activity_cursor"])
+            ):
+                raise FinancialDataUnavailableError(
+                    "new financial baseline regresses the current ledger head"
+                )
+            cursor_rows_json = _financial_canonical_json(cursor_snapshot.orders)
+            baseline_write_now_ns = time.time_ns()
+            self._assert_active_writer_lease(
+                cursor, writer_scope, writer_lease, now_ns=baseline_write_now_ns
+            )
+            cursor.execute(
+                """
+                INSERT INTO account_financial_baselines(
+                    account_key, baseline_ref, version, journal_generation, execution_cursor,
+                    baseline_sha256, baseline_json, directory_sha256, directory_json,
+                    installed_at_ns, writer_scope_key, writer_owner_id, writer_fencing_token
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    baseline.account_key,
+                    baseline.baseline_ref,
+                    baseline.version,
+                    generation,
+                    high_water,
+                    baseline_sha,
+                    baseline_json,
+                    directory_sha,
+                    directory_json,
+                    baseline_write_now_ns,
+                    writer_scope.key,
+                    writer_lease.owner_id,
+                    writer_lease.fencing_token,
+                ),
+            )
+            head_write_now_ns = time.time_ns()
+            self._assert_active_writer_lease(
+                cursor, writer_scope, writer_lease, now_ns=head_write_now_ns
+            )
+            cursor.execute(
+                """
+                INSERT INTO account_financial_ledger_heads(
+                    account_key, baseline_version, journal_generation, scanned_sequence,
+                    execution_cursors_json, directory_sha256, account_facts_generation,
+                    account_facts_cursor, account_facts_sha256, activity_generation,
+                    activity_cursor, activity_sha256, configuration_sha256,
+                    projection_sha256, projection_json, input_sha256, updated_at_ns,
+                    writer_scope_key, writer_owner_id, writer_fencing_token
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, ?, ?, ?, ?)
+                ON CONFLICT(account_key) DO UPDATE SET
+                    baseline_version = excluded.baseline_version,
+                    journal_generation = excluded.journal_generation,
+                    scanned_sequence = excluded.scanned_sequence,
+                    execution_cursors_json = excluded.execution_cursors_json,
+                    directory_sha256 = excluded.directory_sha256,
+                    account_facts_generation = excluded.account_facts_generation,
+                    account_facts_cursor = excluded.account_facts_cursor,
+                    account_facts_sha256 = excluded.account_facts_sha256,
+                    activity_generation = excluded.activity_generation,
+                    activity_cursor = excluded.activity_cursor,
+                    activity_sha256 = NULL,
+                    configuration_sha256 = NULL,
+                    projection_sha256 = NULL,
+                    projection_json = NULL,
+                    input_sha256 = NULL,
+                    updated_at_ns = excluded.updated_at_ns,
+                    writer_scope_key = excluded.writer_scope_key,
+                    writer_owner_id = excluded.writer_owner_id,
+                    writer_fencing_token = excluded.writer_fencing_token
+                """,
+                (
+                    baseline.account_key,
+                    baseline.version,
+                    generation,
+                    high_water,
+                    cursor_rows_json,
+                    directory_sha,
+                    facts_wm.generation,
+                    facts_wm.cursor,
+                    facts_sha,
+                    activity_wm.generation,
+                    activity_wm.cursor,
+                    head_write_now_ns,
+                    writer_scope.key,
+                    writer_lease.owner_id,
+                    writer_lease.fencing_token,
+                ),
+            )
+            precommit_now_ns = time.time_ns()
+            self._assert_active_writer_lease(
+                cursor, writer_scope, writer_lease, now_ns=precommit_now_ns
+            )
+            return baseline_sha
+
+    def reconcile_account_financials(
+        self,
+        baseline: Any,
+        directory: Any,
+        *,
+        current_account: Any,
+        current_cut: Any,
+        activity_batch: Any,
+        instrument_specs: Mapping[str, Any],
+        policy: Any,
+        writer_scope: ExecutionScope,
+        writer_lease: WriterLease,
+        now_ns: int,
+        max_events: int = 100_000,
+    ) -> Any:
+        """Derive, persist, and project one exact financial journal cut.
+
+        The SQLite transaction reads the unfiltered execution journal, verifies
+        every prior source row against the immutable event ledger, and inserts
+        all new source cursors/postings plus the resulting projection together.
+        A bounded source interval that exceeds ``max_events`` fails explicitly;
+        this method never returns a truncated financial book.
+        """
+
+        from .account_financial_ledger import (
+            AccountFinancialBaselineV1,
+            FinancialActivityBatchV1,
+            FinancialDataUnavailableError,
+            FinancialExecutionBatchV1,
+            FinancialExecutionCursorV1,
+            FinancialExecutionPostingV1,
+            FinancialLedgerCutV1,
+            FinancialLedgerPolicyV1,
+            FinancialOrderBaselineCursorV1,
+            FinancialOwnerDirectoryV1,
+            FinancialOwnerKind,
+            FinancialSourceKind,
+            ProviderAccountFinancialSnapshotV1,
+            advance_execution_cursor_v1,
+            project_account_financials_v1,
+        )
+
+        if (
+            type(baseline) is not AccountFinancialBaselineV1
+            or type(directory) is not FinancialOwnerDirectoryV1
+            or type(activity_batch) is not FinancialActivityBatchV1
+            or type(current_account) is not ProviderAccountFinancialSnapshotV1
+            or type(current_cut) is not FinancialLedgerCutV1
+            or type(policy) is not FinancialLedgerPolicyV1
+            or not isinstance(writer_scope, ExecutionScope)
+            or not isinstance(writer_lease, WriterLease)
+            or type(now_ns) is not int
+            or now_ns <= 0
+            or type(max_events) is not int
+            or not 1 <= max_events <= 1_000_000
+            or not isinstance(instrument_specs, Mapping)
+        ):
+            raise ContractValidationError("invalid durable financial reconciliation request")
+        baseline.validate_against_directory(directory)
+        if not self._financial_writer_is_registered(writer_scope, baseline.account_key, directory):
+            raise FinancialDataUnavailableError(
+                "account writer is not registered for this owner set"
+            )
+        if current_cut.account_key != baseline.account_key:
+            raise FinancialDataUnavailableError("financial query uses another account")
+        execution_wm = current_cut.watermark(FinancialSourceKind.EXECUTION_OUTBOX)
+        facts_wm = current_cut.watermark(FinancialSourceKind.ACCOUNT_FACTS)
+        activity_wm = current_cut.watermark(FinancialSourceKind.ACCOUNT_ACTIVITY)
+        baseline_execution_wm = baseline.cut.watermark(FinancialSourceKind.EXECUTION_OUTBOX)
+        if execution_wm.generation != baseline_execution_wm.generation:
+            raise FinancialDataUnavailableError(
+                "execution journal generation changed after baseline"
+            )
+        if execution_wm.cursor < baseline_execution_wm.cursor:
+            raise FinancialDataUnavailableError("execution cursor regressed behind the baseline")
+        event_span = execution_wm.cursor - baseline_execution_wm.cursor
+        if event_span > max_events:
+            raise FinancialDataUnavailableError(
+                "execution financial interval exceeds the configured complete-scan bound"
+            )
+        directory_json = _financial_canonical_json(directory)
+        directory_sha = hashlib.sha256(directory_json.encode("utf-8")).hexdigest()
+        baseline_json = _financial_canonical_json(baseline)
+        baseline_sha = hashlib.sha256(baseline_json.encode("utf-8")).hexdigest()
+        facts_sha = self._financial_account_snapshot_digest(current_account)
+        activity_sha = self._financial_activity_digest(activity_batch)
+        config_sha = _financial_sha256({"instrument_specs": instrument_specs, "policy": policy})
+        input_sha = _financial_sha256(
+            {
+                "baseline_sha256": baseline_sha,
+                "directory": directory,
+                "current_account": current_account,
+                "current_cut": current_cut,
+                "activity_batch": activity_batch,
+                "instrument_specs": instrument_specs,
+                "policy": policy,
+            }
+        )
+        with self._transaction() as cursor:
+            transaction_now_ns = time.time_ns()
+            self._assert_active_writer_lease(
+                cursor, writer_scope, writer_lease, now_ns=transaction_now_ns
+            )
+            stored_baseline = cursor.execute(
+                """
+                SELECT baseline_ref, baseline_sha256, baseline_json,
+                       journal_generation, execution_cursor, directory_sha256, directory_json
+                FROM account_financial_baselines WHERE account_key = ? AND version = ?
+                """,
+                (baseline.account_key, baseline.version),
+            ).fetchone()
+            if stored_baseline is None or (
+                stored_baseline["baseline_ref"] != baseline.baseline_ref
+                or stored_baseline["baseline_sha256"] != baseline_sha
+                or stored_baseline["baseline_json"] != baseline_json
+                or stored_baseline["directory_sha256"] != directory_sha
+                or stored_baseline["directory_json"] != directory_json
+                or stored_baseline["journal_generation"] != baseline_execution_wm.generation
+                or int(stored_baseline["execution_cursor"]) != baseline_execution_wm.cursor
+            ):
+                raise FinancialDataUnavailableError(
+                    "financial baseline is absent or differs from its immutable stored version"
+                )
+            head = cursor.execute(
+                "SELECT * FROM account_financial_ledger_heads WHERE account_key = ?",
+                (baseline.account_key,),
+            ).fetchone()
+            if head is None or int(head["baseline_version"]) != baseline.version:
+                raise FinancialDataUnavailableError(
+                    "financial ledger head is not bound to this baseline"
+                )
+            if head["journal_generation"] != execution_wm.generation:
+                raise FinancialDataUnavailableError(
+                    "financial ledger head has another journal lineage"
+                )
+            previous_sequence = int(head["scanned_sequence"])
+            if (
+                previous_sequence < baseline_execution_wm.cursor
+                or previous_sequence > execution_wm.cursor
+            ):
+                raise FinancialDataUnavailableError(
+                    "financial ledger cursor is outside the requested cut"
+                )
+            generation, high_water, _journal_count = self._financial_journal_cut(cursor)
+            if generation != execution_wm.generation or high_water != execution_wm.cursor:
+                raise FinancialDataUnavailableError(
+                    "financial query cut is not the current complete execution journal head"
+                )
+            if facts_wm.generation != head["account_facts_generation"] or facts_wm.cursor < int(
+                head["account_facts_cursor"]
+            ):
+                raise FinancialDataUnavailableError(
+                    "provider account facts generation/cursor regressed"
+                )
+            if activity_wm.generation != head["activity_generation"] or activity_wm.cursor < int(
+                head["activity_cursor"]
+            ):
+                raise FinancialDataUnavailableError("account activity generation/cursor regressed")
+            if directory_sha != head["directory_sha256"]:
+                raise FinancialDataUnavailableError(
+                    "trusted owner directory changed after baseline"
+                )
+            if (
+                head["configuration_sha256"] is not None
+                and head["configuration_sha256"] != config_sha
+            ):
+                raise FinancialDataUnavailableError(
+                    "financial ledger configuration changed without a new baseline"
+                )
+            if (
+                facts_wm.generation == head["account_facts_generation"]
+                and facts_wm.cursor == int(head["account_facts_cursor"])
+                and facts_sha != head["account_facts_sha256"]
+            ):
+                raise FinancialDataUnavailableError(
+                    "provider account facts changed without advancing their cursor"
+                )
+            if (
+                activity_wm.generation == head["activity_generation"]
+                and activity_wm.cursor == int(head["activity_cursor"])
+                and head["activity_sha256"] is not None
+                and activity_sha != head["activity_sha256"]
+            ):
+                raise FinancialDataUnavailableError(
+                    "account activity changed without advancing its cursor"
+                )
+
+            all_intents, record_rows = self._financial_account_intents(cursor)
+            baseline_cursor_snapshot = baseline.execution_cursors
+            if baseline_cursor_snapshot is None:
+                raise FinancialDataUnavailableError(
+                    "financial baseline has no durable cumulative execution cursors"
+                )
+            cursor_rows = {
+                (row.scope_key, row.intent_id): row for row in baseline_cursor_snapshot.orders
+            }
+            existing_event_rows = cursor.execute(
+                """
+                SELECT * FROM account_financial_events
+                WHERE account_key = ? AND baseline_version = ? AND journal_generation = ?
+                  AND sequence > ? AND sequence <= ?
+                ORDER BY sequence ASC
+                """,
+                (
+                    baseline.account_key,
+                    baseline.version,
+                    generation,
+                    baseline_execution_wm.cursor,
+                    execution_wm.cursor,
+                ),
+            ).fetchall()
+            if len(existing_event_rows) > event_span:
+                raise FinancialDataUnavailableError("financial source event ledger has duplicates")
+            saved_by_sequence = {int(row["sequence"]): row for row in existing_event_rows}
+            if len(saved_by_sequence) != len(existing_event_rows):
+                raise FinancialDataUnavailableError(
+                    "financial source event ledger has duplicate cursors"
+                )
+            source_rows = cursor.execute(
+                """
+                SELECT sequence, event_id, intent_id, scope_key, event_type, state, payload_json,
+                       created_at_ns, journal_incarnation_id
+                FROM execution_outbox
+                WHERE sequence > ? AND sequence <= ? ORDER BY sequence ASC
+                LIMIT ?
+                """,
+                (
+                    baseline_execution_wm.cursor,
+                    execution_wm.cursor,
+                    max_events + 1,
+                ),
+            ).fetchall()
+            if len(source_rows) != event_span:
+                raise FinancialDataUnavailableError(
+                    "execution financial scan is truncated or gapped"
+                )
+            expected_sequence = baseline_execution_wm.cursor + 1
+            source_write_lease_checked = False
+            for row in source_rows:
+                sequence = int(row["sequence"])
+                if sequence != expected_sequence:
+                    raise FinancialDataUnavailableError(
+                        "execution financial scan has a sequence gap"
+                    )
+                expected_sequence += 1
+                if row["journal_incarnation_id"] != generation:
+                    raise FinancialDataUnavailableError(
+                        "execution event lineage differs from its journal"
+                    )
+                try:
+                    payload = json.loads(str(row["payload_json"]))
+                    if canonical_json(payload) != str(row["payload_json"]):
+                        raise ValueError("noncanonical outbox payload")
+                    event = ExecutionEvent(
+                        sequence=sequence,
+                        event_id=str(row["event_id"]),
+                        intent_id=str(row["intent_id"]),
+                        scope_key=str(row["scope_key"]),
+                        event_type=str(row["event_type"]),
+                        state=ExecutionState(str(row["state"])),
+                        payload=payload,
+                        created_at_ns=int(row["created_at_ns"]),
+                        journal_incarnation_id=str(row["journal_incarnation_id"]),
+                    )
+                except (
+                    ContractValidationError,
+                    TypeError,
+                    ValueError,
+                    json.JSONDecodeError,
+                ) as error:
+                    raise DurableStoreError(
+                        "stored execution outbox event is unreadable"
+                    ) from error
+                key = (event.scope_key, event.intent_id)
+                intent_data = all_intents.get(key)
+                if intent_data is None:
+                    raise DurableStoreError("execution outbox event has no immutable intent")
+                intent, intent_sha = intent_data
+                is_account_event = intent.scope.account_key == baseline.account_key
+                owner = None
+                cursor_json = None
+                posting_json = None
+                if is_account_event:
+                    owner = next(
+                        (
+                            item
+                            for item in directory.owners
+                            if item.kind is FinancialOwnerKind.STRATEGY
+                            and item.execution_scope_key == event.scope_key
+                        ),
+                        None,
+                    )
+                    if owner is None:
+                        raise FinancialDataUnavailableError(
+                            "account execution event has no registered financial owner"
+                        )
+                    previous = cursor_rows.get(key)
+                    if previous is None:
+                        previous = FinancialOrderBaselineCursorV1(
+                            owner=owner,
+                            scope_key=event.scope_key,
+                            intent_id=event.intent_id,
+                            intent_payload_sha256=intent_sha,
+                            cursor=FinancialExecutionCursorV1(),
+                        )
+                        cursor_rows[key] = previous
+                    elif previous.owner != owner or previous.intent_payload_sha256 != intent_sha:
+                        raise FinancialDataUnavailableError(
+                            "managed execution owner or immutable intent changed"
+                        )
+                    if event.event_type in {
+                        "provider_observation",
+                        "reconciled_observation",
+                        "provider_commission_evidence",
+                    }:
+                        assert previous is not None
+                        next_cursor, posting = advance_execution_cursor_v1(
+                            event, intent, previous.cursor, owner, instrument_specs
+                        )
+                        current_order = FinancialOrderBaselineCursorV1(
+                            owner=owner,
+                            scope_key=event.scope_key,
+                            intent_id=event.intent_id,
+                            intent_payload_sha256=intent_sha,
+                            cursor=next_cursor,
+                        )
+                        cursor_rows[key] = current_order
+                        cursor_json = _financial_canonical_json(current_order)
+                        posting_json = (
+                            None if posting is None else _financial_canonical_json(posting)
+                        )
+                    current_order = cursor_rows[key]
+                    cursor_json = _financial_canonical_json(current_order)
+
+                payload_json = canonical_json(dict(event.payload))
+                payload_sha = payload_sha256(dict(event.payload))
+                expected_row = (
+                    event.event_id,
+                    event.scope_key,
+                    event.intent_id,
+                    event.event_type,
+                    event.state.value,
+                    payload_sha,
+                    payload_json,
+                    intent_sha,
+                    cursor_json,
+                    posting_json,
+                )
+                saved = saved_by_sequence.get(sequence)
+                if saved is not None:
+                    saved_row = (
+                        str(saved["event_id"]),
+                        str(saved["scope_key"]),
+                        str(saved["intent_id"]),
+                        str(saved["event_type"]),
+                        str(saved["source_state"]),
+                        str(saved["source_payload_sha256"]),
+                        str(saved["source_payload_json"]),
+                        saved["intent_payload_sha256"],
+                        saved["cursor_json"],
+                        saved["posting_json"],
+                    )
+                    if saved_row != expected_row:
+                        raise FinancialDataUnavailableError(
+                            "durable execution source changed after financial ledger application"
+                        )
+                else:
+                    if sequence <= previous_sequence:
+                        raise FinancialDataUnavailableError(
+                            "financial execution event ledger is missing an applied source row"
+                        )
+                    if not source_write_lease_checked:
+                        source_write_now_ns = time.time_ns()
+                        self._assert_active_writer_lease(
+                            cursor,
+                            writer_scope,
+                            writer_lease,
+                            now_ns=source_write_now_ns,
+                        )
+                        source_write_lease_checked = True
+                    cursor.execute(
+                        """
+                        INSERT INTO account_financial_events(
+                            account_key, baseline_version, journal_generation, sequence,
+                            event_id, scope_key, intent_id, event_type, source_state,
+                            source_payload_sha256, source_payload_json, intent_payload_sha256,
+                            cursor_json, posting_json
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            baseline.account_key,
+                            baseline.version,
+                            generation,
+                            sequence,
+                            *expected_row,
+                        ),
+                    )
+
+            for key, (intent, _intent_sha) in all_intents.items():
+                if intent.scope.account_key != baseline.account_key:
+                    continue
+                current_order = cursor_rows.get(key)
+                if current_order is None:
+                    raise FinancialDataUnavailableError(
+                        "complete execution cursor state omits a current account order"
+                    )
+                persisted = record_rows[key]
+                execution_cursor = current_order.cursor
+                if (
+                    Decimal(str(persisted["filled_quantity"])) != execution_cursor.filled_quantity
+                    or (
+                        None
+                        if persisted["average_price"] is None
+                        else Decimal(str(persisted["average_price"]))
+                    )
+                    != execution_cursor.average_price
+                    or (
+                        None
+                        if persisted["cumulative_commission"] is None
+                        else Decimal(str(persisted["cumulative_commission"]))
+                    )
+                    != execution_cursor.cumulative_commission
+                    or persisted["provider_order_id"] != execution_cursor.provider_order_id
+                ):
+                    raise FinancialDataUnavailableError(
+                        "execution cursor differs from its durable intent projection"
+                    )
+            final_cursor_rows = tuple(cursor_rows[key] for key in sorted(cursor_rows))
+            cursor_rows_json = _financial_canonical_json(final_cursor_rows)
+            stored_financial_events = cursor.execute(
+                """
+                SELECT sequence, posting_json FROM account_financial_events
+                WHERE account_key = ? AND baseline_version = ? AND journal_generation = ?
+                  AND sequence > ? AND sequence <= ?
+                ORDER BY sequence ASC
+                """,
+                (
+                    baseline.account_key,
+                    baseline.version,
+                    generation,
+                    baseline_execution_wm.cursor,
+                    execution_wm.cursor,
+                ),
+            ).fetchall()
+            if len(stored_financial_events) != event_span or any(
+                int(row["sequence"]) != baseline_execution_wm.cursor + index
+                for index, row in enumerate(stored_financial_events, start=1)
+            ):
+                raise FinancialDataUnavailableError(
+                    "persisted financial source rows do not cover the baseline-to-current interval"
+                )
+            postings = tuple(
+                self._financial_posting_from_json(str(row["posting_json"]))
+                for row in stored_financial_events
+                if row["posting_json"] is not None
+            )
+            if any(type(item) is not FinancialExecutionPostingV1 for item in postings):
+                raise DurableStoreError("durable financial posting type is invalid")
+            execution_batch = FinancialExecutionBatchV1(
+                journal_generation=generation,
+                from_cursor=baseline_execution_wm.cursor,
+                through_cursor=execution_wm.cursor,
+                scanned_row_count=event_span,
+                postings=postings,
+            )
+            managed_provider_order_ids = tuple(
+                sorted(
+                    {
+                        row.cursor.provider_order_id
+                        for row in final_cursor_rows
+                        if row.cursor.provider_order_id is not None
+                    }
+                )
+            )
+            projection = project_account_financials_v1(
+                baseline=baseline,
+                directory=directory,
+                current_account=current_account,
+                current_cut=current_cut,
+                execution_batch=execution_batch,
+                activity_batch=activity_batch,
+                instrument_specs=instrument_specs,
+                policy=policy,
+                now_ns=now_ns,
+                managed_provider_order_ids=managed_provider_order_ids,
+            )
+            projection_json = _financial_canonical_json(projection)
+            projection_sha = hashlib.sha256(projection_json.encode("utf-8")).hexdigest()
+            if head["input_sha256"] == input_sha and (
+                head["projection_sha256"] != projection_sha
+                or head["projection_json"] != projection_json
+            ):
+                raise DurableStoreError("financial projection replay is not deterministic")
+            head_update_now_ns = time.time_ns()
+            self._assert_active_writer_lease(
+                cursor, writer_scope, writer_lease, now_ns=head_update_now_ns
+            )
+            cursor.execute(
+                """
+                UPDATE account_financial_ledger_heads
+                SET scanned_sequence = ?, execution_cursors_json = ?,
+                    account_facts_generation = ?, account_facts_cursor = ?,
+                    account_facts_sha256 = ?, activity_generation = ?, activity_cursor = ?,
+                    activity_sha256 = ?, configuration_sha256 = ?, projection_sha256 = ?,
+                    projection_json = ?, input_sha256 = ?, updated_at_ns = ?,
+                    writer_scope_key = ?, writer_owner_id = ?, writer_fencing_token = ?
+                WHERE account_key = ? AND baseline_version = ?
+                """,
+                (
+                    execution_wm.cursor,
+                    cursor_rows_json,
+                    facts_wm.generation,
+                    facts_wm.cursor,
+                    facts_sha,
+                    activity_wm.generation,
+                    activity_wm.cursor,
+                    activity_sha,
+                    config_sha,
+                    projection_sha,
+                    projection_json,
+                    input_sha,
+                    head_update_now_ns,
+                    writer_scope.key,
+                    writer_lease.owner_id,
+                    writer_lease.fencing_token,
+                    baseline.account_key,
+                    baseline.version,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise DurableStoreError("financial ledger head changed during projection")
+            precommit_now_ns = time.time_ns()
+            self._assert_active_writer_lease(
+                cursor, writer_scope, writer_lease, now_ns=precommit_now_ns
+            )
+            return projection
 
     @classmethod
     def _ctp_account_store_path(cls, path: str | Path, scope: ExecutionScope | None) -> Path:
@@ -6169,6 +7299,7 @@ class SqliteExecutionStore:
                 "18",
                 "20",
                 "21",
+                "22",
                 str(self._SCHEMA_VERSION),
             }:
                 raise DurableStoreError("unsupported execution store schema")
@@ -6216,9 +7347,10 @@ class SqliteExecutionStore:
             if version != str(self._SCHEMA_VERSION):
                 # V20 already contains the complete CTP schema and its safety
                 # migrations. V21/V22 only add nullable admission/group fields
-                # and the group authorization audit table; do not rerun historical CTP cutover
+                # and the group authorization audit table; V23 adds an adjacent
+                # financial ledger. Do not rerun historical CTP cutover
                 # migrations or downgrade existing READY/CLAIMED commands.
-                if version not in {"20", "21"}:
+                if version not in {"20", "21", "22"}:
                     self._migrate_ctp_account_family_legacy_fence(
                         cursor,
                         previous_tables=previous_tables,
@@ -6329,6 +7461,92 @@ class SqliteExecutionStore:
                     SELECT RAISE(ABORT, 'CTP queue receipt disposition is immutable');
                 END;
                 """
+            )
+            self._execute_schema_statements(
+                cursor,
+                """
+                CREATE TABLE IF NOT EXISTS account_financial_baselines (
+                    account_key TEXT NOT NULL,
+                    baseline_ref TEXT NOT NULL,
+                    version INTEGER NOT NULL CHECK(version > 0),
+                    journal_generation TEXT NOT NULL,
+                    execution_cursor INTEGER NOT NULL CHECK(execution_cursor >= 0),
+                    baseline_sha256 TEXT NOT NULL,
+                    baseline_json TEXT NOT NULL,
+                    directory_sha256 TEXT NOT NULL,
+                    directory_json TEXT NOT NULL,
+                    installed_at_ns INTEGER NOT NULL CHECK(installed_at_ns > 0),
+                    writer_scope_key TEXT NOT NULL,
+                    writer_owner_id TEXT NOT NULL,
+                    writer_fencing_token INTEGER NOT NULL CHECK(writer_fencing_token > 0),
+                    PRIMARY KEY(account_key, version),
+                    UNIQUE(account_key, baseline_ref)
+                );
+                CREATE TRIGGER IF NOT EXISTS account_financial_baselines_immutable_update
+                BEFORE UPDATE ON account_financial_baselines
+                BEGIN
+                    SELECT RAISE(ABORT, 'account financial baselines are immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS account_financial_baselines_immutable_delete
+                BEFORE DELETE ON account_financial_baselines
+                BEGIN
+                    SELECT RAISE(ABORT, 'account financial baselines are immutable');
+                END;
+                CREATE TABLE IF NOT EXISTS account_financial_events (
+                    account_key TEXT NOT NULL,
+                    baseline_version INTEGER NOT NULL,
+                    journal_generation TEXT NOT NULL,
+                    sequence INTEGER NOT NULL CHECK(sequence > 0),
+                    event_id TEXT NOT NULL,
+                    scope_key TEXT NOT NULL,
+                    intent_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    source_state TEXT NOT NULL,
+                    source_payload_sha256 TEXT NOT NULL,
+                    source_payload_json TEXT NOT NULL,
+                    intent_payload_sha256 TEXT,
+                    cursor_json TEXT,
+                    posting_json TEXT,
+                    PRIMARY KEY(account_key, baseline_version, journal_generation, event_id),
+                    UNIQUE(account_key, baseline_version, journal_generation, sequence),
+                    FOREIGN KEY(account_key, baseline_version)
+                        REFERENCES account_financial_baselines(account_key, version)
+                );
+                CREATE TRIGGER IF NOT EXISTS account_financial_events_immutable_update
+                BEFORE UPDATE ON account_financial_events
+                BEGIN
+                    SELECT RAISE(ABORT, 'account financial events are append-only');
+                END;
+                CREATE TRIGGER IF NOT EXISTS account_financial_events_immutable_delete
+                BEFORE DELETE ON account_financial_events
+                BEGIN
+                    SELECT RAISE(ABORT, 'account financial events are append-only');
+                END;
+                CREATE TABLE IF NOT EXISTS account_financial_ledger_heads (
+                    account_key TEXT PRIMARY KEY,
+                    baseline_version INTEGER NOT NULL,
+                    journal_generation TEXT NOT NULL,
+                    scanned_sequence INTEGER NOT NULL CHECK(scanned_sequence >= 0),
+                    execution_cursors_json TEXT NOT NULL,
+                    directory_sha256 TEXT NOT NULL,
+                    account_facts_generation TEXT NOT NULL,
+                    account_facts_cursor INTEGER NOT NULL CHECK(account_facts_cursor >= 0),
+                    account_facts_sha256 TEXT NOT NULL,
+                    activity_generation TEXT NOT NULL,
+                    activity_cursor INTEGER NOT NULL CHECK(activity_cursor >= 0),
+                    activity_sha256 TEXT,
+                    configuration_sha256 TEXT,
+                    projection_sha256 TEXT,
+                    projection_json TEXT,
+                    input_sha256 TEXT,
+                    updated_at_ns INTEGER NOT NULL CHECK(updated_at_ns > 0),
+                    writer_scope_key TEXT NOT NULL,
+                    writer_owner_id TEXT NOT NULL,
+                    writer_fencing_token INTEGER NOT NULL CHECK(writer_fencing_token > 0),
+                    FOREIGN KEY(account_key, baseline_version)
+                        REFERENCES account_financial_baselines(account_key, version)
+                );
+                """,
             )
 
     @staticmethod
