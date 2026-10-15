@@ -12652,6 +12652,70 @@ class SqliteExecutionStore:
                 raise DurableStoreError("unable to list dispatching execution records") from error
         return tuple(self._record_from_row(row) for row in rows)
 
+    def recover_interrupted_dispatches(
+        self,
+        scope: ExecutionScope,
+        *,
+        writer_lease: WriterLease | None = None,
+    ) -> tuple[ExecutionRecord, ...]:
+        """Latch this scope's claimed, unresolved provider calls as UNKNOWN.
+
+        The current writer fence, state transition, and outbox event are
+        committed in one transaction. Recovery never calls a provider and
+        leaves ``PENDING_DISPATCH`` rows alone because they have not crossed
+        the durable dispatch-claim boundary.
+        """
+
+        if not isinstance(scope, ExecutionScope):
+            raise ContractValidationError("execution scope is required")
+        reason_code = "interrupted_order_dispatch"
+        recovered: list[ExecutionRecord] = []
+        with self._transaction() as cursor:
+            self._assert_active_writer_lease(cursor, scope, writer_lease)
+            rows = cursor.execute(
+                """
+                SELECT * FROM execution_records
+                WHERE scope_key = ? AND state = ?
+                ORDER BY created_at_ns ASC, intent_id ASC
+                """,
+                (scope.key, ExecutionState.DISPATCHING.value),
+            ).fetchall()
+            now_ns = time.time_ns()
+            for row in rows:
+                record = self._record_from_row(row)
+                cursor.execute(
+                    """
+                    UPDATE execution_records
+                    SET state = ?, unknown_reason = ?, review_required = 1, updated_at_ns = ?
+                    WHERE scope_key = ? AND intent_id = ? AND state = ?
+                    """,
+                    (
+                        ExecutionState.UNKNOWN.value,
+                        reason_code,
+                        now_ns,
+                        scope.key,
+                        record.intent_id,
+                        ExecutionState.DISPATCHING.value,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise DurableStoreError(
+                        "interrupted execution dispatch changed during recovery"
+                    )
+                self._append_event(
+                    cursor,
+                    intent_id=record.intent_id,
+                    scope_key=scope.key,
+                    event_type="dispatch_unknown",
+                    state=ExecutionState.UNKNOWN,
+                    payload={"reason_code": reason_code},
+                    now_ns=now_ns,
+                )
+                updated = self._fetch_record(cursor, scope.key, record.intent_id)
+                assert updated is not None
+                recovered.append(self._record_from_row(updated))
+        return tuple(recovered)
+
     def assert_writer_lease(self, scope: ExecutionScope, writer_lease: WriterLease) -> None:
         """Fail if this exact facade generation has lost its writer fence."""
 

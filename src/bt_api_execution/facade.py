@@ -121,6 +121,21 @@ class ManagedExecutionFacade:
         self._last_writer_lease = lease
         return lease
 
+    def recover_interrupted_dispatches(self) -> tuple[ExecutionRecord, ...]:
+        """Fence this scope's persisted dispatch claims during service startup.
+
+        The current writer lease is acquired before touching the journal. Any
+        unresolved claim becomes ``UNKNOWN`` atomically, and provider I/O is
+        never retried. A composition must finish this recovery before it
+        accepts managed writes.
+        """
+
+        writer_lease = self.acquire_writer_lease()
+        return self._store.recover_interrupted_dispatches(
+            self._scope,
+            writer_lease=writer_lease,
+        )
+
     def close(self) -> bool:
         """Release only this facade's lease; the store remains caller-owned."""
 

@@ -26,6 +26,7 @@ from .cancellation import ManagedCancellationFacade
 from .contracts import (
     CancelIntent,
     ExecutionScope,
+    ExecutionState,
     OrderIntent,
     cancel_intent_from_payload,
     order_intent_from_payload,
@@ -169,6 +170,34 @@ class ExecutionOrderEntryService:
         if operation == SUBMIT_OPERATION:
             return self._submit(arguments, execution_scope)
         return self._cancel(arguments, execution_scope)
+
+    def recover_interrupted_dispatches(self) -> tuple[ExecutionRecord, ...]:
+        """Recover configured scopes before this service accepts writes.
+
+        The composition root calls this once during startup. Each scope's
+        facade acquires the current writer lease and atomically latches its
+        unresolved dispatch claims as ``UNKNOWN`` without provider I/O.
+        """
+
+        recovered: list[ExecutionRecord] = []
+        seen_scope_keys: set[str] = set()
+        for execution_scope in self._targets.values():
+            if execution_scope.key in seen_scope_keys:
+                continue
+            seen_scope_keys.add(execution_scope.key)
+            order_facade, _ = self._facade_pair(execution_scope)
+            records = order_facade.recover_interrupted_dispatches()
+            if type(records) is not tuple or any(
+                type(record) is not ExecutionRecord
+                or record.scope_key != execution_scope.key
+                or record.state is not ExecutionState.UNKNOWN
+                for record in records
+            ):
+                raise DurableStoreError(
+                    "execution order recovery returned invalid persisted evidence"
+                )
+            recovered.extend(records)
+        return tuple(recovered)
 
     def _submit(
         self, arguments: Mapping[str, Any], execution_scope: ExecutionScope
