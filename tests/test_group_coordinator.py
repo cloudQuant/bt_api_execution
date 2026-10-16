@@ -563,6 +563,95 @@ def test_lost_reserve_reply_with_unknown_code_recovers_active_vector_by_query(
     reopened_store.close()
 
 
+def test_expired_unclaimed_account_vectors_release_before_dispatch_and_reopen(
+    tmp_path,
+) -> None:
+    request = _make_request(accounts=("account-a", "account-b"))
+    clock = _Clock(_NOW + 1)
+    coordinator, store, reservations, orders = _coordinator(tmp_path, request, clock_ns=clock)
+    coordinator.accept(request)
+
+    prepared = coordinator._advance_reservations(
+        coordinator._required(request.portfolio_ref, request.group_id)
+    )
+    assert all(item.phase is GroupReservationPhase.ACTIVE for item in prepared.reservations)
+    assert all(len(port.reserve_calls) == 1 for port in reservations.values())
+    assert all(not port.submissions for port in orders.values())
+    assert all(not port.release_calls for port in reservations.values())
+
+    # The second account commits its release, but its RPC reply is lost. The
+    # coordinator must retain the portfolio hold until the original Risk IDs
+    # are queried and both terminal receipts are verified after restart.
+    reservations["account-b"].lose_release_response = True
+    clock.now_ns = request.deadline_ns + 1
+    interrupted = coordinator.advance_group(request.portfolio_ref, request.group_id)
+
+    assert interrupted.state is GroupOrderState.RECOVERY_REQUIRED
+    assert interrupted.budget_reservation.state.value == "RESERVED"
+    assert all(leg.submitted_intent is None for leg in interrupted.legs)
+    assert all(len(port.reserve_calls) == 1 for port in reservations.values())
+    assert all(port.release_calls == [request.group_id] for port in reservations.values())
+    assert reservations["account-a"].groups[request.group_id].legs
+    assert all(
+        leg["state"] == "RELEASED" and not leg["claimed"] and not leg["resolved"]
+        for port in reservations.values()
+        for leg in port.groups[request.group_id].legs.values()
+    )
+    assert all(not port.submissions and not port.query_ids for port in orders.values())
+    store.close()
+
+    reopened_store = SqliteOrderGroupStore(tmp_path / "groups.sqlite")
+    recovered_coordinator = GroupOrderCoordinator(
+        reopened_store,
+        reservations=reservations,
+        orders=orders,
+        portfolio_budget_policies={request.portfolio_ref: interrupted.budget_reservation.policy},
+        budget_quote_builder=_test_budget_quote,
+        clock_ns=clock,
+    )
+    recovered = recovered_coordinator.advance_group(request.portfolio_ref, request.group_id)
+
+    assert recovered.state is GroupOrderState.REJECTED_BEFORE_DISPATCH
+    assert recovered.error_code == "reservation_not_active"
+    assert recovered.budget_reservation.state.value == "RELEASED"
+    assert all(item.phase is GroupReservationPhase.RELEASED for item in recovered.reservations)
+    assert all(len(port.reserve_calls) == 1 for port in reservations.values())
+    assert all(port.release_calls == [request.group_id] for port in reservations.values())
+    assert all(not port.submissions and not port.query_ids for port in orders.values())
+    reopened_store.close()
+
+
+def test_expired_vector_does_not_release_any_account_if_another_has_a_claim(
+    tmp_path,
+) -> None:
+    request = _make_request(accounts=("account-a", "account-b"))
+    clock = _Clock(_NOW + 1)
+    coordinator, store, reservations, orders = _coordinator(tmp_path, request, clock_ns=clock)
+    coordinator.accept(request)
+    prepared = coordinator._advance_reservations(
+        coordinator._required(request.portfolio_ref, request.group_id)
+    )
+    assert all(item.phase is GroupReservationPhase.ACTIVE for item in prepared.reservations)
+
+    # A claim observed on the second account blocks compensation of the first
+    # account, even though the coordinator has no submitted child intent.
+    claimed = reservations["account-b"].groups[request.group_id].legs["leg-hedge"]
+    claimed["actual_intent_hash"] = payload_sha256({"exact-child": "persisted"})
+    claimed["claimed"] = True
+    claimed["state"] = "SETTLED"
+    clock.now_ns = request.deadline_ns + 1
+
+    blocked = coordinator.advance_group(request.portfolio_ref, request.group_id)
+
+    assert blocked.state is GroupOrderState.RECOVERY_REQUIRED
+    assert blocked.error_code == "reservation_claim_before_dispatch"
+    assert blocked.budget_reservation.state.value == "RESERVED"
+    assert all(leg.submitted_intent is None for leg in blocked.legs)
+    assert all(not port.release_calls for port in reservations.values())
+    assert all(not port.submissions and not port.query_ids for port in orders.values())
+    store.close()
+
+
 def test_trusted_portfolio_budget_denial_has_no_account_or_order_effects(tmp_path) -> None:
     request = _make_request(accounts=("account-a", "account-b"))
     policy = PortfolioGroupBudgetPolicy(

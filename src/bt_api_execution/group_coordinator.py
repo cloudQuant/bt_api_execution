@@ -218,6 +218,19 @@ class GroupOrderCoordinator:
             snapshot = self._advance_reservations(snapshot)
             if snapshot.state is GroupOrderState.REJECTED_BEFORE_DISPATCH:
                 return snapshot
+            if (
+                snapshot.state is GroupOrderState.RECOVERY_REQUIRED
+                and self._first_leg(snapshot).submitted_intent is None
+                and not all(
+                    self._reservation_dispatchable(snapshot, account_ref)
+                    for account_ref in snapshot.request.account_refs
+                )
+            ):
+                # A recovered reservation query can reauthorize progression
+                # only when every exact account receipt is currently
+                # dispatchable. A claim, expired member, or uncertain vector
+                # without a child intent remains recovery-only.
+                return snapshot
             if not self._all_reservations_present(snapshot):
                 return snapshot
             if snapshot.state is GroupOrderState.PREPARING:
@@ -281,7 +294,10 @@ class GroupOrderCoordinator:
 
     def _advance_reservations(self, snapshot: GroupOrderSnapshot) -> GroupOrderSnapshot:
         request = snapshot.request
-        if all(item.phase is GroupReservationPhase.ACTIVE for item in snapshot.reservations):
+        if all(
+            self._reservation_dispatchable(snapshot, account_ref)
+            for account_ref in request.account_refs
+        ):
             return snapshot
         for account_ref in request.account_refs:
             snapshot = self._required(request.portfolio_ref, request.group_id)
@@ -340,6 +356,8 @@ class GroupOrderCoordinator:
                             "recovered_after_lost_reply": True,
                         },
                     )
+                    if not any(leg.submitted_intent is not None for leg in snapshot.legs):
+                        return self._reject_before_dispatch(snapshot, "RESERVATION_NOT_ACTIVE")
                     continue
                 snapshot = self._replace_reservation(
                     snapshot,
@@ -353,6 +371,15 @@ class GroupOrderCoordinator:
                 if not self._reservation_dispatchable(
                     snapshot, account_ref
                 ) and self._has_claim_or_expired(reservation):
+                    if not any(leg.submitted_intent is not None for leg in snapshot.legs):
+                        # A complete account snapshot that is already expired
+                        # before any child intent was persisted is a terminal
+                        # pre-dispatch condition. Reconcile every account and
+                        # release only after the exact unclaimed vector is
+                        # proven below; never strand portfolio capacity merely
+                        # because the Risk read API intentionally does not
+                        # perform TTL cleanup.
+                        return self._reject_before_dispatch(snapshot, "RESERVATION_NOT_ACTIVE")
                     return self._mark_recovery(snapshot, "RESERVATION_NOT_ACTIVE")
                 continue
 
@@ -847,19 +874,68 @@ class GroupOrderCoordinator:
     ) -> GroupOrderSnapshot:
         if any(progress.submitted_intent is not None for progress in snapshot.legs):
             return self._mark_recovery(snapshot, "PRE_DISPATCH_REJECTION_AFTER_ORDER_INTENT")
+
+        # Query all accounts before releasing any vector. A partial preflight
+        # must never release account A and only then discover that account B
+        # has a claim or an uncertain reservation outcome.
+        preflight: list[tuple[str, GroupAccountReservationSnapshot | None]] = []
         for account_ref in snapshot.request.account_refs:
             reservation = self._reservation(snapshot, account_ref)
-            if reservation.phase is not GroupReservationPhase.ACTIVE:
-                continue
             try:
                 receipt = self._query_reservation(snapshot, account_ref)
                 snapshot = self._required(snapshot.request.portfolio_ref, snapshot.request.group_id)
                 risk = self._reservation_from_receipt(snapshot, account_ref, receipt)
-            except Exception:
+            except Exception as error:
+                if _error_code(error) == "GROUP_NOT_FOUND" and (
+                    reservation.phase
+                    in {
+                        GroupReservationPhase.NOT_STARTED,
+                        GroupReservationPhase.REQUESTING,
+                        GroupReservationPhase.UNKNOWN,
+                        GroupReservationPhase.DENIED,
+                    }
+                    and reservation.group_fingerprint is None
+                ):
+                    # The account owner proves the original group ID has no
+                    # reservation. This is safe only for a local phase that
+                    # never recorded a durable Risk vector.
+                    preflight.append((account_ref, None))
+                    continue
                 return self._mark_recovery(snapshot, "RESERVATION_RELEASE_QUERY_UNKNOWN")
             if any(leg.claimed or leg.resolved for leg in risk.legs):
                 return self._mark_recovery(snapshot, "RESERVATION_CLAIM_BEFORE_DISPATCH")
             if any(leg.state not in {"ACTIVE", "RELEASED", "EXPIRED"} for leg in risk.legs):
+                return self._mark_recovery(snapshot, "RESERVATION_RELEASE_UNSAFE")
+            preflight.append((account_ref, risk))
+
+        # No account effect occurs until every existing vector has been
+        # checked for exact identity, membership, and absence of claims.
+        for account_ref, risk in preflight:
+            snapshot = self._required(snapshot.request.portfolio_ref, snapshot.request.group_id)
+            local = self._reservation(snapshot, account_ref)
+            if risk is None:
+                if local.phase not in {
+                    GroupReservationPhase.NOT_STARTED,
+                    GroupReservationPhase.DENIED,
+                }:
+                    snapshot = self._set_reservation_phase(
+                        snapshot,
+                        account_ref,
+                        GroupReservationPhase.DENIED,
+                        event_type="RESERVATION_DENIED",
+                        error_code="group_not_found",
+                    )
+                continue
+            if all(leg.state in {"RELEASED", "EXPIRED"} for leg in risk.legs):
+                snapshot = self._replace_reservation(
+                    snapshot,
+                    risk,
+                    event_type="RESERVATION_RELEASED",
+                    payload={"account_ref": account_ref, "already_terminal": True},
+                    phase=GroupReservationPhase.RELEASED,
+                )
+                continue
+            if any(leg.state != "ACTIVE" for leg in risk.legs):
                 return self._mark_recovery(snapshot, "RESERVATION_RELEASE_UNSAFE")
             if any(leg.state == "ACTIVE" for leg in risk.legs):
                 snapshot = self._record_reservation_event(
@@ -879,7 +955,10 @@ class GroupOrderCoordinator:
                     risk = self._reservation_from_receipt(snapshot, account_ref, released)
                 except Exception:
                     return self._mark_recovery(snapshot, "RESERVATION_RELEASE_UNKNOWN")
-                if any(not leg.claimed and leg.state == "ACTIVE" for leg in risk.legs):
+                if any(
+                    leg.claimed or leg.resolved or leg.state not in {"RELEASED", "EXPIRED"}
+                    for leg in risk.legs
+                ):
                     return self._mark_recovery(snapshot, "RESERVATION_RELEASE_INCOMPLETE")
             snapshot = self._replace_reservation(
                 self._required(snapshot.request.portfolio_ref, snapshot.request.group_id),
