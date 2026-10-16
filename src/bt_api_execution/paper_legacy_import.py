@@ -276,12 +276,34 @@ class PaperLegacyImportV1:
                 continue
             target_instrument = target_by_symbol.get(row.get("symbol"))
             spec = domain.instrument(target_instrument) if target_instrument is not None else None
+            margin_value = _decimal(
+                row.get("margin_value"), "position margin", minimum=Decimal(0)
+            )
+            market_value = _decimal(
+                row.get("market_value"), "position market value", minimum=Decimal(0)
+            )
+            margin_rate = _decimal(
+                row.get("margin_rate"), "position margin rate", minimum=Decimal(0)
+            )
+            # The legacy PaperTradingService stores a full-notional
+            # ``margin_value`` for its 1:1 cash-funded positions.  Its account
+            # cash is still reconciled against every source trade above, so
+            # this is a redundant collateral display rather than borrowed
+            # margin.  Keep accepting older rows which persisted zero, and
+            # accept the producer projection only when the full marked value
+            # is present at a 1:1 multiplier/rate.
+            has_cash_funded_producer_margin = (
+                margin_value is not None
+                and market_value is not None
+                and margin_rate == 1
+                and margin_value == market_value
+            )
             if (
                 spec is None
                 or row.get("multiplier") is None
                 or _decimal(row.get("multiplier"), "position multiplier") != 1
-                or _decimal(row.get("margin_value"), "position margin") != 0
-                or _decimal(row.get("margin_rate"), "position margin rate") != 1
+                or margin_rate != 1
+                or (margin_value != 0 and not has_cash_funded_producer_margin)
             ):
                 raise ContractValidationError("legacy paper position is not representable as spot")
 

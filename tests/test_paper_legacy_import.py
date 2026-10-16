@@ -191,6 +191,50 @@ def _imported(*, pending_order: bool = False) -> PaperLegacyImportV1:
     )
 
 
+def test_import_accepts_legacy_spot_producers_full_notional_margin_projection():
+    scope = _scope()
+    document = _source_document()
+    position = document["positions"][0]
+    position["margin_value"] = position["market_value"]
+
+    imported = PaperLegacyImportV1.from_source_document(
+        source_account_id=_SOURCE_ACCOUNT_ID,
+        source_owner_id=_SOURCE_OWNER_ID,
+        source_document=document,
+        cash_currency="USDT",
+        symbol_bindings=(LegacyPaperSymbolBindingV1("BTC/USDT", "BTC-USDT"),),
+    )
+    imported.validate_domain(scope, _domain(scope))
+
+    persisted_source = json.loads(imported.source_document_json)
+    assert persisted_source["positions"][0]["margin_value"] == 50.0
+    assert persisted_source["positions"][0]["market_value"] == 50.0
+    assert imported.source_sha256 == hashlib.sha256(
+        imported.source_document_json.encode("utf-8")
+    ).hexdigest()
+
+
+@pytest.mark.parametrize(
+    ("margin_value", "margin_rate"),
+    ((25.0, 1.0), (50.0, 0.5)),
+)
+def test_import_rejects_nonmatching_or_leveraged_margin_projection(margin_value, margin_rate):
+    scope = _scope()
+    document = _source_document()
+    document["positions"][0]["margin_value"] = margin_value
+    document["positions"][0]["margin_rate"] = margin_rate
+    imported = PaperLegacyImportV1.from_source_document(
+        source_account_id=_SOURCE_ACCOUNT_ID,
+        source_owner_id=_SOURCE_OWNER_ID,
+        source_document=document,
+        cash_currency="USDT",
+        symbol_bindings=(LegacyPaperSymbolBindingV1("BTC/USDT", "BTC-USDT"),),
+    )
+
+    with pytest.raises(ContractValidationError, match="not representable as spot"):
+        imported.validate_domain(scope, _domain(scope))
+
+
 def _lease(store: SqliteExecutionStore, scope: ExecutionScope):
     return store.acquire_or_renew_lease(scope, "legacy-import-writer", ttl_ns=60_000_000_000)
 
