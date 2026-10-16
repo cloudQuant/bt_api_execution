@@ -36,6 +36,7 @@ _TERMINAL_STATES = frozenset(
         GroupOrderState.REJECTED_BEFORE_DISPATCH,
     }
 )
+_MAX_RECOVERABLE_PAGE_SIZE = 256
 _ALLOWED_STATE_TRANSITIONS = {
     GroupOrderState.PREPARING: frozenset(
         {
@@ -95,6 +96,14 @@ _EVENT_TYPE = frozenset(
         "GROUP_RECOVERY_REQUIRED",
     }
 )
+
+
+def _valid_recoverable_cursor_ref(value: object) -> bool:
+    if type(value) is not str or not 1 <= len(value) <= 128 or not value.isascii():
+        return False
+    return value[0].isalnum() and all(
+        character.isalnum() or character in "._:-" for character in value
+    )
 
 
 class SqliteOrderGroupStore:
@@ -174,6 +183,8 @@ class SqliteOrderGroupStore:
                         ON order_group_events(portfolio_ref, group_id, sequence);
                     CREATE INDEX IF NOT EXISTS order_group_snapshots_state
                         ON order_group_snapshots(state, updated_at_ns);
+                    CREATE INDEX IF NOT EXISTS order_group_snapshots_recovery_page
+                        ON order_group_snapshots(created_at_ns, portfolio_ref, group_id, state);
                     CREATE TRIGGER IF NOT EXISTS order_group_events_immutable_update
                     BEFORE UPDATE ON order_group_events
                     BEGIN
@@ -682,6 +693,51 @@ class SqliteOrderGroupStore:
                 ).fetchall()
             except sqlite3.Error as error:
                 raise DurableStoreError("unable to list recoverable groups") from error
+        return tuple(self._snapshot_from_row(row) for row in rows)
+
+    def list_recoverable_page(
+        self,
+        *,
+        after: tuple[int, str, str] | None = None,
+        limit: int = 64,
+    ) -> tuple[GroupOrderSnapshot, ...]:
+        """Read a bounded page of nonterminal snapshots after a stable key.
+
+        The key is ``(created_at_ns, portfolio_ref, group_id)`` and is
+        exclusive, so callers can persist or retain it between owner ticks.
+        State is evaluated on each page read: rows that become terminal are
+        skipped and their immutable creation key never changes.
+        """
+
+        if type(limit) is not int or not 1 <= limit <= _MAX_RECOVERABLE_PAGE_SIZE:
+            raise ContractValidationError("invalid recoverable group page limit")
+        if after is not None and (
+            type(after) is not tuple
+            or len(after) != 3
+            or type(after[0]) is not int
+            or not 0 < after[0] <= (1 << 63) - 1
+            or not _valid_recoverable_cursor_ref(after[1])
+            or not _valid_recoverable_cursor_ref(after[2])
+        ):
+            raise ContractValidationError("invalid recoverable group page cursor")
+
+        states = tuple(state.value for state in GroupOrderState if state not in _TERMINAL_STATES)
+        placeholders = ",".join("?" for _ in states)
+        query = (
+            "SELECT * FROM order_group_snapshots "
+            f"WHERE state IN ({placeholders})"
+        )
+        parameters: tuple[object, ...] = states
+        if after is not None:
+            query += " AND (created_at_ns, portfolio_ref, group_id) > (?, ?, ?)"
+            parameters += after
+        query += " ORDER BY created_at_ns, portfolio_ref, group_id LIMIT ?"
+        parameters += (limit,)
+        with self._lock:
+            try:
+                rows = self._connection.execute(query, parameters).fetchall()
+            except sqlite3.Error as error:
+                raise DurableStoreError("unable to page recoverable groups") from error
         return tuple(self._snapshot_from_row(row) for row in rows)
 
     def events(
