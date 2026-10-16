@@ -82,6 +82,18 @@ class _CancelGate:
         self.released.append((permit_id, reason))
 
 
+class _TerminalProofCancelGate(_CancelGate):
+    def __init__(self) -> None:
+        super().__init__()
+        self.terminal_resolutions: list[tuple[str, str, ExecutionState]] = []
+
+    def resolve_terminal(self, permit_reference, intent, record, writer_lease):
+        self.terminal_resolutions.append(
+            (permit_reference, intent.cancel_id, record.state)
+        )
+        return object()
+
+
 class _DurableCancelGate(_CancelGate):
     """Tiny SQLite-backed risk fake for the provider-call ordering boundary."""
 
@@ -209,6 +221,52 @@ def test_cancel_is_durable_idempotent_and_keeps_target_identity(tmp_path) -> Non
             "cancel_dispatch_claimed",
             "cancel_provider_observation",
         ]
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+def test_terminal_cancel_proof_retries_from_persisted_record_without_provider_retry(tmp_path) -> None:
+    gate = _TerminalProofCancelGate()
+    store, facade, gate = _ready_facades(tmp_path, cancel_gate=gate)
+    calls: list[str] = []
+    intent = _cancel_intent()
+
+    try:
+        first = facade.cancel(
+            intent,
+            lambda value: calls.append(value.cancel_id)
+            or CancelObservation.cancelled(
+                value.cancel_id, value.target_intent_id, value.provider_order_id
+            ),
+        )
+        replay = facade.resolve_terminal(intent)
+
+        assert first.state is ExecutionState.CANCELLED
+        assert replay is not None and replay.state is ExecutionState.CANCELLED
+        assert calls == [intent.cancel_id]
+        assert gate.terminal_resolutions == [
+            ("cancel-permit-cancel.1", "cancel.1", ExecutionState.CANCELLED),
+            ("cancel-permit-cancel.1", "cancel.1", ExecutionState.CANCELLED),
+        ]
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+def test_unknown_cancel_never_attempts_terminal_proof_resolution(tmp_path) -> None:
+    gate = _TerminalProofCancelGate()
+    store, facade, gate = _ready_facades(tmp_path, cancel_gate=gate)
+
+    try:
+        result = facade.cancel(
+            _cancel_intent(),
+            lambda _intent: (_ for _ in ()).throw(TimeoutError("synthetic timeout")),
+        )
+
+        assert result.state is ExecutionState.UNKNOWN
+        assert gate.terminal_resolutions == []
+        assert gate.settled == []
     finally:
         store.close()
 

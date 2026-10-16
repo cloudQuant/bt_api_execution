@@ -611,6 +611,47 @@ class CancelRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class CancelResolutionSourceV1:
+    """One exact SQLite snapshot for resolving an ordinary owner cancel latch."""
+
+    scope: ExecutionScope
+    cancel_intent: CancelIntent
+    cancel_record: CancelRecord
+    cancel_events: tuple[CancelEvent, ...]
+    target_intent: OrderIntent
+    target_record: ExecutionRecord
+    target_events: tuple[ExecutionEvent, ...]
+    owner_batch_body: Mapping[str, Any]
+    owner_batch_sha256: str
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.scope) is not ExecutionScope
+            or type(self.cancel_intent) is not CancelIntent
+            or type(self.cancel_record) is not CancelRecord
+            or type(self.target_intent) is not OrderIntent
+            or type(self.target_record) is not ExecutionRecord
+            or type(self.cancel_events) is not tuple
+            or any(type(event) is not CancelEvent for event in self.cancel_events)
+            or type(self.target_events) is not tuple
+            or any(type(event) is not ExecutionEvent for event in self.target_events)
+            or not isinstance(self.owner_batch_body, Mapping)
+            or not _is_sha256(self.owner_batch_sha256)
+        ):
+            raise ContractValidationError("invalid cancellation resolution source")
+        if (
+            self.cancel_intent.scope != self.scope
+            or self.cancel_record.scope_key != self.scope.key
+            or self.cancel_record.cancel_id != self.cancel_intent.cancel_id
+            or self.target_record.scope_key != self.scope.key
+            or self.target_record.intent_id != self.cancel_intent.target_intent_id
+            or self.target_intent.scope != self.scope
+            or self.target_record.payload_sha256 != self.target_intent.fingerprint
+        ):
+            raise ContractValidationError("cancellation resolution source identity mismatch")
+
+
+@dataclass(frozen=True, slots=True)
 class CtpOrderIdentityReservation:
     """One account-wide, durable binding for a managed CTP order identity.
 
@@ -17418,6 +17459,368 @@ class SqliteExecutionStore:
         except (TypeError, json.JSONDecodeError) as error:
             raise DurableStoreError("stored cancellation payload is unreadable") from error
         return cancel_intent_from_payload(payload)
+
+    def read_cancel_resolution_source_v1(
+        self, cancel_id: str, *, scope: ExecutionScope
+    ) -> CancelResolutionSourceV1:
+        """Read a terminal owner-cancel proof input from one SQLite snapshot."""
+
+        if type(scope) is not ExecutionScope or type(cancel_id) is not str or not cancel_id:
+            raise ContractValidationError("exact cancellation scope and id are required")
+        try:
+            with self._read_transaction() as cursor:
+                cancel_row = cursor.execute(
+                    "SELECT * FROM cancellation_records WHERE scope_key=? AND cancel_id=?",
+                    (scope.key, cancel_id),
+                ).fetchone()
+                if cancel_row is None:
+                    raise DurableStoreError("cancellation source is unavailable")
+                cancel_record = self._cancel_record_from_row(cancel_row)
+                payload_json = str(cancel_row["payload_json"])
+                try:
+                    payload = json.loads(payload_json)
+                    if canonical_json(payload) != payload_json:
+                        raise ValueError("noncanonical cancellation payload")
+                    cancel_intent = cancel_intent_from_payload(payload)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    raise DurableStoreError("cancellation source identity is unreadable") from None
+                if (
+                    cancel_intent.fingerprint != str(cancel_row["payload_sha256"])
+                    or cancel_intent.scope != scope
+                    or cancel_record.cancel_id != cancel_intent.cancel_id
+                    or cancel_record.target_intent_id != cancel_intent.target_intent_id
+                    or cancel_record.provider_order_id != cancel_intent.provider_order_id
+                    or cancel_record.dispatch_attempts != 1
+                    or cancel_record.permit_reference is None
+                    or cancel_record.unknown_reason is not None
+                    or cancel_record.state not in {ExecutionState.CANCELLED, ExecutionState.REJECTED}
+                ):
+                    raise DurableStoreError("cancellation source is not a single terminal dispatch")
+
+                target_row = self._fetch_record(cursor, scope.key, cancel_intent.target_intent_id)
+                if target_row is None:
+                    raise DurableStoreError("cancellation target source is unavailable")
+                target_record = self._record_from_row(target_row)
+                target_payload_json = str(target_row["payload_json"])
+                try:
+                    target_payload = json.loads(target_payload_json)
+                    if canonical_json(target_payload) != target_payload_json:
+                        raise ValueError("noncanonical target payload")
+                    target_intent = order_intent_from_payload(target_payload)
+                except (ContractValidationError, TypeError, ValueError, json.JSONDecodeError):
+                    raise DurableStoreError("cancellation target identity is unreadable") from None
+                if (
+                    target_record.payload_sha256 != target_intent.fingerprint
+                    or target_record.provider_order_id != cancel_intent.provider_order_id
+                    or target_record.group_binding is not None
+                    or target_record.state
+                    not in {ExecutionState.CANCELLED, ExecutionState.ACKED, ExecutionState.PARTIALLY_FILLED}
+                    or (
+                        cancel_record.state is ExecutionState.CANCELLED
+                        and target_record.state is not ExecutionState.CANCELLED
+                    )
+                    or (
+                        cancel_record.state is ExecutionState.REJECTED
+                        and target_record.state
+                        not in {ExecutionState.ACKED, ExecutionState.PARTIALLY_FILLED}
+                    )
+                ):
+                    raise DurableStoreError("cancellation target postcondition is invalid")
+
+                cancel_rows = cursor.execute(
+                    """SELECT sequence, event_id, cancel_id, target_intent_id, scope_key,
+                              event_type, state, payload_json, created_at_ns
+                       FROM cancellation_outbox WHERE scope_key=? AND cancel_id=?
+                       ORDER BY sequence LIMIT 65""",
+                    (scope.key, cancel_id),
+                ).fetchall()
+                target_rows = cursor.execute(
+                    """SELECT sequence, event_id, intent_id, scope_key, event_type, state,
+                              payload_json, created_at_ns, journal_incarnation_id
+                       FROM execution_outbox WHERE scope_key=? AND intent_id=?
+                       ORDER BY sequence LIMIT ?""",
+                    (scope.key, target_intent.intent_id, _MAX_RECOVERY_SNAPSHOT_EVENTS + 1),
+                ).fetchall()
+                if not cancel_rows or len(cancel_rows) > 64:
+                    raise DurableStoreError("cancellation event source exceeds its bound")
+                if not target_rows or len(target_rows) > _MAX_RECOVERY_SNAPSHOT_EVENTS:
+                    raise DurableStoreError("target event source is unavailable or unbounded")
+
+                try:
+                    cancel_events = tuple(
+                        CancelEvent(
+                            sequence=int(row["sequence"]),
+                            event_id=str(row["event_id"]),
+                            cancel_id=str(row["cancel_id"]),
+                            target_intent_id=str(row["target_intent_id"]),
+                            scope_key=str(row["scope_key"]),
+                            event_type=str(row["event_type"]),
+                            state=ExecutionState(str(row["state"])),
+                            payload=json.loads(str(row["payload_json"])),
+                            created_at_ns=int(row["created_at_ns"]),
+                        )
+                        for row in cancel_rows
+                    )
+                    target_events = tuple(
+                        self._execution_event_from_row(row) for row in target_rows
+                    )
+                    for row, event in zip(cancel_rows, cancel_events):
+                        if canonical_json(dict(event.payload)) != str(row["payload_json"]):
+                            raise ValueError("noncanonical cancel event")
+                except (ContractValidationError, TypeError, ValueError, json.JSONDecodeError):
+                    raise DurableStoreError("cancellation event source is unreadable") from None
+
+                observation_events = [
+                    event
+                    for event in cancel_events
+                    if event.event_type in {"cancel_provider_observation", "cancel_reconciled_observation"}
+                ]
+                terminal_events = [
+                    event
+                    for event in observation_events
+                    if event.state in {ExecutionState.CANCELLED, ExecutionState.REJECTED}
+                ]
+                admitted = [event for event in cancel_events if event.event_type == "cancel_intent_admitted"]
+                claims = [event for event in cancel_events if event.event_type == "cancel_dispatch_claimed"]
+                if (
+                    any(
+                        event.cancel_id != cancel_id
+                        or event.target_intent_id != cancel_intent.target_intent_id
+                        or event.scope_key != scope.key
+                        for event in cancel_events
+                    )
+                    or any(
+                        previous.sequence >= following.sequence
+                        for previous, following in zip(cancel_events, cancel_events[1:])
+                    )
+                    or len({event.event_id for event in cancel_events}) != len(cancel_events)
+                    or cancel_events[0].event_type != "cancel_intent_recorded"
+                    or cancel_events[0].payload.get("payload_sha256") != cancel_intent.fingerprint
+                    or len(admitted) != 1
+                    or admitted[0].payload.get("permit_reference") != cancel_record.permit_reference
+                    or len(claims) != 1
+                    or claims[0].payload != {"dispatch_attempt": 1}
+                    or not observation_events
+                    or len(terminal_events) != 1
+                    or observation_events[-1] != terminal_events[0]
+                    or terminal_events[0].state is not cancel_record.state
+                    or any(
+                        event.state is not ExecutionState.ACKED
+                        for event in observation_events[:-1]
+                    )
+                    or sum(
+                        event.state is ExecutionState.ACKED
+                        for event in observation_events[:-1]
+                    ) > 1
+                    or (
+                        observation_events[:-1]
+                        and terminal_events[0].event_type != "cancel_reconciled_observation"
+                    )
+                    or cancel_events.index(admitted[0]) >= cancel_events.index(claims[0])
+                    or cancel_events.index(claims[0]) >= cancel_events.index(observation_events[0])
+                    or any(
+                        set(event.payload)
+                        != {"provider_order_id", "reason_code", "source"}
+                        or event.payload.get("provider_order_id")
+                        != cancel_intent.provider_order_id
+                        or event.payload.get("source")
+                        != (
+                            "provider"
+                            if event.event_type == "cancel_provider_observation"
+                            else "reconcile"
+                        )
+                        for event in observation_events
+                    )
+                    or any(
+                        event.event_type != "cancel_manual_review_required"
+                        or event.state is not cancel_record.state
+                        or event.payload.get("reason_code")
+                        not in {
+                            "cancel_admission_terminal_resolution_failed",
+                            "cancel_admission_settlement_failed",
+                        }
+                        for event in cancel_events[cancel_events.index(terminal_events[0]) + 1 :]
+                    )
+                ):
+                    raise DurableStoreError("cancellation dispatch evidence is incomplete")
+                try:
+                    for event in observation_events:
+                        CancelObservation(
+                            cancel_id=event.cancel_id,
+                            target_intent_id=event.target_intent_id,
+                            provider_order_id=str(event.payload["provider_order_id"]),
+                            state=event.state,
+                            reason_code=event.payload["reason_code"],
+                        )
+                except (ContractValidationError, KeyError, TypeError, ValueError):
+                    raise DurableStoreError("cancellation observation source is invalid") from None
+
+                target_event = target_events[-1]
+                if (
+                    target_events[0].event_type != "intent_recorded"
+                    or target_events[0].payload.get("payload_sha256") != target_intent.fingerprint
+                    or target_event.state is not target_record.state
+                ):
+                    raise DurableStoreError("cancellation target event projection is inconsistent")
+                if cancel_record.state is ExecutionState.CANCELLED and (
+                    target_record.state is not ExecutionState.CANCELLED
+                    or target_event.event_type != "cancelled_by_cancel_intent"
+                    or target_event.payload.get("cancel_id") != cancel_id
+                    or target_event.payload.get("provider_order_id") != cancel_intent.provider_order_id
+                    or target_event.payload.get("source") != terminal_events[0].payload.get("source")
+                ):
+                    raise DurableStoreError("cancelled target lacks its exact source event")
+
+                tags = cancel_intent.tags
+                expected_tags = {
+                    "owner_cancel_binding_version",
+                    "owner_cancel_batch_key",
+                    "owner_cancel_command_id",
+                    "owner_cancel_principal_ref",
+                    "owner_cancel_actor_ref",
+                    "owner_cancel_strategy_ref",
+                    "owner_cancel_run_id",
+                }
+                if set(tags) != expected_tags or tags["owner_cancel_binding_version"] != "1":
+                    raise DurableStoreError("cancellation lacks trusted owner attribution")
+                batch_row = cursor.execute(
+                    "SELECT value FROM execution_meta WHERE key=?",
+                    (tags["owner_cancel_batch_key"],),
+                ).fetchone()
+                if batch_row is None:
+                    raise DurableStoreError("owner cancel batch source is unavailable")
+                try:
+                    wrapper_json = str(batch_row["value"])
+                    wrapper = json.loads(wrapper_json)
+                    body = wrapper["body"]
+                    if (
+                        canonical_json(wrapper) != wrapper_json
+                        or type(wrapper) is not dict
+                        or set(wrapper) != {"body", "sha256"}
+                        or type(body) is not dict
+                        or wrapper["sha256"] != _owner_cancel_batch_digest(body)
+                    ):
+                        raise ValueError("invalid immutable owner cancel batch")
+                    wire_scope = _owner_wire_scope(body["wire_scope"])
+                    if (
+                        owner_cancel_batch_key(
+                            scope_key=scope.key,
+                            wire_scope=wire_scope,
+                            command_id=tags["owner_cancel_command_id"],
+                        )
+                        != tags["owner_cancel_batch_key"]
+                        or body.get("schema") != "strategy_cancel_batch.v1"
+                        or body.get("scope_key") != scope.key
+                        or body.get("command_id") != tags["owner_cancel_command_id"]
+                        or body.get("principal_ref") != tags["owner_cancel_principal_ref"]
+                        or body.get("actor_ref") != tags["owner_cancel_actor_ref"]
+                        or body.get("strategy_ref") != tags["owner_cancel_strategy_ref"]
+                        or body.get("run_id") != tags["owner_cancel_run_id"]
+                        or wire_scope["account_ref"] != scope.account_ref
+                        or wire_scope["strategy_ref"] != tags["owner_cancel_strategy_ref"]
+                        or wire_scope["run_id"] != tags["owner_cancel_run_id"]
+                        or wire_scope["account_refs"]
+                        or wire_scope["manual_book_ref"] is not None
+                        or wire_scope["group_id"] is not None
+                        or wire_scope["leg_id"] is not None
+                    ):
+                        raise ValueError("owner cancel batch identity mismatch")
+                    items = body.get("items")
+                    matching = [
+                        item
+                        for item in items
+                        if type(item) is dict and item.get("cancel_id") == cancel_id
+                    ] if type(items) is list else []
+                    if len(matching) != 1 or any(
+                        matching[0].get(name) != value
+                        for name, value in {
+                            "decision": "READY",
+                            "intent_id": target_intent.intent_id,
+                            "provider_order_id": cancel_intent.provider_order_id,
+                            "payload_sha256": target_intent.fingerprint,
+                        }.items()
+                    ):
+                        raise ValueError("owner cancel item source mismatch")
+                    run_key = _owner_run_index_key(scope.key, wire_scope, target_intent.intent_id)
+                    run_row = cursor.execute(
+                        "SELECT value FROM execution_meta WHERE key=?", (run_key,)
+                    ).fetchone()
+                    if run_row is None:
+                        raise ValueError("target run attribution is unavailable")
+                    run_json = str(run_row["value"])
+                    run_binding = json.loads(run_json)
+                    if (
+                        canonical_json(run_binding) != run_json
+                        or type(run_binding) is not dict
+                        or run_binding.get("schema") != "execution.owner_run_binding.v1"
+                        or run_binding.get("scope_key") != scope.key
+                        or run_binding.get("wire_scope") != wire_scope
+                        or run_binding.get("strategy_ref") != tags["owner_cancel_strategy_ref"]
+                        or run_binding.get("run_id") != tags["owner_cancel_run_id"]
+                        or run_binding.get("intent_id") != target_intent.intent_id
+                        or run_binding.get("payload_sha256") != target_intent.fingerprint
+                    ):
+                        raise ValueError("target run attribution is inconsistent")
+                except (ContractValidationError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+                    raise DurableStoreError("owner cancel attribution is unreadable") from None
+
+                return CancelResolutionSourceV1(
+                    scope=scope,
+                    cancel_intent=cancel_intent,
+                    cancel_record=cancel_record,
+                    cancel_events=cancel_events,
+                    target_intent=target_intent,
+                    target_record=target_record,
+                    target_events=target_events,
+                    owner_batch_body=MappingProxyType(body),
+                    owner_batch_sha256=wrapper["sha256"],
+                )
+        except sqlite3.Error as error:
+            raise DurableStoreError("unable to read cancellation resolution source") from error
+
+    def read_cancel_resolution_source_by_key_v1(
+        self, cancel_id: str, *, scope_key: str
+    ) -> CancelResolutionSourceV1:
+        """Read the exact terminal cancellation source named by its durable scope key.
+
+        The Risk claim stores the opaque Execution scope key rather than the
+        provider/environment/account/strategy tuple. Recover that tuple only
+        from the immutable, canonical cancellation payload in this same owner
+        store, verify that it hashes back to the requested key, then delegate
+        to the full single-snapshot validator. A missing, ambiguous, or
+        mismatched key never falls back to a broader account scan.
+        """
+
+        if (
+            type(cancel_id) is not str
+            or not cancel_id
+            or type(scope_key) is not str
+            or not scope_key
+        ):
+            raise ContractValidationError("exact cancellation id and scope key are required")
+        try:
+            with self._read_transaction() as cursor:
+                rows = cursor.execute(
+                    "SELECT payload_json FROM cancellation_records "
+                    "WHERE scope_key=? AND cancel_id=? LIMIT 2",
+                    (scope_key, cancel_id),
+                ).fetchall()
+                if len(rows) != 1:
+                    raise DurableStoreError("cancellation source is unavailable")
+                payload_json = str(rows[0]["payload_json"])
+                try:
+                    payload = json.loads(payload_json)
+                    if canonical_json(payload) != payload_json:
+                        raise ValueError("noncanonical cancellation payload")
+                    intent = cancel_intent_from_payload(payload)
+                except (ContractValidationError, TypeError, ValueError, json.JSONDecodeError):
+                    raise DurableStoreError("cancellation source identity is unreadable") from None
+                if intent.cancel_id != cancel_id or intent.scope.key != scope_key:
+                    raise DurableStoreError("cancellation source scope key does not match")
+                scope = intent.scope
+        except sqlite3.Error as error:
+            raise DurableStoreError("unable to resolve cancellation source scope") from error
+        return self.read_cancel_resolution_source_v1(cancel_id, scope=scope)
 
     def admit_cancel(
         self, intent: CancelIntent, *, writer_lease: WriterLease | None = None

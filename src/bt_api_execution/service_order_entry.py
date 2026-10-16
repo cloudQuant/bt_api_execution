@@ -72,6 +72,7 @@ from .strategy_cancel import (
     OWNER_CANCEL_OPERATION,
     OwnerCancelCommandV1,
     OwnerCancelSelectionLimitError,
+    owner_cancel_batch_key,
 )
 
 if TYPE_CHECKING:
@@ -966,19 +967,43 @@ class ExecutionOrderEntryService:
                         "STORE_UNAVAILABLE",
                         {"outcome": "UNKNOWN", "command_id": command.command_id, "items": []},
                     )
-                if self._store.get_cancel(cancel_id, scope=execution_scope) is not None:
+                exact_wire_scope = _wire_scope_binding(wire_scope)
+                batch_key = owner_cancel_batch_key(
+                    scope_key=execution_scope.key,
+                    wire_scope=exact_wire_scope,
+                    command_id=command.command_id,
+                )
+                cancel_intent = CancelIntent(
+                    cancel_id=cancel_id,
+                    scope=execution_scope,
+                    target_intent_id=target_intent_id,
+                    provider_order_id=provider_order_id,
+                    metadata_version="strategy-cancel-v1",
+                    tags={
+                        "owner_cancel_binding_version": "1",
+                        "owner_cancel_batch_key": batch_key,
+                        "owner_cancel_command_id": command.command_id,
+                        "owner_cancel_principal_ref": principal_ref,
+                        "owner_cancel_actor_ref": identity.actor_ref,
+                        "owner_cancel_strategy_ref": wire_scope.strategy_ref or "",
+                        "owner_cancel_run_id": wire_scope.run_id or "",
+                    },
+                )
+                existing_cancel = self._store.get_cancel(cancel_id, scope=execution_scope)
+                if existing_cancel is not None:
                     # Existing cancellation states, especially UNKNOWN and
-                    # DISPATCHING, are query-only and are never replayed.
+                    # DISPATCHING, are query-only and never redispatched. A
+                    # terminal result may retry only its durable Risk proof.
+                    if existing_cancel.state in {
+                        ExecutionState.CANCELLED,
+                        ExecutionState.REJECTED,
+                    }:
+                        try:
+                            cancel_facade.resolve_terminal(cancel_intent)
+                        except (ContractValidationError, WriterLeaseUnavailable, DurableStoreError):
+                            pass
                     continue
                 try:
-                    cancel_intent = CancelIntent(
-                        cancel_id=cancel_id,
-                        scope=execution_scope,
-                        target_intent_id=target_intent_id,
-                        provider_order_id=provider_order_id,
-                        metadata_version="strategy-cancel-v1",
-                    )
-
                     def admit_quota(
                         _intent: CancelIntent,
                         *,
@@ -999,7 +1024,10 @@ class ExecutionOrderEntryService:
                     cancel_facade.cancel(
                         cancel_intent,
                         self._dispatch,
-                        before_provider_dispatch=admit_quota,
+                        # Quota waits happen before the single-use Risk claim.
+                        # claim_before_dispatch then revalidates permit TTL in
+                        # the Risk owner's transaction after this wait.
+                        before_dispatch=admit_quota,
                     )
                 except (AdmissionRequired, IntentConflictError, InvalidStateTransition):
                     # The durable cancel record is authoritative; read it

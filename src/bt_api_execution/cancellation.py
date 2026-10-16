@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from .contracts import CancelIntent, CancelObservation, ExecutionScope, ExecutionState
 from .errors import (
+    AdmissionClaimNotCreated,
     AdmissionDenied,
     AdmissionRequired,
     ContractValidationError,
@@ -78,6 +79,24 @@ class CancelAdmissionGate(Protocol):
     def settle(self, permit_reference: str) -> Any: ...
 
     def release(self, permit_reference: str, reason: str) -> None: ...
+
+
+class CancelTerminalResolutionGate(Protocol):
+    """Optional final-proof hook for the trusted account owner.
+
+    It is called only for a persisted provider/reconciler terminal result after
+    one durable dispatch claim.  Implementations must reread the owner store,
+    reject UNKNOWN and incomplete facts, and return only after their own
+    durable resolution receipt is queryable.
+    """
+
+    def resolve_terminal(
+        self,
+        permit_reference: str,
+        intent: CancelIntent,
+        record: CancelRecord,
+        writer_lease: WriterLease,
+    ) -> Any: ...
 
 
 class ManagedCancellationFacade:
@@ -153,7 +172,7 @@ class ManagedCancellationFacade:
         if record.state is ExecutionState.PENDING_ADMISSION:
             record = self._admit(intent, writer_lease)
         if record.state is not ExecutionState.PENDING_DISPATCH:
-            return record
+            return self._resolve_terminal_if_supported(record, writer_lease=writer_lease)
         record, claimed = self._store.claim_cancel_for_dispatch(
             intent.cancel_id, self._scope, writer_lease=writer_lease
         )
@@ -179,6 +198,14 @@ class ManagedCancellationFacade:
                 )
             try:
                 claim_result = claim(permit_reference, intent)
+            except AdmissionClaimNotCreated:
+                # The adapter may return this only after proving that the
+                # transactional Risk claim did not commit.  This is a
+                # durable no-dispatch outcome, so the still-unclaimed permit
+                # may be released instead of leaving the cancellation frozen.
+                return self._block_before_dispatch(
+                    intent, "cancel_admission_claim_not_created", writer_lease
+                )
             except Exception:
                 return self._store.mark_cancel_unknown(
                     intent.cancel_id,
@@ -260,7 +287,27 @@ class ManagedCancellationFacade:
                 "invalid_cancel_provider_evidence",
                 writer_lease=writer_lease,
             )
-        return self._settle_after_evidenced_outcome(record, writer_lease=writer_lease)
+        return self._settle_after_evidenced_outcome(
+            record, intent=intent, writer_lease=writer_lease
+        )
+
+    def resolve_terminal(self, intent: CancelIntent) -> CancelRecord | None:
+        """Retry proof projection for one existing terminal record, without I/O.
+
+        This is used when an owner batch is replayed after restart.  It never
+        creates a cancellation or calls the provider; unresolved and unknown
+        records are returned untouched.
+        """
+
+        self._require_scope(intent)
+        writer_lease = self._require_writer_lease()
+        record = self._store.get_cancel(intent.cancel_id, scope=self._scope)
+        if record is None:
+            return None
+        stored_intent = self._store.get_cancel_intent(intent.cancel_id, scope=self._scope)
+        if stored_intent != intent:
+            raise ContractValidationError("cancel_id is bound to another immutable intent")
+        return self._resolve_terminal_if_supported(record, writer_lease=writer_lease)
 
     def reconcile(self, observation: CancelObservation) -> CancelRecord:
         """Persist externally obtained cancellation evidence without provider I/O."""
@@ -288,6 +335,7 @@ class ManagedCancellationFacade:
             )
         return self._settle_after_evidenced_outcome(
             record,
+            intent=self._store.get_cancel_intent(observation.cancel_id, scope=self._scope),
             settle_permit=previous_state
             in {
                 ExecutionState.PENDING_ADMISSION,
@@ -471,6 +519,7 @@ class ManagedCancellationFacade:
         self,
         record: CancelRecord,
         *,
+        intent: CancelIntent | None = None,
         settle_permit: bool = True,
         writer_lease: WriterLease,
     ) -> CancelRecord:
@@ -504,6 +553,65 @@ class ManagedCancellationFacade:
                 record.cancel_id,
                 self._scope,
                 "cancel_admission_settlement_failed",
+                writer_lease=writer_lease,
+            )
+        if intent is None:
+            intent = self._store.get_cancel_intent(record.cancel_id, scope=self._scope)
+        if intent is None:
+            return self._store.mark_cancel_review_required(
+                record.cancel_id,
+                self._scope,
+                "cancel_admission_terminal_intent_unavailable",
+                writer_lease=writer_lease,
+            )
+        return self._resolve_terminal_if_supported(
+            record, intent=intent, writer_lease=writer_lease
+        )
+
+    def _resolve_terminal_if_supported(
+        self,
+        record: CancelRecord,
+        *,
+        intent: CancelIntent | None = None,
+        writer_lease: WriterLease,
+    ) -> CancelRecord:
+        if (
+            record.state not in {ExecutionState.CANCELLED, ExecutionState.REJECTED}
+            or record.dispatch_attempts != 1
+            or self._admission_gate is None
+        ):
+            return record
+        resolver = getattr(self._admission_gate, "resolve_terminal", None)
+        if not callable(resolver):
+            return record
+        if record.permit_reference is None:
+            return self._store.mark_cancel_review_required(
+                record.cancel_id,
+                self._scope,
+                "cancel_admission_terminal_permit_unavailable",
+                writer_lease=writer_lease,
+            )
+        if intent is None:
+            intent = self._store.get_cancel_intent(record.cancel_id, scope=self._scope)
+        if intent is None:
+            return self._store.mark_cancel_review_required(
+                record.cancel_id,
+                self._scope,
+                "cancel_admission_terminal_intent_unavailable",
+                writer_lease=writer_lease,
+            )
+        try:
+            self._store.assert_writer_lease(self._scope, writer_lease)
+            receipt = resolver(record.permit_reference, intent, record, writer_lease)
+            if receipt is None:
+                raise AdmissionDenied("terminal cancel proof was not resolved")
+        except WriterLeaseUnavailable:
+            raise
+        except Exception:
+            return self._store.mark_cancel_review_required(
+                record.cancel_id,
+                self._scope,
+                "cancel_admission_terminal_resolution_failed",
                 writer_lease=writer_lease,
             )
         return record
@@ -547,5 +655,6 @@ __all__ = [
     "CancelBeforeDispatchCallable",
     "CancelDispatchClaimReceiptV1",
     "CancelDispatchCallable",
+    "CancelTerminalResolutionGate",
     "ManagedCancellationFacade",
 ]

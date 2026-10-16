@@ -154,6 +154,7 @@ from .ctp_native_callbacks import (
     map_ctp_native_trade_fact_v2,
 )
 from .errors import (
+    AdmissionClaimNotCreated,
     AdmissionDenied,
     AdmissionRequired,
     ContractValidationError,
@@ -306,6 +307,7 @@ __all__ = [
     "ApprovedTargetWireScopeV1",
     "AccountReservationsPort",
     "AccountScopedGroupAdmissionAdapter",
+    "AdmissionClaimNotCreated",
     "CancelAdmissionGate",
     "CancelBeforeDispatchCallable",
     "CancelDispatchClaimReceiptV1",

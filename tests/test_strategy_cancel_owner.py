@@ -9,6 +9,8 @@ from bt_api_base.service_protocol import WireIdentity, WireRole, WireScope
 
 from bt_api_execution import (
     CancelObservation,
+    CancelDispatchClaimReceiptV1,
+    DurableStoreError,
     ExecutionScope,
     ExecutionState,
     OrderIntent,
@@ -31,10 +33,15 @@ _EXECUTION_SCOPE = ExecutionScope("PAPER", "simulation", _ACCOUNT, _STRATEGY, "2
 
 class _SyntheticProvider:
     def __init__(
-        self, *, unknown_cancel: bool = False, unknown_submit: bool = False
+        self,
+        *,
+        unknown_cancel: bool = False,
+        unknown_submit: bool = False,
+        terminal_cancel: bool = False,
     ) -> None:
         self.unknown_cancel = unknown_cancel
         self.unknown_submit = unknown_submit
+        self.terminal_cancel = terminal_cancel
         self.submitted: list[str] = []
         self.cancelled: list[str] = []
 
@@ -48,9 +55,54 @@ class _SyntheticProvider:
         self.cancelled.append(intent.cancel_id)
         if self.unknown_cancel:
             raise TimeoutError("synthetic cancellation timeout")
+        if self.terminal_cancel:
+            return CancelObservation.cancelled(
+                intent.cancel_id, intent.target_intent_id, intent.provider_order_id
+            )
         return CancelObservation.accepted(
             intent.cancel_id, intent.target_intent_id, intent.provider_order_id
         )
+
+
+class _TerminalCancelGate:
+    """Test adapter that records final-proof callback identity and ordering."""
+
+    def __init__(self) -> None:
+        self.claims: list[tuple[str, str]] = []
+        self.settled: list[str] = []
+        self.resolutions: list[tuple[str, str, str, str, str]] = []
+
+    def reserve(self, intent):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(permit_id="cancel-permit-v1")
+
+    def validate(self, permit_reference, intent):
+        return None
+
+    def claim_before_dispatch(self, permit_reference, intent):
+        self.claims.append((permit_reference, intent.cancel_id))
+        return CancelDispatchClaimReceiptV1(
+            permit_reference=permit_reference,
+            scope_key=intent.scope.key,
+            cancel_id=intent.cancel_id,
+            intent_fingerprint=intent.fingerprint,
+        )
+
+    def settle(self, permit_reference):
+        self.settled.append(permit_reference)
+
+    def resolve_terminal(self, permit_reference, intent, record, writer_lease):
+        self.resolutions.append(
+            (
+                permit_reference,
+                intent.cancel_id,
+                intent.tags["owner_cancel_command_id"],
+                intent.tags["owner_cancel_strategy_ref"],
+                intent.tags["owner_cancel_run_id"],
+            )
+        )
+        return object()
 
 
 def _wire_scope(
@@ -84,7 +136,13 @@ def _order_arguments(intent_id: str) -> dict[str, object]:
 
 
 def _service(
-    tmp_path, *, provider=None, quota=True, portfolio_ref=None, additional_portfolios=()
+    tmp_path,
+    *,
+    provider=None,
+    quota=True,
+    portfolio_ref=None,
+    additional_portfolios=(),
+    cancel_gate=None,
 ):
     quota_suffix = "with-quota" if quota else "without-quota"
     store = SqliteExecutionStore(tmp_path / f"owner-cancel-{quota_suffix}.sqlite3")
@@ -105,6 +163,7 @@ def _service(
         provider,
         allow_unprotected=True,
         cancel_quota_admission=admit_quota if quota else None,
+        cancel_admission_gate=cancel_gate,
     )
     return store, service, provider, quota_calls
 
@@ -198,6 +257,126 @@ def test_owner_cancel_is_exact_run_scoped_and_uses_trusted_quota_args(tmp_path) 
         assert other_portfolio["result"]["outcome"] == "NO_EFFECT"
         assert other_portfolio["result"]["total_count"] == 0
         assert provider.cancelled == [receipt["items"][0]["cancel_id"]]
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+def test_owner_cancel_terminal_proof_retry_keeps_exact_run_binding_and_never_redispatches(
+    tmp_path,
+) -> None:
+    provider = _SyntheticProvider(terminal_cancel=True)
+    gate = _TerminalCancelGate()
+    store, service, provider, quota_calls = _service(
+        tmp_path, provider=provider, cancel_gate=gate
+    )
+    scope = _wire_scope(run_id="run-proof")
+    try:
+        assert _submit(service, "proof-order", scope=scope)["ok"] is True
+
+        first = _cancel(service, "proof-stop", scope=scope)
+        cancel_id = first["result"]["items"][0]["cancel_id"]
+        persisted_intent = store.get_cancel_intent(cancel_id, scope=_EXECUTION_SCOPE)
+        replay = _cancel(service, "proof-stop", scope=scope)
+
+        assert first["ok"] is True
+        assert first["result"]["items"][0]["cancel_state"] == ExecutionState.CANCELLED.value
+        assert replay["result"]["items"][0]["cancel_state"] == ExecutionState.CANCELLED.value
+        assert persisted_intent is not None
+        assert persisted_intent.tags["owner_cancel_binding_version"] == "1"
+        assert persisted_intent.tags["owner_cancel_command_id"] == "proof-stop"
+        assert persisted_intent.tags["owner_cancel_principal_ref"] == _OWNER_PRINCIPAL
+        assert persisted_intent.tags["owner_cancel_actor_ref"] == "portfolio-operator"
+        assert persisted_intent.tags["owner_cancel_strategy_ref"] == _STRATEGY
+        assert persisted_intent.tags["owner_cancel_run_id"] == "run-proof"
+        assert persisted_intent.tags["owner_cancel_batch_key"].startswith("owner_cancel_batch.v1:")
+        assert provider.cancelled == [cancel_id]
+        assert len(quota_calls) == 1
+        assert gate.claims == [("cancel-permit-v1", cancel_id)]
+        assert gate.resolutions == [
+            ("cancel-permit-v1", cancel_id, "proof-stop", _STRATEGY, "run-proof"),
+            ("cancel-permit-v1", cancel_id, "proof-stop", _STRATEGY, "run-proof"),
+        ]
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+def test_owner_cancel_resolution_source_binds_terminal_result_and_exact_run(tmp_path) -> None:
+    provider = _SyntheticProvider(terminal_cancel=True)
+    store, service, provider, _quota_calls = _service(
+        tmp_path, provider=provider, cancel_gate=_TerminalCancelGate()
+    )
+    scope = _wire_scope(run_id="run-source")
+    try:
+        assert _submit(service, "source-order", scope=scope)["ok"] is True
+        result = _cancel(service, "source-stop", scope=scope)
+        cancel_id = result["result"]["items"][0]["cancel_id"]
+
+        source = store.read_cancel_resolution_source_by_key_v1(
+            cancel_id, scope_key=_EXECUTION_SCOPE.key
+        )
+
+        assert source.cancel_record.state is ExecutionState.CANCELLED
+        assert source.cancel_record.dispatch_attempts == 1
+        assert source.cancel_intent.tags["owner_cancel_command_id"] == "source-stop"
+        assert source.cancel_intent.tags["owner_cancel_run_id"] == "run-source"
+        assert source.target_record.state is ExecutionState.CANCELLED
+        assert source.target_events[-1].event_type == "cancelled_by_cancel_intent"
+        assert source.target_events[-1].payload["cancel_id"] == cancel_id
+        assert source.owner_batch_body["run_id"] == "run-source"
+
+        with pytest.raises(DurableStoreError):
+            store.read_cancel_resolution_source_by_key_v1(
+                cancel_id, scope_key="scope:" + "0" * 64
+            )
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+def test_owner_cancel_resolution_source_never_projects_unknown_as_terminal(tmp_path) -> None:
+    provider = _SyntheticProvider(unknown_cancel=True)
+    store, service, provider, _quota_calls = _service(
+        tmp_path, provider=provider, cancel_gate=_TerminalCancelGate()
+    )
+    scope = _wire_scope(run_id="run-unknown-source")
+    try:
+        assert _submit(service, "unknown-source-order", scope=scope)["ok"] is True
+        result = _cancel(service, "unknown-source-stop", scope=scope)
+        cancel_id = result["result"]["items"][0]["cancel_id"]
+
+        assert result["result"]["items"][0]["cancel_state"] == ExecutionState.UNKNOWN.value
+        with pytest.raises(DurableStoreError):
+            store.read_cancel_resolution_source_by_key_v1(
+                cancel_id, scope_key=_EXECUTION_SCOPE.key
+            )
+        assert provider.cancelled == [cancel_id]
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+def test_owner_cancel_unknown_replay_never_attempts_terminal_proof_or_redispatches(
+    tmp_path,
+) -> None:
+    provider = _SyntheticProvider(unknown_cancel=True)
+    gate = _TerminalCancelGate()
+    store, service, provider, _quota_calls = _service(
+        tmp_path, provider=provider, cancel_gate=gate
+    )
+    scope = _wire_scope(run_id="run-unknown-proof")
+    try:
+        assert _submit(service, "unknown-proof-order", scope=scope)["ok"] is True
+
+        first = _cancel(service, "unknown-proof-stop", scope=scope)
+        replay = _cancel(service, "unknown-proof-stop", scope=scope)
+
+        assert first["result"]["outcome"] == "UNKNOWN"
+        assert replay["result"]["outcome"] == "UNKNOWN"
+        assert provider.cancelled == [first["result"]["items"][0]["cancel_id"]]
+        assert gate.resolutions == []
+        assert gate.settled == []
     finally:
         store.close()
 

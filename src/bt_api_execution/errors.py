@@ -49,6 +49,12 @@ class AdmissionDeniedError(ExecutionError):
     code = "admission_denied"
 
 
+class AdmissionClaimNotCreatedError(AdmissionDeniedError):
+    """A trusted owner proved that no durable dispatch claim was created."""
+
+    code = "admission_claim_not_created"
+
+
 class ExecutionBasicAdmissionDeniedError(AdmissionDeniedError):
     """Execution-owned identity, provider-capability, or order-policy denial."""
 
@@ -79,5 +85,6 @@ InvalidStateTransition = InvalidStateTransitionError
 WriterLeaseUnavailable = WriterLeaseUnavailableError
 AdmissionRequired = AdmissionRequiredError
 AdmissionDenied = AdmissionDeniedError
+AdmissionClaimNotCreated = AdmissionClaimNotCreatedError
 ExecutionBasicAdmissionDenied = ExecutionBasicAdmissionDeniedError
 ExecutionUnknown = ExecutionUnknownError
