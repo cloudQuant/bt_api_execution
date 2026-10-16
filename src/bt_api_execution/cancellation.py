@@ -132,15 +132,21 @@ class ManagedCancellationFacade:
         dispatcher: CancelDispatchCallable | Any,
         *,
         before_dispatch: CancelBeforeDispatchCallable | None = None,
+        before_provider_dispatch: CancelBeforeDispatchCallable | None = None,
     ) -> CancelRecord:
         """Dispatch a cancellation at most once after durable admission.
 
         Repeated calls return their durable record without another provider
         call.  Unknown results must be resolved only by :meth:`reconcile`.
+        ``before_dispatch`` runs before the single-use Risk claim, while
+        ``before_provider_dispatch`` runs after that claim and immediately
+        before the provider call.
         """
 
         if before_dispatch is not None and not callable(before_dispatch):
             raise ContractValidationError("invalid cancellation pre-dispatch guard")
+        if before_provider_dispatch is not None and not callable(before_provider_dispatch):
+            raise ContractValidationError("invalid cancellation provider-dispatch guard")
         self._require_scope(intent)
         writer_lease = self._require_writer_lease()
         record = self._store.admit_cancel(intent, writer_lease=writer_lease)
@@ -187,6 +193,31 @@ class ManagedCancellationFacade:
                 intent_fingerprint=intent.fingerprint,
             )
             if (
+                type(claim_result) is not CancelDispatchClaimReceiptV1
+                or claim_result != expected_claim
+            ):
+                return self._store.mark_cancel_unknown(
+                    intent.cancel_id,
+                    self._scope,
+                    "cancel_admission_claim_outcome_unknown",
+                    writer_lease=writer_lease,
+                )
+        try:
+            self._store.assert_writer_lease(self._scope, writer_lease)
+        except WriterLeaseUnavailable:
+            raise
+        if before_provider_dispatch is not None:
+            try:
+                before_provider_dispatch(intent)
+            except Exception:
+                return self._block_before_dispatch(
+                    intent, "cancel_provider_dispatch_guard_failed", writer_lease
+                )
+            # Quota admission can block. Reconfirm ownership at the actual
+            # provider boundary so an expired/replaced lease cannot authorize
+            # a late call.
+            self._store.assert_writer_lease(self._scope, writer_lease)
+            if self._admission_gate is not None and (
                 type(claim_result) is not CancelDispatchClaimReceiptV1
                 or claim_result != expected_claim
             ):

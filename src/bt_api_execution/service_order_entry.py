@@ -19,6 +19,7 @@ import threading
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager, suppress
 from sys import exc_info
+from time import monotonic_ns
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
@@ -67,6 +68,11 @@ from .service_component import (
     _stored_record_dto,
 )
 from .store import CancelRecord, ExecutionRecord, SqliteExecutionStore, WriterLease
+from .strategy_cancel import (
+    OWNER_CANCEL_OPERATION,
+    OwnerCancelCommandV1,
+    OwnerCancelSelectionLimitError,
+)
 
 if TYPE_CHECKING:
     from .ports import DispatchPort
@@ -74,7 +80,11 @@ if TYPE_CHECKING:
 SUBMIT_OPERATION = "orders.submit"
 CANCEL_OPERATION = "orders.cancel"
 QUERY_OPERATION = "orders.query"
-SUPPORTED_OPERATIONS = frozenset({SUBMIT_OPERATION, CANCEL_OPERATION, QUERY_OPERATION})
+SUPPORTED_OPERATIONS = frozenset(
+    {SUBMIT_OPERATION, CANCEL_OPERATION, QUERY_OPERATION, OWNER_CANCEL_OPERATION}
+)
+OWNER_CANCEL_QUOTA_WINDOW_NS = 5_000_000_000
+CancelQuotaAdmissionCallable = Callable[[str, str, str, str, str, int], None]
 
 
 class _GroupAuthorityGuardError(Exception):
@@ -155,6 +165,7 @@ class ExecutionOrderEntryService:
         group_coordinator_authority: GroupCoordinatorAuthority | None = None,
         paper_owner_domain: PaperOwnerDomainV1 | None = None,
         approved_target_authority: ApprovedTargetAuthorityV1 | None = None,
+        cancel_quota_admission: CancelQuotaAdmissionCallable | None = None,
         allow_unprotected: bool = False,
         writer_id: str = _DEFAULT_WRITER_ID,
         lease_ttl_ns: int = _DEFAULT_LEASE_TTL_NS,
@@ -208,6 +219,8 @@ class ExecutionOrderEntryService:
             raise ContractValidationError(
                 "cancellation admission gate requires claim_before_dispatch"
             )
+        if cancel_quota_admission is not None and not callable(cancel_quota_admission):
+            raise ContractValidationError("cancellation quota admission must be callable")
         if group_coordinator_authority is not None and not callable(
             getattr(group_coordinator_authority, "hold_group_leg_authorization", None)
         ):
@@ -254,6 +267,7 @@ class ExecutionOrderEntryService:
         self._admission_gate = admission_gate
         self._basic_admission_gate = basic_admission_gate
         self._cancel_admission_gate = cancel_admission_gate
+        self._cancel_quota_admission = cancel_quota_admission
         self._group_coordinator_authority = group_coordinator_authority
         self._paper_owner_domain = paper_owner_domain
         self._approved_target_authority = approved_target_authority
@@ -263,6 +277,7 @@ class ExecutionOrderEntryService:
         self._lease_ttl_ns = lease_ttl_ns
         self._read_service = ExecutionReadService(store, copied)
         self._lock = threading.RLock()
+        self._owner_cancel_lock = threading.RLock()
         self._facades: dict[str, tuple[ManagedExecutionFacade, ManagedCancellationFacade]] = {}
         self.supported_operations = (
             SUPPORTED_OPERATIONS
@@ -293,6 +308,8 @@ class ExecutionOrderEntryService:
 
         if type(identity) is not WireIdentity or identity.principal_ref != principal_ref:
             raise ContractValidationError("trusted identity does not match the request principal")
+        if operation == OWNER_CANCEL_OPERATION and identity.role is not WireRole.SERVICE:
+            return _reply(False, "ROLE_NOT_AUTHORIZED", {"found": False, "items": []})
         if identity.role not in _WRITE_ROLES:
             return _reply(False, "ROLE_NOT_AUTHORIZED", {})
         if type(scope) is not WireScope:
@@ -305,6 +322,25 @@ class ExecutionOrderEntryService:
             and execution_scope.key not in self._paper_ready_scope_keys
         ):
             return _reply(False, "SERVICE_NOT_READY", {"found": False, "record": None})
+
+        if operation == OWNER_CANCEL_OPERATION:
+            if (
+                scope.account_ref is None
+                or scope.account_refs
+                or scope.strategy_ref is None
+                or scope.run_id is None
+                or scope.manual_book_ref is not None
+                or scope.group_id is not None
+                or scope.leg_id is not None
+            ):
+                return _reply(False, "SCOPE_DENIED", {"found": False, "items": []})
+            return self._owner_cancel_batch(
+                arguments,
+                principal_ref=principal_ref,
+                identity=identity,
+                wire_scope=scope,
+                execution_scope=execution_scope,
+            )
 
         if operation in {SUBMIT_OPERATION, APPROVED_TARGET_OPERATION}:
             admission_context = None
@@ -333,7 +369,12 @@ class ExecutionOrderEntryService:
                 and self._approved_target_authority.requires_approval(scope)
             ):
                 return _reply(False, "APPROVAL_REQUIRED", {"found": False, "record": None})
-            return self._submit(arguments, execution_scope, admission_context)
+            return self._submit(
+                arguments,
+                execution_scope,
+                admission_context,
+                owner_wire_scope=scope if scope.strategy_ref is not None else None,
+            )
         return self._cancel(arguments, execution_scope)
 
     def submit_group_leg(
@@ -645,6 +686,8 @@ class ExecutionOrderEntryService:
         arguments: Mapping[str, Any],
         execution_scope: ExecutionScope,
         admission_context: ExecutionAdmissionContextV1 | None,
+        *,
+        owner_wire_scope: WireScope | None = None,
     ) -> Mapping[str, Any]:
         try:
             intent = _order_intent(arguments, execution_scope)
@@ -657,6 +700,13 @@ class ExecutionOrderEntryService:
                 intent,
                 self._dispatch,
                 admission_context=admission_context,
+                owner_strategy_ref=(
+                    None if owner_wire_scope is None else owner_wire_scope.strategy_ref
+                ),
+                owner_run_id=None if owner_wire_scope is None else owner_wire_scope.run_id,
+                owner_wire_scope=(
+                    None if owner_wire_scope is None else _wire_scope_binding(owner_wire_scope)
+                ),
             )
         except IntentConflictError:
             return self._failure_with_record("INTENT_CONFLICT", intent.intent_id, execution_scope)
@@ -736,6 +786,9 @@ class ExecutionOrderEntryService:
 
         order_facade, _ = self._facade_pair(execution_scope)
         try:
+            owner_wire_scope = (
+                None if wire_scope.strategy_ref is None else _wire_scope_binding(wire_scope)
+            )
             record = order_facade.submit_approved_target(
                 intent,
                 self._dispatch,
@@ -746,6 +799,9 @@ class ExecutionOrderEntryService:
                     target,
                     intent_sha256=checked_intent.fingerprint,
                 ),
+                owner_strategy_ref=wire_scope.strategy_ref,
+                owner_run_id=wire_scope.run_id,
+                owner_wire_scope=owner_wire_scope,
             )
         except IntentConflictError:
             return self._failure_with_record("INTENT_CONFLICT", intent.intent_id, execution_scope)
@@ -823,6 +879,258 @@ class ExecutionOrderEntryService:
             return _reply(False, "STORE_UNAVAILABLE", {"found": False, "record": None})
         return _reply(True, "OK", {"found": True, "record": _cancel_record_dto(record)})
 
+    def _owner_cancel_batch(
+        self,
+        arguments: Mapping[str, Any],
+        *,
+        principal_ref: str,
+        identity: WireIdentity,
+        wire_scope: WireScope,
+        execution_scope: ExecutionScope,
+    ) -> Mapping[str, Any]:
+        """Cancel only durable open orders attributed to one exact run."""
+
+        quota_admission = self._cancel_quota_admission
+        if quota_admission is None:
+            return _reply(
+                False,
+                "QUOTA_ADMISSION_UNAVAILABLE",
+                {"outcome": "NO_EFFECT", "command_id": None, "items": []},
+            )
+        try:
+            command = OwnerCancelCommandV1.from_arguments(arguments)
+        except ContractValidationError:
+            return _reply(False, "INVALID_REQUEST", {"outcome": "NO_EFFECT", "items": []})
+
+        order_facade, cancel_facade = self._facade_pair(execution_scope)
+        try:
+            writer_lease = order_facade.acquire_writer_lease()
+            frozen = self._store.freeze_owner_cancel_batch(
+                scope=execution_scope,
+                strategy_ref=wire_scope.strategy_ref or "",
+                run_id=wire_scope.run_id or "",
+                command_id=command.command_id,
+                principal_ref=principal_ref,
+                actor_ref=identity.actor_ref,
+                delegate_ref=identity.delegate_ref,
+                wire_scope=_wire_scope_binding(wire_scope),
+                writer_lease=writer_lease,
+            )
+        except IntentConflictError:
+            return _reply(
+                False,
+                "COMMAND_ID_CONFLICT",
+                {"outcome": "NO_EFFECT", "command_id": command.command_id, "items": []},
+            )
+        except WriterLeaseUnavailable:
+            return _reply(
+                False,
+                "OWNER_LEASE_UNAVAILABLE",
+                {"outcome": "UNKNOWN", "command_id": command.command_id, "items": []},
+            )
+        except OwnerCancelSelectionLimitError:
+            return _reply(
+                False,
+                "OWNER_CANCEL_SCOPE_TOO_LARGE",
+                {"outcome": "NO_EFFECT", "command_id": command.command_id, "items": []},
+            )
+        except (ContractValidationError, DurableStoreError):
+            return _reply(
+                False,
+                "STORE_UNAVAILABLE",
+                {"outcome": "UNKNOWN", "command_id": command.command_id, "items": []},
+            )
+
+        body = frozen["body"]
+        frozen_items = body["items"]
+        if type(frozen_items) is not list:
+            return _reply(
+                False,
+                "STORE_UNAVAILABLE",
+                {"outcome": "UNKNOWN", "command_id": command.command_id, "items": []},
+            )
+        with self._owner_cancel_lock:
+            for item in frozen_items:
+                if type(item) is not dict or item.get("decision") != "READY":
+                    continue
+                cancel_id = item.get("cancel_id")
+                target_intent_id = item.get("intent_id")
+                provider_order_id = item.get("provider_order_id")
+                instrument_ref = item.get("instrument_ref")
+                if not all(
+                    type(value) is str and value
+                    for value in (cancel_id, target_intent_id, provider_order_id, instrument_ref)
+                ):
+                    return _reply(
+                        False,
+                        "STORE_UNAVAILABLE",
+                        {"outcome": "UNKNOWN", "command_id": command.command_id, "items": []},
+                    )
+                if self._store.get_cancel(cancel_id, scope=execution_scope) is not None:
+                    # Existing cancellation states, especially UNKNOWN and
+                    # DISPATCHING, are query-only and are never replayed.
+                    continue
+                try:
+                    cancel_intent = CancelIntent(
+                        cancel_id=cancel_id,
+                        scope=execution_scope,
+                        target_intent_id=target_intent_id,
+                        provider_order_id=provider_order_id,
+                        metadata_version="strategy-cancel-v1",
+                    )
+
+                    def admit_quota(
+                        _intent: CancelIntent,
+                        *,
+                        item_instrument_ref: str = instrument_ref,
+                    ) -> None:
+                        deadline = monotonic_ns() + OWNER_CANCEL_QUOTA_WINDOW_NS
+                        admission_result = quota_admission(
+                            wire_scope.account_ref or "",
+                            wire_scope.strategy_ref or "",
+                            wire_scope.run_id or "",
+                            item_instrument_ref,
+                            "CANCEL",
+                            deadline,
+                        )
+                        if admission_result is not None or monotonic_ns() >= deadline:
+                            raise AdmissionRequired("cancel quota admission returned an invalid result")
+
+                    cancel_facade.cancel(
+                        cancel_intent,
+                        self._dispatch,
+                        before_provider_dispatch=admit_quota,
+                    )
+                except (AdmissionRequired, IntentConflictError, InvalidStateTransition):
+                    # The durable cancel record is authoritative; read it
+                    # below and report the finite state without replaying.
+                    continue
+                except (ContractValidationError, WriterLeaseUnavailable, DurableStoreError):
+                    continue
+
+        result_items: list[dict[str, object]] = []
+        state_counts: dict[str, int] = {}
+        unresolved_orders = 0
+        pending_orders = 0
+        for frozen_item in frozen_items:
+            decision = frozen_item.get("decision")
+            if decision in {"UNKNOWN", "UNRESOLVED"}:
+                unresolved_orders += 1
+            elif decision == "PENDING":
+                pending_orders += 1
+            cancel_id = (
+                frozen_item.get("existing_cancel_id")
+                if decision == "EXISTING_CANCEL"
+                else frozen_item.get("cancel_id")
+            )
+            cancel_record = (
+                None
+                if type(cancel_id) is not str
+                else self._store.get_cancel(cancel_id, scope=execution_scope)
+            )
+            if cancel_record is None and decision == "READY":
+                # Another serialized owner command may have admitted the
+                # target cancellation after this batch snapshot was frozen.
+                # Project that durable record rather than inventing a
+                # successful or empty result for the losing command.
+                try:
+                    target_cancellations = self._store.list_cancellations_for_target(
+                        frozen_item.get("intent_id"), scope=execution_scope
+                    )
+                except (ContractValidationError, DurableStoreError):
+                    return _reply(
+                        False,
+                        "STORE_UNAVAILABLE",
+                        {"outcome": "UNKNOWN", "command_id": command.command_id, "items": []},
+                    )
+                if target_cancellations:
+                    cancel_record = target_cancellations[0]
+                    cancel_id = cancel_record.cancel_id
+                    decision = "EXISTING_CANCEL"
+            cancellation_state = None if cancel_record is None else cancel_record.state.value
+            if cancellation_state is not None:
+                state_counts[cancellation_state] = state_counts.get(cancellation_state, 0) + 1
+            result_items.append(
+                {
+                    "intent_id": frozen_item.get("intent_id"),
+                    "instrument_ref": frozen_item.get("instrument_ref"),
+                    "record_state": frozen_item.get("record_state"),
+                    "decision": decision,
+                    "cancel_id": cancel_id,
+                    "cancel_state": cancellation_state,
+                    "unknown_reason": (
+                        None if cancel_record is None else cancel_record.unknown_reason
+                    ),
+                    "review_required": (
+                        False if cancel_record is None else cancel_record.review_required
+                    ),
+                    "dispatch_attempts": (
+                        0 if cancel_record is None else cancel_record.dispatch_attempts
+                    ),
+                }
+            )
+
+        omitted_count = body["omitted_count"]
+        unknown = state_counts.get(ExecutionState.UNKNOWN.value, 0) + unresolved_orders
+        pending = pending_orders + sum(
+            state_counts.get(state.value, 0)
+            for state in {
+                ExecutionState.PENDING_ADMISSION,
+                ExecutionState.PENDING_DISPATCH,
+                ExecutionState.DISPATCHING,
+            }
+        )
+        cancelled = state_counts.get(ExecutionState.CANCELLED.value, 0)
+        acknowledged = state_counts.get(ExecutionState.ACKED.value, 0)
+        if unknown:
+            outcome = "UNKNOWN"
+        elif pending:
+            outcome = "PENDING"
+        elif omitted_count or cancelled or acknowledged:
+            outcome = (
+                "APPLIED"
+                if (
+                    cancelled == body["total_count"]
+                    and acknowledged == 0
+                    and omitted_count == 0
+                )
+                else "ACKNOWLEDGED"
+                if acknowledged == body["selected_count"]
+                and cancelled == 0
+                and omitted_count == 0
+                else "PARTIAL"
+            )
+        else:
+            outcome = "NO_EFFECT"
+        ok = outcome in {"APPLIED", "ACKNOWLEDGED", "PARTIAL", "NO_EFFECT"}
+        code = {
+            "APPLIED": "OWNER_CANCEL_APPLIED",
+            "ACKNOWLEDGED": "OWNER_CANCEL_ACKNOWLEDGED",
+            "PARTIAL": "OWNER_CANCEL_PARTIAL",
+            "PENDING": "OWNER_CANCEL_PENDING",
+            "UNKNOWN": "OWNER_CANCEL_UNKNOWN",
+            "NO_EFFECT": "OWNER_CANCEL_NO_EFFECT",
+        }[outcome]
+        return _reply(
+            ok,
+            code,
+            {
+                "command_id": body["command_id"],
+                "batch_sha256": frozen["sha256"],
+                "scope_key": body["scope_key"],
+                "account_ref": body["account_ref"],
+                "portfolio_ref": body["portfolio_ref"],
+                "strategy_ref": body["strategy_ref"],
+                "run_id": body["run_id"],
+                "total_count": body["total_count"],
+                "selected_count": body["selected_count"],
+                "omitted_count": omitted_count,
+                "state_counts": state_counts,
+                "outcome": outcome,
+                "items": result_items,
+            },
+        )
+
     def _failure_with_record(
         self, code: str, intent_id: str, execution_scope: ExecutionScope
     ) -> Mapping[str, Any]:
@@ -891,6 +1199,22 @@ def _has_dispatch(dispatch: object, method_name: str) -> bool:
     # A bare callable is accepted only for submission, where the port protocol
     # itself is a single call.
     return method_name == "submit" and callable(dispatch)
+
+
+def _wire_scope_binding(scope: WireScope) -> dict[str, object]:
+    """Serialize the authenticated routing scope used for owner attribution."""
+
+    return {
+        "execution_domain_ref": scope.execution_domain_ref,
+        "account_ref": scope.account_ref,
+        "account_refs": list(scope.account_refs),
+        "strategy_ref": scope.strategy_ref,
+        "run_id": scope.run_id,
+        "manual_book_ref": scope.manual_book_ref,
+        "portfolio_ref": scope.portfolio_ref,
+        "group_id": scope.group_id,
+        "leg_id": scope.leg_id,
+    }
 
 
 def _order_intent(arguments: Mapping[str, Any], execution_scope: ExecutionScope) -> OrderIntent:

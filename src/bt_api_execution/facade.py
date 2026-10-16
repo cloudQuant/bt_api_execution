@@ -216,6 +216,9 @@ class ManagedExecutionFacade:
         *,
         before_dispatch: BeforeDispatchCallable | None = None,
         admission_context: ExecutionAdmissionContextV1 | None = None,
+        owner_strategy_ref: str | None = None,
+        owner_run_id: str | None = None,
+        owner_wire_scope: Mapping[str, Any] | None = None,
     ) -> ExecutionRecord:
         """Submit an ordinary intent; group namespace IDs require the group path."""
 
@@ -229,6 +232,9 @@ class ManagedExecutionFacade:
             group_binding=None,
             group_authorization=None,
             writer_lease=None,
+            owner_strategy_ref=owner_strategy_ref,
+            owner_run_id=owner_run_id,
+            owner_wire_scope=owner_wire_scope,
         )
 
     def submit_approved_target(
@@ -239,6 +245,9 @@ class ManagedExecutionFacade:
         admission_context: ExecutionAdmissionContextV1,
         consume_authorization: ApprovedTargetConsumeCallable,
         before_dispatch: BeforeDispatchCallable | None = None,
+        owner_strategy_ref: str | None = None,
+        owner_run_id: str | None = None,
+        owner_wire_scope: Mapping[str, Any] | None = None,
     ) -> ExecutionRecord:
         """Submit one code-bound target after a one-use AFI consume decision.
 
@@ -271,6 +280,9 @@ class ManagedExecutionFacade:
             group_authorization=None,
             writer_lease=None,
             approved_target_consume=consume_authorization,
+            owner_strategy_ref=owner_strategy_ref,
+            owner_run_id=owner_run_id,
+            owner_wire_scope=owner_wire_scope,
         )
 
     def submit_group_leg(
@@ -329,6 +341,9 @@ class ManagedExecutionFacade:
         group_authorization: GroupLegAuthorization | None,
         writer_lease: WriterLease | None,
         approved_target_consume: ApprovedTargetConsumeCallable | None = None,
+        owner_strategy_ref: str | None = None,
+        owner_run_id: str | None = None,
+        owner_wire_scope: Mapping[str, Any] | None = None,
     ) -> ExecutionRecord:
         """Durably admit and dispatch an intent at most once.
 
@@ -404,6 +419,9 @@ class ManagedExecutionFacade:
             writer_lease=writer_lease,
             group_binding=group_binding,
             group_authorization=group_authorization,
+            owner_strategy_ref=owner_strategy_ref,
+            owner_run_id=owner_run_id,
+            owner_wire_scope=owner_wire_scope,
         )
         if record.state is ExecutionState.PENDING_ADMISSION:
             if group_binding is None:

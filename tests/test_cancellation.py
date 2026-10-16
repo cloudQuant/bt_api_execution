@@ -261,6 +261,46 @@ def test_cancel_pre_dispatch_guard_runs_before_risk_claim_and_provider(tmp_path)
 
 
 @pytest.mark.unit
+def test_provider_quota_guard_runs_after_risk_claim_before_provider(tmp_path) -> None:
+    gate = _DurableCancelGate(tmp_path / "risk.sqlite3")
+    store, facade, gate = _ready_facades(tmp_path, cancel_gate=gate)
+    call_order: list[str] = []
+    original_claim = gate.claim_before_dispatch
+
+    def claim_before_dispatch(
+        permit_id: str, intent: CancelIntent
+    ) -> CancelDispatchClaimReceiptV1:
+        call_order.append("risk_claim")
+        return original_claim(permit_id, intent)
+
+    gate.claim_before_dispatch = claim_before_dispatch  # type: ignore[method-assign]
+
+    def quota_guard(intent: CancelIntent) -> None:
+        assert intent.cancel_id == "cancel.1"
+        assert gate.claimed == ["cancel.1"]
+        assert gate.has_durable_claim("cancel-permit-cancel.1")
+        call_order.append("quota")
+
+    def provider(intent: CancelIntent) -> CancelObservation:
+        call_order.append("provider")
+        return CancelObservation.accepted(
+            intent.cancel_id, intent.target_intent_id, intent.provider_order_id
+        )
+
+    try:
+        record = facade.cancel(
+            _cancel_intent(), provider, before_provider_dispatch=quota_guard
+        )
+
+        assert record.state is ExecutionState.ACKED
+        assert call_order == ["risk_claim", "quota", "provider"]
+        assert gate.claimed == ["cancel.1"]
+    finally:
+        gate.close()
+        store.close()
+
+
+@pytest.mark.unit
 def test_cancel_risk_claim_failure_is_unknown_without_release_or_provider_retry(tmp_path) -> None:
     store, facade, gate = _ready_facades(tmp_path)
     provider_calls: list[str] = []

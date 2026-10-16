@@ -53,11 +53,28 @@ from .errors import (
     WriterLeaseUnavailable,
 )
 from .group_contracts import GroupLegAuthorization, GroupPermitBinding
+from .strategy_cancel import (
+    OWNER_CANCEL_MAX_ITEMS,
+    OWNER_CANCEL_MAX_SCAN,
+    OwnerCancelSelectionLimitError,
+    owner_cancel_batch_key,
+    owner_cancel_id,
+)
 
 _MAX_RECOVERY_SCOPE_COUNT = 512
 _MAX_RECOVERY_SNAPSHOT_ORDERS = 512
 _MAX_RECOVERY_SNAPSHOT_EVENTS = 20_000
 _MAX_RECOVERY_PAGE_SIZE = 128
+_OWNER_CANCEL_OPEN_STATES = frozenset(
+    {
+        ExecutionState.PENDING_ADMISSION,
+        ExecutionState.PENDING_DISPATCH,
+        ExecutionState.DISPATCHING,
+        ExecutionState.ACKED,
+        ExecutionState.PARTIALLY_FILLED,
+        ExecutionState.UNKNOWN,
+    }
+)
 
 
 def _is_sha256(value: Any) -> bool:
@@ -78,6 +95,102 @@ def _is_local_queue_receipt_id(value: Any) -> bool:
 
 def _is_prefixed_digest(value: Any, prefix: str) -> bool:
     return type(value) is str and value.startswith(prefix) and _is_sha256(value[len(prefix) :])
+
+
+def _owner_scope_binding_key(scope_key: str, intent_id: str) -> str:
+    digest = hashlib.sha256(canonical_json([scope_key, intent_id]).encode("utf-8")).hexdigest()
+    return f"owner_run_binding.v1:{digest}"
+
+
+def _owner_wire_scope(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate and detach the server-captured WireScope used for owner control."""
+
+    required = {
+        "execution_domain_ref",
+        "account_ref",
+        "account_refs",
+        "strategy_ref",
+        "run_id",
+        "manual_book_ref",
+        "portfolio_ref",
+        "group_id",
+        "leg_id",
+    }
+    if not isinstance(value, Mapping) or any(type(key) is not str for key in value):
+        raise ContractValidationError("owner WireScope binding must be a mapping")
+    if set(value) != required:
+        raise ContractValidationError("owner WireScope binding fields are incomplete")
+    copied = dict(value)
+    def valid_text(item: Any) -> bool:
+        if type(item) is not str or not item or item != item.strip():
+            return False
+        try:
+            if len(item.encode("utf-8", errors="strict")) > 256:
+                return False
+        except UnicodeEncodeError:
+            return False
+        return not any(
+            ord(character) < 32 or 0x7F <= ord(character) <= 0x9F
+            for character in item
+        )
+
+    if not valid_text(copied["execution_domain_ref"]):
+        raise ContractValidationError("invalid owner WireScope execution domain")
+    for name in (
+        "account_ref",
+        "strategy_ref",
+        "run_id",
+        "manual_book_ref",
+        "portfolio_ref",
+        "group_id",
+        "leg_id",
+    ):
+        if copied[name] is not None and not valid_text(copied[name]):
+            raise ContractValidationError("invalid owner WireScope text")
+    if copied["strategy_ref"] is None:
+        raise ContractValidationError("owner WireScope requires a strategy")
+    account_refs = copied["account_refs"]
+    if type(account_refs) is not list or any(
+        not valid_text(item)
+        for item in account_refs
+    ) or len(set(account_refs)) != len(account_refs):
+        raise ContractValidationError("invalid owner WireScope account_refs")
+    if copied["run_id"] is not None and copied["strategy_ref"] is None:
+        raise ContractValidationError("owner run binding requires a strategy")
+    if copied["manual_book_ref"] is not None and copied["strategy_ref"] is not None:
+        raise ContractValidationError("manual book cannot bind a strategy run")
+    if copied["group_id"] is None:
+        if copied["leg_id"] is not None:
+            raise ContractValidationError("owner WireScope leg requires a group")
+        if copied["account_ref"] is not None and account_refs:
+            raise ContractValidationError("owner WireScope account fields conflict")
+    elif (
+        copied["leg_id"] is None
+        or copied["portfolio_ref"] is None
+        or copied["account_ref"] is not None
+        or not account_refs
+    ):
+        raise ContractValidationError("owner WireScope group fields are incomplete")
+    return copied
+
+
+def _owner_run_index_prefix(scope_key: str, wire_scope: Mapping[str, Any]) -> str:
+    digest = hashlib.sha256(
+        canonical_json([scope_key, wire_scope]).encode("utf-8")
+    ).hexdigest()
+    return f"owner_run_index.v1:{digest}:"
+
+
+def _owner_run_index_key(
+    scope_key: str, wire_scope: Mapping[str, Any], intent_id: str
+) -> str:
+    prefix = _owner_run_index_prefix(scope_key, wire_scope)
+    intent_digest = hashlib.sha256(intent_id.encode("utf-8")).hexdigest()
+    return f"{prefix}{intent_digest}"
+
+
+def _owner_cancel_batch_digest(body: Mapping[str, Any]) -> str:
+    return hashlib.sha256(canonical_json(body).encode("utf-8")).hexdigest()
 
 
 def _financial_json_value(value: Any) -> Any:
@@ -16721,6 +16834,243 @@ class SqliteExecutionStore:
             raise DurableStoreError("stored intent payload is unreadable") from error
         return order_intent_from_payload(payload)
 
+    def freeze_owner_cancel_batch(
+        self,
+        *,
+        scope: ExecutionScope,
+        strategy_ref: str,
+        run_id: str,
+        wire_scope: Mapping[str, Any],
+        command_id: str,
+        principal_ref: str,
+        actor_ref: str,
+        delegate_ref: str | None,
+        writer_lease: WriterLease,
+    ) -> Mapping[str, Any]:
+        """Persist or replay one exact-run cancellation selection.
+
+        Selection and command persistence share one SQLite write transaction.
+        Only intents whose strategy/run attribution was recorded with normal
+        order admission are eligible; historical unbound rows are never
+        guessed into a run.  A replay returns the same immutable selection,
+        while later cancellation records are projected separately by the
+        service and are never redispatched from this snapshot.
+        """
+
+        if type(scope) is not ExecutionScope:
+            raise ContractValidationError("execution scope is required")
+        for value, name in (
+            (strategy_ref, "strategy_ref"),
+            (run_id, "run_id"),
+            (command_id, "command_id"),
+            (principal_ref, "principal_ref"),
+            (actor_ref, "actor_ref"),
+        ):
+            if (
+                type(value) is not str
+                or not value
+                or value != value.strip()
+                or len(value) > 256
+            ):
+                raise ContractValidationError(f"invalid owner cancel {name}")
+        if delegate_ref is not None and (
+            type(delegate_ref) is not str
+            or not delegate_ref
+            or delegate_ref != delegate_ref.strip()
+            or len(delegate_ref) > 256
+        ):
+            raise ContractValidationError("invalid owner cancel delegate_ref")
+        bound_scope = _owner_wire_scope(wire_scope)
+        if (
+            bound_scope["strategy_ref"] != strategy_ref
+            or bound_scope["run_id"] != run_id
+            or bound_scope["account_ref"] is None
+            or bound_scope["account_refs"]
+            or bound_scope["manual_book_ref"] is not None
+            or bound_scope["group_id"] is not None
+            or bound_scope["leg_id"] is not None
+        ):
+            raise ContractValidationError("owner cancel WireScope is not an exact account run")
+        if type(writer_lease) is not WriterLease:
+            raise ContractValidationError("owner cancel requires its writer lease")
+
+        batch_key = owner_cancel_batch_key(
+            scope_key=scope.key,
+            wire_scope=bound_scope,
+            command_id=command_id,
+        )
+        expected_identity = {
+            "schema": "strategy_cancel_batch.v1",
+            "scope_key": scope.key,
+            "account_ref": bound_scope["account_ref"],
+            "portfolio_ref": bound_scope["portfolio_ref"],
+            "strategy_ref": strategy_ref,
+            "run_id": run_id,
+            "wire_scope": bound_scope,
+            "command_id": command_id,
+            "principal_ref": principal_ref,
+            "actor_ref": actor_ref,
+            "delegate_ref": delegate_ref,
+        }
+        with self._transaction() as cursor:
+            self._assert_active_writer_lease(cursor, scope, writer_lease)
+            existing = cursor.execute(
+                "SELECT value FROM execution_meta WHERE key = ?", (batch_key,)
+            ).fetchone()
+            if existing is not None:
+                try:
+                    wrapper_json = str(existing["value"])
+                    wrapper = json.loads(wrapper_json)
+                    if (
+                        canonical_json(wrapper) != wrapper_json
+                        or type(wrapper) is not dict
+                        or set(wrapper) != {"body", "sha256"}
+                        or type(wrapper["body"]) is not dict
+                        or wrapper["sha256"] != _owner_cancel_batch_digest(wrapper["body"])
+                    ):
+                        raise ValueError("owner cancel batch digest is invalid")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    raise DurableStoreError("stored owner cancel batch is unreadable") from None
+                if any(
+                    wrapper["body"].get(key) != value
+                    for key, value in expected_identity.items()
+                ):
+                    raise IntentConflictError("command_id is bound to another owner identity")
+                return MappingProxyType(
+                    {"body": wrapper["body"], "sha256": wrapper["sha256"]}
+                )
+
+            prefix = _owner_run_index_prefix(scope.key, bound_scope)
+            total_row = cursor.execute(
+                "SELECT COUNT(*) AS item_count FROM execution_meta WHERE key >= ? AND key < ?",
+                (prefix, prefix + "g"),
+            ).fetchone()
+            indexed_count = int(total_row["item_count"])
+            if indexed_count > OWNER_CANCEL_MAX_SCAN:
+                raise OwnerCancelSelectionLimitError(
+                    "owner cancel run exceeds the bounded attribution scan"
+                )
+            index_rows = cursor.execute(
+                """
+                SELECT key, value FROM execution_meta
+                WHERE key >= ? AND key < ? ORDER BY key LIMIT ?
+                """,
+                (prefix, prefix + "g", OWNER_CANCEL_MAX_SCAN + 1),
+            ).fetchall()
+            if len(index_rows) > OWNER_CANCEL_MAX_SCAN:
+                raise OwnerCancelSelectionLimitError(
+                    "owner cancel run exceeds the bounded attribution scan"
+                )
+            items: list[dict[str, Any]] = []
+            total_count = 0
+            for index_row in index_rows:
+                index_key = str(index_row["key"])
+                binding_json = str(index_row["value"])
+                try:
+                    binding = json.loads(binding_json)
+                    if (
+                        canonical_json(binding) != binding_json
+                        or type(binding) is not dict
+                        or binding.get("schema") != "execution.owner_run_binding.v1"
+                        or binding.get("scope_key") != scope.key
+                        or binding.get("wire_scope") != bound_scope
+                        or binding.get("strategy_ref") != strategy_ref
+                        or binding.get("run_id") != run_id
+                        or type(binding.get("intent_id")) is not str
+                        or not _is_sha256(binding.get("payload_sha256"))
+                        or _owner_run_index_key(scope.key, bound_scope, binding["intent_id"])
+                        != index_key
+                    ):
+                        raise ValueError("owner run index is inconsistent")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    raise DurableStoreError("owner run index is unreadable") from None
+                record_row = self._fetch_record(cursor, scope.key, binding["intent_id"])
+                if record_row is None:
+                    raise DurableStoreError("owner run index references a missing order")
+                record = self._record_from_row(record_row)
+                if (
+                    record.group_binding is not None
+                    or record.payload_sha256 != binding["payload_sha256"]
+                ):
+                    raise DurableStoreError("owner run index order binding is inconsistent")
+                try:
+                    intent_payload = json.loads(str(record_row["payload_json"]))
+                    if canonical_json(intent_payload) != str(record_row["payload_json"]):
+                        raise ValueError("noncanonical order payload")
+                    intent = order_intent_from_payload(intent_payload)
+                except (ContractValidationError, TypeError, ValueError, json.JSONDecodeError):
+                    raise DurableStoreError("owner cancel order payload is unreadable") from None
+                if record.state not in _OWNER_CANCEL_OPEN_STATES:
+                    continue
+                total_count += 1
+                if len(items) >= OWNER_CANCEL_MAX_ITEMS:
+                    continue
+                cancellation_rows = cursor.execute(
+                    """
+                    SELECT * FROM cancellation_records
+                    WHERE scope_key = ? AND target_intent_id = ?
+                    ORDER BY updated_at_ns DESC, cancel_id DESC LIMIT 1
+                    """,
+                    (scope.key, intent.intent_id),
+                ).fetchall()
+                previous_cancel = (
+                    None
+                    if not cancellation_rows
+                    else self._cancel_record_from_row(cancellation_rows[0])
+                )
+                if previous_cancel is not None:
+                    decision = "EXISTING_CANCEL"
+                elif record.state in {ExecutionState.ACKED, ExecutionState.PARTIALLY_FILLED}:
+                    decision = "READY" if record.provider_order_id is not None else "UNRESOLVED"
+                elif record.state is ExecutionState.UNKNOWN:
+                    decision = "UNKNOWN"
+                elif record.state in {
+                    ExecutionState.PENDING_ADMISSION,
+                    ExecutionState.PENDING_DISPATCH,
+                    ExecutionState.DISPATCHING,
+                }:
+                    decision = "PENDING"
+                elif record.state is ExecutionState.CANCELLED:
+                    decision = "ALREADY_CANCELLED"
+                else:
+                    decision = "ALREADY_TERMINAL"
+                items.append(
+                    {
+                        "intent_id": intent.intent_id,
+                        "payload_sha256": intent.fingerprint,
+                        "instrument_ref": intent.instrument,
+                        "record_state": record.state.value,
+                        "provider_order_id": record.provider_order_id,
+                        "cancel_id": owner_cancel_id(
+                            command_id=command_id, intent_id=intent.intent_id
+                        ),
+                        "decision": decision,
+                        "existing_cancel_id": (
+                            None if previous_cancel is None else previous_cancel.cancel_id
+                        ),
+                        "existing_cancel_state": (
+                            None
+                            if previous_cancel is None
+                            else previous_cancel.state.value
+                        ),
+                    }
+                )
+
+            body = {
+                **expected_identity,
+                "created_at_ns": time.time_ns(),
+                "total_count": total_count,
+                "selected_count": len(items),
+                "omitted_count": total_count - len(items),
+                "items": items,
+            }
+            wrapper = {"body": body, "sha256": _owner_cancel_batch_digest(body)}
+            cursor.execute(
+                "INSERT INTO execution_meta(key, value) VALUES (?, ?)",
+                (batch_key, canonical_json(wrapper)),
+            )
+            return MappingProxyType(wrapper)
+
     def list_group_authorization_attempts(
         self, intent_id: str, *, scope: ExecutionScope
     ) -> tuple[GroupLegAuthorization, ...]:
@@ -16839,6 +17189,27 @@ class SqliteExecutionStore:
             except sqlite3.Error as error:
                 raise DurableStoreError("unable to read cancellation record") from error
         return None if row is None else self._cancel_record_from_row(row)
+
+    def list_cancellations_for_target(
+        self, target_intent_id: str, *, scope: ExecutionScope
+    ) -> tuple[CancelRecord, ...]:
+        """Read every durable cancel attempt for one exact order, without dispatch."""
+
+        if not isinstance(scope, ExecutionScope):
+            raise ContractValidationError("execution scope is required")
+        with self._lock:
+            try:
+                rows = self._connection.execute(
+                    """
+                    SELECT * FROM cancellation_records
+                    WHERE scope_key = ? AND target_intent_id = ?
+                    ORDER BY updated_at_ns DESC, cancel_id DESC
+                    """,
+                    (scope.key, target_intent_id),
+                ).fetchall()
+            except sqlite3.Error as error:
+                raise DurableStoreError("unable to list target cancellation records") from error
+        return tuple(self._cancel_record_from_row(row) for row in rows)
 
     def list_unknown_cancellations(self, scope: ExecutionScope) -> list[CancelRecord]:
         """Return only durable unknown cancellations in one exact execution scope.
@@ -17070,6 +17441,25 @@ class SqliteExecutionStore:
                 ):
                     raise IntentConflictError("cancel_id was reused with another payload")
                 return self._cancel_record_from_row(existing)
+            prior_cancellations = cursor.execute(
+                """
+                SELECT state FROM cancellation_records
+                WHERE scope_key = ? AND target_intent_id = ?
+                """,
+                (intent.scope.key, intent.target_intent_id),
+            ).fetchall()
+            if any(
+                str(row["state"])
+                not in {
+                    ExecutionState.CANCELLED.value,
+                    ExecutionState.REJECTED.value,
+                    ExecutionState.BLOCKED.value,
+                }
+                for row in prior_cancellations
+            ):
+                # A second cancel identity must not bypass an earlier request
+                # whose provider outcome is still pending or UNKNOWN.
+                raise IntentConflictError("target has an unresolved cancellation")
             target_row = self._fetch_record(cursor, intent.scope.key, intent.target_intent_id)
             if target_row is None:
                 raise ContractValidationError("cancellation target intent is unknown")
@@ -17533,6 +17923,9 @@ class SqliteExecutionStore:
         writer_lease: WriterLease | None = None,
         group_binding: GroupPermitBinding | None = None,
         group_authorization: GroupLegAuthorization | None = None,
+        owner_strategy_ref: str | None = None,
+        owner_run_id: str | None = None,
+        owner_wire_scope: Mapping[str, Any] | None = None,
     ) -> ExecutionRecord:
         """Persist an immutable intent before admission or provider dispatch.
 
@@ -17542,6 +17935,37 @@ class SqliteExecutionStore:
 
         if (group_binding is None) != (group_authorization is None):
             raise ContractValidationError("group binding and attempt authorization must be paired")
+        if owner_strategy_ref is not None and (
+            type(owner_strategy_ref) is not str
+            or not owner_strategy_ref
+            or owner_strategy_ref != owner_strategy_ref.strip()
+            or len(owner_strategy_ref) > 256
+        ):
+            raise ContractValidationError("invalid owner strategy binding")
+        if owner_run_id is not None and (
+            type(owner_run_id) is not str
+            or not owner_run_id
+            or owner_run_id != owner_run_id.strip()
+            or len(owner_run_id) > 256
+        ):
+            raise ContractValidationError("invalid owner run binding")
+        if owner_run_id is not None and owner_strategy_ref is None:
+            raise ContractValidationError("owner run binding requires a strategy")
+        if (owner_strategy_ref is None) != (owner_wire_scope is None):
+            raise ContractValidationError("owner strategy attribution requires its WireScope")
+        bound_owner_wire_scope = (
+            None if owner_wire_scope is None else _owner_wire_scope(owner_wire_scope)
+        )
+        if bound_owner_wire_scope is not None and (
+            bound_owner_wire_scope["strategy_ref"] != owner_strategy_ref
+            or bound_owner_wire_scope["run_id"] != owner_run_id
+            or bound_owner_wire_scope["account_refs"]
+            or bound_owner_wire_scope["group_id"] is not None
+            or bound_owner_wire_scope["leg_id"] is not None
+        ):
+            raise ContractValidationError("owner attribution is not an ordinary strategy scope")
+        if group_binding is not None and bound_owner_wire_scope is not None:
+            raise ContractValidationError("group legs cannot be strategy-run indexed")
         if group_binding is not None:
             if type(group_binding) is not GroupPermitBinding:
                 raise ContractValidationError("invalid group permit binding")
@@ -17562,6 +17986,25 @@ class SqliteExecutionStore:
             group_binding_json = None
             group_binding_sha256 = None
             business_fingerprint = intent.fingerprint
+        owner_binding_json: str | None = None
+        owner_binding_key: str | None = None
+        owner_index_key: str | None = None
+        if bound_owner_wire_scope is not None:
+            owner_binding = {
+                "schema": "execution.owner_run_binding.v1",
+                "scope_key": intent.scope.key,
+                "strategy_ref": owner_strategy_ref,
+                "run_id": owner_run_id,
+                "wire_scope": bound_owner_wire_scope,
+                "intent_id": intent.intent_id,
+                "payload_sha256": business_fingerprint,
+            }
+            owner_binding_json = canonical_json(owner_binding)
+            owner_binding_key = _owner_scope_binding_key(intent.scope.key, intent.intent_id)
+            if owner_run_id is not None:
+                owner_index_key = _owner_run_index_key(
+                    intent.scope.key, bound_owner_wire_scope, intent.intent_id
+                )
         now_ns = time.time_ns()
         payload_json = canonical_json(intent.to_payload())
         with self._transaction() as cursor:
@@ -17575,6 +18018,23 @@ class SqliteExecutionStore:
                     or existing["scope_key"] != intent.scope.key
                 ):
                     raise IntentConflictError()
+                if owner_binding_key is not None:
+                    bound = cursor.execute(
+                        "SELECT value FROM execution_meta WHERE key = ?",
+                        (owner_binding_key,),
+                    ).fetchone()
+                    # A legacy row without a server-captured WireScope run
+                    # remains readable/idempotent but is never retroactively
+                    # attributed to a run by a later request.
+                    if bound is not None and str(bound["value"]) != owner_binding_json:
+                        raise IntentConflictError("intent is bound to a different strategy run")
+                    if bound is not None and owner_index_key is not None:
+                        indexed = cursor.execute(
+                            "SELECT value FROM execution_meta WHERE key = ?",
+                            (owner_index_key,),
+                        ).fetchone()
+                        if indexed is None or str(indexed["value"]) != owner_binding_json:
+                            raise DurableStoreError("strategy run index is inconsistent")
                 if group_binding is not None and ExecutionState(existing["state"]) in {
                     ExecutionState.PENDING_ADMISSION,
                     ExecutionState.PENDING_DISPATCH,
@@ -17622,6 +18082,16 @@ class SqliteExecutionStore:
                 },
                 now_ns=now_ns,
             )
+            if owner_binding_key is not None and owner_binding_json is not None:
+                cursor.execute(
+                    "INSERT INTO execution_meta(key, value) VALUES (?, ?)",
+                    (owner_binding_key, owner_binding_json),
+                )
+                if owner_index_key is not None:
+                    cursor.execute(
+                        "INSERT INTO execution_meta(key, value) VALUES (?, ?)",
+                        (owner_index_key, owner_binding_json),
+                    )
             if group_binding is not None:
                 assert group_authorization is not None
                 self._record_group_authorization_attempt(

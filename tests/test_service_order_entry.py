@@ -200,7 +200,11 @@ def _call(service, operation: str, arguments: dict[str, object], *, scope: WireS
 
 @pytest.mark.unit
 def test_operations_cover_the_account_owner_write_and_read_ports() -> None:
-    assert frozenset({SUBMIT_OPERATION, CANCEL_OPERATION, QUERY_OPERATION}) == SUPPORTED_OPERATIONS
+    from bt_api_execution.strategy_cancel import OWNER_CANCEL_OPERATION
+
+    assert frozenset(
+        {SUBMIT_OPERATION, CANCEL_OPERATION, QUERY_OPERATION, OWNER_CANCEL_OPERATION}
+    ) == SUPPORTED_OPERATIONS
 
 
 @pytest.mark.unit
