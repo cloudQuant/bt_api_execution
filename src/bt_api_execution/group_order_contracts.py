@@ -75,6 +75,59 @@ class GroupBudgetReservationState(StrEnum):
     DENIED = "DENIED"
 
 
+@dataclass(frozen=True, slots=True)
+class GroupCompensationBudgetPolicy:
+    """Explicit trusted cap for recovery CLOSE reference notional.
+
+    The cap is per accepted group. It is independent of the OPEN gross quote
+    and cannot pool across currencies. ``LIMIT_CLOSE_NOTIONAL_V1`` reserves
+    close quantity times the accepted source LIMIT price times the accepted
+    base-unit conversion, all in the source instrument's quote currency.
+    """
+
+    policy_id: str
+    policy_version: int
+    cap_amount: Decimal
+    currency: str
+    metric: str = "LIMIT_CLOSE_NOTIONAL_V1"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "policy_id", _reference(self.policy_id, "compensation policy id"))
+        if type(self.policy_version) is not int or self.policy_version <= 0:
+            raise ContractValidationError("invalid compensation policy version")
+        object.__setattr__(self, "cap_amount", _positive_decimal(self.cap_amount, "compensation cap"))
+        if type(self.currency) is not str or not _NOTIONAL_UNIT.fullmatch(self.currency):
+            raise ContractValidationError("invalid compensation budget currency")
+        if self.metric != "LIMIT_CLOSE_NOTIONAL_V1":
+            raise ContractValidationError("unsupported compensation budget metric")
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "schema": "group-compensation-budget-policy-v1",
+            "policy_id": self.policy_id,
+            "policy_version": self.policy_version,
+            "cap_amount": format(self.cap_amount, "f"),
+            "currency": self.currency,
+            "metric": self.metric,
+        }
+
+    @property
+    def fingerprint(self) -> str:
+        return payload_sha256(self.to_payload())
+
+    @classmethod
+    def from_payload(cls, value: object) -> GroupCompensationBudgetPolicy:
+        if not isinstance(value, Mapping) or set(value) != {
+            "schema", "policy_id", "policy_version", "cap_amount", "currency", "metric"
+        } or value["schema"] != "group-compensation-budget-policy-v1":
+            raise ContractValidationError("invalid compensation budget policy payload")
+        return cls(
+            policy_id=value["policy_id"],
+            policy_version=value["policy_version"],
+            cap_amount=_parse_decimal(value["cap_amount"], "compensation cap"),
+            currency=value["currency"],
+            metric=value["metric"],
+        )
 class GroupLegPhase(StrEnum):
     READY = "READY"
     REQUESTING = "REQUESTING"
@@ -476,6 +529,7 @@ class GroupOrderIntent:
     budget_quote: GroupBudgetQuote | None = None
     recovery_policy: str = "HOLD_AND_QUERY_ORIGINAL_IDS"
     version: int = 1
+    compensation_budget_policy: GroupCompensationBudgetPolicy | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -495,6 +549,14 @@ class GroupOrderIntent:
             raise ContractValidationError("invalid absolute group deadline")
         if type(self.version) is not int or self.version not in {1, 2, 3}:
             raise ContractValidationError("unsupported group order contract version")
+        if self.compensation_budget_policy is not None:
+            if (
+                type(self.compensation_budget_policy) is not GroupCompensationBudgetPolicy
+                or self.version != 3
+            ):
+                raise ContractValidationError(
+                    "compensation budget policy is supported only for trusted v3 groups"
+                )
         expected_legs = 3 if self.version == 3 else 2
         if not isinstance(self.legs, tuple) or len(self.legs) != expected_legs:
             raise ContractValidationError(
@@ -627,6 +689,8 @@ class GroupOrderIntent:
         }
         if self.version != 1 and self.budget_quote is not None:
             payload["budget_quote"] = self.budget_quote.to_payload()
+        if self.compensation_budget_policy is not None:
+            payload["compensation_budget_policy"] = self.compensation_budget_policy.to_payload()
         return payload
 
     @classmethod
@@ -644,9 +708,13 @@ class GroupOrderIntent:
             "recovery_policy",
         }
         current_keys = legacy_keys | {"budget_quote"}
+        compensation_keys = legacy_keys | {"compensation_budget_policy"}
+        combined_keys = legacy_keys | {"budget_quote", "compensation_budget_policy"}
         if not isinstance(value, Mapping) or frozenset(value) not in {
             frozenset(legacy_keys),
             frozenset(current_keys),
+            frozenset(compensation_keys),
+            frozenset(combined_keys),
         }:
             raise ContractValidationError("invalid group order intent payload")
         if not isinstance(value["legs"], list):
@@ -665,6 +733,9 @@ class GroupOrderIntent:
             if "budget_quote" not in value
             else GroupBudgetQuote.from_payload(value["budget_quote"]),
             recovery_policy=value["recovery_policy"],
+            compensation_budget_policy=None
+            if "compensation_budget_policy" not in value
+            else GroupCompensationBudgetPolicy.from_payload(value["compensation_budget_policy"]),
         )
 
 
@@ -1567,6 +1638,7 @@ __all__ = [
     "GroupBudgetReservation",
     "GroupBudgetReservationState",
     "GroupChildOrderStatus",
+    "GroupCompensationBudgetPolicy",
     "GroupDispatchResolutionReceipt",
     "GroupLegClaimReceipt",
     "GroupLegPhase",
