@@ -28,6 +28,9 @@ _REFERENCE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _ACCOUNT_OWNER_PORTS = frozenset(
     {"service.order_entry", "service.order_query", "service.owner_control"}
 )
+_PAPER_COMPOSITION_MODES = frozenset(
+    {"execution_only", "execution_risk", "execution_risk_monitor"}
+)
 _GROUP_COORDINATOR_PORTS = frozenset({"service.order_group_entry"})
 _WIRE_SCOPE_FIELDS = (
     "execution_domain_ref",
@@ -66,7 +69,12 @@ def validate_service_options(
         raise ContractValidationError("execution service role is required")
 
     if role == "account_owner":
-        if set(keys) - {"role", "provider_session_ref", "approved_target_required"}:
+        if set(keys) - {
+            "role",
+            "provider_session_ref",
+            "approved_target_required",
+            "paper_composition",
+        }:
             raise ContractValidationError("unknown account_owner service option")
         if any(port not in _ACCOUNT_OWNER_PORTS for port in bind_ports):
             raise ContractValidationError("account_owner cannot bind the requested port")
@@ -85,6 +93,14 @@ def validate_service_options(
                     "approved_target_required requires service.order_entry"
                 )
             result["approved_target_required"] = approved_target_required
+        if "paper_composition" in options:
+            paper_composition = options["paper_composition"]
+            if (
+                type(paper_composition) is not str
+                or paper_composition not in _PAPER_COMPOSITION_MODES
+            ):
+                raise ContractValidationError("invalid paper_composition")
+            result["paper_composition"] = paper_composition
         return MappingProxyType(result)
 
     if role == "group_coordinator":

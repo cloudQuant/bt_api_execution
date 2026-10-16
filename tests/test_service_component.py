@@ -150,6 +150,31 @@ def test_approved_target_required_is_strict_server_option_and_write_only() -> No
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    "mode", ("execution_only", "execution_risk", "execution_risk_monitor")
+)
+def test_paper_composition_is_a_closed_server_owned_account_owner_option(mode: str) -> None:
+    normalized = validate_service_options(
+        {"role": "account_owner", "paper_composition": mode},
+        ("service.order_entry",),
+    )
+    assert normalized["paper_composition"] == mode
+    assert validate_service_options(
+        {"role": "account_owner"}, ("service.order_entry",)
+    ) == {"role": "account_owner"}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("mode", ("execution_risk_live", "risk", "", 1, None))
+def test_paper_composition_rejects_every_unlisted_value(mode: object) -> None:
+    with pytest.raises(ContractValidationError):
+        validate_service_options(
+            {"role": "account_owner", "paper_composition": mode},
+            ("service.order_entry",),
+        )
+
+
+@pytest.mark.unit
 def test_orders_query_reads_json_dto_and_preserves_unknown_state_without_writes(tmp_path) -> None:
     store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
     execution_scope = _execution_scope()
