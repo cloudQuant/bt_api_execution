@@ -60,6 +60,7 @@ _ALLOWED_STATE_TRANSITIONS = {
             GroupOrderState.FIRST_PENDING,
             GroupOrderState.HEDGE_PENDING,
             GroupOrderState.PAIRED,
+            GroupOrderState.UNWINDING,
             GroupOrderState.CLOSED,
             GroupOrderState.REJECTED_BEFORE_DISPATCH,
         }
@@ -91,11 +92,37 @@ _EVENT_TYPE = frozenset(
         "HEDGE_LEG_SUBMIT_STARTED",
         "HEDGE_LEG_STATUS_OBSERVED",
         "GROUP_PAIRED",
+        "GROUP_COMPENSATION_PLAN_RECORDED",
+        "GROUP_COMPENSATION_SUBMIT_STARTED",
+        "GROUP_COMPENSATION_STATUS_OBSERVED",
+        "GROUP_COMPENSATION_RESOLVED",
         "GROUP_REJECTED_BEFORE_DISPATCH",
         "GROUP_CLOSED_NO_EXPOSURE",
         "GROUP_RECOVERY_REQUIRED",
     }
 )
+_COMPENSATION_EVENT_TRANSITIONS = {
+    "GROUP_COMPENSATION_PLAN_RECORDED": frozenset(
+        {
+            (GroupOrderState.RECOVERY_REQUIRED, GroupOrderState.UNWINDING),
+            (GroupOrderState.UNWINDING, GroupOrderState.UNWINDING),
+        }
+    ),
+    "GROUP_COMPENSATION_SUBMIT_STARTED": frozenset(
+        {(GroupOrderState.UNWINDING, GroupOrderState.UNWINDING)}
+    ),
+    "GROUP_COMPENSATION_STATUS_OBSERVED": frozenset(
+        {
+            (GroupOrderState.UNWINDING, GroupOrderState.UNWINDING),
+            (GroupOrderState.UNWINDING, GroupOrderState.RECOVERY_REQUIRED),
+            (GroupOrderState.RECOVERY_REQUIRED, GroupOrderState.RECOVERY_REQUIRED),
+            (GroupOrderState.RECOVERY_REQUIRED, GroupOrderState.UNWINDING),
+        }
+    ),
+    "GROUP_COMPENSATION_RESOLVED": frozenset(
+        {(GroupOrderState.UNWINDING, GroupOrderState.UNWINDING)}
+    ),
+}
 
 
 def _valid_recoverable_cursor_ref(value: object) -> bool:
@@ -536,6 +563,14 @@ class SqliteOrderGroupStore:
             and target_state not in _ALLOWED_STATE_TRANSITIONS[snapshot.state]
         ):
             raise ContractValidationError("invalid group state transition")
+        if event_type in _COMPENSATION_EVENT_TRANSITIONS:
+            if (snapshot.state, target_state) not in _COMPENSATION_EVENT_TRANSITIONS[event_type]:
+                raise ContractValidationError("invalid compensation event state transition")
+        elif (
+            snapshot.state is GroupOrderState.RECOVERY_REQUIRED
+            and target_state is GroupOrderState.UNWINDING
+        ):
+            raise ContractValidationError("recovery can enter unwinding only through compensation")
         candidate = replace(
             snapshot,
             revision=snapshot.revision + 1,
