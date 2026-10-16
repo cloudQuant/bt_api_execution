@@ -67,6 +67,12 @@ class DurableStoreError(ExecutionError):
     code = "durable_execution_store_error"
 
 
+class PaperImportResidualUnrepresentableError(DurableStoreError):
+    """An imported equity remainder cannot be represented by the active Paper book."""
+
+    code = "paper_import_residual_unrepresentable"
+
+
 # Short aliases are part of the deliberately small public API.  The concrete
 # classes keep an ``Error`` suffix for standard exception naming conventions.
 InvalidStateTransition = InvalidStateTransitionError

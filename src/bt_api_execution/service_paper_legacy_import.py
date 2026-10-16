@@ -15,7 +15,12 @@ from typing import Any
 from bt_api_base.service_protocol import WireScope
 
 from .contracts import ExecutionScope
-from .errors import ContractValidationError, DurableStoreError, WriterLeaseUnavailable
+from .errors import (
+    ContractValidationError,
+    DurableStoreError,
+    PaperImportResidualUnrepresentableError,
+    WriterLeaseUnavailable,
+)
 from .paper_execution import PaperOwnerDomainV1
 from .paper_legacy_import import (
     PaperLegacyImportAccountStatusV1,
@@ -76,6 +81,7 @@ def _receipt_projection(receipt: PaperLegacyImportReceiptV1) -> dict[str, object
         "source_account_id": imported.source_account_id,
         "source_owner_id": imported.source_owner_id,
         "source_sha256": imported.source_sha256,
+        "unallocated_equity_residual": format(imported.unallocated_equity_residual, "f"),
         "import_sha256": receipt.import_sha256,
         "domain_sha256": receipt.domain_sha256,
     }
@@ -92,6 +98,9 @@ def _account_status_projection(status: PaperLegacyImportAccountStatusV1) -> dict
             "state": source.state,
             "scope_key": source.scope_key,
             "account_key": source.account_key,
+            "unallocated_equity_residual": format(
+                source.unallocated_equity_residual, "f"
+            ),
             "import_sha256": source.import_sha256,
             "domain_sha256": source.domain_sha256,
         }
@@ -209,6 +218,7 @@ class PaperLegacyImportService:
                 return _reply(False, "INVALID_ARGUMENTS", {})
             try:
                 imported = PaperLegacyImportV1.from_payload(arguments["imported"])
+                imported.validate_new_import()
                 imported.validate_domain(execution_scope, self._domain)
             except Exception:
                 return _reply(False, "IMPORT_INVALID", {})
@@ -276,6 +286,8 @@ class PaperLegacyImportService:
             value = action(lease)
         except ContractValidationError:
             error_code = "IMPORT_INVALID"
+        except PaperImportResidualUnrepresentableError:
+            error_code = "IMPORT_RESIDUAL_UNREPRESENTABLE"
         except DurableStoreError:
             error_code = "IMPORT_STATE_CONFLICT"
         except Exception:

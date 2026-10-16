@@ -52,6 +52,37 @@ def _decimal(value: Any, field: str, *, minimum: Decimal | None = None) -> Decim
     return result
 
 
+def _validate_import_profit_loss(account: Mapping[str, Any]) -> None:
+    """Require a newly imported source row to reconcile its equity projection.
+
+    The persisted V1 import receipt predates this stronger source-ingress
+    invariant.  Keep decoding its historical finite P&L fields compatible,
+    while requiring the reconciliation for all new imports and writes.
+    """
+
+    initial_cash = _decimal(account.get("initial_cash"), "initial cash", minimum=Decimal(0))
+    total_equity = _decimal(account.get("total_equity"), "total equity")
+    profit_loss = _decimal(account.get("profit_loss"), "profit and loss")
+    profit_loss_pct = _decimal(account.get("profit_loss_pct"), "profit and loss percent")
+    expected_profit_loss = total_equity - initial_cash
+    pnl_tolerance = max(
+        Decimal("1e-12"),
+        max(abs(expected_profit_loss), abs(profit_loss)) * Decimal("1e-12"),
+    )
+    if abs(profit_loss - expected_profit_loss) > pnl_tolerance:
+        raise ContractValidationError("legacy paper profit and loss does not reconcile")
+    if initial_cash == 0:
+        expected_profit_loss_pct = Decimal(0)
+    else:
+        expected_profit_loss_pct = (profit_loss / initial_cash) * Decimal(100)
+    pct_tolerance = max(
+        Decimal("1e-10"),
+        max(abs(expected_profit_loss_pct), abs(profit_loss_pct)) * Decimal("1e-12"),
+    )
+    if abs(profit_loss_pct - expected_profit_loss_pct) > pct_tolerance:
+        raise ContractValidationError("legacy paper profit and loss percent does not reconcile")
+
+
 def _source_document(document_json: Any, expected_sha256: str) -> dict[str, Any]:
     if type(document_json) is not str:
         raise ContractValidationError("legacy paper source snapshot exceeds its bound")
@@ -253,6 +284,11 @@ class PaperLegacyImportV1:
                 or _decimal(row.get("margin_rate"), "position margin rate") != 1
             ):
                 raise ContractValidationError("legacy paper position is not representable as spot")
+
+    def validate_new_import(self) -> None:
+        """Validate ingress-only invariants before persisting a new import."""
+
+        _validate_import_profit_loss(self._document()["account"])
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -560,7 +596,7 @@ class PaperLegacyImportV1:
                 Decimal(0),
             )
         )
-        return cls(
+        imported = cls(
             source_account_id=source_account_id,
             source_owner_id=source_owner_id,
             source_sha256=source_sha256,
@@ -569,6 +605,8 @@ class PaperLegacyImportV1:
             symbol_bindings=symbol_bindings,
             unallocated_equity_residual=residual,
         )
+        imported.validate_new_import()
+        return imported
 
 
 @dataclass(frozen=True, slots=True)
@@ -595,6 +633,7 @@ class PaperLegacyImportSourceReceiptV1:
     account_key: str
     import_sha256: str
     domain_sha256: str
+    unallocated_equity_residual: Decimal
 
 
 @dataclass(frozen=True, slots=True)

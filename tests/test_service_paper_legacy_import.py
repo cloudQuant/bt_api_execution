@@ -75,7 +75,7 @@ def _domain() -> tuple[ExecutionScope, PaperOwnerDomainV1]:
     return scope, domain
 
 
-def _imported() -> PaperLegacyImportV1:
+def _imported(*, equity_residual: Decimal = Decimal("0")) -> PaperLegacyImportV1:
     document = {
         "schema": "afi.legacy-paper-inventory.v1",
         "account": {
@@ -84,9 +84,9 @@ def _imported() -> PaperLegacyImportV1:
             "is_active": True,
             "initial_cash": 100.0,
             "current_cash": 89.9,
-            "total_equity": 99.9,
-            "profit_loss": -0.1,
-            "profit_loss_pct": -0.1,
+            "total_equity": float(Decimal("99.9") + equity_residual),
+            "profit_loss": float(Decimal("-0.1") + equity_residual),
+            "profit_loss_pct": float((Decimal("-0.1") + equity_residual)),
             "commission_rate": 0.01,
             "slippage_rate": 0.0,
         },
@@ -205,5 +205,50 @@ def test_service_uses_fixed_target_and_real_store_handoff_without_execution_fact
         after = service.handle(STATUS_OPERATION, scope=_WIRE_SCOPE, arguments={})
         assert after["ok"] is True
         assert after["result"]["receipt"]["state"] == "ACTIVE"
+    finally:
+        store.close()
+
+
+def test_service_refuses_nonzero_residual_and_keeps_source_handoff_prepared(tmp_path) -> None:
+    scope, domain = _domain()
+    store = SqliteExecutionStore(tmp_path / "legacy-import-residual.sqlite3")
+    service = PaperLegacyImportService(
+        store,
+        {_WIRE_SCOPE: scope},
+        domain,
+        writer_id="afi12-import-host-v1",
+    )
+    imported = _imported(equity_residual=Decimal("1.0"))
+    try:
+        prepared = service.handle(
+            PREPARE_OPERATION,
+            scope=_WIRE_SCOPE,
+            arguments={"imported": imported.to_payload()},
+        )
+        assert prepared["ok"] is True
+        assert prepared["result"]["state"] == "PREPARED"
+        assert prepared["result"]["unallocated_equity_residual"] == "1.0"
+
+        activated = service.handle(ACTIVATE_OPERATION, scope=_WIRE_SCOPE, arguments={})
+        assert activated == {
+            "ok": False,
+            "code": "IMPORT_RESIDUAL_UNREPRESENTABLE",
+            "result": {},
+        }
+        status = service.handle(STATUS_OPERATION, scope=_WIRE_SCOPE, arguments={})
+        assert status["ok"] is True
+        assert status["result"]["receipt"]["state"] == "PREPARED"
+        assert status["result"]["receipt"]["unallocated_equity_residual"] == "1.0"
+
+        inspected = service.handle(
+            INSPECT_SOURCE_OPERATION,
+            scope=_WIRE_SCOPE,
+            arguments={"source_account_id": _SOURCE_ACCOUNT_ID},
+        )
+        assert inspected["ok"] is True
+        assert inspected["result"]["active_account_import_state"] == "PREPARED"
+        assert inspected["result"]["owner_domain_exists"] is False
+        assert store._connection.execute("SELECT COUNT(*) FROM paper_owner_domains").fetchone()[0] == 0
+        assert store._connection.execute("SELECT COUNT(*) FROM execution_records").fetchone()[0] == 0
     finally:
         store.close()

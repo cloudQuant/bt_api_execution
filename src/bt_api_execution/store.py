@@ -49,6 +49,7 @@ from .errors import (
     DurableStoreError,
     IntentConflictError,
     InvalidStateTransition,
+    PaperImportResidualUnrepresentableError,
     WriterLeaseUnavailable,
 )
 from .group_contracts import GroupLegAuthorization, GroupPermitBinding
@@ -2613,6 +2614,7 @@ class SqliteExecutionStore:
             or scope.strategy_id != domain.strategy_ref
         ):
             raise ContractValidationError("typed legacy import and paper owner scope are required")
+        imported.validate_new_import()
         imported.validate_domain(scope, domain)
         domain_json = canonical_json(domain.to_payload())
         domain_sha256 = hashlib.sha256(domain_json.encode("utf-8")).hexdigest()
@@ -2723,6 +2725,15 @@ class SqliteExecutionStore:
             if row is None:
                 raise DurableStoreError("prepared paper legacy import is absent")
             receipt = self._paper_legacy_import_from_row(row, scope=scope)
+            # The source inventory may have a nonzero equity remainder that is
+            # correctly retained in the immutable import receipt, but the
+            # current active Paper owner has no spendable/valuation field for
+            # that amount.  Keep the receipt PREPARED and the legacy source
+            # fenced rather than activating a book whose equity would differ.
+            if receipt.imported.unallocated_equity_residual != 0:
+                raise PaperImportResidualUnrepresentableError(
+                    "legacy paper equity residual cannot be represented by the active book"
+                )
             domain_json = str(row["domain_json"])
             try:
                 domain_payload = json.loads(domain_json)
@@ -3025,6 +3036,7 @@ class SqliteExecutionStore:
                             account_key=account_key,
                             import_sha256=import_sha256,
                             domain_sha256=domain_sha256,
+                            unallocated_equity_residual=imported.unallocated_equity_residual,
                         )
 
                 active_imports = cursor.execute(

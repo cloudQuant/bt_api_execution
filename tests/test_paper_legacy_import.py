@@ -15,7 +15,12 @@ from bt_api_execution import (
     SqliteExecutionStore,
 )
 from bt_api_execution.contracts import ExecutionScope
-from bt_api_execution.errors import ContractValidationError, DurableStoreError, IntentConflictError
+from bt_api_execution.errors import (
+    ContractValidationError,
+    DurableStoreError,
+    IntentConflictError,
+    PaperImportResidualUnrepresentableError,
+)
 from bt_api_execution.paper_execution import PaperOpeningPositionV1
 from bt_api_execution.paper_legacy_import import (
     LegacyPaperSymbolBindingV1,
@@ -175,6 +180,8 @@ def _imported(*, pending_order: bool = False) -> PaperLegacyImportV1:
         document["positions"] = []
         document["account"]["current_cash"] = 1000.0  # type: ignore[index]
         document["account"]["total_equity"] = 1000.0  # type: ignore[index]
+        document["account"]["profit_loss"] = 0.0  # type: ignore[index]
+        document["account"]["profit_loss_pct"] = 0.0  # type: ignore[index]
     return PaperLegacyImportV1.from_source_document(
         source_account_id=_SOURCE_ACCOUNT_ID,
         source_owner_id=_SOURCE_OWNER_ID,
@@ -299,6 +306,176 @@ def test_import_prepares_without_owner_then_activates_the_exact_opening_snapshot
             == activated
         )
         assert store.activate_paper_legacy_import(scope, writer_lease=lease) == activated
+    finally:
+        store.close()
+
+
+def test_import_reconciles_profit_loss_and_handles_zero_initial_cash() -> None:
+    document = _source_document()
+    account = document["account"]
+    assert isinstance(account, dict)
+    account["initial_cash"] = 0.0
+    account["current_cash"] = 0.0
+    account["total_equity"] = 1.0
+    account["profit_loss"] = 1.0
+    account["profit_loss_pct"] = 0.0
+    document["orders"] = []
+    document["positions"] = []
+    document["trades"] = []
+
+    imported = PaperLegacyImportV1.from_source_document(
+        source_account_id=_SOURCE_ACCOUNT_ID,
+        source_owner_id=_SOURCE_OWNER_ID,
+        source_document=document,
+        cash_currency="USDT",
+        symbol_bindings=(LegacyPaperSymbolBindingV1("BTC/USDT", "BTC-USDT"),),
+    )
+    assert imported.unallocated_equity_residual == Decimal("1.0")
+
+    account["profit_loss"] = 0.0
+    with pytest.raises(ContractValidationError, match="profit and loss does not reconcile"):
+        PaperLegacyImportV1.from_source_document(
+            source_account_id=_SOURCE_ACCOUNT_ID,
+            source_owner_id=_SOURCE_OWNER_ID,
+            source_document=document,
+            cash_currency="USDT",
+            symbol_bindings=(LegacyPaperSymbolBindingV1("BTC/USDT", "BTC-USDT"),),
+        )
+
+    account["profit_loss"] = 1.0
+    account["profit_loss_pct"] = 1.0
+    with pytest.raises(
+        ContractValidationError,
+        match="profit and loss percent does not reconcile",
+    ):
+        PaperLegacyImportV1.from_source_document(
+            source_account_id=_SOURCE_ACCOUNT_ID,
+            source_owner_id=_SOURCE_OWNER_ID,
+            source_document=document,
+            cash_currency="USDT",
+            symbol_bindings=(LegacyPaperSymbolBindingV1("BTC/USDT", "BTC-USDT"),),
+        )
+
+
+def test_stored_v1_receipt_keeps_historically_accepted_pnl_readable(tmp_path) -> None:
+    scope = _scope()
+    domain = _domain(scope)
+    payload = _imported().to_payload()
+    document = json.loads(payload["source_document_json"])
+    # Earlier V1 receipts accepted finite P&L projections without enforcing
+    # the newer ingress reconciliation.  Reading them must preserve the
+    # receipt and owner rather than invalidating existing durable state.
+    document["account"]["profit_loss"] = 99.0
+    document["account"]["profit_loss_pct"] = -7.0
+    source_json = json.dumps(
+        document,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    payload["source_document_json"] = source_json
+    payload["source_sha256"] = hashlib.sha256(source_json.encode("utf-8")).hexdigest()
+    import_json = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    domain_json = json.dumps(
+        domain.to_payload(),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    row = {
+        "import_json": import_json,
+        "domain_json": domain_json,
+        "source_system": "afi_legacy_paper",
+        "source_account_id": _SOURCE_ACCOUNT_ID,
+        "source_owner_id": _SOURCE_OWNER_ID,
+        "source_sha256": payload["source_sha256"],
+        "import_sha256": hashlib.sha256(import_json.encode("utf-8")).hexdigest(),
+        "domain_sha256": hashlib.sha256(domain_json.encode("utf-8")).hexdigest(),
+        "scope_key": scope.key,
+        "account_key": scope.account_key,
+        "state": "ACTIVE",
+    }
+
+    receipt = SqliteExecutionStore._paper_legacy_import_from_row(row, scope=scope)
+
+    assert receipt.imported.to_payload() == payload
+    with pytest.raises(ContractValidationError, match="profit and loss does not reconcile"):
+        receipt.imported.validate_new_import()
+
+    store = SqliteExecutionStore(tmp_path / "paper-legacy-v1-ingress.sqlite3")
+    lease = _lease(store, scope)
+    try:
+        with pytest.raises(
+            ContractValidationError,
+            match="profit and loss does not reconcile",
+        ):
+            store.prepare_paper_legacy_import(
+                scope,
+                domain,
+                receipt.imported,
+                writer_lease=lease,
+            )
+        assert store.get_paper_legacy_import(scope) is None
+    finally:
+        store.close()
+
+
+def test_nonzero_equity_residual_stays_prepared_and_never_creates_active_owner(tmp_path):
+    scope = _scope()
+    domain = _domain(scope)
+    document = _source_document()
+    account = document["account"]
+    assert isinstance(account, dict)
+    account["total_equity"] = 1025.975
+    account["profit_loss"] = 25.975
+    account["profit_loss_pct"] = 2.5975
+    imported = PaperLegacyImportV1.from_source_document(
+        source_account_id=_SOURCE_ACCOUNT_ID,
+        source_owner_id=_SOURCE_OWNER_ID,
+        source_document=document,
+        cash_currency="USDT",
+        symbol_bindings=(LegacyPaperSymbolBindingV1("BTC/USDT", "BTC-USDT"),),
+    )
+    assert imported.unallocated_equity_residual == Decimal("1.000")
+
+    store = SqliteExecutionStore(tmp_path / "paper-legacy-residual.sqlite3")
+    lease = _lease(store, scope)
+    try:
+        prepared = store.prepare_paper_legacy_import(
+            scope, domain, imported, writer_lease=lease
+        )
+        assert prepared.state == "PREPARED"
+        assert prepared.imported.unallocated_equity_residual == Decimal("1.000")
+
+        with pytest.raises(PaperImportResidualUnrepresentableError):
+            store.activate_paper_legacy_import(scope, writer_lease=lease)
+
+        # The complete source facts and source fence remain durable, while the
+        # active owner stays absent.  Callers cannot turn this refusal into an
+        # empty-target success or silently discard the residual.
+        assert store.get_paper_legacy_import(scope) == prepared
+        status = store.inspect_paper_legacy_import_account(
+            scope, source_account_id=_SOURCE_ACCOUNT_ID
+        )
+        assert status.source_receipt is not None
+        assert status.source_receipt.state == "PREPARED"
+        assert status.source_receipt.unallocated_equity_residual == Decimal("1.000")
+        assert status.active_account_import_state == "PREPARED"
+        assert status.owner_domain_exists is False
+        assert (
+            store._connection.execute(
+                "SELECT 1 FROM paper_owner_domains WHERE scope_key = ?", (scope.key,)
+            ).fetchone()
+            is None
+        )
     finally:
         store.close()
 
