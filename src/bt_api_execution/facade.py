@@ -94,6 +94,16 @@ def _is_typed_risk_admission_denial(error: BaseException) -> bool:
     )
 
 
+def _is_paper_risk_admission_adapter(gate: object) -> bool:
+    """Select only the canonical Paper adapter's lease-aware snapshot path."""
+
+    try:
+        from .paper_risk import PaperRiskAdmissionAdapter
+    except ImportError:
+        return False
+    return type(gate) is PaperRiskAdmissionAdapter
+
+
 class ManagedExecutionFacade:
     """Coordinate durable intent admission and one provider dispatch attempt.
 
@@ -846,7 +856,12 @@ class ManagedExecutionFacade:
                 )
                 context_fingerprint = admission_context.fingerprint
             if gate is not None:
-                risk_permit = gate.reserve(intent)
+                if _is_paper_risk_admission_adapter(gate):
+                    risk_permit = gate.reserve_for_execution(
+                        intent, writer_lease=writer_lease
+                    )
+                else:
+                    risk_permit = gate.reserve(intent)
         except ExecutionBasicAdmissionDenied:
             if basic_reference is not None and basic_gate is not None:
                 basic_gate.revoke(basic_reference)
@@ -1119,7 +1134,14 @@ class ManagedExecutionFacade:
             if callable(claimer):
                 try:
                     self._store.assert_writer_lease(self._scope, writer_lease)
-                    claimer(reference, intent)
+                    if _is_paper_risk_admission_adapter(gate):
+                        gate.claim_for_dispatch_for_execution(
+                            reference,
+                            intent,
+                            writer_lease=writer_lease,
+                        )
+                    else:
+                        claimer(reference, intent)
                 except WriterLeaseUnavailable:
                     raise
                 except AdmissionDenied:
@@ -1354,6 +1376,25 @@ class ManagedExecutionFacade:
                 ),
                 False,
             )
+        resolve_paper_outcome = getattr(
+            self._admission_gate, "after_evidenced_outcome", None
+        )
+        if callable(resolve_paper_outcome):
+            try:
+                self._store.assert_writer_lease(self._scope, writer_lease)
+                resolve_paper_outcome(record, writer_lease=writer_lease)
+            except WriterLeaseUnavailable:
+                raise
+            except Exception:
+                return (
+                    self._store.mark_review_required(
+                        record.intent_id,
+                        self._scope,
+                        "paper_risk_resolution_failed",
+                        writer_lease=writer_lease,
+                    ),
+                    False,
+                )
         return record, True
 
     @staticmethod

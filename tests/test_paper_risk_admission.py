@@ -91,7 +91,7 @@ def _domain() -> PaperOwnerDomainV1:
     )
 
 
-def _risk_adapter(path, domain, matcher):
+def _risk_adapter(path, domain, matcher, store):
     scope = AccountScope(PAPER_PROVIDER, _SIM_ACCOUNT, PAPER_ENVIRONMENT)
     gate = DurableRiskGate(
         path,
@@ -110,7 +110,17 @@ def _risk_adapter(path, domain, matcher):
         max_notional=Decimal("500"),
         notional_unit="USDT",
     )
-    return gate, PaperRiskAdmissionAdapter(gate, domain, matcher), scope
+    return (
+        gate,
+        PaperRiskAdmissionAdapter(
+            gate,
+            domain,
+            matcher,
+            execution_store=store,
+            execution_scope=_EXECUTION_SCOPE,
+        ),
+        scope,
+    )
 
 
 def _order(intent_id: str, *, side: Side = Side.BUY) -> OrderIntent:
@@ -135,10 +145,10 @@ def test_managed_paper_risk_reserves_same_quote_used_by_durable_fill(tmp_path):
     domain = _domain()
     quotes = _QuoteSource()
     matcher = PaperMatchingPort(domain, quotes)
-    risk_gate, risk_adapter, risk_scope = _risk_adapter(
-        tmp_path / "paper-risk-ledger.sqlite3", domain, matcher
-    )
     store = SqliteExecutionStore(tmp_path / "paper-execution.sqlite3")
+    risk_gate, risk_adapter, risk_scope = _risk_adapter(
+        tmp_path / "paper-risk-ledger.sqlite3", domain, matcher, store
+    )
     try:
         validator = ExecutionProviderValidatorV1(
             provider_id=PAPER_PROVIDER,
@@ -203,6 +213,10 @@ def test_managed_paper_risk_reserves_same_quote_used_by_durable_fill(tmp_path):
         assert receipt.fee_amount == Decimal("0.0125")
         assert quotes.calls == ["BTC-USDT"]
         assert risk_adapter.is_bound_to(risk_gate)
+        assert risk_adapter.risk_gate is risk_gate
+        assert risk_adapter.is_bound_to_composition(risk_gate, domain, matcher)
+        assert not risk_adapter.is_bound_to_composition(risk_gate, _domain(), matcher)
+        assert not risk_adapter.is_bound_to_composition(risk_gate, domain, PaperMatchingPort(domain, quotes))
         assert risk_adapter.policy_binding.policy_id == "paper-risk-policy-v1-test"
         assert allocation.scope == risk_scope
         assert allocation.strategy_id == _STRATEGY
@@ -212,7 +226,7 @@ def test_managed_paper_risk_reserves_same_quote_used_by_durable_fill(tmp_path):
         close = _order("paper-risk-close-v1", side=Side.SELL)
         with pytest.raises(RiskAdmissionDeniedError) as denied:
             risk_adapter.reserve(close)
-        assert denied.value.code == "PAPER_RISK_CLOSE_REBASE_REQUIRED"
+        assert denied.value.code == "PAPER_EXECUTION_CONTEXT_REQUIRED"
         assert quotes.calls == ["BTC-USDT"]
         assert risk_gate.get_strategy_allocation(risk_scope, _STRATEGY).used_notional == Decimal(
             "12.5375"

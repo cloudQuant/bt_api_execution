@@ -8,8 +8,10 @@ quote leaf.
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from decimal import ROUND_HALF_EVEN, Decimal
+from time import time_ns
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
@@ -746,6 +748,113 @@ class PaperMatchingPort:
             raise ContractValidationError("paper matching port requires a trusted quote source")
         self.owner_domain = owner_domain
         self._quote_source = quote_source
+        self._risk_quote_lock = threading.RLock()
+        self._risk_quotes: dict[str, PaperQuoteV1] = {}
+        self._risk_quote_required: set[str] = set()
+
+    def prepare_risk_quote(self, intent: OrderIntent) -> PaperQuoteV1:
+        """Bind Risk valuation to the exact quote later used for this paper match.
+
+        This method is only for the trusted Paper/Risk composition. It does not
+        accept a client quote and it never changes the economic book. Repeated
+        Risk validation of one durable intent reuses its first quote; a stale
+        quote fails closed instead of being silently repriced under an existing
+        permit.
+        """
+
+        if type(intent) is not OrderIntent or intent.scope.provider != PAPER_PROVIDER:
+            raise ContractValidationError("paper risk quote requires a paper order intent")
+        spec = self.owner_domain.instrument(intent.instrument)
+        if (
+            spec is None
+            or intent.metadata_version != spec.metadata_version
+            or intent.order_type is not OrderType.MARKET
+            or intent.time_in_force is not TimeInForce.FOK
+            or not (
+                (
+                    intent.side is Side.BUY
+                    and intent.position_effect is PositionEffect.OPEN
+                    and not intent.reduce_only
+                )
+                or (
+                    intent.side is Side.SELL
+                    and intent.position_effect is PositionEffect.CLOSE
+                    and intent.reduce_only
+                )
+            )
+        ):
+            raise ContractValidationError("paper risk order is outside the supported matching domain")
+        with self._risk_quote_lock:
+            quote = self._risk_quotes.get(intent.fingerprint)
+            if quote is None:
+                try:
+                    quote = self._quote_source.read_quote(intent.instrument)
+                except Exception:
+                    raise ContractValidationError("paper risk quote is unavailable") from None
+                self._validate_risk_quote(quote, intent, spec)
+                if len(self._risk_quotes) >= 1024:
+                    now = time_ns()
+                    stale = [
+                        key
+                        for key, value in self._risk_quotes.items()
+                        if now >= value.as_of_ns
+                        and now - value.as_of_ns > self.owner_domain.max_quote_age_ns
+                    ]
+                    for key in stale:
+                        self._risk_quotes.pop(key, None)
+                        self._risk_quote_required.discard(key)
+                    if len(self._risk_quotes) >= 1024:
+                        raise ContractValidationError("paper risk quote capacity is full")
+                self._risk_quotes[intent.fingerprint] = quote
+                self._risk_quote_required.add(intent.fingerprint)
+            self._validate_risk_quote(quote, intent, spec)
+            self._risk_quote_required.add(intent.fingerprint)
+            return quote
+
+    def restore_risk_quote(self, intent: OrderIntent, quote: PaperQuoteV1) -> None:
+        """Restore an exact durable admission quote without consulting its source."""
+
+        if type(intent) is not OrderIntent:
+            raise ContractValidationError("paper risk quote restore requires a typed order")
+        spec = self.owner_domain.instrument(intent.instrument)
+        if spec is None:
+            raise ContractValidationError("paper risk quote instrument is not configured")
+        self._validate_risk_quote(quote, intent, spec)
+        with self._risk_quote_lock:
+            prior = self._risk_quotes.get(intent.fingerprint)
+            if prior is not None and prior != quote:
+                raise ContractValidationError("paper risk quote conflicts with its durable snapshot")
+            self._risk_quotes[intent.fingerprint] = quote
+            self._risk_quote_required.add(intent.fingerprint)
+
+    def discard_risk_quote(self, intent_fingerprint: str) -> None:
+        """Discard an unused quote after Risk definitively refuses an intent."""
+
+        if type(intent_fingerprint) is not str or len(intent_fingerprint) != 64:
+            raise ContractValidationError("invalid paper risk intent fingerprint")
+        with self._risk_quote_lock:
+            self._risk_quotes.pop(intent_fingerprint, None)
+            self._risk_quote_required.discard(intent_fingerprint)
+
+    def _validate_risk_quote(
+        self,
+        quote: PaperQuoteV1 | None,
+        intent: OrderIntent,
+        spec: PaperInstrumentV1,
+    ) -> None:
+        now = time_ns()
+        if (
+            type(quote) is not PaperQuoteV1
+            or quote.source_ref != self.owner_domain.quote_source_ref
+            or quote.instrument != intent.instrument
+            or quote.metadata_version != spec.metadata_version
+            or quote.quote_currency != spec.quote_currency
+            or quote.bid % spec.price_tick != 0
+            or quote.ask % spec.price_tick != 0
+            or now < quote.as_of_ns
+            or now - quote.as_of_ns > self.owner_domain.max_quote_age_ns
+        ):
+            raise ContractValidationError("paper risk quote is invalid or stale")
 
     def submit(self, intent: OrderIntent) -> PaperDispatchResultV1:
         raise ContractValidationError("paper matching requires execution-only admission")
@@ -850,16 +959,29 @@ class PaperMatchingPort:
                 "paper_time_in_force_unsupported",
                 authorization,
             )
-        try:
-            quote = self._quote_source.read_quote(intent.instrument)
-        except Exception:
-            return PaperDispatchResultV1(
-                intent.intent_id,
-                intent.fingerprint,
-                None,
-                "paper_quote_unavailable",
-                authorization,
-            )
+        with self._risk_quote_lock:
+            quote = self._risk_quotes.pop(intent.fingerprint, None)
+            risk_quote_required = intent.fingerprint in self._risk_quote_required
+            self._risk_quote_required.discard(intent.fingerprint)
+        if quote is None:
+            if risk_quote_required:
+                return PaperDispatchResultV1(
+                    intent.intent_id,
+                    intent.fingerprint,
+                    None,
+                    "paper_quote_unavailable",
+                    authorization,
+                )
+            try:
+                quote = self._quote_source.read_quote(intent.instrument)
+            except Exception:
+                return PaperDispatchResultV1(
+                    intent.intent_id,
+                    intent.fingerprint,
+                    None,
+                    "paper_quote_unavailable",
+                    authorization,
+                )
         if quote is None:
             return PaperDispatchResultV1(
                 intent.intent_id,
@@ -881,6 +1003,17 @@ class PaperMatchingPort:
                 "paper_quote_invalid",
                 authorization,
             )
+        if risk_quote_required:
+            try:
+                self._validate_risk_quote(quote, intent, spec)
+            except ContractValidationError:
+                return PaperDispatchResultV1(
+                    intent.intent_id,
+                    intent.fingerprint,
+                    None,
+                    "paper_quote_invalid",
+                    authorization,
+                )
         return PaperDispatchResultV1(
             intent.intent_id,
             intent.fingerprint,
