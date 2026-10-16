@@ -68,7 +68,20 @@ def _reply(ok: bool, code: str, result: Mapping[str, object]) -> Mapping[str, An
 
 
 def _arguments(arguments: Mapping[str, object], expected: frozenset[str]) -> bool:
-    return isinstance(arguments, Mapping) and type(arguments) is dict and set(arguments) == expected
+    return (
+        type(arguments) in {dict, MappingProxyType}
+        and set(arguments) == expected
+    )
+
+
+def _plain_wire_json(value: object) -> object:
+    """Copy immutable Wire JSON values into the strict model decoder shape."""
+
+    if type(value) in {dict, MappingProxyType}:
+        return {key: _plain_wire_json(item) for key, item in value.items()}
+    if type(value) in {list, tuple}:
+        return [_plain_wire_json(item) for item in value]
+    return value
 
 
 def _receipt_projection(receipt: PaperLegacyImportReceiptV1) -> dict[str, object]:
@@ -217,7 +230,8 @@ class PaperLegacyImportService:
             if not _arguments(arguments, frozenset({"imported"})):
                 return _reply(False, "INVALID_ARGUMENTS", {})
             try:
-                imported = PaperLegacyImportV1.from_payload(arguments["imported"])
+                imported_payload = _plain_wire_json(arguments["imported"])
+                imported = PaperLegacyImportV1.from_payload(imported_payload)
                 imported.validate_new_import()
                 imported.validate_domain(execution_scope, self._domain)
             except Exception:
