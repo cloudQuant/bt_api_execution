@@ -406,7 +406,11 @@ class ExecutionJournalCutV1:
         if type(self.high_water_sequence) is not int or self.high_water_sequence < 0:
             raise ContractValidationError("invalid recovery outbox high-water")
         if self.row_count == 0:
-            if self.first_sequence is not None or self.last_sequence is not None or self.high_water_sequence:
+            if (
+                self.first_sequence is not None
+                or self.last_sequence is not None
+                or self.high_water_sequence
+            ):
                 raise ContractValidationError("empty recovery outbox bounds are inconsistent")
         elif (
             type(self.first_sequence) is not int
@@ -450,13 +454,18 @@ class ExecutionOutboxPageV1:
     def __post_init__(self) -> None:
         if type(self.has_more) is not bool:
             raise ContractValidationError("invalid recovery page continuation state")
-        if type(self.scanned_through) is not int or not 0 <= self.scanned_through <= self.cut.high_water_sequence:
+        if (
+            type(self.scanned_through) is not int
+            or not 0 <= self.scanned_through <= self.cut.high_water_sequence
+        ):
             raise ContractValidationError("invalid recovery page scanned cursor")
         if self.has_more:
             if not self.events or self.scanned_through != self.events[-1].sequence:
                 raise ContractValidationError("recovery continuation cursor is inconsistent")
         elif self.scanned_through != self.cut.high_water_sequence:
-            raise ContractValidationError("complete recovery page did not scan to journal high-water")
+            raise ContractValidationError(
+                "complete recovery page did not scan to journal high-water"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -2145,13 +2154,18 @@ class SqliteExecutionStore:
     def _ensure_paper_schema(cursor: sqlite3.Cursor, *, create: bool) -> None:
         """Create or verify the separately versioned, opt-in paper tables."""
 
-        expected_objects = {
+        version_one_objects = {
             "paper_owner_domains",
             "paper_match_receipts",
             "paper_owner_domains_immutable_update",
             "paper_owner_domains_immutable_delete",
             "paper_match_receipts_immutable_update",
             "paper_match_receipts_immutable_delete",
+        }
+        version_two_objects = version_one_objects | {
+            "paper_legacy_import_receipts",
+            "paper_legacy_import_receipts_state_transition",
+            "paper_legacy_import_receipts_immutable_delete",
         }
         version_row = cursor.execute(
             "SELECT value FROM execution_meta WHERE key = 'paper_schema_version'"
@@ -2233,8 +2247,10 @@ class SqliteExecutionStore:
             cursor.execute(
                 "INSERT INTO execution_meta(key, value) VALUES ('paper_schema_version', '1')"
             )
-        elif str(version_row["value"]) != "1":
+        schema_version = "1" if version_row is None else str(version_row["value"])
+        if schema_version not in {"1", "2"}:
             raise DurableStoreError("unsupported paper execution schema version")
+        expected_objects = version_one_objects if schema_version == "1" else version_two_objects
         existing_objects = {
             str(row["name"])
             for row in cursor.execute(
@@ -2277,6 +2293,25 @@ class SqliteExecutionStore:
                 "writer_fencing_token",
             ),
         }
+        if schema_version == "2":
+            expected_columns["paper_legacy_import_receipts"] = (
+                "scope_key",
+                "account_key",
+                "source_system",
+                "source_account_id",
+                "source_owner_id",
+                "source_sha256",
+                "domain_sha256",
+                "domain_json",
+                "import_sha256",
+                "import_json",
+                "state",
+                "created_at_ns",
+                "updated_at_ns",
+                "writer_scope_key",
+                "writer_owner_id",
+                "writer_fencing_token",
+            )
         for table_name, expected in expected_columns.items():
             columns = tuple(
                 str(row["name"])
@@ -2284,6 +2319,104 @@ class SqliteExecutionStore:
             )
             if columns != expected:
                 raise DurableStoreError("paper execution table shape is unknown")
+        expected_indexes = (
+            {
+                "paper_legacy_import_receipts_active_account",
+                "paper_legacy_import_receipts_active_source",
+            }
+            if schema_version == "2"
+            else set()
+        )
+        existing_indexes = {
+            str(row["name"])
+            for row in cursor.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' "
+                "AND name LIKE 'paper_%' AND sql IS NOT NULL"
+            ).fetchall()
+        }
+        if existing_indexes != expected_indexes:
+            raise DurableStoreError("paper execution indexes are incomplete or unknown")
+
+    @staticmethod
+    def _upgrade_paper_schema_v2(cursor: sqlite3.Cursor) -> None:
+        """Explicitly add immutable imported-baseline receipts to paper schema v1."""
+
+        SqliteExecutionStore._ensure_paper_schema(cursor, create=True)
+        version_row = cursor.execute(
+            "SELECT value FROM execution_meta WHERE key = 'paper_schema_version'"
+        ).fetchone()
+        if version_row is None:
+            raise DurableStoreError("paper execution schema version is missing")
+        version = str(version_row["value"])
+        if version == "2":
+            SqliteExecutionStore._ensure_paper_schema(cursor, create=False)
+            return
+        if version != "1":
+            raise DurableStoreError("unsupported paper execution schema version")
+        SqliteExecutionStore._execute_schema_statements(
+            cursor,
+            """
+            CREATE TABLE paper_legacy_import_receipts (
+                scope_key TEXT PRIMARY KEY,
+                account_key TEXT NOT NULL,
+                source_system TEXT NOT NULL CHECK(source_system = 'afi_legacy_paper'),
+                source_account_id TEXT NOT NULL,
+                source_owner_id TEXT NOT NULL,
+                source_sha256 TEXT NOT NULL CHECK(length(source_sha256) = 64),
+                domain_sha256 TEXT NOT NULL CHECK(length(domain_sha256) = 64),
+                domain_json TEXT NOT NULL,
+                import_sha256 TEXT NOT NULL CHECK(length(import_sha256) = 64),
+                import_json TEXT NOT NULL,
+                state TEXT NOT NULL CHECK(state IN ('PREPARED', 'ACTIVE', 'ABORTED')),
+                created_at_ns INTEGER NOT NULL CHECK(created_at_ns > 0),
+                updated_at_ns INTEGER NOT NULL CHECK(updated_at_ns >= created_at_ns),
+                writer_scope_key TEXT NOT NULL,
+                writer_owner_id TEXT NOT NULL,
+                writer_fencing_token INTEGER NOT NULL CHECK(writer_fencing_token > 0)
+            );
+            CREATE UNIQUE INDEX paper_legacy_import_receipts_active_account
+            ON paper_legacy_import_receipts(account_key)
+            WHERE state IN ('PREPARED', 'ACTIVE');
+            CREATE UNIQUE INDEX paper_legacy_import_receipts_active_source
+            ON paper_legacy_import_receipts(source_account_id)
+            WHERE state IN ('PREPARED', 'ACTIVE');
+            CREATE TRIGGER paper_legacy_import_receipts_state_transition
+            BEFORE UPDATE ON paper_legacy_import_receipts
+            WHEN NOT (
+                OLD.state = 'PREPARED'
+                AND NEW.state IN ('ACTIVE', 'ABORTED')
+                AND NEW.scope_key = OLD.scope_key
+                AND NEW.account_key = OLD.account_key
+                AND NEW.source_system = OLD.source_system
+                AND NEW.source_account_id = OLD.source_account_id
+                AND NEW.source_owner_id = OLD.source_owner_id
+                AND NEW.source_sha256 = OLD.source_sha256
+                AND NEW.domain_sha256 = OLD.domain_sha256
+                AND NEW.domain_json = OLD.domain_json
+                AND NEW.import_sha256 = OLD.import_sha256
+                AND NEW.import_json = OLD.import_json
+                AND NEW.created_at_ns = OLD.created_at_ns
+                AND NEW.writer_scope_key = OLD.writer_scope_key
+                AND NEW.writer_owner_id = OLD.writer_owner_id
+                AND NEW.writer_fencing_token = OLD.writer_fencing_token
+                AND NEW.updated_at_ns > OLD.updated_at_ns
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'paper legacy import receipt transition is invalid');
+            END;
+            CREATE TRIGGER paper_legacy_import_receipts_immutable_delete
+            BEFORE DELETE ON paper_legacy_import_receipts
+            BEGIN
+                SELECT RAISE(ABORT, 'paper legacy import receipts are immutable');
+            END;
+            """,
+        )
+        cursor.execute(
+            "UPDATE execution_meta SET value = '2' WHERE key = 'paper_schema_version' AND value = '1'"
+        )
+        if cursor.rowcount != 1:
+            raise DurableStoreError("paper execution schema upgrade lost its version fence")
+        SqliteExecutionStore._ensure_paper_schema(cursor, create=False)
 
     def register_paper_owner_domain(
         self,
@@ -2312,9 +2445,25 @@ class SqliteExecutionStore:
             transaction_now_ns = time.time_ns()
             self._assert_active_writer_lease(cursor, scope, writer_lease, now_ns=transaction_now_ns)
             self._ensure_paper_schema(cursor, create=True)
+            schema_version = cursor.execute(
+                "SELECT value FROM execution_meta WHERE key = 'paper_schema_version'"
+            ).fetchone()
+            legacy_import = None
+            if schema_version is not None and str(schema_version["value"]) == "2":
+                legacy_import = cursor.execute(
+                    "SELECT state FROM paper_legacy_import_receipts "
+                    "WHERE scope_key = ? OR account_key = ? ORDER BY created_at_ns DESC LIMIT 1",
+                    (scope.key, scope.account_key),
+                ).fetchone()
+                if legacy_import is not None and str(legacy_import["state"]) != "ACTIVE":
+                    raise DurableStoreError(
+                        "paper owner registration is blocked by legacy import state"
+                    )
             existing = cursor.execute(
                 "SELECT * FROM paper_owner_domains WHERE scope_key = ?", (scope.key,)
             ).fetchone()
+            if legacy_import is not None and existing is None:
+                raise DurableStoreError("active legacy import lost its paper owner domain")
             if existing is not None:
                 if (
                     str(existing["account_key"]) != scope.account_key
@@ -2377,6 +2526,365 @@ class SqliteExecutionStore:
             final_now_ns = time.time_ns()
             self._assert_active_writer_lease(cursor, scope, writer_lease, now_ns=final_now_ns)
         return domain_sha
+
+    @staticmethod
+    def _paper_import_has_execution_history(cursor: sqlite3.Cursor, scope: ExecutionScope) -> bool:
+        queries = (
+            "SELECT 1 FROM execution_records WHERE scope_key = ? LIMIT 1",
+            "SELECT 1 FROM execution_outbox WHERE scope_key = ? LIMIT 1",
+            "SELECT 1 FROM cancellation_records WHERE scope_key = ? LIMIT 1",
+            "SELECT 1 FROM cancellation_outbox WHERE scope_key = ? LIMIT 1",
+        )
+        return any(
+            cursor.execute(query, (scope.key,)).fetchone() is not None for query in queries
+        )
+
+    @staticmethod
+    def _paper_legacy_import_from_row(row: sqlite3.Row, *, scope: ExecutionScope) -> Any:
+        from .paper_execution import PaperOwnerDomainV1
+        from .paper_legacy_import import PaperLegacyImportReceiptV1, PaperLegacyImportV1
+
+        try:
+            import_json = str(row["import_json"])
+            import_payload = json.loads(import_json)
+            domain_json = str(row["domain_json"])
+            domain_payload = json.loads(domain_json)
+            if (
+                canonical_json(import_payload) != import_json
+                or canonical_json(domain_payload) != domain_json
+            ):
+                raise ValueError("noncanonical imported paper payload")
+            imported = PaperLegacyImportV1.from_payload(import_payload)
+            domain = PaperOwnerDomainV1.from_payload(domain_payload)
+            imported.validate_domain(scope, domain)
+            import_sha256 = hashlib.sha256(import_json.encode("utf-8")).hexdigest()
+            domain_sha256 = hashlib.sha256(domain_json.encode("utf-8")).hexdigest()
+            if (
+                str(row["source_system"]) != "afi_legacy_paper"
+                or str(row["source_account_id"]) != imported.source_account_id
+                or str(row["source_owner_id"]) != imported.source_owner_id
+                or str(row["source_sha256"]) != imported.source_sha256
+                or str(row["import_sha256"]) != import_sha256
+                or imported.fingerprint != import_sha256
+                or str(row["domain_sha256"]) != domain_sha256
+                or domain.fingerprint != domain_sha256
+                or str(row["scope_key"]) != scope.key
+                or str(row["account_key"]) != scope.account_key
+            ):
+                raise ValueError("legacy import receipt binding changed")
+            return PaperLegacyImportReceiptV1(
+                state=str(row["state"]),
+                scope_key=str(row["scope_key"]),
+                account_key=str(row["account_key"]),
+                import_sha256=import_sha256,
+                domain_sha256=domain_sha256,
+                imported=imported,
+            )
+        except (ContractValidationError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise DurableStoreError("stored paper legacy import is unreadable") from error
+
+    def prepare_paper_legacy_import(
+        self,
+        scope: ExecutionScope,
+        domain: Any,
+        imported: Any,
+        *,
+        writer_lease: WriterLease,
+    ) -> Any:
+        """Persist a provenance-only import receipt without enabling its owner.
+
+        This is phase one of the source-freeze handoff. The paper owner domain
+        remains absent until ``activate_paper_legacy_import`` commits it.
+        Repeating the exact source/domain pair is idempotent; conflicting
+        source facts or mappings fail closed.
+        """
+
+        from .paper_execution import PAPER_ENVIRONMENT, PAPER_PROVIDER, PaperOwnerDomainV1
+        from .paper_legacy_import import PaperLegacyImportV1
+
+        if (
+            type(scope) is not ExecutionScope
+            or type(domain) is not PaperOwnerDomainV1
+            or type(imported) is not PaperLegacyImportV1
+            or type(writer_lease) is not WriterLease
+            or scope.provider != PAPER_PROVIDER
+            or scope.environment != PAPER_ENVIRONMENT
+            or scope.account_ref != domain.simulation_account_ref
+            or scope.strategy_id != domain.strategy_ref
+        ):
+            raise ContractValidationError("typed legacy import and paper owner scope are required")
+        imported.validate_domain(scope, domain)
+        domain_json = canonical_json(domain.to_payload())
+        domain_sha256 = hashlib.sha256(domain_json.encode("utf-8")).hexdigest()
+        import_json = canonical_json(imported.to_payload())
+        import_sha256 = hashlib.sha256(import_json.encode("utf-8")).hexdigest()
+        if imported.fingerprint != import_sha256:
+            raise ContractValidationError("legacy paper import fingerprint changed")
+
+        with self._transaction() as cursor:
+            now_ns = time.time_ns()
+            self._assert_active_writer_lease(cursor, scope, writer_lease, now_ns=now_ns)
+            self._upgrade_paper_schema_v2(cursor)
+            same_source = cursor.execute(
+                "SELECT * FROM paper_legacy_import_receipts "
+                "WHERE source_account_id = ? AND state IN ('PREPARED', 'ACTIVE') LIMIT 1",
+                (imported.source_account_id,),
+            ).fetchone()
+            if same_source is not None:
+                receipt = self._paper_legacy_import_from_row(same_source, scope=scope)
+                if (
+                    receipt.scope_key != scope.key
+                    or receipt.import_sha256 != import_sha256
+                    or receipt.domain_sha256 != domain_sha256
+                    or str(same_source["import_json"]) != import_json
+                    or str(same_source["domain_json"]) != domain_json
+                ):
+                    raise IntentConflictError("legacy paper source already has a different import")
+                self._assert_active_writer_lease(cursor, scope, writer_lease, now_ns=time.time_ns())
+                return receipt
+
+            if (
+                cursor.execute(
+                    "SELECT 1 FROM paper_legacy_import_receipts WHERE scope_key = ? LIMIT 1",
+                    (scope.key,),
+                ).fetchone()
+                is not None
+            ):
+                raise IntentConflictError("legacy paper import scope has prior receipt history")
+            if (
+                cursor.execute(
+                    "SELECT 1 FROM paper_owner_domains WHERE account_key = ? LIMIT 1",
+                    (scope.account_key,),
+                ).fetchone()
+                is not None
+            ):
+                raise DurableStoreError("paper account already has an owner domain")
+            if self._paper_import_has_execution_history(cursor, scope):
+                raise DurableStoreError("paper legacy import cannot adopt execution history")
+
+            cursor.execute(
+                """
+                INSERT INTO paper_legacy_import_receipts(
+                    scope_key, account_key, source_system, source_account_id, source_owner_id,
+                    source_sha256, domain_sha256, domain_json, import_sha256, import_json,
+                    state, created_at_ns, updated_at_ns, writer_scope_key, writer_owner_id,
+                    writer_fencing_token
+                ) VALUES (?, ?, 'afi_legacy_paper', ?, ?, ?, ?, ?, ?, ?, 'PREPARED', ?, ?, ?, ?, ?)
+                """,
+                (
+                    scope.key,
+                    scope.account_key,
+                    imported.source_account_id,
+                    imported.source_owner_id,
+                    imported.source_sha256,
+                    domain_sha256,
+                    domain_json,
+                    import_sha256,
+                    import_json,
+                    now_ns,
+                    now_ns,
+                    scope.key,
+                    writer_lease.owner_id,
+                    writer_lease.fencing_token,
+                ),
+            )
+            self._assert_active_writer_lease(cursor, scope, writer_lease, now_ns=time.time_ns())
+            row = cursor.execute(
+                "SELECT * FROM paper_legacy_import_receipts WHERE scope_key = ?", (scope.key,)
+            ).fetchone()
+            if row is None:
+                raise DurableStoreError("paper legacy import receipt was not persisted")
+            return self._paper_legacy_import_from_row(row, scope=scope)
+
+    def activate_paper_legacy_import(
+        self,
+        scope: ExecutionScope,
+        *,
+        writer_lease: WriterLease,
+    ) -> Any:
+        """Atomically create the imported opening owner from one prepared receipt."""
+
+        from .paper_execution import PAPER_ENVIRONMENT, PAPER_PROVIDER, PaperOwnerDomainV1
+
+        if (
+            type(scope) is not ExecutionScope
+            or scope.provider != PAPER_PROVIDER
+            or scope.environment != PAPER_ENVIRONMENT
+            or type(writer_lease) is not WriterLease
+        ):
+            raise ContractValidationError("paper scope and writer lease are required")
+        with self._transaction() as cursor:
+            now_ns = time.time_ns()
+            self._assert_active_writer_lease(cursor, scope, writer_lease, now_ns=now_ns)
+            self._ensure_paper_schema(cursor, create=False)
+            row = cursor.execute(
+                "SELECT * FROM paper_legacy_import_receipts WHERE scope_key = ?", (scope.key,)
+            ).fetchone()
+            if row is None:
+                raise DurableStoreError("prepared paper legacy import is absent")
+            receipt = self._paper_legacy_import_from_row(row, scope=scope)
+            domain_json = str(row["domain_json"])
+            try:
+                domain_payload = json.loads(domain_json)
+                domain = PaperOwnerDomainV1.from_payload(domain_payload)
+            except (ContractValidationError, TypeError, ValueError, json.JSONDecodeError) as error:
+                raise DurableStoreError("prepared paper legacy domain is unreadable") from error
+            if receipt.state == "ACTIVE":
+                existing = cursor.execute(
+                    "SELECT * FROM paper_owner_domains WHERE scope_key = ?", (scope.key,)
+                ).fetchone()
+                if (
+                    existing is None
+                    or str(existing["domain_sha256"]) != receipt.domain_sha256
+                    or str(existing["domain_json"]) != domain_json
+                ):
+                    raise DurableStoreError("active legacy import owner binding changed")
+                self._assert_active_writer_lease(cursor, scope, writer_lease, now_ns=time.time_ns())
+                return receipt
+            if receipt.state != "PREPARED":
+                raise DurableStoreError("aborted legacy paper import cannot be activated")
+            if self._paper_import_has_execution_history(cursor, scope):
+                raise DurableStoreError(
+                    "paper legacy import cannot activate over execution history"
+                )
+            if (
+                cursor.execute(
+                    "SELECT 1 FROM paper_owner_domains WHERE account_key = ? LIMIT 1",
+                    (scope.account_key,),
+                ).fetchone()
+                is not None
+            ):
+                raise DurableStoreError("paper account already has an owner domain")
+            existing_import = cursor.execute(
+                "SELECT 1 FROM paper_legacy_import_receipts "
+                "WHERE account_key = ? AND state = 'ACTIVE' LIMIT 1",
+                (scope.account_key,),
+            ).fetchone()
+            if existing_import is not None:
+                raise DurableStoreError("paper account already has an active legacy import")
+
+            cursor.execute(
+                """
+                INSERT INTO paper_owner_domains(
+                    scope_key, account_key, execution_domain_ref, simulation_account_ref,
+                    experiment_ref, strategy_ref, model_ref, model_version, domain_sha256,
+                    domain_json, registered_at_ns, writer_scope_key, writer_owner_id,
+                    writer_fencing_token
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    scope.key,
+                    scope.account_key,
+                    domain.execution_domain_ref,
+                    domain.simulation_account_ref,
+                    domain.experiment_ref,
+                    domain.strategy_ref,
+                    domain.model_ref,
+                    domain.model_version,
+                    receipt.domain_sha256,
+                    domain_json,
+                    now_ns,
+                    scope.key,
+                    writer_lease.owner_id,
+                    writer_lease.fencing_token,
+                ),
+            )
+            cursor.execute(
+                "UPDATE paper_legacy_import_receipts SET state = 'ACTIVE', updated_at_ns = ? "
+                "WHERE scope_key = ? AND state = 'PREPARED'",
+                (max(time.time_ns(), int(row["updated_at_ns"]) + 1), scope.key),
+            )
+            if cursor.rowcount != 1:
+                raise DurableStoreError("paper legacy import activation lost its state fence")
+            self._assert_active_writer_lease(cursor, scope, writer_lease, now_ns=time.time_ns())
+            activated = cursor.execute(
+                "SELECT * FROM paper_legacy_import_receipts WHERE scope_key = ?", (scope.key,)
+            ).fetchone()
+            if activated is None:
+                raise DurableStoreError("active paper legacy import receipt is missing")
+            return self._paper_legacy_import_from_row(activated, scope=scope)
+
+    def abort_paper_legacy_import(
+        self,
+        scope: ExecutionScope,
+        *,
+        source_sha256: str,
+        writer_lease: WriterLease,
+    ) -> Any:
+        """Rollback only a prepared import that has never acquired an owner."""
+
+        from .paper_execution import PAPER_ENVIRONMENT, PAPER_PROVIDER
+
+        if (
+            type(scope) is not ExecutionScope
+            or scope.provider != PAPER_PROVIDER
+            or scope.environment != PAPER_ENVIRONMENT
+            or type(source_sha256) is not str
+            or not _is_sha256(source_sha256)
+            or type(writer_lease) is not WriterLease
+        ):
+            raise ContractValidationError("paper legacy rollback binding is invalid")
+        with self._transaction() as cursor:
+            now_ns = time.time_ns()
+            self._assert_active_writer_lease(cursor, scope, writer_lease, now_ns=now_ns)
+            self._ensure_paper_schema(cursor, create=False)
+            row = cursor.execute(
+                "SELECT * FROM paper_legacy_import_receipts WHERE scope_key = ?", (scope.key,)
+            ).fetchone()
+            if row is None or str(row["source_sha256"]) != source_sha256:
+                raise DurableStoreError("paper legacy rollback source does not match")
+            receipt = self._paper_legacy_import_from_row(row, scope=scope)
+            if receipt.state == "ABORTED":
+                return receipt
+            if receipt.state != "PREPARED":
+                raise DurableStoreError("active legacy paper import cannot be rolled back")
+            if cursor.execute(
+                "SELECT 1 FROM paper_owner_domains WHERE scope_key = ?", (scope.key,)
+            ).fetchone() is not None or self._paper_import_has_execution_history(cursor, scope):
+                raise DurableStoreError("paper legacy import has crossed its rollback boundary")
+            cursor.execute(
+                "UPDATE paper_legacy_import_receipts SET state = 'ABORTED', updated_at_ns = ? "
+                "WHERE scope_key = ? AND state = 'PREPARED'",
+                (max(time.time_ns(), int(row["updated_at_ns"]) + 1), scope.key),
+            )
+            if cursor.rowcount != 1:
+                raise DurableStoreError("paper legacy rollback lost its state fence")
+            self._assert_active_writer_lease(cursor, scope, writer_lease, now_ns=time.time_ns())
+            aborted = cursor.execute(
+                "SELECT * FROM paper_legacy_import_receipts WHERE scope_key = ?", (scope.key,)
+            ).fetchone()
+            if aborted is None:
+                raise DurableStoreError("aborted paper legacy import receipt is missing")
+            return self._paper_legacy_import_from_row(aborted, scope=scope)
+
+    def get_paper_legacy_import(self, scope: ExecutionScope) -> Any | None:
+        """Read one immutable legacy import receipt without changing paper state."""
+
+        from .paper_execution import PAPER_ENVIRONMENT, PAPER_PROVIDER
+
+        if (
+            type(scope) is not ExecutionScope
+            or scope.provider != PAPER_PROVIDER
+            or scope.environment != PAPER_ENVIRONMENT
+        ):
+            raise ContractValidationError("paper legacy import reads require a paper scope")
+        try:
+            with self._read_transaction() as cursor:
+                version_row = cursor.execute(
+                    "SELECT value FROM execution_meta WHERE key = 'paper_schema_version'"
+                ).fetchone()
+                if version_row is None or str(version_row["value"]) == "1":
+                    return None
+                self._ensure_paper_schema(cursor, create=False)
+                row = cursor.execute(
+                    "SELECT * FROM paper_legacy_import_receipts WHERE scope_key = ?",
+                    (scope.key,),
+                ).fetchone()
+                return None if row is None else self._paper_legacy_import_from_row(row, scope=scope)
+        except DurableStoreError:
+            raise
+        except (sqlite3.Error, ContractValidationError, TypeError, ValueError) as error:
+            raise DurableStoreError("unable to read paper legacy import") from error
 
     @staticmethod
     def _paper_domain_in_transaction(cursor: sqlite3.Cursor, scope: ExecutionScope) -> Any:
@@ -3037,9 +3545,7 @@ class SqliteExecutionStore:
             # Evaluation and V2 replay use this exact sample. Event creation
             # gets its own later local journal timestamp below.
             match_time_ns = time.time_ns()
-            self._assert_active_writer_lease(
-                cursor, scope, writer_lease, now_ns=match_time_ns
-            )
+            self._assert_active_writer_lease(cursor, scope, writer_lease, now_ns=match_time_ns)
             parameters = authorization.parameters
             if (
                 type(parameters) is not ExecutionProviderOrderParametersV1
@@ -17647,7 +18153,9 @@ class SqliteExecutionStore:
                 high_water_sequence=high_water,
             )
         except ContractValidationError as error:
-            raise DurableStoreError("execution outbox is not a complete contiguous journal") from error
+            raise DurableStoreError(
+                "execution outbox is not a complete contiguous journal"
+            ) from error
 
     @staticmethod
     def _recovery_record_from_row(
@@ -17672,7 +18180,13 @@ class SqliteExecutionStore:
             ):
                 raise ValueError("execution record does not match its trusted intent scope")
             return ExecutionRecoveryIntentV1(record=record, intent=intent)
-        except (ContractValidationError, DurableStoreError, TypeError, ValueError, KeyError) as error:
+        except (
+            ContractValidationError,
+            DurableStoreError,
+            TypeError,
+            ValueError,
+            KeyError,
+        ) as error:
             raise DurableStoreError("stored execution recovery record is inconsistent") from error
 
     @staticmethod
@@ -17729,9 +18243,7 @@ class SqliteExecutionStore:
                 raise DurableStoreError("recovery snapshot exceeds its bounded event history")
             events = self._recovery_events_from_rows(event_rows, cut=cut)
 
-        record_by_key = {
-            (item.record.scope_key, item.record.intent_id): item for item in records
-        }
+        record_by_key = {(item.record.scope_key, item.record.intent_id): item for item in records}
         history: dict[tuple[str, str], list[ExecutionEvent]] = {}
         for event in events:
             key = (event.scope_key, event.intent_id)
@@ -17804,7 +18316,9 @@ class SqliteExecutionStore:
             has_more = len(rows) > limit
             page_rows = rows[:limit]
             events = self._recovery_events_from_rows(page_rows, cut=cut)
-            event_keys = tuple(dict.fromkeys((event.scope_key, event.intent_id) for event in events))
+            event_keys = tuple(
+                dict.fromkeys((event.scope_key, event.intent_id) for event in events)
+            )
             records_by_key: dict[tuple[str, str], ExecutionRecoveryIntentV1] = {}
             if event_keys:
                 predicates = " OR ".join("(scope_key = ? AND intent_id = ?)" for _ in event_keys)
