@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import threading
 import time
@@ -15,12 +16,14 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from pathlib import Path
 
+from .contracts import TERMINAL_STATES as _EXECUTION_TERMINAL_STATES
 from .contracts import canonical_json, payload_sha256
 from .errors import ContractValidationError, DurableStoreError, IntentConflictError
 from .group_order_contracts import (
     GroupAccountReservationSnapshot,
     GroupBudgetReservation,
     GroupBudgetReservationState,
+    GroupChildOrderStatus,
     GroupLegProgress,
     GroupOrderEvent,
     GroupOrderIntent,
@@ -96,6 +99,7 @@ _EVENT_TYPE = frozenset(
         "GROUP_COMPENSATION_SUBMIT_STARTED",
         "GROUP_COMPENSATION_STATUS_OBSERVED",
         "GROUP_COMPENSATION_RESOLVED",
+        "GROUP_COMPENSATION_CLOSED",
         "GROUP_REJECTED_BEFORE_DISPATCH",
         "GROUP_CLOSED_NO_EXPOSURE",
         "GROUP_RECOVERY_REQUIRED",
@@ -109,7 +113,10 @@ _COMPENSATION_EVENT_TRANSITIONS = {
         }
     ),
     "GROUP_COMPENSATION_SUBMIT_STARTED": frozenset(
-        {(GroupOrderState.UNWINDING, GroupOrderState.UNWINDING)}
+        {
+            (GroupOrderState.UNWINDING, GroupOrderState.UNWINDING),
+            (GroupOrderState.RECOVERY_REQUIRED, GroupOrderState.UNWINDING),
+        }
     ),
     "GROUP_COMPENSATION_STATUS_OBSERVED": frozenset(
         {
@@ -120,9 +127,19 @@ _COMPENSATION_EVENT_TRANSITIONS = {
         }
     ),
     "GROUP_COMPENSATION_RESOLVED": frozenset(
-        {(GroupOrderState.UNWINDING, GroupOrderState.UNWINDING)}
+        {
+            (GroupOrderState.UNWINDING, GroupOrderState.UNWINDING),
+            (GroupOrderState.RECOVERY_REQUIRED, GroupOrderState.UNWINDING),
+        }
+    ),
+    "GROUP_COMPENSATION_CLOSED": frozenset(
+        {
+            (GroupOrderState.UNWINDING, GroupOrderState.CLOSED),
+            (GroupOrderState.RECOVERY_REQUIRED, GroupOrderState.CLOSED),
+        }
     ),
 }
+_COMPENSATION_EVENT_TYPES = frozenset(_COMPENSATION_EVENT_TRANSITIONS)
 
 
 def _valid_recoverable_cursor_ref(value: object) -> bool:
@@ -571,6 +588,20 @@ class SqliteOrderGroupStore:
             and target_state is GroupOrderState.UNWINDING
         ):
             raise ContractValidationError("recovery can enter unwinding only through compensation")
+        compensation_history: tuple[GroupOrderEvent, ...] = ()
+        if event_type in _COMPENSATION_EVENT_TYPES:
+            compensation_history = self.events(
+                snapshot.request.portfolio_ref, snapshot.request.group_id
+            )
+            if len(compensation_history) != snapshot.revision + 1:
+                raise IntentConflictError()
+            _validate_compensation_event_transition(
+                snapshot,
+                event_type,
+                event_payload,
+                compensation_history,
+                target_state,
+            )
         candidate = replace(
             snapshot,
             revision=snapshot.revision + 1,
@@ -614,24 +645,31 @@ class SqliteOrderGroupStore:
                     )
                 target_budget_state = GroupBudgetReservationState.RELEASED
             elif target_state is GroupOrderState.CLOSED:
-                if event_type != "GROUP_CLOSED_NO_EXPOSURE" or not _proven_no_exposure_close(
-                    candidate, persisted_event_payload
-                ):
+                if event_type == "GROUP_CLOSED_NO_EXPOSURE":
+                    proven = _proven_no_exposure_close(candidate, persisted_event_payload)
+                elif event_type == "GROUP_COMPENSATION_CLOSED":
+                    proven = _proven_group_compensation_close(
+                        candidate, persisted_event_payload, compensation_history
+                    )
+                else:
+                    proven = False
+                if not proven:
                     raise ContractValidationError(
-                        "group budget release requires exact terminal no-fill evidence"
+                        "group budget release requires exact terminal no-exposure evidence"
                     )
                 target_budget_state = GroupBudgetReservationState.RELEASED
             if target_budget_state is not current_budget.state:
                 target_budget = replace(current_budget, state=target_budget_state)
-                persisted_event_payload["budget_transition"] = {
-                    "from": current_budget.state.value,
-                    "to": target_budget_state.value,
-                    "policy_fingerprint": current_budget.policy_fingerprint,
-                    "quote_fingerprint": current_budget.quote_fingerprint,
-                    "valuation_unit": current_budget.valuation_unit,
-                    "gross_notional": format(current_budget.gross_notional, "f"),
-                }
-            else:
+                if event_type not in _COMPENSATION_EVENT_TYPES:
+                    persisted_event_payload["budget_transition"] = {
+                        "from": current_budget.state.value,
+                        "to": target_budget_state.value,
+                        "policy_fingerprint": current_budget.policy_fingerprint,
+                        "quote_fingerprint": current_budget.quote_fingerprint,
+                        "valuation_unit": current_budget.valuation_unit,
+                        "gross_notional": format(current_budget.gross_notional, "f"),
+                    }
+            elif event_type not in _COMPENSATION_EVENT_TYPES:
                 persisted_event_payload["budget_state"] = current_budget.state.value
         new_snapshot = replace(candidate, state=target_state, budget_reservation=target_budget)
         self._validate_event(event_type, persisted_event_payload, occurred_at_ns)
@@ -960,6 +998,896 @@ def _safe_pre_dispatch_release(snapshot: GroupOrderSnapshot) -> bool:
         reservation.phase.value in {"NOT_STARTED", "DENIED", "RELEASED"}
         for reservation in snapshot.reservations
     )
+
+
+def _proven_group_compensation_close(
+    snapshot: GroupOrderSnapshot,
+    event_payload: Mapping[str, Any],
+    history: tuple[GroupOrderEvent, ...],
+) -> bool:
+    """Require durable, full-fill CLOSE receipts for every actual source fill.
+
+    The coordinator verifies every receipt against the account-owned Risk
+    journal before recording ``GROUP_COMPENSATION_RESOLVED``.  This store
+    independently binds that ordered evidence to the accepted group, checks
+    each receipt digest and action phase, and recomputes the signed per-leg
+    exposure from source fills minus verified CLOSE fills.  The historical
+    chain-deficit vector is retained for diagnosis; it is never used as the
+    quantity to close.
+    """
+
+    try:
+        request = snapshot.request
+        policy = request.compensation_budget_policy
+        if (
+            snapshot.state
+            not in {GroupOrderState.UNWINDING, GroupOrderState.RECOVERY_REQUIRED}
+            or request.version != 3
+            or len(request.legs) != 3
+            or policy is None
+            or snapshot.residual_vector is None
+            or snapshot.budget_reservation is None
+            or snapshot.budget_reservation.state
+            not in {GroupBudgetReservationState.RESERVED, GroupBudgetReservationState.HELD}
+            # ``update`` passes the next-revision candidate while history
+            # still contains only events through the previous revision.
+            or len(history) != snapshot.revision
+        ):
+            return False
+        if any(reservation.phase.value != "RELEASED" for reservation in snapshot.reservations):
+            return False
+        if len(snapshot.reservations) != 1:
+            return False
+        for reservation in snapshot.reservations:
+            if reservation.phase.value != "RELEASED":
+                return False
+            for leg in reservation.legs:
+                if leg.claimed:
+                    if not leg.resolved or leg.state not in {"SETTLED", "NO_FILL_TERMINAL"}:
+                        return False
+                elif leg.state not in {"RELEASED", "EXPIRED"}:
+                    return False
+
+        plans_by_leg = {plan.leg_id: plan for plan in request.legs}
+        progress_by_leg = {progress.leg_id: progress for progress in snapshot.legs}
+        exposure: dict[str, Fraction] = {}
+        for plan in request.legs:
+            progress = progress_by_leg[plan.leg_id]
+            intent = progress.submitted_intent
+            status = progress.child_status
+            claim = progress.claim_receipt
+            resolution = progress.resolution_receipt
+            if intent is None:
+                if (
+                    progress.phase.value != "READY"
+                    or status is not None
+                    or claim is not None
+                    or resolution is not None
+                ):
+                    return False
+                exposure[plan.leg_id] = Fraction(0)
+                continue
+            if (
+                status is None
+                or claim is None
+                or resolution is None
+                or progress.phase.value != "OBSERVED"
+                or intent.intent_id != plan.maximum_intent.intent_id
+                or intent.position_effect.value != "OPEN"
+                or status.intent_id != intent.intent_id
+                or status.state not in _EXECUTION_TERMINAL_STATES
+                or Fraction(status.filled_quantity) > Fraction(intent.quantity)
+                or claim.permit.group_id != request.group_id
+                or claim.permit.leg_id != plan.leg_id
+                or claim.permit.order_intent_hash != intent.fingerprint
+                or resolution.claim != claim
+                or resolution.final_state is not status.state
+                or resolution.filled_quantity != status.filled_quantity
+                or resolution.dispatch_latch_active
+            ):
+                return False
+            if status.filled_quantity > 0:
+                if (
+                    resolution.resolution_kind != "TERMINAL_EXPOSURE_RESOLVED"
+                    or resolution.trade_count <= 0
+                ):
+                    return False
+            elif resolution.resolution_kind != "TERMINAL_NO_FILL_RESOLVED":
+                return False
+            sign = 1 if intent.side.value == "BUY" else -1
+            exposure[plan.leg_id] = (
+                sign
+                * Fraction(status.filled_quantity)
+                * Fraction(plan.base_units_per_order_unit)
+            )
+
+        expected_chain_vector = [
+            [plan.leg_id, format(snapshot.residual_vector[index], "f")]
+            for index, plan in enumerate(request.legs)
+        ]
+        if event_payload.get("schema") != "group-compensation-close-proof-v1":
+            return False
+        if event_payload.get("group_fingerprint") != request.fingerprint:
+            return False
+        if event_payload.get("chain_deficit_vector_base_units") != expected_chain_vector:
+            return False
+
+        planned: dict[str, dict[str, Any]] = {}
+        started: dict[str, dict[str, Any]] = {}
+        statuses: dict[str, list[dict[str, Any]]] = {}
+        resolved: dict[str, dict[str, Any]] = {}
+        for event in history:
+            payload = event.payload
+            if event.event_type == "GROUP_COMPENSATION_PLAN_RECORDED":
+                action_id = payload.get("action_id")
+                authorization = payload.get("authorization")
+                if (
+                    set(payload) != {"action_id", "authorization_digest", "authorization"}
+                    or type(action_id) is not str
+                    or action_id in planned
+                    or not isinstance(authorization, Mapping)
+                    or payload.get("authorization_digest")
+                    != authorization.get("authorization_digest")
+                ):
+                    return False
+                planned[action_id] = dict(payload)
+            elif event.event_type == "GROUP_COMPENSATION_SUBMIT_STARTED":
+                action_id = payload.get("action_id")
+                if (
+                    set(payload)
+                    != {"action_id", "authorization_digest", "intent_id", "client_order_id"}
+                    or type(action_id) is not str
+                    or action_id not in planned
+                    or action_id in started
+                    or payload.get("authorization_digest")
+                    != planned[action_id].get("authorization_digest")
+                    or payload.get("intent_id")
+                    != planned[action_id]["authorization"].get("intent_id")
+                    or payload.get("client_order_id")
+                    != planned[action_id]["authorization"].get("client_order_id")
+                ):
+                    return False
+                started[action_id] = dict(payload)
+            elif event.event_type == "GROUP_COMPENSATION_STATUS_OBSERVED":
+                action_id = payload.get("action_id")
+                status_payload = payload.get("status")
+                if (
+                    set(payload) != {"action_id", "authorization_digest", "status"}
+                    or type(action_id) is not str
+                    or action_id not in started
+                    or not isinstance(status_payload, Mapping)
+                    or payload.get("authorization_digest")
+                    != planned[action_id].get("authorization_digest")
+                ):
+                    return False
+                try:
+                    status_value = GroupChildOrderStatus.from_payload(status_payload)
+                except Exception:
+                    return False
+                close_quantity = _exact_event_fraction(
+                    planned[action_id]["authorization"].get("close_quantity")
+                )
+                if (
+                    status_value.intent_id
+                    != planned[action_id]["authorization"].get("intent_id")
+                    or Fraction(status_value.filled_quantity) > close_quantity
+                ):
+                    return False
+                statuses.setdefault(action_id, []).append(dict(status_payload))
+            elif event.event_type == "GROUP_COMPENSATION_RESOLVED":
+                action_id = payload.get("action_id")
+                if (
+                    set(payload)
+                    != {
+                        "action_id",
+                        "authorization_digest",
+                        "authorization",
+                        "close_receipt",
+                    }
+                    or type(action_id) is not str
+                    or action_id not in started
+                    or action_id in resolved
+                    or payload.get("authorization_digest")
+                    != planned[action_id].get("authorization_digest")
+                    or payload.get("authorization")
+                    != planned[action_id].get("authorization")
+                ):
+                    return False
+                resolved[action_id] = dict(payload)
+
+        if (
+            not planned
+            or len(planned) > 9
+            or set(planned) != set(started)
+            or set(planned) != set(resolved)
+            or set(planned) != set(statuses)
+        ):
+            return False
+
+        cap = Fraction(policy.cap_amount)
+        consumed = Fraction(0)
+        resolved_refs: list[dict[str, Any]] = []
+        action_ordinals: dict[str, int] = {}
+        for action_id in planned:
+            plan_event = planned[action_id]
+            authorization = plan_event["authorization"]
+            digest = plan_event.get("authorization_digest")
+            authorization_body = dict(authorization)
+            embedded_digest = authorization_body.pop("authorization_digest", None)
+            if (
+                authorization.get("schema") != "group-compensation-close-auth-v4"
+                or type(digest) is not str
+                or embedded_digest != digest
+                or payload_sha256(authorization_body) != digest
+                or authorization.get("action_id") != action_id
+                or authorization.get("group_id") != request.group_id
+                or authorization.get("group_fingerprint") != request.fingerprint
+                or authorization.get("source_request_fingerprint") != request.fingerprint
+                or authorization.get("action_remaining_budget_policy_fingerprint")
+                != policy.fingerprint
+                or authorization.get("action_remaining_budget_policy_id") != policy.policy_id
+                or authorization.get("action_remaining_budget_policy_version")
+                != policy.policy_version
+                or authorization.get("action_remaining_budget_metric") != policy.metric
+                or authorization.get("action_remaining_budget_currency") != policy.currency
+                or _exact_event_fraction(authorization.get("compensation_budget_cap_amount"))
+                != Fraction(policy.cap_amount)
+                or _exact_event_fraction(authorization.get("action_remaining_budget_amount"))
+                != cap - consumed
+            ):
+                return False
+
+            source_leg_id = authorization.get("source_leg_id")
+            if source_leg_id not in plans_by_leg:
+                return False
+            source_plan = plans_by_leg[source_leg_id]
+            source_progress = progress_by_leg[source_leg_id]
+            source_intent = source_progress.submitted_intent
+            source_status = source_progress.child_status
+            if source_intent is None or source_status is None:
+                return False
+            coordinate = exposure[source_leg_id]
+            source_side = source_intent.side.value
+            closing_side = "SELL" if source_side == "BUY" else "BUY"
+            if (
+                authorization.get("source_intent_id") != source_intent.intent_id
+                or authorization.get("source_terminal_status") != source_status.to_payload()
+                or authorization.get("source_side") != source_side
+                or authorization.get("closing_side") != closing_side
+                or authorization.get("source_price")
+                != (None if source_intent.price is None else format(source_intent.price, "f"))
+                or source_intent.price is None
+                or _exact_event_fraction(authorization.get("source_base_units_per_order_unit"))
+                != Fraction(source_plan.base_units_per_order_unit)
+                or _exact_event_fraction(authorization.get("source_requested_quantity"))
+                != Fraction(source_intent.quantity)
+                or _exact_event_fraction(authorization.get("source_uncompensated_position_base_units"))
+                != coordinate
+                or coordinate == 0
+                or (source_side == "BUY" and coordinate < 0)
+                or (source_side == "SELL" and coordinate > 0)
+                or authorization.get("source_claim_digest")
+                != payload_sha256(source_progress.claim_receipt.to_payload())
+                or authorization.get("source_risk_resolution_digest")
+                != payload_sha256(source_progress.resolution_receipt.to_payload())
+                or authorization.get("instrument") != source_intent.instrument
+                or authorization.get("metadata_version") != source_intent.metadata_version
+            ):
+                return False
+
+            vector = authorization.get("source_filled_position_exposure_vector_base_units")
+            expected_vector = [
+                [leg.leg_id, _exact_event_fraction_text(exposure[leg.leg_id])]
+                for leg in request.legs
+            ]
+            if vector != expected_vector:
+                return False
+            source_chain = authorization.get("source_chain_deficit_vector_base_units")
+            if source_chain != expected_chain_vector:
+                return False
+            if authorization.get("prior_resolved_actions") != resolved_refs:
+                return False
+
+            ordinal = authorization.get("ordinal")
+            if type(ordinal) is not int or ordinal <= 0:
+                return False
+            expected_ordinal = action_ordinals.get(source_leg_id, 0) + 1
+            if ordinal != expected_ordinal:
+                return False
+            action_ordinals[source_leg_id] = ordinal
+            source_event_digest = authorization.get("source_event_digest")
+            if not _is_sha256_digest(source_event_digest):
+                return False
+            derived_action_id = "gca-" + payload_sha256(
+                {
+                    "group_id": request.group_id,
+                    "group_fingerprint": request.fingerprint,
+                    "source_leg_id": source_leg_id,
+                    "source_event_digest": source_event_digest,
+                    "ordinal": ordinal,
+                }
+            )[:48]
+            expected_intent_id = "gclose-" + action_id
+            risk_intent_id = authorization.get("risk_intent_id")
+            expected_client_order_id = "gco-" + payload_sha256(
+                {"schema": "group-compensation-client-order-id-v1", "action_id": action_id}
+            )[:48]
+            if (
+                action_id != derived_action_id
+                or authorization.get("intent_id") != expected_intent_id
+                or not _is_risk_order_intent_id(risk_intent_id)
+                or authorization.get("client_order_id") != expected_client_order_id
+            ):
+                return False
+
+            close_quantity = _exact_event_fraction(authorization.get("close_quantity"))
+            close_notional = _exact_event_fraction(
+                authorization.get("close_reference_notional")
+            )
+            limit_price = _exact_event_fraction(authorization.get("source_price"))
+            conversion = Fraction(source_plan.base_units_per_order_unit)
+            if (
+                close_quantity <= 0
+                or close_quantity * conversion > abs(coordinate)
+                or close_notional != close_quantity * limit_price * conversion
+                or close_notional > cap - consumed
+                or authorization.get("close_quantity_unit")
+                != authorization.get("source_quantity_unit")
+                or authorization.get("source_quote_currency") != policy.currency
+            ):
+                return False
+
+            action_statuses = statuses[action_id]
+            final_status = action_statuses[-1]
+            if (
+                any(item.get("intent_id") != expected_intent_id for item in action_statuses)
+                or final_status.get("state") != "FILLED"
+                or _exact_event_fraction(final_status.get("filled_quantity")) != close_quantity
+            ):
+                return False
+            resolution_event = resolved[action_id]
+            receipt = resolution_event.get("close_receipt")
+            if not isinstance(receipt, Mapping):
+                return False
+            receipt_body = dict(receipt)
+            receipt_digest = receipt_body.pop("receipt_sha256", None)
+            if (
+                not _is_sha256_digest(receipt_digest)
+                or payload_sha256(receipt_body) != receipt_digest
+                or receipt.get("status") != "TERMINAL_CLOSE_RESOLVED"
+                or receipt.get("final_state") != "FILLED"
+                or receipt.get("position_effect") != "CLOSE"
+                or receipt.get("claim", {}).get("intent_id") != risk_intent_id
+                or _exact_event_fraction(receipt.get("requested_quantity")) != close_quantity
+                or _exact_event_fraction(receipt.get("filled_quantity")) != close_quantity
+                or type(receipt.get("trade_count")) is not int
+                or receipt.get("trade_count", 0) <= 0
+                or receipt.get("dispatch_latch_active") is not False
+                or receipt.get("has_other_active_freezes") is not False
+                or not _is_sha256_digest(receipt.get("proof_sha256"))
+                or not _is_sha256_digest(receipt.get("exposure_proof_sha256"))
+                or not _is_sha256_digest(receipt.get("exposure_reservation_sha256"))
+            ):
+                return False
+            claim = receipt.get("claim")
+            if (
+                type(claim) is not dict
+                or set(claim)
+                != {
+                    "cause_id",
+                    "claim_digest",
+                    "claimed_at",
+                    "intent_hash",
+                    "intent_id",
+                    "permit_id",
+                    "scope_key",
+                }
+                or type(claim.get("claimed_at")) not in (int, float)
+                or not math.isfinite(claim["claimed_at"])
+                or claim["claimed_at"] <= 0
+                or not all(
+                type(claim.get(key)) is str and claim[key]
+                for key in ("cause_id", "claim_digest", "intent_hash", "intent_id", "permit_id", "scope_key")
+                )
+            ):
+                return False
+
+            close_sign = 1 if closing_side == "BUY" else -1
+            exposure[source_leg_id] += close_sign * close_quantity * conversion
+            if not _is_sha256_digest(receipt_digest):
+                return False
+            resolved_refs.append(
+                {
+                    "schema": "group-compensation-resolved-action-ref-v3",
+                    "action_id": action_id,
+                    "source_leg_id": source_leg_id,
+                    "intent_id": expected_intent_id,
+                    "risk_intent_id": risk_intent_id,
+                    "client_order_id": expected_client_order_id,
+                    "permit_id": claim["permit_id"],
+                    "authorization_digest": digest,
+                    "receipt_sha256": receipt_digest,
+                    "closing_side": closing_side,
+                    "close_quantity": authorization["close_quantity"],
+                    "close_quantity_unit": authorization["close_quantity_unit"],
+                    "source_base_units_per_order_unit": authorization[
+                        "source_base_units_per_order_unit"
+                    ],
+                    "instrument": authorization["instrument"],
+                    "metadata_version": authorization["metadata_version"],
+                    "close_limit_price": authorization["source_price"],
+                    "close_reference_notional": authorization[
+                        "close_reference_notional"
+                    ],
+                    "quote_currency": authorization["source_quote_currency"],
+                    "budget_policy_fingerprint": policy.fingerprint,
+                }
+            )
+            consumed += close_notional
+
+        if any(exposure[plan.leg_id] != 0 for plan in request.legs):
+            return False
+        remaining = cap - consumed
+        reservation_digest = payload_sha256(
+            [reservation.to_payload() for reservation in snapshot.reservations]
+        )
+        expected_receipts = [item["receipt_sha256"] for item in resolved_refs]
+        expected_payload = {
+            "schema": "group-compensation-close-proof-v1",
+            "group_fingerprint": request.fingerprint,
+            "closure_facts_digest": event_payload.get("closure_facts_digest"),
+            "chain_deficit_vector_base_units": expected_chain_vector,
+            "signed_uncompensated_filled_exposure_vector_base_units": [
+                [plan.leg_id, "0"] for plan in request.legs
+            ],
+            "resolved_action_receipt_sha256s": expected_receipts,
+            "reservation_state_sha256": reservation_digest,
+            "active_dispatch_latches": 0,
+            "budget_policy_fingerprint": policy.fingerprint,
+            "budget_cap_amount": format(policy.cap_amount, "f"),
+            "budget_consumed_reference_notional": _exact_event_fraction_text(consumed),
+            "budget_remaining_amount": _exact_event_fraction_text(remaining),
+            "pending_budget_obligation_amount": "0",
+        }
+        return (
+            _is_sha256_digest(expected_payload["closure_facts_digest"])
+            and dict(event_payload) == expected_payload
+        )
+    except (AttributeError, KeyError, TypeError, ValueError, ZeroDivisionError):
+        return False
+
+
+def _is_sha256_digest(value: object) -> bool:
+    return (
+        type(value) is str
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _is_risk_order_intent_id(value: object) -> bool:
+    return (
+        type(value) is str
+        and value.startswith("risk-order:")
+        and _is_sha256_digest(value[len("risk-order:"):])
+    )
+
+
+def _exact_event_fraction(value: object) -> Fraction:
+    if type(value) is not str or not 1 <= len(value) <= 512:
+        raise ValueError("invalid exact compensation decimal")
+    try:
+        decimal_value = Decimal(value)
+    except Exception:
+        raise ValueError("invalid exact compensation decimal") from None
+    if (
+        not decimal_value.is_finite()
+        or format(decimal_value, "f") != value
+        or len(decimal_value.as_tuple().digits) > 256
+        or abs(decimal_value.as_tuple().exponent) > 256
+    ):
+        raise ValueError("invalid exact compensation decimal")
+    return Fraction(decimal_value)
+
+
+def _exact_event_fraction_text(value: Fraction) -> str:
+    if value == 0:
+        return "0"
+    denominator = value.denominator
+    twos = 0
+    fives = 0
+    while denominator % 2 == 0:
+        twos += 1
+        denominator //= 2
+    while denominator % 5 == 0:
+        fives += 1
+        denominator //= 5
+    if denominator != 1:
+        raise ValueError("compensation exposure is not a finite decimal")
+    scale = max(twos, fives)
+    coefficient = value.numerator * (2 ** (scale - twos)) * (5 ** (scale - fives))
+    digits = tuple(int(digit) for digit in str(abs(coefficient))) if coefficient else (0,)
+    return format(Decimal((int(coefficient < 0), digits, -scale)), "f")
+
+
+def _validate_compensation_event_transition(
+    snapshot: GroupOrderSnapshot,
+    event_type: str,
+    payload: Mapping[str, Any],
+    history: tuple[GroupOrderEvent, ...],
+    target_state: GroupOrderState,
+) -> None:
+    """Reject malformed or regressing compensation events before SQLite writes.
+
+    The event chain itself is hash-verified by ``events``. This validator adds
+    the semantic state machine: each planned close has one durable start,
+    status observations are monotonic, and only an exact full-fill typed CLOSE
+    receipt can resolve an action. The writer still checks the snapshot
+    revision inside its transaction after this read-only validation.
+    """
+
+    request = snapshot.request
+    if request.version != 3 or len(request.legs) != 3 or request.compensation_budget_policy is None:
+        raise ContractValidationError("compensation events require a budgeted v3 group")
+
+    auth_keys = {
+        "schema", "action_id", "ordinal", "group_id", "origin_run_id",
+        "group_fingerprint", "execution_scope_key", "account_ref", "strategy_id",
+        "source_leg_id", "source_intent_id", "source_request_fingerprint",
+        "source_terminal_status", "source_requested_quantity", "source_claim_digest",
+        "source_risk_resolution_digest", "source_event_digest", "source_side",
+        "instrument", "metadata_version", "source_price",
+        "source_base_units_per_order_unit", "source_quantity_unit",
+        "source_quote_currency", "closing_side", "close_quantity",
+        "close_quantity_unit", "close_reference_notional",
+        "source_uncompensated_position_base_units",
+        "source_chain_deficit_vector_base_units",
+        "source_filled_position_exposure_vector_base_units",
+        "prior_resolved_actions", "compensation_budget_cap_amount",
+        "action_remaining_budget_amount", "action_remaining_budget_currency",
+        "action_remaining_budget_metric", "action_remaining_budget_policy_id",
+        "action_remaining_budget_policy_version",
+        "action_remaining_budget_policy_fingerprint", "close_position_version",
+        "close_allocation_available_quantity", "close_allocation_quantity_unit",
+        "intent_id", "risk_intent_id", "client_order_id", "source_facts_digest",
+        "authorization_digest",
+    }
+    actions: dict[str, dict[str, Any]] = {}
+    leg_order = tuple(plan.leg_id for plan in request.legs)
+    policy = request.compensation_budget_policy
+    for event in history:
+        kind = event.event_type
+        item = event.payload
+        if kind == "GROUP_COMPENSATION_PLAN_RECORDED":
+            if set(item) != {"action_id", "authorization_digest", "authorization"}:
+                raise ContractValidationError("invalid compensation plan event")
+            auth = item["authorization"]
+            if not isinstance(auth, Mapping) or set(auth) != auth_keys:
+                raise ContractValidationError("invalid compensation authorization payload")
+            body = dict(auth)
+            auth_digest = body.pop("authorization_digest", None)
+            action_id = auth.get("action_id")
+            if (
+                auth.get("schema") != "group-compensation-close-auth-v4"
+                or type(action_id) is not str
+                or action_id in actions
+                or item.get("action_id") != action_id
+                or item.get("authorization_digest") != auth_digest
+                or not _is_sha256_digest(auth_digest)
+                or payload_sha256(body) != auth_digest
+                or auth.get("group_id") != request.group_id
+                or auth.get("group_fingerprint") != request.fingerprint
+                or auth.get("source_request_fingerprint") != request.fingerprint
+                or auth.get("action_id") != "gca-" + payload_sha256(
+                    {
+                        "group_id": request.group_id,
+                        "group_fingerprint": request.fingerprint,
+                        "source_leg_id": auth.get("source_leg_id"),
+                        "source_event_digest": auth.get("source_event_digest"),
+                        "ordinal": auth.get("ordinal"),
+                    }
+                )[:48]
+                or auth.get("intent_id") != "gclose-" + action_id
+                or not _is_risk_order_intent_id(auth.get("risk_intent_id"))
+                or auth.get("client_order_id") != "gco-" + payload_sha256(
+                    {"schema": "group-compensation-client-order-id-v1", "action_id": action_id}
+                )[:48]
+                or auth.get("action_remaining_budget_policy_id") != policy.policy_id
+                or auth.get("action_remaining_budget_policy_version") != policy.policy_version
+                or auth.get("action_remaining_budget_policy_fingerprint") != policy.fingerprint
+                or auth.get("action_remaining_budget_metric") != policy.metric
+                or auth.get("action_remaining_budget_currency") != policy.currency
+                or _exact_event_fraction(auth.get("compensation_budget_cap_amount"))
+                != Fraction(policy.cap_amount)
+                or auth.get("source_leg_id") not in leg_order
+                or not _is_sha256_digest(auth.get("source_facts_digest"))
+                or not _is_sha256_digest(auth.get("source_event_digest"))
+            ):
+                raise ContractValidationError("compensation plan binding is invalid")
+            actions[action_id] = {
+                "authorization": dict(auth),
+                "digest": auth_digest,
+                "phase": "PLAN_RECORDED",
+                "statuses": [],
+                "receipt": None,
+            }
+        elif kind == "GROUP_COMPENSATION_SUBMIT_STARTED":
+            if set(item) != {"action_id", "authorization_digest", "intent_id", "client_order_id"}:
+                raise ContractValidationError("invalid compensation start event")
+            action = actions.get(item.get("action_id"))
+            if (
+                action is None
+                or action["phase"] != "PLAN_RECORDED"
+                or item.get("authorization_digest") != action["digest"]
+                or item.get("intent_id") != action["authorization"]["intent_id"]
+                or item.get("client_order_id") != action["authorization"]["client_order_id"]
+            ):
+                raise ContractValidationError("compensation start does not match its plan")
+            action["phase"] = "SUBMIT_STARTED"
+        elif kind == "GROUP_COMPENSATION_STATUS_OBSERVED":
+            if set(item) != {"action_id", "authorization_digest", "status"}:
+                raise ContractValidationError("invalid compensation status event")
+            action = actions.get(item.get("action_id"))
+            if (
+                action is None
+                or action["phase"] not in {"SUBMIT_STARTED", "STATUS_OBSERVED"}
+                or item.get("authorization_digest") != action["digest"]
+                or not isinstance(item.get("status"), Mapping)
+            ):
+                raise ContractValidationError("compensation status is not attached to a started action")
+            try:
+                status = GroupChildOrderStatus.from_payload(item["status"])
+            except Exception:
+                raise ContractValidationError("invalid compensation child status") from None
+            auth = action["authorization"]
+            previous = (
+                None
+                if not action["statuses"]
+                else GroupChildOrderStatus.from_payload(action["statuses"][-1])
+            )
+            if (
+                status.intent_id != auth["intent_id"]
+                or Fraction(status.filled_quantity) > _exact_event_fraction(auth["close_quantity"])
+                or (
+                    previous is not None
+                    and (
+                        previous.state in _EXECUTION_TERMINAL_STATES
+                        or Fraction(status.filled_quantity) < Fraction(previous.filled_quantity)
+                        or not _valid_compensation_status_transition(previous.state.value, status.state.value)
+                    )
+                )
+            ):
+                raise ContractValidationError("compensation status regressed or exceeds its plan")
+            action["statuses"].append(dict(item["status"]))
+            action["phase"] = "STATUS_OBSERVED"
+        elif kind == "GROUP_COMPENSATION_RESOLVED":
+            if set(item) != {"action_id", "authorization_digest", "authorization", "close_receipt"}:
+                raise ContractValidationError("invalid compensation resolution event")
+            action = actions.get(item.get("action_id"))
+            if (
+                action is None
+                or action["phase"] not in {"SUBMIT_STARTED", "STATUS_OBSERVED"}
+                or item.get("authorization_digest") != action["digest"]
+                or item.get("authorization") != action["authorization"]
+                or not action["statuses"]
+                or not isinstance(item.get("close_receipt"), Mapping)
+            ):
+                raise ContractValidationError("compensation resolution is not bound to an active action")
+            status = GroupChildOrderStatus.from_payload(action["statuses"][-1])
+            receipt = dict(item["close_receipt"])
+            receipt_body = dict(receipt)
+            receipt_digest = receipt_body.pop("receipt_sha256", None)
+            quantity = _exact_event_fraction(action["authorization"]["close_quantity"])
+            if (
+                status.state.value != "FILLED"
+                or Fraction(status.filled_quantity) != quantity
+                or not _is_sha256_digest(receipt_digest)
+                or payload_sha256(receipt_body) != receipt_digest
+                or receipt.get("status") != "TERMINAL_CLOSE_RESOLVED"
+                or receipt.get("final_state") != "FILLED"
+                or receipt.get("position_effect") != "CLOSE"
+                or receipt.get("claim", {}).get("intent_id") != action["authorization"]["risk_intent_id"]
+                or _exact_event_fraction(receipt.get("requested_quantity")) != quantity
+                or _exact_event_fraction(receipt.get("filled_quantity")) != quantity
+                or receipt.get("dispatch_latch_active") is not False
+                or receipt.get("has_other_active_freezes") is not False
+            ):
+                raise ContractValidationError("compensation resolution lacks exact terminal CLOSE receipt")
+            action["phase"] = "RESOLVED"
+            action["receipt"] = receipt
+
+    pending = [item for item in actions.values() if item["phase"] != "RESOLVED"]
+    if len(actions) > 9 or len(pending) > 1:
+        raise ContractValidationError("compensation action history is not bounded or sequential")
+    if event_type == "GROUP_COMPENSATION_PLAN_RECORDED":
+        if (
+            (snapshot.state, target_state) not in _COMPENSATION_EVENT_TRANSITIONS[event_type]
+            or pending
+            or set(payload) != {"action_id", "authorization_digest", "authorization"}
+        ):
+            raise ContractValidationError("a compensation plan requires no pending action")
+        auth = payload.get("authorization")
+        if (
+            not isinstance(auth, Mapping)
+            or set(auth) != auth_keys
+            or payload.get("action_id") != auth.get("action_id")
+            or payload.get("authorization_digest") != auth.get("authorization_digest")
+            or not _is_sha256_digest(auth.get("authorization_digest"))
+            or payload_sha256(
+                {
+                    key: value
+                    for key, value in auth.items()
+                    if key != "authorization_digest"
+                }
+            ) != auth.get("authorization_digest")
+            or auth.get("schema") != "group-compensation-close-auth-v4"
+            or auth.get("group_id") != request.group_id
+            or auth.get("group_fingerprint") != request.fingerprint
+            or auth.get("source_request_fingerprint") != request.fingerprint
+            or auth.get("action_remaining_budget_policy_fingerprint") != policy.fingerprint
+            or auth.get("action_remaining_budget_policy_id") != policy.policy_id
+            or auth.get("action_remaining_budget_policy_version") != policy.policy_version
+            or auth.get("action_remaining_budget_metric") != policy.metric
+            or auth.get("action_remaining_budget_currency") != policy.currency
+            or auth.get("compensation_budget_cap_amount") != format(policy.cap_amount, "f")
+            or auth.get("source_leg_id") not in leg_order
+            or auth.get("intent_id") != "gclose-" + str(auth.get("action_id"))
+            or not _is_risk_order_intent_id(auth.get("risk_intent_id"))
+            or auth.get("client_order_id") != "gco-" + payload_sha256(
+                {
+                    "schema": "group-compensation-client-order-id-v1",
+                    "action_id": auth.get("action_id"),
+                }
+            )[:48]
+            or auth.get("source_filled_position_exposure_vector_base_units")
+            != [
+                [leg_id, _exact_event_fraction_text(amount)]
+                for leg_id, amount in _current_signed_source_exposure(snapshot, actions).items()
+            ]
+        ):
+            raise ContractValidationError("compensation plan exposure does not match source facts")
+    elif event_type == "GROUP_COMPENSATION_SUBMIT_STARTED":
+        if set(payload) != {"action_id", "authorization_digest", "intent_id", "client_order_id"}:
+            raise ContractValidationError("invalid compensation submit marker")
+        action = actions.get(payload.get("action_id"))
+        if (
+            action is None
+            or action["phase"] != "PLAN_RECORDED"
+            or payload.get("authorization_digest") != action["digest"]
+            or payload.get("intent_id") != action["authorization"]["intent_id"]
+            or payload.get("client_order_id") != action["authorization"]["client_order_id"]
+        ):
+            raise ContractValidationError("submit marker must follow exactly one plan")
+    elif event_type == "GROUP_COMPENSATION_STATUS_OBSERVED":
+        if set(payload) != {"action_id", "authorization_digest", "status"}:
+            raise ContractValidationError("invalid compensation status observation")
+        action = actions.get(payload.get("action_id"))
+        if (
+            action is None
+            or action["phase"] not in {"SUBMIT_STARTED", "STATUS_OBSERVED"}
+            or payload.get("authorization_digest") != action["digest"]
+            or not isinstance(payload.get("status"), Mapping)
+        ):
+            raise ContractValidationError("status marker requires a started action")
+        try:
+            observed = GroupChildOrderStatus.from_payload(payload["status"])
+            previous = (
+                None
+                if not action["statuses"]
+                else GroupChildOrderStatus.from_payload(action["statuses"][-1])
+            )
+        except Exception:
+            raise ContractValidationError("invalid compensation status observation") from None
+        if (
+            observed.intent_id != action["authorization"]["intent_id"]
+            or Fraction(observed.filled_quantity)
+            > _exact_event_fraction(action["authorization"]["close_quantity"])
+            or (
+                previous is not None
+                and (
+                    previous.state in _EXECUTION_TERMINAL_STATES
+                    or Fraction(observed.filled_quantity) < Fraction(previous.filled_quantity)
+                    or not _valid_compensation_status_transition(
+                        previous.state.value, observed.state.value
+                    )
+                )
+            )
+        ):
+            raise ContractValidationError("compensation status observation regressed")
+    elif event_type == "GROUP_COMPENSATION_RESOLVED":
+        if set(payload) != {
+            "action_id",
+            "authorization_digest",
+            "authorization",
+            "close_receipt",
+        }:
+            raise ContractValidationError("invalid compensation resolution payload")
+        action = actions.get(payload.get("action_id"))
+        if (
+            action is None
+            or action["phase"] not in {"SUBMIT_STARTED", "STATUS_OBSERVED"}
+            or payload.get("authorization_digest") != action["digest"]
+            or payload.get("authorization") != action["authorization"]
+            or not action["statuses"]
+            or not isinstance(payload.get("close_receipt"), Mapping)
+        ):
+            raise ContractValidationError("resolution marker requires a fully filled close")
+        try:
+            final_status = GroupChildOrderStatus.from_payload(action["statuses"][-1])
+            receipt = dict(payload["close_receipt"])
+            receipt_body = dict(receipt)
+            receipt_digest = receipt_body.pop("receipt_sha256", None)
+            close_quantity = _exact_event_fraction(action["authorization"]["close_quantity"])
+            valid = (
+                final_status.state.value == "FILLED"
+                and Fraction(final_status.filled_quantity) == close_quantity
+                and _is_sha256_digest(receipt_digest)
+                and payload_sha256(receipt_body) == receipt_digest
+                and receipt.get("status") == "TERMINAL_CLOSE_RESOLVED"
+                and receipt.get("final_state") == "FILLED"
+                and receipt.get("position_effect") == "CLOSE"
+                and receipt.get("claim", {}).get("intent_id") == action["authorization"]["risk_intent_id"]
+                and _exact_event_fraction(receipt.get("requested_quantity")) == close_quantity
+                and _exact_event_fraction(receipt.get("filled_quantity")) == close_quantity
+                and receipt.get("dispatch_latch_active") is False
+                and receipt.get("has_other_active_freezes") is False
+            )
+        except Exception:
+            valid = False
+        if not valid:
+            raise ContractValidationError("resolution marker has no exact terminal CLOSE receipt")
+    elif event_type == "GROUP_COMPENSATION_CLOSED":
+        if pending or not actions:
+            raise ContractValidationError("group close requires all actions resolved")
+
+
+def _current_signed_source_exposure(
+    snapshot: GroupOrderSnapshot,
+    prior_actions: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Fraction]:
+    request = snapshot.request
+    progress = {item.leg_id: item for item in snapshot.legs}
+    exposure: dict[str, Fraction] = {}
+    for plan in request.legs:
+        item = progress[plan.leg_id]
+        intent = item.submitted_intent
+        status = item.child_status
+        if intent is None or status is None:
+            exposure[plan.leg_id] = Fraction(0)
+        else:
+            if status.state not in _EXECUTION_TERMINAL_STATES:
+                raise ContractValidationError("source group leg is not terminal")
+            sign = 1 if intent.side.value == "BUY" else -1
+            exposure[plan.leg_id] = (
+                sign * Fraction(status.filled_quantity) * Fraction(plan.base_units_per_order_unit)
+            )
+    for action in prior_actions.values():
+        if action["phase"] != "RESOLVED":
+            raise ContractValidationError("a previous compensation action remains unresolved")
+        auth = action["authorization"]
+        leg_id = auth["source_leg_id"]
+        plan = next((item for item in request.legs if item.leg_id == leg_id), None)
+        if plan is None:
+            raise ContractValidationError("compensation action references an unknown source leg")
+        close_sign = 1 if auth["closing_side"] == "BUY" else -1
+        exposure[leg_id] += (
+            close_sign
+            * _exact_event_fraction(auth["close_quantity"])
+            * Fraction(plan.base_units_per_order_unit)
+        )
+    return exposure
+
+
+def _valid_compensation_status_transition(previous: str, current: str) -> bool:
+    allowed = {
+        "PENDING_ADMISSION": {"PENDING_DISPATCH", "REJECTED", "BLOCKED"},
+        "PENDING_DISPATCH": {"DISPATCHING", "CANCELLED", "BLOCKED"},
+        "DISPATCHING": {"ACKED", "PARTIALLY_FILLED", "FILLED", "CANCELLED", "REJECTED", "UNKNOWN"},
+        "ACKED": {"PARTIALLY_FILLED", "FILLED", "CANCELLED", "REJECTED", "UNKNOWN"},
+        "PARTIALLY_FILLED": {"PARTIALLY_FILLED", "FILLED", "CANCELLED", "UNKNOWN"},
+        "UNKNOWN": {"ACKED", "PARTIALLY_FILLED", "FILLED", "CANCELLED", "REJECTED", "BLOCKED"},
+    }
+    return current in allowed.get(previous, set())
 
 
 def _proven_no_exposure_close(
