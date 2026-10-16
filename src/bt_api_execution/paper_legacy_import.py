@@ -583,8 +583,33 @@ class PaperLegacyImportReceiptV1:
     imported: PaperLegacyImportV1
 
 
+@dataclass(frozen=True, slots=True)
+class PaperLegacyImportSourceReceiptV1:
+    """Safe source-keyed projection for cross-store handoff recovery."""
+
+    source_account_id: str
+    source_owner_id: str
+    source_sha256: str
+    state: str
+    scope_key: str
+    account_key: str
+    import_sha256: str
+    domain_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class PaperLegacyImportAccountStatusV1:
+    """Read-only account-wide owner/import facts needed before source unfreeze."""
+
+    source_receipt: PaperLegacyImportSourceReceiptV1 | None
+    active_account_import_state: str | None
+    owner_domain_exists: bool
+
+
 __all__ = (
     "LegacyPaperSymbolBindingV1",
+    "PaperLegacyImportAccountStatusV1",
     "PaperLegacyImportReceiptV1",
+    "PaperLegacyImportSourceReceiptV1",
     "PaperLegacyImportV1",
 )

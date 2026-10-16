@@ -2886,6 +2886,204 @@ class SqliteExecutionStore:
         except (sqlite3.Error, ContractValidationError, TypeError, ValueError) as error:
             raise DurableStoreError("unable to read paper legacy import") from error
 
+    def inspect_paper_legacy_import_account(
+        self, scope: ExecutionScope, *, source_account_id: str
+    ) -> Any:
+        """Read source and account-wide target ownership before a source rollback.
+
+        The requested scope selects the target account key, while source receipt
+        lookup is keyed by the legacy account id.  This deliberately sees an
+        owner/import created under another strategy scope for the same target
+        account, so callers cannot unfreeze legacy writes on a misleading
+        scope-local ``None`` result.
+        """
+
+        from .paper_execution import PAPER_ENVIRONMENT, PAPER_PROVIDER, PaperOwnerDomainV1
+        from .paper_legacy_import import (
+            PaperLegacyImportAccountStatusV1,
+            PaperLegacyImportSourceReceiptV1,
+            PaperLegacyImportV1,
+        )
+
+        if (
+            type(scope) is not ExecutionScope
+            or scope.provider != PAPER_PROVIDER
+            or scope.environment != PAPER_ENVIRONMENT
+            or type(source_account_id) is not str
+            or not source_account_id
+            or source_account_id != source_account_id.strip()
+            or len(source_account_id) > 256
+            or not source_account_id.isprintable()
+        ):
+            raise ContractValidationError("paper legacy account status binding is invalid")
+
+        try:
+            with self._read_transaction() as cursor:
+                base = cursor.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'execution_meta'"
+                ).fetchone()
+                if base is None:
+                    return PaperLegacyImportAccountStatusV1(None, None, False)
+                version_row = cursor.execute(
+                    "SELECT value FROM execution_meta WHERE key = 'paper_schema_version'"
+                ).fetchone()
+                if version_row is None:
+                    existing_objects = cursor.execute(
+                        "SELECT 1 FROM sqlite_master WHERE name LIKE 'paper_%' "
+                        "AND type IN ('table', 'trigger') LIMIT 1"
+                    ).fetchone()
+                    if existing_objects is not None:
+                        raise DurableStoreError("paper execution schema is partial or unversioned")
+                    return PaperLegacyImportAccountStatusV1(None, None, False)
+
+                schema_version = str(version_row["value"])
+                if schema_version not in {"1", "2"}:
+                    raise DurableStoreError("unsupported paper execution schema version")
+                self._ensure_paper_schema(cursor, create=False)
+
+                source_receipt = None
+                if schema_version == "2":
+                    rows = cursor.execute(
+                        "SELECT * FROM paper_legacy_import_receipts "
+                        "WHERE source_account_id = ? "
+                        "ORDER BY updated_at_ns DESC, created_at_ns DESC, scope_key DESC",
+                        (source_account_id,),
+                    ).fetchall()
+                    active_rows = [
+                        row for row in rows if str(row["state"]) in {"PREPARED", "ACTIVE"}
+                    ]
+                    if len(active_rows) > 1:
+                        raise DurableStoreError("paper legacy source has conflicting active imports")
+                    if rows:
+                        row = rows[0]
+                        state = str(row["state"])
+                        scope_key = str(row["scope_key"])
+                        account_key = str(row["account_key"])
+                        source_owner_id = str(row["source_owner_id"])
+                        source_sha256 = str(row["source_sha256"])
+                        import_sha256 = str(row["import_sha256"])
+                        domain_sha256 = str(row["domain_sha256"])
+                        try:
+                            if (
+                                state not in {"PREPARED", "ACTIVE", "ABORTED"}
+                                or not _is_prefixed_digest(scope_key, "scope:")
+                                or not _is_prefixed_digest(account_key, "account:")
+                                or not _is_sha256(source_sha256)
+                                or not _is_sha256(import_sha256)
+                                or not _is_sha256(domain_sha256)
+                                or str(row["source_system"]) != "afi_legacy_paper"
+                            ):
+                                raise ValueError("invalid receipt identity")
+                            import_json = str(row["import_json"])
+                            domain_json = str(row["domain_json"])
+                            import_payload = json.loads(import_json)
+                            domain_payload = json.loads(domain_json)
+                            if (
+                                canonical_json(import_payload) != import_json
+                                or canonical_json(domain_payload) != domain_json
+                            ):
+                                raise ValueError("noncanonical receipt payload")
+                            imported = PaperLegacyImportV1.from_payload(import_payload)
+                            domain = PaperOwnerDomainV1.from_payload(domain_payload)
+                            account_scope = ExecutionScope(
+                                PAPER_PROVIDER,
+                                PAPER_ENVIRONMENT,
+                                domain.simulation_account_ref,
+                                domain.strategy_ref,
+                            )
+                            imported.validate_domain(account_scope, domain)
+                            if (
+                                imported.source_account_id != source_account_id
+                                or imported.source_owner_id != source_owner_id
+                                or imported.source_sha256 != source_sha256
+                                or imported.fingerprint != import_sha256
+                                or domain.fingerprint != domain_sha256
+                                or account_scope.account_key != account_key
+                            ):
+                                raise ValueError("receipt content binding changed")
+                        except (
+                            ContractValidationError,
+                            TypeError,
+                            ValueError,
+                            json.JSONDecodeError,
+                        ) as error:
+                            raise DurableStoreError(
+                                "stored paper legacy source receipt is unreadable"
+                            ) from error
+                        source_receipt = PaperLegacyImportSourceReceiptV1(
+                            source_account_id=source_account_id,
+                            source_owner_id=source_owner_id,
+                            source_sha256=source_sha256,
+                            state=state,
+                            scope_key=scope_key,
+                            account_key=account_key,
+                            import_sha256=import_sha256,
+                            domain_sha256=domain_sha256,
+                        )
+
+                active_imports = cursor.execute(
+                    "SELECT state, scope_key, domain_sha256 FROM paper_legacy_import_receipts "
+                    "WHERE account_key = ? AND state IN ('PREPARED', 'ACTIVE')",
+                    (scope.account_key,),
+                ).fetchall() if schema_version == "2" else []
+                if len(active_imports) > 1:
+                    raise DurableStoreError("paper account has conflicting active imports")
+                active_state = None if not active_imports else str(active_imports[0]["state"])
+                owner_rows = cursor.execute(
+                    "SELECT scope_key, domain_sha256, domain_json FROM paper_owner_domains "
+                    "WHERE account_key = ?",
+                    (scope.account_key,),
+                ).fetchall()
+                if len(owner_rows) > 1:
+                    raise DurableStoreError("paper account has conflicting owner domains")
+                owner_exists = bool(owner_rows)
+                if owner_exists:
+                    owner = owner_rows[0]
+                    try:
+                        owner_scope_key = str(owner["scope_key"])
+                        owner_domain_sha256 = str(owner["domain_sha256"])
+                        owner_domain_json = str(owner["domain_json"])
+                        owner_payload = json.loads(owner_domain_json)
+                        if canonical_json(owner_payload) != owner_domain_json:
+                            raise ValueError("noncanonical owner domain")
+                        owner_domain = PaperOwnerDomainV1.from_payload(owner_payload)
+                        owner_account_scope = ExecutionScope(
+                            PAPER_PROVIDER,
+                            PAPER_ENVIRONMENT,
+                            owner_domain.simulation_account_ref,
+                            owner_domain.strategy_ref,
+                        )
+                        if (
+                            not _is_prefixed_digest(owner_scope_key, "scope:")
+                            or owner_domain.fingerprint != owner_domain_sha256
+                            or owner_account_scope.account_key != scope.account_key
+                        ):
+                            raise ValueError("owner domain binding changed")
+                    except (
+                        ContractValidationError,
+                        TypeError,
+                        ValueError,
+                        json.JSONDecodeError,
+                    ) as error:
+                        raise DurableStoreError("stored paper owner domain is unreadable") from error
+                    if active_state == "ACTIVE" and (
+                        str(active_imports[0]["scope_key"]) != owner_scope_key
+                        or str(active_imports[0]["domain_sha256"]) != owner_domain_sha256
+                    ):
+                        raise DurableStoreError("active paper import owner binding changed")
+                elif active_state == "ACTIVE":
+                    raise DurableStoreError("active paper import has no owner domain")
+
+                return PaperLegacyImportAccountStatusV1(
+                    source_receipt=source_receipt,
+                    active_account_import_state=active_state,
+                    owner_domain_exists=owner_exists,
+                )
+        except DurableStoreError:
+            raise
+        except (sqlite3.Error, ContractValidationError, TypeError, ValueError) as error:
+            raise DurableStoreError("unable to inspect paper legacy import account") from error
+
     @staticmethod
     def _paper_domain_in_transaction(cursor: sqlite3.Cursor, scope: ExecutionScope) -> Any:
         from .paper_execution import PaperOwnerDomainV1

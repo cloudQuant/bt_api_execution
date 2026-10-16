@@ -195,11 +195,30 @@ def test_import_prepares_without_owner_then_activates_the_exact_opening_snapshot
     store = SqliteExecutionStore(tmp_path / "paper-legacy-import.sqlite3")
     lease = _lease(store, scope)
     try:
+        before = store.inspect_paper_legacy_import_account(
+            scope, source_account_id=_SOURCE_ACCOUNT_ID
+        )
+        assert before.source_receipt is None
+        assert before.active_account_import_state is None
+        assert before.owner_domain_exists is False
+
         prepared = store.prepare_paper_legacy_import(scope, domain, imported, writer_lease=lease)
         assert prepared.state == "PREPARED"
         assert prepared.import_sha256 == imported.fingerprint
         assert prepared.imported.origin == "imported_legacy"
         assert store.get_paper_legacy_import(scope) == prepared
+        connection = store._connection
+        changes_before_status_read = connection.total_changes
+        prepared_status = store.inspect_paper_legacy_import_account(
+            scope, source_account_id=_SOURCE_ACCOUNT_ID
+        )
+        assert prepared_status.source_receipt is not None
+        assert prepared_status.source_receipt.state == "PREPARED"
+        assert prepared_status.source_receipt.scope_key == scope.key
+        assert prepared_status.source_receipt.account_key == scope.account_key
+        assert prepared_status.active_account_import_state == "PREPARED"
+        assert prepared_status.owner_domain_exists is False
+        assert connection.total_changes == changes_before_status_read
         with pytest.raises(DurableStoreError, match="blocked by legacy import state"):
             store.register_paper_owner_domain(scope, domain, writer_lease=lease)
 
@@ -218,7 +237,19 @@ def test_import_prepares_without_owner_then_activates_the_exact_opening_snapshot
         assert book.receipt_count == 0
         assert book.execution_cursor == 0
 
+        other_strategy_scope = _scope("managed-strategy-02")
         connection = store._connection
+        changes_before_status_read = connection.total_changes
+        account_status = store.inspect_paper_legacy_import_account(
+            other_strategy_scope, source_account_id=_SOURCE_ACCOUNT_ID
+        )
+        assert account_status.source_receipt is not None
+        assert account_status.source_receipt.scope_key == scope.key
+        assert account_status.source_receipt.state == "ACTIVE"
+        assert account_status.active_account_import_state == "ACTIVE"
+        assert account_status.owner_domain_exists is True
+        assert connection.total_changes == changes_before_status_read
+
         changes_before = connection.total_changes
         reloaded = store.get_paper_legacy_import(scope)
         assert reloaded == activated
@@ -277,6 +308,13 @@ def test_prepared_import_can_be_aborted_and_retried_under_a_new_scope(tmp_path):
         )
         assert aborted.state == "ABORTED"
         assert store.get_paper_legacy_import(first_scope) == aborted
+        aborted_status = store.inspect_paper_legacy_import_account(
+            first_scope, source_account_id=_SOURCE_ACCOUNT_ID
+        )
+        assert aborted_status.source_receipt is not None
+        assert aborted_status.source_receipt.state == "ABORTED"
+        assert aborted_status.active_account_import_state is None
+        assert aborted_status.owner_domain_exists is False
         with pytest.raises(DurableStoreError, match="cannot be activated"):
             store.activate_paper_legacy_import(first_scope, writer_lease=lease)
         with pytest.raises(IntentConflictError, match="prior receipt history"):
