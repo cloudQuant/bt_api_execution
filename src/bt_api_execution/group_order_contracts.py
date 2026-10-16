@@ -274,11 +274,11 @@ class GroupBudgetQuote:
         )
         if (
             type(self.legs) is not tuple
-            or len(self.legs) != 2
+            or len(self.legs) not in {2, 3}
             or any(type(item) is not GroupBudgetLegQuote for item in self.legs)
         ):
-            raise ContractValidationError("P5A group quote requires exactly two leg facts")
-        if len({item.leg_id for item in self.legs}) != 2 or any(
+            raise ContractValidationError("P5A group quote requires two or three leg facts")
+        if len({item.leg_id for item in self.legs}) != len(self.legs) or any(
             item.valuation_unit != self.valuation_unit for item in self.legs
         ):
             raise ContractValidationError("group quote legs do not share one valuation unit")
@@ -398,6 +398,7 @@ class GroupOrderLegPlan:
     base_units_per_order_unit: Decimal
     quantity_step: Decimal
     metadata_valid_until_ns: int
+    ratio: Decimal | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "leg_id", _reference(self.leg_id, "leg_id"))
@@ -416,9 +417,11 @@ class GroupOrderLegPlan:
             raise ContractValidationError("maximum quantity is not aligned to its step")
         if type(self.metadata_valid_until_ns) is not int or self.metadata_valid_until_ns <= 0:
             raise ContractValidationError("invalid metadata_valid_until_ns")
+        if self.ratio is not None:
+            object.__setattr__(self, "ratio", _positive_decimal(self.ratio, "ratio"))
 
     def to_payload(self) -> dict[str, Any]:
-        return {
+        payload = {
             "leg_id": self.leg_id,
             "account_ref": self.account_ref,
             "maximum_intent": self.maximum_intent.to_payload(),
@@ -426,16 +429,23 @@ class GroupOrderLegPlan:
             "quantity_step": format(self.quantity_step, "f"),
             "metadata_valid_until_ns": self.metadata_valid_until_ns,
         }
+        if self.ratio is not None:
+            payload["ratio"] = format(self.ratio, "f")
+        return payload
 
     @classmethod
     def from_payload(cls, value: object) -> GroupOrderLegPlan:
-        if not isinstance(value, Mapping) or set(value) != {
+        legacy_keys = {
             "leg_id",
             "account_ref",
             "maximum_intent",
             "base_units_per_order_unit",
             "quantity_step",
             "metadata_valid_until_ns",
+        }
+        if not isinstance(value, Mapping) or frozenset(value) not in {
+            frozenset(legacy_keys),
+            frozenset(legacy_keys | {"ratio"}),
         }:
             raise ContractValidationError("invalid group leg plan payload")
         return cls(
@@ -447,6 +457,7 @@ class GroupOrderLegPlan:
             ),
             quantity_step=_parse_decimal(value["quantity_step"], "quantity_step"),
             metadata_valid_until_ns=value["metadata_valid_until_ns"],
+            ratio=None if "ratio" not in value else _parse_decimal(value["ratio"], "ratio"),
         )
 
 
@@ -482,15 +493,34 @@ class GroupOrderIntent:
             raise ContractValidationError("invalid received_at_ns")
         if type(self.deadline_ns) is not int or self.deadline_ns <= self.received_at_ns:
             raise ContractValidationError("invalid absolute group deadline")
-        if type(self.version) is not int or self.version not in {1, 2}:
+        if type(self.version) is not int or self.version not in {1, 2, 3}:
             raise ContractValidationError("unsupported group order contract version")
-        if not isinstance(self.legs, tuple) or len(self.legs) != 2:
-            raise ContractValidationError("P5A requires exactly two legs")
+        expected_legs = 3 if self.version == 3 else 2
+        if not isinstance(self.legs, tuple) or len(self.legs) != expected_legs:
+            raise ContractValidationError(
+                "v3 group intent requires exactly three legs"
+                if self.version == 3
+                else "P5A requires exactly two legs"
+            )
         if any(type(leg) is not GroupOrderLegPlan for leg in self.legs):
             raise ContractValidationError("invalid group leg plan")
         ids = tuple(leg.leg_id for leg in self.legs)
-        if len(set(ids)) != 2 or self.first_leg_id not in ids:
+        if len(set(ids)) != len(self.legs) or self.first_leg_id not in ids:
             raise ContractValidationError("invalid ordered group legs")
+        if self.version == 3:
+            # P5B: one same-account Call/Put/Future chain executed strictly in
+            # legs tuple order, with exact per-leg ratio semantics.
+            if self.legs[0].leg_id != self.first_leg_id:
+                raise ContractValidationError("v3 group legs must start at the first leg")
+            if len({leg.account_ref for leg in self.legs}) != 1:
+                raise ContractValidationError("v3 group legs must share one account")
+            if self.legs[0].ratio != Decimal(1):
+                raise ContractValidationError("v3 first-leg ratio must equal one")
+            for leg in self.legs[1:]:
+                if leg.ratio is None or leg.ratio <= 0:
+                    raise ContractValidationError("v3 non-first legs require a positive ratio")
+        elif any(leg.ratio is not None for leg in self.legs):
+            raise ContractValidationError("legacy group legs cannot carry a ratio")
         for leg in self.legs:
             intent = leg.maximum_intent
             if (
@@ -505,11 +535,14 @@ class GroupOrderIntent:
                 or leg.metadata_valid_until_ns < self.deadline_ns
             ):
                 raise ContractValidationError("group leg violates the normalized P5A policy")
+        quote = self.budget_quote
         if self.version == 1:
-            if self.budget_quote is not None:
+            if quote is not None:
                 raise ContractValidationError("legacy group intent cannot carry a budget quote")
-        else:
-            quote = self.budget_quote
+        elif quote is not None or self.version == 2:
+            # Version 2 always requires the trusted quote. A version-3 strategy
+            # request may arrive unquoted (the coordinator's trusted builder
+            # quotes it); any quote that is present must bind exactly.
             if type(quote) is not GroupBudgetQuote:
                 raise ContractValidationError("new group intent requires a trusted budget quote")
             plans = {plan.leg_id: plan for plan in self.legs}
@@ -526,8 +559,25 @@ class GroupOrderIntent:
                     or item.valid_until_ns < self.deadline_ns
                 ):
                     raise ContractValidationError("group budget quote is not bound to its leg")
-        first, second = self.ordered_legs
-        if first.maximum_intent.side is second.maximum_intent.side:
+        ordered = self.ordered_legs
+        if self.version == 3:
+            if len({leg.maximum_intent.side for leg in self.legs}) < 2:
+                raise ContractValidationError("v3 group legs cannot all use one side")
+            first_plan = ordered[0]
+            first_base = Fraction(first_plan.base_units_per_order_unit) * Fraction(
+                first_plan.maximum_intent.quantity
+            )
+            for plan in ordered[1:]:
+                reachable = Fraction(plan.ratio) * first_base / Fraction(
+                    plan.base_units_per_order_unit
+                )
+                if reachable < Fraction(plan.quantity_step):
+                    raise ContractValidationError(
+                        "v3 leg ratio cannot be expressed in its step"
+                    )
+        elif (
+            ordered[0].maximum_intent.side is ordered[1].maximum_intent.side
+        ):
             raise ContractValidationError("P5A legs must have opposing sides")
 
     @property
@@ -544,10 +594,10 @@ class GroupOrderIntent:
         return payload_sha256(payload)
 
     @property
-    def ordered_legs(self) -> tuple[GroupOrderLegPlan, GroupOrderLegPlan]:
+    def ordered_legs(self) -> tuple[GroupOrderLegPlan, ...]:
         first = self.leg(self.first_leg_id)
-        second = next(leg for leg in self.legs if leg.leg_id != self.first_leg_id)
-        return first, second
+        rest = tuple(leg for leg in self.legs if leg.leg_id != self.first_leg_id)
+        return (first, *rest)
 
     def leg(self, leg_id: str) -> GroupOrderLegPlan:
         for leg in self.legs:
@@ -575,8 +625,7 @@ class GroupOrderIntent:
             "legs": [leg.to_payload() for leg in self.legs],
             "recovery_policy": self.recovery_policy,
         }
-        if self.version == 2:
-            assert self.budget_quote is not None
+        if self.version != 1 and self.budget_quote is not None:
             payload["budget_quote"] = self.budget_quote.to_payload()
         return payload
 
@@ -1315,6 +1364,7 @@ class GroupOrderSnapshot:
     created_at_ns: int
     updated_at_ns: int
     budget_reservation: GroupBudgetReservation | None = None
+    residual_vector: tuple[Decimal, ...] | None = None
 
     def __post_init__(self) -> None:
         if type(self.request) is not GroupOrderIntent:
@@ -1342,6 +1392,20 @@ class GroupOrderSnapshot:
             or not self.residual_base_units.is_finite()
         ):
             raise ContractValidationError("invalid group residual")
+        if self.residual_vector is not None:
+            if (
+                type(self.residual_vector) is not tuple
+                or len(self.residual_vector) != len(self.request.legs)
+                or any(
+                    type(item) is not Decimal or not item.is_finite()
+                    for item in self.residual_vector
+                )
+            ):
+                raise ContractValidationError("invalid group residual vector")
+            if self.request.version != 3:
+                raise ContractValidationError(
+                    "only a version-3 group can carry a residual vector"
+                )
         if self.error_code is not None:
             object.__setattr__(self, "error_code", _reference(self.error_code, "error_code"))
         for name in ("created_at_ns", "updated_at_ns"):
@@ -1404,9 +1468,15 @@ class GroupOrderSnapshot:
             "created_at_ns": self.created_at_ns,
             "updated_at_ns": self.updated_at_ns,
         }
-        if self.request.version == 2:
+        if self.request.version != 1:
             assert self.budget_reservation is not None
             payload["budget_reservation"] = self.budget_reservation.to_payload()
+        if self.request.version == 3:
+            payload["residual_vector"] = (
+                None
+                if self.residual_vector is None
+                else [format(item, "f") for item in self.residual_vector]
+            )
         return payload
 
     @classmethod
@@ -1423,13 +1493,18 @@ class GroupOrderSnapshot:
             "updated_at_ns",
         }
         current_keys = legacy_keys | {"budget_reservation"}
+        vector_keys = current_keys | {"residual_vector"}
         if not isinstance(value, Mapping) or frozenset(value) not in {
             frozenset(legacy_keys),
             frozenset(current_keys),
+            frozenset(vector_keys),
         }:
             raise ContractValidationError("invalid group snapshot payload")
         if not isinstance(value["reservations"], list) or not isinstance(value["legs"], list):
             raise ContractValidationError("invalid group snapshot collections")
+        residual_vector = value.get("residual_vector")
+        if residual_vector is not None and not isinstance(residual_vector, list):
+            raise ContractValidationError("invalid group residual vector payload")
         return cls(
             request=GroupOrderIntent.from_payload(value["request"]),
             state=GroupOrderState(value["state"]),
@@ -1447,6 +1522,11 @@ class GroupOrderSnapshot:
             budget_reservation=None
             if "budget_reservation" not in value
             else GroupBudgetReservation.from_payload(value["budget_reservation"]),
+            residual_vector=None
+            if residual_vector is None
+            else tuple(
+                _parse_decimal(item, "residual_vector") for item in residual_vector
+            ),
         )
 
 

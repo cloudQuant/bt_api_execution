@@ -257,7 +257,7 @@ class SqliteOrderGroupStore:
                     raise IntentConflictError()
                 return existing
 
-            if request.version == 2:
+            if request.version in {2, 3}:
                 if type(budget_policy) is not PortfolioGroupBudgetPolicy:
                     raise ContractValidationError(
                         "trusted portfolio group budget policy is required"
@@ -508,6 +508,7 @@ class SqliteOrderGroupStore:
         reservations: tuple[GroupAccountReservationSnapshot, ...] | None = None,
         legs: tuple[GroupLegProgress, ...] | None = None,
         residual_base_units: Any = ...,
+        residual_vector: Any = ...,
         error_code: str | None | Any = ...,
         now_ns: int | None = None,
     ) -> GroupOrderSnapshot:
@@ -531,6 +532,9 @@ class SqliteOrderGroupStore:
             legs=snapshot.legs if legs is None else legs,
             residual_base_units=(
                 snapshot.residual_base_units if residual_base_units is ... else residual_base_units
+            ),
+            residual_vector=(
+                snapshot.residual_vector if residual_vector is ... else residual_vector
             ),
             error_code=snapshot.error_code if error_code is ... else error_code,
             updated_at_ns=occurred_at_ns,

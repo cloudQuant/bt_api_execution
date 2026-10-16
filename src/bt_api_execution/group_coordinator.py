@@ -172,7 +172,7 @@ class GroupOrderCoordinator:
             if existing.request.unquoted_fingerprint != request.unquoted_fingerprint:
                 raise IntentConflictError()
             return existing
-        if request.version != 1 or request.budget_quote is not None:
+        if request.version not in {1, 3} or request.budget_quote is not None:
             raise ContractValidationError("new group budget quotes are built by the trusted owner")
         policy = self._budget_policies.get(request.portfolio_ref)
         if policy is None or self._budget_quote_builder is None:
@@ -183,7 +183,11 @@ class GroupOrderCoordinator:
         quote = self._budget_quote_builder(request, policy, now_ns=now)
         if type(quote) is not GroupBudgetQuote or quote.policy_fingerprint != policy.fingerprint:
             raise ContractValidationError("trusted quote builder returned an unbound group quote")
-        accepted_request = replace(request, version=2, budget_quote=quote)
+        accepted_request = replace(
+            request,
+            version=2 if request.version == 1 else 3,
+            budget_quote=quote,
+        )
         snapshot = self._store.create_or_get(
             accepted_request,
             budget_policy=policy,
@@ -254,14 +258,14 @@ class GroupOrderCoordinator:
                     now_ns=self._now(),
                 )
 
-            # A single owner-thread tick may complete both legs when the
+            # A single owner-thread tick may complete every leg when the
             # account order service returns terminal evidence synchronously.
-            for _ in range(4):
+            for _ in range(2 * len(snapshot.request.legs) + 2):
                 snapshot = self._required(portfolio_ref, group_id)
                 if snapshot.state is GroupOrderState.FIRST_PENDING or (
                     snapshot.state is GroupOrderState.RECOVERY_REQUIRED
                     and self._first_leg(snapshot).submitted_intent is not None
-                    and self._second_leg(snapshot).submitted_intent is None
+                    and self._only_first_leg_submitted(snapshot)
                 ):
                     snapshot, ready = self._advance_first_leg(snapshot)
                     if not ready:
@@ -275,9 +279,17 @@ class GroupOrderCoordinator:
                     continue
                 if snapshot.state is GroupOrderState.HEDGE_PENDING or (
                     snapshot.state is GroupOrderState.RECOVERY_REQUIRED
-                    and self._second_leg(snapshot).submitted_intent is not None
+                    and any(
+                        progress.submitted_intent is not None
+                        for progress in snapshot.legs[1:]
+                    )
                 ):
-                    snapshot, done = self._advance_hedge_leg(snapshot)
+                    advance = (
+                        self._advance_chain
+                        if snapshot.request.version == 3
+                        else self._advance_hedge_leg
+                    )
+                    snapshot, done = advance(snapshot)
                     if done or snapshot.state is GroupOrderState.RECOVERY_REQUIRED:
                         return snapshot
                     continue
@@ -460,7 +472,7 @@ class GroupOrderCoordinator:
         return self._required(request.portfolio_ref, request.group_id)
 
     def _advance_first_leg(self, snapshot: GroupOrderSnapshot) -> tuple[GroupOrderSnapshot, bool]:
-        first_plan, _ = snapshot.request.ordered_legs
+        first_plan = snapshot.request.ordered_legs[0]
         progress = self._leg(snapshot, first_plan.leg_id)
         if progress.submitted_intent is None:
             intent = first_plan.maximum_intent
@@ -685,7 +697,11 @@ class GroupOrderCoordinator:
                 return self._close_no_fill(snapshot, plan.leg_id), False
             if claim is None:
                 return self._mark_recovery(snapshot, "FIRST_LEG_CLAIM_MISSING"), False
+            if snapshot.request.version == 3:
+                return self._size_chain(snapshot), True
             return self._size_hedge(snapshot, plan, status.filled_quantity), True
+        if snapshot.request.version == 3:
+            return self._chain_terminal_leg(snapshot, plan, status, claim)
         if status.filled_quantity > 0 and claim is None:
             return self._mark_recovery(snapshot, "HEDGE_LEG_CLAIM_MISSING"), False
         return self._finish_hedge(snapshot)
@@ -797,6 +813,242 @@ class GroupOrderCoordinator:
             now_ns=self._now(),
         )
         return snapshot, True
+
+    def _chain_terminal_leg(
+        self,
+        snapshot: GroupOrderSnapshot,
+        plan: Any,
+        status: GroupChildOrderStatus,
+        claim: GroupLegClaimReceipt | None,
+    ) -> tuple[GroupOrderSnapshot, bool]:
+        """Apply one terminal v3 mid-chain outcome; later legs never dispatch."""
+
+        if status.filled_quantity == 0:
+            # A rejected/cancelled zero-fill leg 2/3 fails the chain closed:
+            # no later leg is ever submitted, and the residual vector keeps
+            # the prior legs' unhedged exposure for compensation decisions.
+            vector, scalar = self._chain_residual(snapshot)
+            return (
+                self._mark_recovery(
+                    snapshot,
+                    "CHAIN_INTERRUPTED_ZERO_FILL",
+                    residual_base_units=scalar,
+                    residual_vector=vector,
+                ),
+                True,
+            )
+        if claim is None:
+            return self._mark_recovery(snapshot, "HEDGE_LEG_CLAIM_MISSING"), False
+        if any(
+            self._leg(snapshot, item.leg_id).submitted_intent is None
+            for item in snapshot.request.ordered_legs[1:]
+        ):
+            return self._size_chain(snapshot), False
+        return self._finish_chain(snapshot)
+
+    def _size_chain(self, snapshot: GroupOrderSnapshot) -> GroupOrderSnapshot:
+        """Size the next unsubmitted v3 leg with whole-group step reduction."""
+
+        ordered = snapshot.request.ordered_legs
+        first_plan = ordered[0]
+        first_status = self._leg(snapshot, first_plan.leg_id).child_status
+        if (
+            first_status is None
+            or first_status.state not in TERMINAL_STATES
+            or first_status.filled_quantity <= 0
+        ):
+            return self._mark_recovery(snapshot, "FIRST_LEG_NOT_TERMINAL_FILLED")
+        first_base = Fraction(first_status.filled_quantity) * Fraction(
+            first_plan.base_units_per_order_unit
+        )
+        remaining = tuple(
+            item
+            for item in ordered[1:]
+            if self._leg(snapshot, item.leg_id).submitted_intent is None
+        )
+        if not remaining:
+            return snapshot
+        quantities = {
+            item.leg_id: self._chain_express(item, first_base) for item in remaining
+        }
+        if any(quantity <= 0 for quantity in quantities.values()):
+            return self._chain_shortfall(snapshot)
+        # Whole-group reduction: one common fillable base B* keeps every
+        # remaining leg's ratio semantics after decimal-step flooring. The
+        # reduction only ever shrinks not-yet-submitted legs.
+        base = self._common_chain_base(remaining, quantities)
+        for _ in range(64):
+            reduced = {
+                item.leg_id: self._chain_express(item, base) for item in remaining
+            }
+            if any(quantity <= 0 for quantity in reduced.values()):
+                return self._chain_shortfall(snapshot)
+            next_base = self._common_chain_base(remaining, reduced)
+            quantities = reduced
+            if next_base == base:
+                break
+            base = next_base
+        else:
+            return self._mark_recovery(snapshot, "CHAIN_REDUCTION_NOT_CONVERGED")
+        next_plan = remaining[0]
+        quantity = quantities[next_plan.leg_id]
+        intent = replace(next_plan.maximum_intent, quantity=quantity)
+        progress = replace(
+            self._leg(snapshot, next_plan.leg_id),
+            phase=GroupLegPhase.READY,
+            submitted_intent=intent,
+            child_status=None,
+        )
+        preview = replace(
+            snapshot,
+            legs=tuple(
+                progress if item.leg_id == progress.leg_id else item
+                for item in snapshot.legs
+            ),
+        )
+        vector, scalar = self._chain_residual(preview)
+        return self._replace_leg(
+            snapshot,
+            progress,
+            event_type="HEDGE_LEG_SIZED",
+            payload={
+                "leg_id": next_plan.leg_id,
+                "intent_id": intent.intent_id,
+                "quantity": format(quantity, "f"),
+                "first_filled_quantity": format(first_status.filled_quantity, "f"),
+            },
+            state=GroupOrderState.HEDGE_PENDING,
+            residual_base_units=scalar,
+            residual_vector=vector,
+        )
+
+    def _advance_chain(self, snapshot: GroupOrderSnapshot) -> tuple[GroupOrderSnapshot, bool]:
+        """Drive the staged v3 chain against the original leg identities."""
+
+        ordered = snapshot.request.ordered_legs
+        active_index = None
+        for index, item in enumerate(ordered):
+            if self._leg(snapshot, item.leg_id).submitted_intent is not None:
+                active_index = index
+        if active_index is None:
+            return self._mark_recovery(snapshot, "CHAIN_STATE_INCONSISTENT"), True
+        if active_index == 0:
+            return self._advance_first_leg(snapshot)
+        for index in range(active_index):
+            status = self._leg(snapshot, ordered[index].leg_id).child_status
+            if (
+                status is None
+                or status.state not in TERMINAL_STATES
+                or status.filled_quantity <= 0
+            ):
+                code = (
+                    "FIRST_LEG_NOT_TERMINAL_FILLED"
+                    if index == 0
+                    else "CHAIN_PRIOR_LEG_NOT_TERMINAL_FILLED"
+                )
+                return self._mark_recovery(snapshot, code), True
+        active_plan = ordered[active_index]
+        progress = self._leg(snapshot, active_plan.leg_id)
+        intent = progress.submitted_intent
+        if progress.phase is GroupLegPhase.UNKNOWN:
+            try:
+                order_receipt = self._orders[active_plan.account_ref].query(intent.intent_id)
+            except Exception:
+                return self._mark_recovery(snapshot, "HEDGE_LEG_QUERY_UNKNOWN"), True
+            if order_receipt is None:
+                return self._mark_recovery(snapshot, "HEDGE_LEG_STILL_UNKNOWN"), True
+            return self._record_child_status(snapshot, active_plan, order_receipt, first=False)
+        try:
+            order_receipt = self._orders[active_plan.account_ref].query(intent.intent_id)
+        except Exception:
+            return self._mark_recovery(snapshot, "HEDGE_LEG_QUERY_UNKNOWN"), True
+        if order_receipt is None:
+            if progress.phase is not GroupLegPhase.READY:
+                return self._mark_recovery(snapshot, "HEDGE_LEG_RECORD_MISSING"), True
+            return self._submit_leg(snapshot, active_plan, intent, first=False)
+        return self._record_child_status(snapshot, active_plan, order_receipt, first=False)
+
+    def _finish_chain(self, snapshot: GroupOrderSnapshot) -> tuple[GroupOrderSnapshot, bool]:
+        ordered = snapshot.request.ordered_legs
+        statuses = tuple(self._leg(snapshot, item.leg_id).child_status for item in ordered)
+        if any(status is None for status in statuses):
+            return self._mark_recovery(snapshot, "GROUP_CHILD_STATUS_MISSING"), True
+        if any(status.state not in TERMINAL_STATES for status in statuses):
+            return snapshot, False
+        vector, scalar = self._chain_residual(snapshot)
+        balanced = all(item == 0 for item in vector)
+        snapshot = self._store.update(
+            snapshot,
+            event_type="GROUP_PAIRED" if balanced else "GROUP_RECOVERY_REQUIRED",
+            event_payload={
+                "leg_ids": [item.leg_id for item in ordered],
+                "filled_quantities": [
+                    format(status.filled_quantity, "f") for status in statuses
+                ],
+                "residual_vector": [format(item, "f") for item in vector],
+                "residual_base_units": format(scalar, "f"),
+            },
+            state=GroupOrderState.PAIRED if balanced else GroupOrderState.RECOVERY_REQUIRED,
+            residual_base_units=scalar,
+            residual_vector=vector,
+            error_code=None if balanced else "chain_residual_unresolved",
+            now_ns=self._now(),
+        )
+        return snapshot, True
+
+    def _chain_residual(
+        self, snapshot: GroupOrderSnapshot
+    ) -> tuple[tuple[Decimal, ...], Decimal]:
+        """Per-leg base-unit deviation from the ratio target of the first leg."""
+
+        ordered = snapshot.request.ordered_legs
+        first_status = self._leg(snapshot, ordered[0].leg_id).child_status
+        first_base = (
+            Fraction(0)
+            if first_status is None
+            else Fraction(first_status.filled_quantity)
+            * Fraction(ordered[0].base_units_per_order_unit)
+        )
+        components: list[Fraction] = []
+        for item in ordered:
+            status = self._leg(snapshot, item.leg_id).child_status
+            filled = (
+                Fraction(0)
+                if status is None
+                else Fraction(status.filled_quantity) * Fraction(item.base_units_per_order_unit)
+            )
+            components.append(Fraction(item.ratio) * first_base - filled)
+        vector = tuple(_fraction_to_decimal(item) for item in components)
+        scalar = _fraction_to_decimal(sum((abs(item) for item in components), Fraction(0)))
+        return vector, scalar
+
+    @staticmethod
+    def _chain_express(plan: Any, base: Fraction) -> Decimal:
+        """Floor one leg's quantity for a target first-leg base (exact math)."""
+
+        raw = Fraction(plan.ratio) * base / Fraction(plan.base_units_per_order_unit)
+        step = Fraction(plan.quantity_step)
+        steps = raw // step
+        quantity = _fraction_to_decimal(steps * step)
+        quantity = min(quantity, plan.maximum_intent.quantity)
+        quantity = quantity - (quantity % plan.quantity_step)
+        return quantity
+
+    @staticmethod
+    def _common_chain_base(
+        remaining: tuple[Any, ...], quantities: Mapping[str, Decimal]
+    ) -> Fraction:
+        return min(
+            Fraction(quantities[item.leg_id])
+            * Fraction(item.base_units_per_order_unit)
+            / Fraction(item.ratio)
+            for item in remaining
+        )
+
+    def _chain_shortfall(self, snapshot: GroupOrderSnapshot) -> GroupOrderSnapshot:
+        if any(progress.submitted_intent is not None for progress in snapshot.legs):
+            return self._mark_recovery(snapshot, "CHAIN_QUANTITY_ROUNDS_TO_ZERO")
+        return self._reject_before_dispatch(snapshot, "CHAIN_STEP_SHORTFALL")
 
     def _close_no_fill(self, snapshot: GroupOrderSnapshot, first_leg_id: str) -> GroupOrderSnapshot:
         first_plan = snapshot.request.leg(first_leg_id)
@@ -1258,6 +1510,7 @@ class GroupOrderCoordinator:
         payload: Mapping[str, Any],
         state: GroupOrderState | None = None,
         residual_base_units: Decimal | None | object = ...,
+        residual_vector: tuple[Decimal, ...] | None | object = ...,
     ) -> GroupOrderSnapshot:
         entries = tuple(leg if item.leg_id == leg.leg_id else item for item in snapshot.legs)
         return self._store.update(
@@ -1267,6 +1520,7 @@ class GroupOrderCoordinator:
             state=state,
             legs=entries,
             residual_base_units=residual_base_units,
+            residual_vector=residual_vector,
             error_code=None
             if state in {GroupOrderState.FIRST_PENDING, GroupOrderState.HEDGE_PENDING}
             else ...,
@@ -1302,18 +1556,33 @@ class GroupOrderCoordinator:
         )
         return snapshot, False
 
-    def _mark_recovery(self, snapshot: GroupOrderSnapshot, code: str) -> GroupOrderSnapshot:
+    def _mark_recovery(
+        self,
+        snapshot: GroupOrderSnapshot,
+        code: str,
+        *,
+        residual_base_units: Decimal | None | object = ...,
+        residual_vector: tuple[Decimal, ...] | None | object = ...,
+    ) -> GroupOrderSnapshot:
+        if (
+            snapshot.state is GroupOrderState.RECOVERY_REQUIRED
+            and snapshot.error_code == code.lower()
+            and (residual_vector is ... or snapshot.residual_vector == residual_vector)
+            and (
+                residual_base_units is ...
+                or snapshot.residual_base_units == residual_base_units
+            )
+        ):
+            return snapshot
         if snapshot.state is GroupOrderState.RECOVERY_REQUIRED:
-            return (
-                snapshot
-                if snapshot.error_code == code.lower()
-                else self._store.update(
-                    snapshot,
-                    event_type="GROUP_RECOVERY_REQUIRED",
-                    event_payload={"code": code},
-                    error_code=code.lower(),
-                    now_ns=self._now(),
-                )
+            return self._store.update(
+                snapshot,
+                event_type="GROUP_RECOVERY_REQUIRED",
+                event_payload={"code": code},
+                error_code=code.lower(),
+                residual_base_units=residual_base_units,
+                residual_vector=residual_vector,
+                now_ns=self._now(),
             )
         return self._store.update(
             snapshot,
@@ -1321,6 +1590,8 @@ class GroupOrderCoordinator:
             event_payload={"code": code},
             state=GroupOrderState.RECOVERY_REQUIRED,
             error_code=code.lower(),
+            residual_base_units=residual_base_units,
+            residual_vector=residual_vector,
             now_ns=self._now(),
         )
 
@@ -1341,13 +1612,8 @@ class GroupOrderCoordinator:
     def _first_leg(self, snapshot: GroupOrderSnapshot) -> GroupLegProgress:
         return self._leg(snapshot, snapshot.request.first_leg_id)
 
-    def _second_leg(self, snapshot: GroupOrderSnapshot) -> GroupLegProgress:
-        leg_id = next(
-            item.leg_id
-            for item in snapshot.request.legs
-            if item.leg_id != snapshot.request.first_leg_id
-        )
-        return self._leg(snapshot, leg_id)
+    def _only_first_leg_submitted(self, snapshot: GroupOrderSnapshot) -> bool:
+        return all(progress.submitted_intent is None for progress in snapshot.legs[1:])
 
     def _now(self) -> int:
         value = self._clock_ns()
