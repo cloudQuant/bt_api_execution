@@ -188,6 +188,35 @@ def _lease(store: SqliteExecutionStore, scope: ExecutionScope):
     return store.acquire_or_renew_lease(scope, "legacy-import-writer", ttl_ns=60_000_000_000)
 
 
+def test_account_status_fails_closed_when_schema_metadata_is_missing(tmp_path):
+    scope = _scope()
+    store = SqliteExecutionStore(tmp_path / "paper-legacy-missing-meta.sqlite3")
+    lease = _lease(store, scope)
+    try:
+        empty_status = store.inspect_paper_legacy_import_account(
+            scope, source_account_id=_SOURCE_ACCOUNT_ID
+        )
+        assert empty_status.source_receipt is None
+        assert empty_status.active_account_import_state is None
+        assert empty_status.owner_domain_exists is False
+
+        domain = _domain(scope)
+        imported = _imported()
+        store.prepare_paper_legacy_import(scope, domain, imported, writer_lease=lease)
+        store.activate_paper_legacy_import(scope, writer_lease=lease)
+
+        # Simulate loss/corruption of the metadata table while owner and import
+        # facts remain.  Returning an empty account status here would let the
+        # AFI source rollback path unfreeze a second writer.
+        store._connection.execute("DROP TABLE execution_meta")
+        with pytest.raises(DurableStoreError, match="partial or unversioned"):
+            store.inspect_paper_legacy_import_account(
+                scope, source_account_id=_SOURCE_ACCOUNT_ID
+            )
+    finally:
+        store.close()
+
+
 def test_import_prepares_without_owner_then_activates_the_exact_opening_snapshot(tmp_path):
     scope = _scope()
     domain = _domain(scope)

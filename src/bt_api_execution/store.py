@@ -2923,6 +2923,12 @@ class SqliteExecutionStore:
                     "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'execution_meta'"
                 ).fetchone()
                 if base is None:
+                    existing_objects = cursor.execute(
+                        "SELECT 1 FROM sqlite_master WHERE name LIKE 'paper_%' "
+                        "AND type IN ('table', 'trigger') LIMIT 1"
+                    ).fetchone()
+                    if existing_objects is not None:
+                        raise DurableStoreError("paper execution schema is partial or unversioned")
                     return PaperLegacyImportAccountStatusV1(None, None, False)
                 version_row = cursor.execute(
                     "SELECT value FROM execution_meta WHERE key = 'paper_schema_version'"
