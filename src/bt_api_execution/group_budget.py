@@ -37,15 +37,24 @@ def build_instrument_risk_group_budget_quote(
     *,
     now_ns: int,
 ) -> GroupBudgetQuote:
-    """Build the maximum two-leg budget from trusted Risk assessments.
+    """Build the maximum unquoted group budget from trusted Risk assessments.
 
     ``InstrumentRiskRegistry.assess(order, now_ns)`` is the sole estimator.
     It applies the reviewed adverse-price envelope, multiplier, taker fee and
     fixed fee.  This builder rejects absent quantity/valuation units and any
     cross-currency conversion need; it never trusts a caller-supplied amount.
+    Version-1 legacy requests keep their original two-leg behavior; version-3
+    three-leg requests are quoted leg by leg with the same estimator, so each
+    leg's own instrument multiplier and fees are reflected and the quote binds
+    to the ratio-carrying plan fingerprint.  Anything else, including a request
+    that already carries a trusted quote, fails closed.
     """
 
-    if type(request) is not GroupOrderIntent or request.version != 1:
+    if (
+        type(request) is not GroupOrderIntent
+        or request.version not in {1, 3}
+        or request.budget_quote is not None
+    ):
         raise ContractValidationError("group budget quote source must be an unquoted request")
     if type(policy) is not PortfolioGroupBudgetPolicy:
         raise ContractValidationError("trusted portfolio group budget policy is required")
