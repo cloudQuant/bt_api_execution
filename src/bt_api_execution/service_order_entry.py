@@ -249,14 +249,34 @@ class ExecutionOrderEntryService:
                 or type(dispatch) is not PaperMatchingPort
                 or dispatch.owner_domain is not paper_owner_domain
                 or basic_admission_gate is None
-                or admission_gate is not None
                 or allow_unprotected
             ):
                 raise ContractValidationError(
                     "paper execution requires its exact trusted port and basic-admission gate"
                 )
+            if admission_gate is not None:
+                # Risk is an optional Paper composition. Import its adapter
+                # only when the trusted Paper owner explicitly selects one;
+                # generic admission gates must not gain Paper authority by
+                # merely implementing ``reserve``.
+                from .paper_risk import PaperRiskAdmissionAdapter
+
+                if type(admission_gate) is not PaperRiskAdmissionAdapter:
+                    raise ContractValidationError(
+                        "paper admission requires the canonical Risk adapter"
+                    )
             for wire_scope, execution_scope in copied.items():
                 paper_owner_domain.validate_binding(wire_scope, execution_scope)
+                if admission_gate is not None and not admission_gate.is_bound_to_composition(
+                    admission_gate.risk_gate,
+                    paper_owner_domain,
+                    dispatch,
+                    store=store,
+                    execution_scope=execution_scope,
+                ):
+                    raise ContractValidationError(
+                        "paper Risk adapter does not match the trusted owner composition"
+                    )
         elif type(dispatch) is PaperMatchingPort or any(
             execution_scope.provider == PAPER_PROVIDER for execution_scope in copied.values()
         ):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 import json
 import sqlite3
 from decimal import Decimal
@@ -30,7 +31,7 @@ from bt_api_execution import (
     SqliteExecutionStore,
     TimeInForce,
 )
-from bt_api_execution.errors import DurableStoreError
+from bt_api_execution.errors import ContractValidationError, DurableStoreError
 from bt_api_execution.paper_execution import (
     PAPER_FEE_MODEL_REF,
     PAPER_FEE_MODEL_VERSION,
@@ -152,6 +153,10 @@ def _build_service(
     *,
     quote_source: _SyntheticQuoteSource | None = None,
     domain: PaperOwnerDomainV1 | None = None,
+    admission_gate_factory: Callable[
+        [SqliteExecutionStore, PaperOwnerDomainV1, PaperMatchingPort], object
+    ]
+    | None = None,
 ) -> tuple[SqliteExecutionStore, ExecutionOrderEntryService, _SyntheticQuoteSource]:
     source = _SyntheticQuoteSource() if quote_source is None else quote_source
     domain = _domain() if domain is None else domain
@@ -180,10 +185,16 @@ def _build_service(
             ExecutionAdmissionValidatorRegistry((validator,)),
             permit_ttl_ns=60_000_000_000,
         )
+        admission_gate = (
+            None
+            if admission_gate_factory is None
+            else admission_gate_factory(store, domain, port)
+        )
         service = ExecutionOrderEntryService(
             store,
             {_WIRE_SCOPE: _EXECUTION_SCOPE},
             port,
+            admission_gate=admission_gate,
             basic_admission_gate=gate,
             paper_owner_domain=domain,
             writer_id="paper-v2-test-owner",
@@ -194,6 +205,176 @@ def _build_service(
     except Exception:
         store.close()
         raise
+
+
+def _make_risk_adapter(
+    store: SqliteExecutionStore,
+    domain: PaperOwnerDomainV1,
+    dispatch: PaperMatchingPort,
+    risk_path: Path,
+    *,
+    bound_domain: PaperOwnerDomainV1 | None = None,
+    bound_dispatch: PaperMatchingPort | None = None,
+    bound_store: SqliteExecutionStore | None = None,
+    bound_scope: ExecutionScope | None = None,
+) -> tuple[object, object, type[object]]:
+    from bt_api_risk import AccountScope, DurableRiskGate, RiskPolicy
+
+    from bt_api_execution.paper_risk import PaperRiskAdmissionAdapter
+
+    selected_domain = domain if bound_domain is None else bound_domain
+    selected_dispatch = dispatch if bound_dispatch is None else bound_dispatch
+    selected_store = store if bound_store is None else bound_store
+    selected_scope = _EXECUTION_SCOPE if bound_scope is None else bound_scope
+    risk_scope = AccountScope(
+        PAPER_PROVIDER,
+        selected_domain.simulation_account_ref,
+        PAPER_ENVIRONMENT,
+    )
+    risk_gate = DurableRiskGate(
+        risk_path,
+        RiskPolicy(
+            policy_id=f"paper-v2-constructor-{risk_path.stem}",
+            max_increase_notional=Decimal("1000"),
+            max_increase_count=10,
+            require_strategy_allocation=True,
+            notional_unit=selected_domain.cash_currency,
+        ),
+    )
+    risk_gate.set_strategy_allocation(
+        risk_scope,
+        selected_domain.strategy_ref,
+        f"paper-v2-allocation-{risk_path.stem}",
+        max_notional=Decimal("500"),
+        notional_unit=selected_domain.cash_currency,
+    )
+    adapter = PaperRiskAdmissionAdapter(
+        risk_gate,
+        selected_domain,
+        selected_dispatch,
+        execution_store=selected_store,
+        execution_scope=selected_scope,
+    )
+    return risk_gate, adapter, PaperRiskAdmissionAdapter
+
+
+def test_managed_paper_accepts_exact_risk_adapter_with_basic_admission(tmp_path) -> None:
+    risk_gates = []
+    adapter_types = []
+
+    def build_adapter(store, domain, dispatch):
+        risk_gate, adapter, adapter_type = _make_risk_adapter(
+            store,
+            domain,
+            dispatch,
+            tmp_path / "paper-risk-owner.sqlite",
+        )
+        risk_gates.append(risk_gate)
+        adapter_types.append(adapter_type)
+        return adapter
+
+    store, service, _source = _build_service(
+        tmp_path / "paper-execution-owner.sqlite",
+        admission_gate_factory=build_adapter,
+    )
+    try:
+        assert type(service._admission_gate) is adapter_types[0]
+        assert service._admission_gate.is_bound_to_composition(
+            risk_gates[0],
+            service._paper_owner_domain,
+            service._dispatch,
+            store=store,
+            execution_scope=_EXECUTION_SCOPE,
+        )
+        assert service._basic_admission_gate is not None
+        assert service._allow_unprotected is False
+    finally:
+        store.close()
+        for risk_gate in risk_gates:
+            risk_gate.close()
+
+
+def test_managed_paper_rejects_generic_structural_risk_gate(tmp_path) -> None:
+    with pytest.raises(ContractValidationError, match="canonical Risk adapter"):
+        _build_service(
+            tmp_path / "paper-generic-risk-owner.sqlite",
+            admission_gate_factory=lambda *_: SimpleNamespace(reserve=lambda _intent: None),
+        )
+
+
+@pytest.mark.parametrize("mismatch", ("domain", "dispatch", "store", "scope"))
+def test_managed_paper_rejects_risk_adapter_bound_to_other_composition(
+    tmp_path, mismatch: str
+) -> None:
+    risk_gates = []
+    extra_stores = []
+
+    def build_adapter(store, domain, dispatch):
+        bound_domain = domain
+        bound_dispatch = dispatch
+        bound_store = store
+        bound_scope = _EXECUTION_SCOPE
+        if mismatch == "domain":
+            bound_domain = _domain()
+            bound_dispatch = PaperMatchingPort(bound_domain, _SyntheticQuoteSource())
+        elif mismatch == "dispatch":
+            bound_dispatch = PaperMatchingPort(domain, _SyntheticQuoteSource())
+        elif mismatch == "store":
+            bound_store = SqliteExecutionStore(tmp_path / "other-execution-store.sqlite")
+            extra_stores.append(bound_store)
+        elif mismatch == "scope":
+            bound_scope = ExecutionScope(
+                PAPER_PROVIDER,
+                PAPER_ENVIRONMENT,
+                _SIM_ACCOUNT,
+                _STRATEGY,
+                "different-trading-day",
+            )
+        risk_gate, adapter, _adapter_type = _make_risk_adapter(
+            store,
+            domain,
+            dispatch,
+            tmp_path / f"paper-risk-{mismatch}.sqlite",
+            bound_domain=bound_domain,
+            bound_dispatch=bound_dispatch,
+            bound_store=bound_store,
+            bound_scope=bound_scope,
+        )
+        risk_gates.append(risk_gate)
+        return adapter
+
+    try:
+        with pytest.raises(ContractValidationError, match="trusted owner composition"):
+            _build_service(
+                tmp_path / f"paper-mismatched-{mismatch}.sqlite",
+                admission_gate_factory=build_adapter,
+            )
+    finally:
+        for store in extra_stores:
+            store.close()
+        for risk_gate in risk_gates:
+            risk_gate.close()
+
+
+def test_managed_paper_e_only_does_not_import_optional_risk_adapter(tmp_path, monkeypatch) -> None:
+    observed_optional_imports = []
+    original_import = builtins.__import__
+
+    def observe_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "bt_api_risk" or (name == "paper_risk" and level == 1):
+            observed_optional_imports.append((name, level))
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", observe_import)
+    store, service, _source = _build_service(tmp_path / "paper-e-only-owner.sqlite")
+    try:
+        assert service._admission_gate is None
+        assert service._basic_admission_gate is not None
+        assert service._paper_owner_domain is not None
+        assert service._allow_unprotected is False
+        assert observed_optional_imports == []
+    finally:
+        store.close()
 
 
 def _arguments(intent_id: str = "paper-v2-buy") -> dict[str, object]:
