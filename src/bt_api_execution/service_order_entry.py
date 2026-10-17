@@ -673,6 +673,16 @@ class ExecutionOrderEntryService:
         recovered: list[ExecutionRecord] = []
         seen_scope_keys: set[str] = set()
         ready_scope_keys: set[str] = set()
+        if self._paper_owner_domain is not None:
+            # A repeated recovery invalidates the previous readiness result.
+            # Publish readiness only after every configured Paper scope has
+            # completed both dispatch recovery and its trusted Risk cut.
+            paper_scope_keys = {
+                scope.key
+                for scope in self._targets.values()
+                if scope.provider == PAPER_PROVIDER
+            }
+            self._paper_ready_scope_keys.difference_update(paper_scope_keys)
         for execution_scope in self._targets.values():
             if execution_scope.key in seen_scope_keys:
                 continue
@@ -697,6 +707,17 @@ class ExecutionOrderEntryService:
                 )
             recovered.extend(records)
             if self._paper_owner_domain is not None:
+                if self._admission_gate is not None:
+                    recover_paper_scope = getattr(
+                        self._admission_gate, "recover_paper_scope", None
+                    )
+                    if not callable(recover_paper_scope):
+                        raise DurableStoreError(
+                            "Paper Risk admission has no trusted full-book recovery hook"
+                        )
+                    recover_paper_scope(
+                        writer_lease=order_facade.acquire_writer_lease()
+                    )
                 ready_scope_keys.add(execution_scope.key)
         if self._paper_owner_domain is not None:
             self._paper_ready_scope_keys.update(ready_scope_keys)
