@@ -31,6 +31,14 @@ from .group_order_contracts import (
     GroupOrderState,
     PortfolioGroupBudgetPolicy,
 )
+from .group_roll_exit_contracts import GroupRollExitClosedProofV1
+from .group_roll_exit_validation import (
+    ROLL_EXIT_EVENT_TYPES,
+    validate_roll_exit_close,
+    validate_roll_exit_event_transition,
+)
+
+_ROLL_EXIT_CLOSE_TOKEN = object()
 
 _TERMINAL_STATES = frozenset(
     {
@@ -100,6 +108,11 @@ _EVENT_TYPE = frozenset(
         "GROUP_COMPENSATION_STATUS_OBSERVED",
         "GROUP_COMPENSATION_RESOLVED",
         "GROUP_COMPENSATION_CLOSED",
+        "GROUP_ROLL_EXIT_PLAN_RECORDED",
+        "GROUP_ROLL_EXIT_SUBMIT_STARTED",
+        "GROUP_ROLL_EXIT_STATUS_OBSERVED",
+        "GROUP_ROLL_EXIT_RESOLVED",
+        "GROUP_ROLL_EXIT_CLOSED",
         "GROUP_REJECTED_BEFORE_DISPATCH",
         "GROUP_CLOSED_NO_EXPOSURE",
         "GROUP_RECOVERY_REQUIRED",
@@ -566,11 +579,17 @@ class SqliteOrderGroupStore:
         residual_vector: Any = ...,
         error_code: str | None | Any = ...,
         now_ns: int | None = None,
+        _roll_exit_close_token: object | None = None,
     ) -> GroupOrderSnapshot:
         if type(snapshot) is not GroupOrderSnapshot:
             raise ContractValidationError("group snapshot is required")
         if event_type not in _EVENT_TYPE:
             raise ContractValidationError("unsupported group event type")
+        if event_type == "GROUP_ROLL_EXIT_CLOSED":
+            if _roll_exit_close_token is not _ROLL_EXIT_CLOSE_TOKEN:
+                raise ContractValidationError("roll-exit close must use the typed close API")
+        elif _roll_exit_close_token is not None:
+            raise ContractValidationError("roll-exit close must use the typed close API")
         occurred_at_ns = time.time_ns() if now_ns is None else now_ns
         if type(occurred_at_ns) is not int or occurred_at_ns <= 0:
             raise ContractValidationError("invalid group event time")
@@ -583,6 +602,10 @@ class SqliteOrderGroupStore:
         if event_type in _COMPENSATION_EVENT_TRANSITIONS:
             if (snapshot.state, target_state) not in _COMPENSATION_EVENT_TRANSITIONS[event_type]:
                 raise ContractValidationError("invalid compensation event state transition")
+        elif event_type in ROLL_EXIT_EVENT_TYPES:
+            # Roll-exit events have their own strict state machine, including
+            # the RECOVERY_REQUIRED -> UNWINDING recovery transition.
+            pass
         elif (
             snapshot.state is GroupOrderState.RECOVERY_REQUIRED
             and target_state is GroupOrderState.UNWINDING
@@ -602,6 +625,19 @@ class SqliteOrderGroupStore:
                 compensation_history,
                 target_state,
             )
+        roll_exit_history: tuple[GroupOrderEvent, ...] = ()
+        if event_type in ROLL_EXIT_EVENT_TYPES:
+            roll_exit_history = self.events(
+                snapshot.request.portfolio_ref, snapshot.request.group_id
+            )
+            if len(roll_exit_history) != snapshot.revision + 1:
+                raise IntentConflictError()
+            if event_type == "GROUP_ROLL_EXIT_CLOSED":
+                validate_roll_exit_close(snapshot, event_payload, roll_exit_history)
+            else:
+                validate_roll_exit_event_transition(
+                    snapshot, event_type, event_payload, roll_exit_history, target_state
+                )
         candidate = replace(
             snapshot,
             revision=snapshot.revision + 1,
@@ -619,6 +655,29 @@ class SqliteOrderGroupStore:
         persisted_event_payload = dict(event_payload)
         current_budget = snapshot.budget_reservation
         target_budget = current_budget
+        close_proven = False
+        if target_state is GroupOrderState.CLOSED:
+            if event_type == "GROUP_ROLL_EXIT_CLOSED":
+                # validate_roll_exit_close checked the immutable pre-close
+                # snapshot and hash-verified history above.
+                close_proven = _roll_exit_close_token is _ROLL_EXIT_CLOSE_TOKEN
+            elif event_type == "GROUP_CLOSED_NO_EXPOSURE":
+                close_proven = _proven_no_exposure_close(candidate, persisted_event_payload)
+            elif event_type == "GROUP_COMPENSATION_CLOSED":
+                close_proven = _proven_group_compensation_close(
+                    candidate, persisted_event_payload, compensation_history
+                )
+            if not close_proven:
+                raise ContractValidationError("group CLOSED requires a complete typed terminal proof")
+        if target_state is GroupOrderState.CLOSED and event_type == "GROUP_ROLL_EXIT_CLOSED":
+            # Validate for v1 as well as v2, then let the same SQLite update
+            # transaction persist both CLOSED and the v2 HELD -> RELEASED
+            # budget transition.  The private token prevents generic update
+            # callers from reaching this branch.
+            if _roll_exit_close_token is not _ROLL_EXIT_CLOSE_TOKEN:
+                raise ContractValidationError("roll-exit close requires typed proof")
+        elif _roll_exit_close_token is not None:
+            raise ContractValidationError("roll-exit close token used for another event")
         if current_budget is not None:
             target_budget_state = current_budget.state
             if event_type in {"FIRST_LEG_SUBMIT_STARTED", "HEDGE_LEG_SUBMIT_STARTED"}:
@@ -645,22 +704,10 @@ class SqliteOrderGroupStore:
                     )
                 target_budget_state = GroupBudgetReservationState.RELEASED
             elif target_state is GroupOrderState.CLOSED:
-                if event_type == "GROUP_CLOSED_NO_EXPOSURE":
-                    proven = _proven_no_exposure_close(candidate, persisted_event_payload)
-                elif event_type == "GROUP_COMPENSATION_CLOSED":
-                    proven = _proven_group_compensation_close(
-                        candidate, persisted_event_payload, compensation_history
-                    )
-                else:
-                    proven = False
-                if not proven:
-                    raise ContractValidationError(
-                        "group budget release requires exact terminal no-exposure evidence"
-                    )
                 target_budget_state = GroupBudgetReservationState.RELEASED
             if target_budget_state is not current_budget.state:
                 target_budget = replace(current_budget, state=target_budget_state)
-                if event_type not in _COMPENSATION_EVENT_TYPES:
+                if event_type not in _COMPENSATION_EVENT_TYPES | ROLL_EXIT_EVENT_TYPES:
                     persisted_event_payload["budget_transition"] = {
                         "from": current_budget.state.value,
                         "to": target_budget_state.value,
@@ -669,7 +716,7 @@ class SqliteOrderGroupStore:
                         "valuation_unit": current_budget.valuation_unit,
                         "gross_notional": format(current_budget.gross_notional, "f"),
                     }
-            elif event_type not in _COMPENSATION_EVENT_TYPES:
+            elif event_type not in _COMPENSATION_EVENT_TYPES | ROLL_EXIT_EVENT_TYPES:
                 persisted_event_payload["budget_state"] = current_budget.state.value
         new_snapshot = replace(candidate, state=target_state, budget_reservation=target_budget)
         self._validate_event(event_type, persisted_event_payload, occurred_at_ns)
@@ -688,6 +735,11 @@ class SqliteOrderGroupStore:
             if (
                 int(row["revision"]) != snapshot.revision
                 or persisted.request.fingerprint != snapshot.request.fingerprint
+                or (
+                    event_type in ROLL_EXIT_EVENT_TYPES
+                    and canonical_json(persisted.to_payload())
+                    != canonical_json(snapshot.to_payload())
+                )
             ):
                 raise IntentConflictError()
             cursor.execute(
@@ -740,6 +792,40 @@ class SqliteOrderGroupStore:
                 occurred_at_ns,
             )
         return new_snapshot
+
+    def close_roll_exit(
+        self,
+        snapshot: GroupOrderSnapshot,
+        proof: GroupRollExitClosedProofV1,
+        *,
+        now_ns: int | None = None,
+    ) -> GroupOrderSnapshot:
+        """Atomically persist the proof-gated v1/v2 aggregate CLOSED state.
+
+        Risk receipts and fee rows are first validated and persisted by the
+        trusted coordinator from the Risk owner.  This method independently
+        rechecks those hash-verified group events, reservation releases, and
+        (for v2) the exact held budget before one revision CAS closes the
+        group.  A caller cannot close through ``update`` directly.
+        """
+
+        if type(snapshot) is not GroupOrderSnapshot or type(proof) is not GroupRollExitClosedProofV1:
+            raise ContractValidationError("typed roll-exit close proof is required")
+        payload = {
+            "schema": "group-roll-exit-closed-event-v1",
+            "proof": proof.to_payload(),
+            "proof_sha256": proof.proof_sha256,
+        }
+        return self.update(
+            snapshot,
+            event_type="GROUP_ROLL_EXIT_CLOSED",
+            event_payload=payload,
+            state=GroupOrderState.CLOSED,
+            residual_base_units=Decimal("0"),
+            error_code=None,
+            now_ns=now_ns,
+            _roll_exit_close_token=_ROLL_EXIT_CLOSE_TOKEN,
+        )
 
     def get(self, portfolio_ref: str, group_id: str) -> GroupOrderSnapshot | None:
         with self._lock:
