@@ -1154,8 +1154,6 @@ def _validate_released_reservations(
             or reservation.account_ref not in release_positions
         ):
             raise ContractValidationError("account reservation is not durably released")
-        if request.version == 2 and reservation.policy_fingerprint != snapshot.budget_reservation.policy_fingerprint:
-            raise ContractValidationError("account reservation policy differs from budget hold")
         expected_ids = {leg_id for leg_id, account in expected_legs.items() if account == reservation.account_ref}
         if {item.leg_id for item in reservation.legs} != expected_ids:
             raise ContractValidationError("released reservation leg membership is incomplete")

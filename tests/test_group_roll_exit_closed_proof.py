@@ -405,7 +405,10 @@ def _budget_quote(
 
 
 def _paired_group(
-    database: Path, *, partial_open_leg_id: str | None = None
+    database: Path,
+    *,
+    partial_open_leg_id: str | None = None,
+    risk_policy_fingerprint: str | None = None,
 ) -> tuple[SqliteOrderGroupStore, Any]:
     request = _make_request()
     scope = request.legs[0].maximum_intent.scope
@@ -422,7 +425,7 @@ def _paired_group(
     reservations = _ReservationPort(
         scope,
         group_fingerprint=risk_group_fingerprint,
-        policy_fingerprint=policy.fingerprint,
+        policy_fingerprint=risk_policy_fingerprint or policy.fingerprint,
     )
     orders = _OrdersPort(reservations, partial_open_leg_id=partial_open_leg_id)
     store = SqliteOrderGroupStore(database)
@@ -944,9 +947,16 @@ def _proof(snapshot: Any, store: SqliteOrderGroupStore, actions: tuple[_RollActi
 
 
 def _full_scenario(
-    database: Path, *, partial_open_leg_id: str | None = None
+    database: Path,
+    *,
+    partial_open_leg_id: str | None = None,
+    risk_policy_fingerprint: str | None = None,
 ) -> _Scenario:
-    store, snapshot = _paired_group(database, partial_open_leg_id=partial_open_leg_id)
+    store, snapshot = _paired_group(
+        database,
+        partial_open_leg_id=partial_open_leg_id,
+        risk_policy_fingerprint=risk_policy_fingerprint,
+    )
     actions: list[_RollAction] = []
     for index, plan in enumerate(snapshot.request.legs):
         action = _roll_action(snapshot, store, plan.leg_id)
@@ -957,6 +967,41 @@ def _full_scenario(
     snapshot = _release_reservations(store, snapshot)
     proof = _proof(snapshot, store, tuple(actions))
     return _Scenario(database, store, snapshot, proof, tuple(actions))
+
+
+def test_roll_exit_keeps_risk_and_portfolio_budget_policies_independent(
+    tmp_path: Path,
+) -> None:
+    risk_policy_fingerprint = payload_sha256({"risk_policy": "account-risk-policy-v1"})
+    scenario = _full_scenario(
+        tmp_path / "distinct-risk-and-budget-policies.sqlite",
+        risk_policy_fingerprint=risk_policy_fingerprint,
+    )
+    snapshot, store, proof = scenario.snapshot, scenario.store, scenario.proof
+    budget_fingerprint = snapshot.budget_reservation.policy_fingerprint
+
+    assert risk_policy_fingerprint != budget_fingerprint
+    assert all(
+        reservation.policy_fingerprint == risk_policy_fingerprint
+        for reservation in snapshot.reservations
+    )
+    assert all(
+        leg.claim_receipt is not None
+        and leg.claim_receipt.permit.policy_fingerprint == risk_policy_fingerprint
+        for leg in snapshot.legs
+    )
+    assert proof.budget_release is not None
+    assert proof.budget_release.policy_fingerprint == budget_fingerprint
+    assert proof.budget_release.policy_fingerprint != risk_policy_fingerprint
+
+    closed = store.close_roll_exit(snapshot, proof, now_ns=_NOW_NS + 701)
+
+    assert closed.state is GroupOrderState.CLOSED
+    assert closed.budget_reservation.policy_fingerprint == budget_fingerprint
+    assert all(
+        reservation.policy_fingerprint == risk_policy_fingerprint
+        for reservation in closed.reservations
+    )
 
 
 def test_closed_proof_requires_two_fully_resolved_legs_and_releases_v2_budget(
