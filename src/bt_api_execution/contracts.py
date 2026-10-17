@@ -433,6 +433,8 @@ class OrderIntent:
     metadata_version: str = "unknown"
     deadline_ns: int | None = None
     tags: Mapping[str, str] = field(default_factory=dict)
+    position_side: str = "NET"
+    position_bucket: str = "ALL"
 
     def __post_init__(self) -> None:
         if not isinstance(self.scope, ExecutionScope):
@@ -452,6 +454,28 @@ class OrderIntent:
                 object.__setattr__(self, name, enum_type(getattr(self, name)))
             except (TypeError, ValueError) as error:
                 raise ContractValidationError(f"invalid {name}") from error
+        position_side = self.position_side
+        position_bucket = self.position_bucket
+        if type(position_side) is not str or position_side not in {"NET", "LONG", "SHORT"}:
+            raise ContractValidationError("invalid position_side")
+        if type(position_bucket) is not str or position_bucket not in {
+            "ALL",
+            "TODAY",
+            "YESTERDAY",
+        }:
+            raise ContractValidationError("invalid position_bucket")
+        if self.position_effect is PositionEffect.CLOSE_TODAY:
+            if position_bucket not in {"ALL", "TODAY"}:
+                raise ContractValidationError("position effect and bucket disagree")
+            position_bucket = "TODAY"
+        elif self.position_effect is PositionEffect.CLOSE_YESTERDAY:
+            if position_bucket not in {"ALL", "YESTERDAY"}:
+                raise ContractValidationError("position effect and bucket disagree")
+            position_bucket = "YESTERDAY"
+        if self.position_effect is PositionEffect.OPEN and position_bucket != "ALL":
+            raise ContractValidationError("opening intent cannot select a close bucket")
+        object.__setattr__(self, "position_side", position_side)
+        object.__setattr__(self, "position_bucket", position_bucket)
         object.__setattr__(self, "quantity", _decimal(self.quantity, "quantity", positive=True))
         object.__setattr__(
             self, "metadata_version", _text(self.metadata_version, "metadata_version")
@@ -494,6 +518,8 @@ class OrderIntent:
         metadata_version: str = "unknown",
         deadline_ns: int | None = None,
         tags: Mapping[str, str] | None = None,
+        position_side: str = "NET",
+        position_bucket: str = "ALL",
     ) -> OrderIntent:
         return cls(
             intent_id=intent_id,
@@ -510,10 +536,12 @@ class OrderIntent:
             metadata_version=metadata_version,
             deadline_ns=deadline_ns,
             tags={} if tags is None else tags,
+            position_side=position_side,
+            position_bucket=position_bucket,
         )
 
     def to_payload(self) -> dict[str, Any]:
-        return {
+        payload = {
             "intent_id": self.intent_id,
             "scope": self.scope.to_payload(),
             "signal_id": self.signal_id,
@@ -529,6 +557,23 @@ class OrderIntent:
             "deadline_ns": self.deadline_ns,
             "tags": dict(self.tags),
         }
+        # Preserve v1 fingerprints and persisted payloads for the established
+        # NET/ALL contract. Explicit hedge or dated-position semantics are
+        # part of the immutable intent identity.
+        if self.position_side != "NET":
+            payload["position_side"] = self.position_side
+        # The legacy close enums already carry their dated bucket. Preserve
+        # their established wire payload and fingerprint; the explicit bucket
+        # is serialized only when the generic CLOSE effect needs it.
+        if (
+            self.position_bucket != "ALL"
+            and self.position_effect not in {
+                PositionEffect.CLOSE_TODAY,
+                PositionEffect.CLOSE_YESTERDAY,
+            }
+        ):
+            payload["position_bucket"] = self.position_bucket
+        return payload
 
     @property
     def fingerprint(self) -> str:
@@ -556,6 +601,8 @@ def order_intent_from_payload(payload: Mapping[str, Any]) -> OrderIntent:
             metadata_version=payload["metadata_version"],
             deadline_ns=payload["deadline_ns"],
             tags=payload["tags"],
+            position_side=payload.get("position_side", "NET"),
+            position_bucket=payload.get("position_bucket", "ALL"),
         )
     except (KeyError, TypeError, ValueError, InvalidOperation) as error:
         raise ContractValidationError("invalid persisted intent payload") from error
