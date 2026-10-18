@@ -15464,6 +15464,11 @@ class SqliteExecutionStore:
         deferred transaction on this Store connection. The transaction always
         rolls back because this method is strictly read-only. UNKNOWN commands
         and open account fences are reported as not-ready and remain untouched.
+        When ``cancel_command_id`` is supplied, the preliminary fence check
+        excludes only that exact unresolved CANCEL to SUBMIT postcondition so
+        this snapshot can inspect it. Other postconditions and fence classes,
+        including poisoned owners, continue to block. This read never resolves
+        the postcondition.
         """
 
         account_key, trading_day, scope_key = self._validate_ctp_order_identity_scope(scope)
@@ -15645,7 +15650,23 @@ class SqliteExecutionStore:
                     return not_ready("NOT_SUBMIT_COMMAND")
                 if command.status == "UNKNOWN":
                     return not_ready("COMMAND_UNKNOWN")
-                if self._ctp_dispatch_has_open_account_fence(cursor, account_key):
+                cancel_postcondition_exception = None
+                if cancel_command_id is not None:
+                    # This snapshot is allowed to inspect only the exact
+                    # CANCEL -> SUBMIT postcondition it will validate below.
+                    # The account-wide fence remains in force for every other
+                    # cancellation and every other fence class.
+                    cancel_postcondition_exception = (
+                        scope_key,
+                        trading_day,
+                        cancel_command_id,
+                        command_id,
+                    )
+                if self._ctp_dispatch_has_open_account_fence(
+                    cursor,
+                    account_key,
+                    cancel_postcondition_exception=cancel_postcondition_exception,
+                ):
                     return not_ready("ACCOUNT_FENCED")
                 if (
                     command.status != "COMPLETED"
@@ -17557,9 +17578,36 @@ class SqliteExecutionStore:
         )
 
     @staticmethod
-    def _ctp_dispatch_has_open_account_fence(cursor: sqlite3.Cursor, account_key: str) -> bool:
-        row = cursor.execute(
+    def _ctp_dispatch_has_open_account_fence(
+        cursor: sqlite3.Cursor,
+        account_key: str,
+        *,
+        cancel_postcondition_exception: tuple[str, str, str, str] | None = None,
+    ) -> bool:
+        cancel_postcondition_clause = ""
+        parameters: tuple[Any, ...] = (account_key,)
+        if cancel_postcondition_exception is not None:
+            if (
+                type(cancel_postcondition_exception) is not tuple
+                or len(cancel_postcondition_exception) != 4
+                or any(
+                    type(value) is not str or not value
+                    for value in cancel_postcondition_exception
+                )
+            ):
+                raise ContractValidationError("exact CTP cancel postcondition identity is required")
+            cancel_postcondition_clause = """
+                  AND NOT (
+                      postcondition.scope_key = ?
+                      AND postcondition.trading_day = ?
+                      AND postcondition.cancel_command_id = ?
+                      AND postcondition.target_submit_command_id = ?
+                      AND postcondition.identity_state = 'EXACT'
+                  )
             """
+            parameters += cancel_postcondition_exception
+        row = cursor.execute(
+            f"""
             SELECT 1 FROM ctp_dispatch_commands
             WHERE account_key = ? AND (
                 status = 'CLAIMED'
@@ -17575,6 +17623,7 @@ class SqliteExecutionStore:
                 OR EXISTS (
                     SELECT 1 FROM ctp_dispatch_cancel_postconditions AS postcondition
                     WHERE postcondition.account_key = ctp_dispatch_commands.account_key
+                      {cancel_postcondition_clause}
                       AND NOT EXISTS (
                           SELECT 1 FROM ctp_dispatch_cancel_postcondition_resolutions AS resolution
                           WHERE resolution.account_key = postcondition.account_key
@@ -17589,7 +17638,7 @@ class SqliteExecutionStore:
             )
             LIMIT 1
             """,
-            (account_key,),
+            parameters,
         ).fetchone()
         return row is not None
 

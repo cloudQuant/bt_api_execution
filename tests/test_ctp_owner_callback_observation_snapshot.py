@@ -444,13 +444,20 @@ def test_owner_observation_cancel_ack_stays_fenced_until_terminal_order_matches_
 
         before = store._connection.total_changes
         _assert_not_ready(
+            _read(store, scope, "command-observation-cancel"),
+            "ACCOUNT_FENCED",
+        )
+        # A requested cancel snapshot may inspect its own exact postcondition,
+        # but the existing order callback is still required before any
+        # observation can be returned.
+        _assert_not_ready(
             _read(
                 store,
                 scope,
                 "command-observation-cancel",
                 cancel_command_id="cancel-observation-cancel",
             ),
-            "ACCOUNT_FENCED",
+            "PROVIDER_ORDER_NOT_READY",
         )
         assert store._connection.total_changes == before
 
@@ -477,6 +484,211 @@ def test_owner_observation_cancel_ack_stays_fenced_until_terminal_order_matches_
         assert snapshot.trade_notional == Decimal("99.25")
         assert snapshot.cancel_command_id == "cancel-observation-cancel"
         assert snapshot.cancel_action_state == "ACKNOWLEDGED"
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+def test_owner_observation_cancel_snapshot_exempts_only_its_exact_postcondition(tmp_path):
+    scope = _scope()
+    store = SqliteExecutionStore(tmp_path / "owner-observation-cancel-fence.sqlite3")
+    lease = _lease(store, scope)
+    try:
+        owner = _active_owner(store, scope, lease)
+        reservation, _ = _submit(
+            store,
+            scope,
+            lease,
+            owner,
+            intent_id="observation-cancel-fence-target",
+            command_id="command-observation-cancel-fence-target",
+        )
+        _other_reservation, _ = _submit(
+            store,
+            scope,
+            lease,
+            owner,
+            intent_id="observation-cancel-fence-other",
+            command_id="command-observation-cancel-fence-other",
+            request_id=72,
+        )
+        _append_order(
+            store,
+            owner,
+            scope,
+            reservation,
+            source_sequence=4,
+            volume_traded=0,
+            status="3",
+        )
+        cancel_command_id = "cancel-observation-cancel-fence-target"
+        _stage_cancel_and_complete(
+            store,
+            scope,
+            lease,
+            owner,
+            reservation,
+            cancel_command_id,
+            501,
+        )
+        session = store._active_ctp_callback_sessions[owner.owner_intent_id]
+        cancel = store.read_ctp_dispatch_command(scope, cancel_command_id)
+        action = cancel.correlation_key
+        store.append_ctp_callback_ingress(
+            owner,
+            _record(
+                owner,
+                "OnRspOrderAction",
+                5,
+                phase="ACTIVE",
+                callback_class="ROUTEABLE",
+                request_id=action.native_request_id,
+                is_last=True,
+                fields=(
+                    (0, "BrokerID", "broker"),
+                    (0, "InvestorID", "user"),
+                    (0, "UserID", "user"),
+                    (0, "InstrumentID", "rb2710"),
+                    (0, "OrderRef", reservation.order_ref),
+                    (0, "ExchangeID", "SHFE"),
+                    (0, "OrderSysID", "sys-" + reservation.order_ref),
+                    (0, "FrontID", session.dispatch_front_id),
+                    (0, "SessionID", session.dispatch_session_id),
+                    (0, "RequestID", action.native_request_id),
+                    (0, "OrderActionRef", action.native_action_ref),
+                    (0, "ActionFlag", "0"),
+                    (1, "ErrorID", 0),
+                ),
+            ),
+        )
+        _adapter_for(store, owner).apply_next_ingress(
+            callback_verifier=_SnapshotOrderCallbackVerifier(),
+            trade_fact_verifier=_TradeVerifier(),
+        )
+
+        postcondition = store._connection.execute(
+            """
+            SELECT account_key, scope_key, trading_day, cancel_command_id,
+                   target_submit_command_id, identity_state
+            FROM ctp_dispatch_cancel_postconditions
+            WHERE account_key = ? AND cancel_command_id = ?
+            """,
+            (scope.account_key, cancel_command_id),
+        ).fetchone()
+        assert tuple(postcondition) == (
+            scope.account_key,
+            reservation.scope_key,
+            reservation.trading_day,
+            cancel_command_id,
+            "command-observation-cancel-fence-target",
+            "EXACT",
+        )
+        assert store._connection.execute(
+            "SELECT 1 FROM ctp_dispatch_cancel_postcondition_resolutions "
+            "WHERE account_key = ? AND cancel_command_id = ?",
+            (scope.account_key, cancel_command_id),
+        ).fetchone() is None
+
+        cursor = store._connection.cursor()
+        try:
+            assert store._ctp_dispatch_has_open_account_fence(cursor, scope.account_key)
+            assert not store._ctp_dispatch_has_open_account_fence(
+                cursor,
+                scope.account_key,
+                cancel_postcondition_exception=(
+                    reservation.scope_key,
+                    reservation.trading_day,
+                    cancel_command_id,
+                    "command-observation-cancel-fence-target",
+                ),
+            )
+            assert store._ctp_dispatch_has_open_account_fence(
+                cursor,
+                scope.account_key,
+                cancel_postcondition_exception=(
+                    reservation.scope_key + "-other",
+                    reservation.trading_day,
+                    cancel_command_id,
+                    "command-observation-cancel-fence-target",
+                ),
+            )
+            assert store._ctp_dispatch_has_open_account_fence(
+                cursor,
+                scope.account_key,
+                cancel_postcondition_exception=(
+                    reservation.scope_key,
+                    reservation.trading_day + "-other",
+                    cancel_command_id,
+                    "command-observation-cancel-fence-target",
+                ),
+            )
+            assert store._ctp_dispatch_has_open_account_fence(
+                cursor,
+                scope.account_key,
+                cancel_postcondition_exception=(
+                    reservation.scope_key,
+                    reservation.trading_day,
+                    cancel_command_id,
+                    "command-observation-cancel-fence-other",
+                ),
+            )
+        finally:
+            cursor.close()
+
+        before_changes = store._connection.total_changes
+        _assert_not_ready(
+            _read(store, scope, "command-observation-cancel-fence-target"),
+            "ACCOUNT_FENCED",
+        )
+        _assert_not_ready(
+            _read(
+                store,
+                scope,
+                "command-observation-cancel-fence-target",
+                cancel_command_id="cancel-observation-cancel-fence-other",
+            ),
+            "ACCOUNT_FENCED",
+        )
+        _assert_not_ready(
+            _read(
+                store,
+                scope,
+                "command-observation-cancel-fence-other",
+                cancel_command_id=cancel_command_id,
+            ),
+            "ACCOUNT_FENCED",
+        )
+
+        snapshot = _read(
+            store,
+            scope,
+            "command-observation-cancel-fence-target",
+            cancel_command_id=cancel_command_id,
+        )
+        assert isinstance(snapshot, CtpOwnerCallbackObservationSnapshotV1)
+        assert snapshot.provider_state == "ACKNOWLEDGED"
+        assert snapshot.cancel_command_id == cancel_command_id
+        assert snapshot.cancel_action_state == "ACKNOWLEDGED"
+        assert store._connection.total_changes == before_changes
+        assert store._connection.execute(
+            "SELECT 1 FROM ctp_dispatch_cancel_postcondition_resolutions "
+            "WHERE account_key = ? AND cancel_command_id = ?",
+            (scope.account_key, cancel_command_id),
+        ).fetchone() is None
+
+        poisoned = store.poison_ctp_callback_session_owner(owner, "owner_stop")
+        assert poisoned.durable_state == "POISONED"
+        before_poisoned_read = store._connection.total_changes
+        _assert_not_ready(
+            _read(
+                store,
+                scope,
+                "command-observation-cancel-fence-target",
+                cancel_command_id=cancel_command_id,
+            ),
+            "ACCOUNT_FENCED",
+        )
+        assert store._connection.total_changes == before_poisoned_read
     finally:
         store.close()
 
