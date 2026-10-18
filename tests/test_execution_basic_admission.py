@@ -12,6 +12,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+from _legacy_execution_schema import drop_v24_callback_owner_scope_schema
 from bt_api_base.service_protocol import WireIdentity, WireRole, WireScope
 
 from bt_api_execution import (
@@ -670,6 +671,7 @@ def test_schema_v20_migration_adds_nullable_basic_admission_binding_columns(tmp_
 
     connection = sqlite3.connect(path, isolation_level=None)
     try:
+        drop_v24_callback_owner_scope_schema(connection)
         connection.execute("ALTER TABLE execution_records DROP COLUMN basic_admission_reference")
         connection.execute("ALTER TABLE execution_records DROP COLUMN admission_context_sha256")
         connection.execute("UPDATE execution_meta SET value = '20' WHERE key = 'schema_version'")
@@ -704,7 +706,7 @@ def test_schema_v20_migration_adds_nullable_basic_admission_binding_columns(tmp_
                 "PRAGMA table_info(execution_records)"
             ).fetchall()
         }
-        assert version == "21"
+        assert version == "24"
         assert {"basic_admission_reference", "admission_context_sha256"}.issubset(columns)
         assert record is not None and record.state is ExecutionState.PENDING_DISPATCH
         assert record.permit_reference == "risk-permit-migration"

@@ -981,12 +981,16 @@ def test_v22_store_migration_adds_financial_schema_without_changing_journal(tmp_
             "account_financial_baselines_immutable_delete",
             "account_financial_events_immutable_update",
             "account_financial_events_immutable_delete",
+            "ctp_callback_session_owner_scopes_owner_match",
+            "ctp_callback_session_owner_scopes_immutable_update",
+            "ctp_callback_session_owner_scopes_immutable_delete",
         ):
             connection.execute(f'DROP TRIGGER IF EXISTS "{trigger}"')
         for table in (
             "account_financial_ledger_heads",
             "account_financial_events",
             "account_financial_baselines",
+            "ctp_dispatch_callback_session_owner_scopes",
         ):
             connection.execute(f'DROP TABLE IF EXISTS "{table}"')
         connection.execute("UPDATE execution_meta SET value = '22' WHERE key = 'schema_version'")
@@ -1002,7 +1006,7 @@ def test_v22_store_migration_adds_financial_schema_without_changing_journal(tmp_
             schema_version = connection.execute(
                 "SELECT value FROM execution_meta WHERE key = 'schema_version'"
             ).fetchone()[0]
-            assert schema_version == "23"
+            assert schema_version == "24"
             tables = {
                 row[0]
                 for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")

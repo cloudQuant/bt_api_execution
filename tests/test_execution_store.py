@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from hashlib import sha256
 
 import pytest
+from _legacy_execution_schema import drop_v24_callback_owner_scope_schema
 
 from bt_api_execution import (
     ContractValidationError,
@@ -78,7 +79,7 @@ def test_v2_execution_store_adds_nullable_cumulative_commission_column(tmp_path)
             "SELECT value FROM execution_meta WHERE key = 'schema_version'"
         ).fetchone()["value"]
         assert "cumulative_commission" in columns
-        assert version == "22"
+        assert version == "24"
     finally:
         store.close()
 
@@ -109,7 +110,7 @@ def test_v3_execution_store_adds_ctp_order_identity_reservations(tmp_path) -> No
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-        assert version == "22"
+        assert version == "24"
         assert "ctp_order_identity_reservations" in tables
         assert "ctp_dispatch_commands" in tables
         assert "ctp_dispatch_authority_uses" in tables
@@ -145,7 +146,7 @@ def test_v10_execution_store_adds_callback_lifecycle_fence_schema(tmp_path) -> N
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-        assert version == "22"
+        assert version == "24"
         assert "ctp_dispatch_callback_source_lifecycle_fences" in tables
         assert "ctp_dispatch_callback_ingestion_resolutions" not in tables
         assert "ctp_order_target_projections" in tables
@@ -164,6 +165,7 @@ def test_v10_execution_store_migrates_immutable_cancel_target_projection_tables(
     # their indexes/triggers, and restoring the prior version marker.
     connection = sqlite3.connect(path)
     try:
+        drop_v24_callback_owner_scope_schema(connection)
         connection.execute("DROP TABLE ctp_order_target_projection_consumptions")
         connection.execute("DROP TABLE ctp_order_target_projections")
         connection.execute("DROP TABLE ctp_dispatch_callback_source_lifecycle_fences")
@@ -201,7 +203,7 @@ def test_v10_execution_store_migrates_immutable_cancel_target_projection_tables(
                 "SELECT name FROM sqlite_master WHERE type = 'trigger'"
             ).fetchall()
         }
-        assert version == "22"
+        assert version == "24"
         assert {
             "ctp_order_target_projections",
             "ctp_order_target_projection_consumptions",
@@ -229,6 +231,7 @@ def test_v10_execution_store_migrates_immutable_cancel_target_projection_tables(
 def test_v11_projection_lineage_migrates_without_inventing_callback_fence(tmp_path) -> None:
     path = tmp_path / "execution.sqlite3"
     store = SqliteExecutionStore(path)
+    drop_v24_callback_owner_scope_schema(store._connection)
     store._connection.execute("DROP TABLE ctp_dispatch_callback_source_lifecycle_fences")
     store._connection.execute("UPDATE execution_meta SET value = '11' WHERE key = 'schema_version'")
     store.close()
@@ -239,7 +242,7 @@ def test_v11_projection_lineage_migrates_without_inventing_callback_fence(tmp_pa
             migrated._connection.execute(
                 "SELECT value FROM execution_meta WHERE key = 'schema_version'"
             ).fetchone()[0]
-            == "22"
+            == "24"
         )
         tables = {
             str(row["name"])
@@ -267,7 +270,7 @@ def test_v11_projection_lineage_migrates_without_inventing_callback_fence(tmp_pa
             reopened._connection.execute(
                 "SELECT value FROM execution_meta WHERE key = 'schema_version'"
             ).fetchone()[0]
-            == "22"
+            == "24"
         )
         assert (
             reopened._connection.execute(
@@ -283,6 +286,7 @@ def test_v11_projection_lineage_migrates_without_inventing_callback_fence(tmp_pa
 def test_ambiguous_v11_store_lineage_is_rejected_before_upgrade(tmp_path) -> None:
     path = tmp_path / "execution.sqlite3"
     store = SqliteExecutionStore(path)
+    drop_v24_callback_owner_scope_schema(store._connection)
     store._connection.execute("DROP TABLE ctp_order_target_projection_consumptions")
     store._connection.execute("DROP TABLE ctp_order_target_projections")
     store._connection.execute("DROP TABLE ctp_dispatch_callback_source_lifecycle_fences")
@@ -327,6 +331,7 @@ def test_released_writer_lease_generation_is_never_reused_after_reopen(tmp_path)
 def test_v12_store_without_lifecycle_fence_table_is_rejected(tmp_path) -> None:
     path = tmp_path / "execution.sqlite3"
     store = SqliteExecutionStore(path)
+    drop_v24_callback_owner_scope_schema(store._connection)
     store._connection.execute("DROP TABLE ctp_order_target_projection_consumptions")
     store._connection.execute("DROP TABLE ctp_order_target_projections")
     store._connection.execute("DROP TABLE ctp_dispatch_callback_source_lifecycle_fences")

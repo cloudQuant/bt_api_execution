@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 from decimal import Decimal
 
 import pytest
+from _legacy_execution_schema import drop_v24_callback_owner_scope_schema
 
 from bt_api_execution import (
     ContractValidationError,
@@ -2250,6 +2251,7 @@ def test_v17_upgrade_preserves_possibly_sent_cancel_as_pending_postcondition(tmp
     store._connection.execute("DROP TABLE ctp_dispatch_cancel_postcondition_resolutions")
     store._connection.execute("DROP TABLE ctp_dispatch_cancel_terminal_observations")
     store._connection.execute("DROP TABLE ctp_dispatch_cancel_postconditions")
+    drop_v24_callback_owner_scope_schema(store._connection)
     store._connection.execute("UPDATE execution_meta SET value = '17' WHERE key = 'schema_version'")
     store.close()
 
@@ -2259,7 +2261,7 @@ def test_v17_upgrade_preserves_possibly_sent_cancel_as_pending_postcondition(tmp
             upgraded._connection.execute(
                 "SELECT value FROM execution_meta WHERE key = 'schema_version'"
             ).fetchone()[0]
-            == "20"
+            == "24"
         )
         row = upgraded._connection.execute(
             "SELECT identity_state, target_submit_command_id, owner_intent_id "

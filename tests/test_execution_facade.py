@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 import pytest
+from _legacy_execution_schema import drop_v24_callback_owner_scope_schema
 
 from bt_api_execution import (
     AdmissionDenied,
@@ -683,6 +684,7 @@ def test_v13_outbox_events_remain_unbound_during_v14_v15_migrations(tmp_path) ->
         )
         connection.execute("ALTER TABLE execution_outbox DROP COLUMN journal_incarnation_id")
         connection.execute("DELETE FROM execution_meta WHERE key = 'journal_incarnation_id'")
+        drop_v24_callback_owner_scope_schema(connection)
         connection.execute("UPDATE execution_meta SET value = '13' WHERE key = 'schema_version'")
         connection.commit()
     finally:

@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from _legacy_execution_schema import drop_v24_callback_owner_scope_schema
 
 from bt_api_execution import (
     ContractValidationError,
@@ -590,6 +591,7 @@ def _write_legacy_v11_resolved_guard(bound, *, correlation_digest=None):
             2,
         ),
     )
+    drop_v24_callback_owner_scope_schema(bound.store._connection)
     bound.store._connection.execute(
         "UPDATE execution_meta SET value = '11' WHERE key = 'schema_version'"
     )
@@ -1591,7 +1593,7 @@ def test_v11_resolved_guard_migrates_to_permanent_fence_and_stays_after_reopen(t
         version = migrated._connection.execute(
             "SELECT value FROM execution_meta WHERE key = 'schema_version'"
         ).fetchone()["value"]
-        assert version == "20"
+        assert version == "24"
         assert migrated.read_ctp_dispatch_command(bound.scope, bound.command_id).status == (
             "COMPLETED"
         )
@@ -1666,6 +1668,7 @@ def test_v12_permanent_fence_and_projectionless_cancel_migrate_to_v19(tmp_path):
         try:
             connection.execute("DROP TABLE ctp_order_target_projection_consumptions")
             connection.execute("DROP TABLE ctp_order_target_projections")
+            drop_v24_callback_owner_scope_schema(connection)
             connection.execute(
                 "UPDATE execution_meta SET value = '12' WHERE key = 'schema_version'"
             )
@@ -1678,7 +1681,7 @@ def test_v12_permanent_fence_and_projectionless_cancel_migrate_to_v19(tmp_path):
             migrated._connection.execute(
                 "SELECT value FROM execution_meta WHERE key = 'schema_version'"
             ).fetchone()[0]
-            == "20"
+            == "24"
         )
         command = migrated.read_ctp_dispatch_command(bound.scope, bound.command_id)
         assert command is not None

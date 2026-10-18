@@ -5,6 +5,7 @@ from decimal import Decimal
 from hashlib import sha256
 
 import pytest
+from _legacy_execution_schema import drop_v24_callback_owner_scope_schema
 
 from bt_api_execution import (
     CancelIntent,
@@ -167,6 +168,7 @@ def test_v18_history_migrates_to_permanent_unmapped_family_fence(tmp_path) -> No
 
     connection = sqlite3.connect(path)
     try:
+        drop_v24_callback_owner_scope_schema(connection)
         connection.execute("UPDATE execution_meta SET value = '18' WHERE key = 'schema_version'")
         connection.commit()
     finally:
@@ -178,7 +180,7 @@ def test_v18_history_migrates_to_permanent_unmapped_family_fence(tmp_path) -> No
             migrated._connection.execute(
                 "SELECT value FROM execution_meta WHERE key = 'schema_version'"
             ).fetchone()[0]
-            == "20"
+            == "24"
         )
         fence = migrated._connection.execute(
             "SELECT reason_code, source_schema_version FROM ctp_account_family_legacy_fences"

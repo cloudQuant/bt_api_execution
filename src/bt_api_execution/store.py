@@ -66,6 +66,8 @@ _MAX_RECOVERY_SNAPSHOT_ORDERS = 512
 _MAX_RECOVERY_SNAPSHOT_EVENTS = 20_000
 _MAX_RECOVERY_PAGE_SIZE = 128
 _MAX_CTP_DISPATCH_TRADE_FACT_PAGE_SIZE = 100
+_MAX_CTP_CALLBACK_OWNER_SCOPES = 256
+_CTP_CALLBACK_OWNER_SCOPE_SET_SCHEMA = "ctp-callback-owner-scope-set.v1"
 _OWNER_CANCEL_OPEN_STATES = frozenset(
     {
         ExecutionState.PENDING_ADMISSION,
@@ -236,6 +238,9 @@ _CTP_ACCOUNT_STORE_TABLES = frozenset(
         "cancellation_records",
         "cancellation_outbox",
         "execution_writer_leases",
+        "account_financial_baselines",
+        "account_financial_events",
+        "account_financial_ledger_heads",
         "ctp_account_family_owners",
         "ctp_account_store_identity",
         "ctp_account_family_legacy_fences",
@@ -254,6 +259,7 @@ _CTP_ACCOUNT_STORE_TABLES = frozenset(
         "ctp_dispatch_order_cumulative_ledger",
         "ctp_dispatch_callback_source_lifecycle_fences",
         "ctp_dispatch_callback_session_owners",
+        "ctp_dispatch_callback_session_owner_scopes",
         "ctp_dispatch_callback_ingress",
         "ctp_dispatch_callback_ingress_applications",
         "ctp_dispatch_order_projection",
@@ -292,6 +298,10 @@ _CTP_ACCOUNT_STORE_TRIGGERS = frozenset(
     {
         "group_authorization_attempts_immutable_update",
         "group_authorization_attempts_immutable_delete",
+        "account_financial_baselines_immutable_update",
+        "account_financial_baselines_immutable_delete",
+        "account_financial_events_immutable_update",
+        "account_financial_events_immutable_delete",
         "ctp_account_family_owner_immutable_identity",
         "ctp_account_family_owner_no_delete",
         "ctp_account_store_identity_immutable_update",
@@ -315,6 +325,9 @@ _CTP_ACCOUNT_STORE_TRIGGERS = frozenset(
         "ctp_dispatch_callback_source_lifecycle_immutable_delete",
         "ctp_callback_session_owner_immutable_identity",
         "ctp_callback_session_owner_no_delete",
+        "ctp_callback_session_owner_scopes_owner_match",
+        "ctp_callback_session_owner_scopes_immutable_update",
+        "ctp_callback_session_owner_scopes_immutable_delete",
         "ctp_callback_ingress_immutable_update",
         "ctp_callback_ingress_immutable_delete",
         "ctp_callback_ingress_applications_immutable_update",
@@ -2378,7 +2391,8 @@ class SqliteExecutionStore:
     # caller-context digest used for safe PENDING_DISPATCH reauthorization.
     # Version 22 adds the immutable group-permit binding to execution rows.
     # Version 23 adds a fenced append-only financial baseline/event ledger.
-    _SCHEMA_VERSION = 23
+    # Version 24 binds one immutable configured scope set to each new callback owner.
+    _SCHEMA_VERSION = 24
 
     def __init__(self, path: str | Path, *, busy_timeout_ms: int = 5_000) -> None:
         if type(busy_timeout_ms) is not int or busy_timeout_ms <= 0:
@@ -6380,16 +6394,34 @@ class SqliteExecutionStore:
                 str(row["key"]): str(row["value"])
                 for row in connection.execute("SELECT key, value FROM execution_meta").fetchall()
             }
-            if metadata.get("schema_version") != str(cls._SCHEMA_VERSION):
+            schema_version = metadata.get("schema_version")
+            if schema_version not in {"23", str(cls._SCHEMA_VERSION)}:
                 raise DurableStoreError("existing CTP execution store schema is not current")
             non_internal_tables = tables - {"sqlite_sequence"}
-            if non_internal_tables != _CTP_ACCOUNT_STORE_TABLES:
+            legacy_scope_set_table = "ctp_dispatch_callback_session_owner_scopes"
+            expected_tables = (
+                _CTP_ACCOUNT_STORE_TABLES - {legacy_scope_set_table}
+                if schema_version == "23"
+                else _CTP_ACCOUNT_STORE_TABLES
+            )
+            if non_internal_tables != expected_tables:
                 raise DurableStoreError(
                     "existing CTP execution store schema is incomplete or unknown"
                 )
+            expected_schema_objects = cls._code_owned_ctp_store_schema_objects()
+            if schema_version == "23":
+                legacy_scope_objects = {
+                    legacy_scope_set_table,
+                    "ctp_callback_session_owner_scopes_owner_match",
+                    "ctp_callback_session_owner_scopes_immutable_update",
+                    "ctp_callback_session_owner_scopes_immutable_delete",
+                }
+                expected_schema_objects = tuple(
+                    item for item in expected_schema_objects if item[1] not in legacy_scope_objects
+                )
             if (
                 cls._ctp_store_schema_objects(connection)
-                != cls._code_owned_ctp_store_schema_objects()
+                != expected_schema_objects
             ):
                 raise DurableStoreError(
                     "existing CTP execution store schema definitions do not match code"
@@ -6408,7 +6440,17 @@ class SqliteExecutionStore:
                     "SELECT name FROM sqlite_master WHERE type = 'trigger'"
                 ).fetchall()
             }
-            if triggers != _CTP_ACCOUNT_STORE_TRIGGERS:
+            expected_triggers = (
+                _CTP_ACCOUNT_STORE_TRIGGERS
+                - {
+                    "ctp_callback_session_owner_scopes_owner_match",
+                    "ctp_callback_session_owner_scopes_immutable_update",
+                    "ctp_callback_session_owner_scopes_immutable_delete",
+                }
+                if schema_version == "23"
+                else _CTP_ACCOUNT_STORE_TRIGGERS
+            )
+            if triggers != expected_triggers:
                 raise DurableStoreError(
                     "CTP execution store trigger schema is incomplete or unknown"
                 )
@@ -6948,6 +6990,7 @@ class SqliteExecutionStore:
         scope: ExecutionScope,
         *,
         writer_lease: WriterLease,
+        authorized_scopes: tuple[ExecutionScope, ...] | None = None,
     ) -> CtpCallbackSessionOwnerHandle:
         """Persist a one-shot account owner before native API construction.
 
@@ -6957,7 +7000,46 @@ class SqliteExecutionStore:
         separate recovery design and reject this candidate owner.
         """
 
-        account_key, _, scope_key = self._validate_ctp_order_identity_scope(scope)
+        if type(scope) is not ExecutionScope:
+            raise ContractValidationError("exact CTP source execution scope is required")
+        account_key, trading_day, scope_key = self._validate_ctp_order_identity_scope(scope)
+        if authorized_scopes is None:
+            requested_scopes = (scope,)
+        elif type(authorized_scopes) is tuple:
+            requested_scopes = authorized_scopes
+        else:
+            raise ContractValidationError("CTP authorized scopes must be an immutable tuple")
+        if not requested_scopes or len(requested_scopes) > _MAX_CTP_CALLBACK_OWNER_SCOPES:
+            raise ContractValidationError("CTP callback owner scope count is outside its bound")
+        scope_keys: list[str] = []
+        for authorized_scope in requested_scopes:
+            if type(authorized_scope) is not ExecutionScope:
+                raise ContractValidationError("CTP authorized scopes must be exact execution scopes")
+            authorized_account_key, authorized_trading_day, authorized_scope_key = (
+                self._validate_ctp_order_identity_scope(authorized_scope)
+            )
+            if (
+                authorized_account_key != account_key
+                or authorized_scope.provider != scope.provider
+                or authorized_scope.environment != scope.environment
+                or authorized_scope.account_ref != scope.account_ref
+                or authorized_trading_day != trading_day
+            ):
+                raise ContractValidationError(
+                    "CTP callback owner scopes must share account, environment, and trading day"
+                )
+            if authorized_scope_key in scope_keys:
+                raise ContractValidationError("duplicate CTP callback owner scope")
+            scope_keys.append(authorized_scope_key)
+        if scope_key not in scope_keys:
+            raise ContractValidationError("CTP callback owner scope set must include its source scope")
+        ordered_scope_keys = [scope_key, *sorted(key for key in scope_keys if key != scope_key)]
+        scope_set_payload = {
+            "schema": _CTP_CALLBACK_OWNER_SCOPE_SET_SCHEMA,
+            "scope_keys": ordered_scope_keys,
+        }
+        scope_keys_json = canonical_json(scope_set_payload)
+        scope_set_sha256 = hashlib.sha256(scope_keys_json.encode("utf-8")).hexdigest()
         owner_intent_id = uuid.uuid4().hex
         now_ns = time.time_ns()
         with self._lock:
@@ -7015,6 +7097,23 @@ class SqliteExecutionStore:
                         now_ns,
                     ),
                 )
+                cursor.execute(
+                    """
+                    INSERT INTO ctp_dispatch_callback_session_owner_scopes(
+                        owner_intent_id, account_key, source_scope_key, scope_count,
+                        scope_set_sha256, scope_keys_json, created_at_ns
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        owner_intent_id,
+                        account_key,
+                        scope_key,
+                        len(ordered_scope_keys),
+                        scope_set_sha256,
+                        scope_keys_json,
+                        now_ns,
+                    ),
+                )
             handle = CtpCallbackSessionOwnerHandle(
                 owner_intent_id=owner_intent_id,
                 account_key=account_key,
@@ -7022,6 +7121,93 @@ class SqliteExecutionStore:
             )
             self._issued_ctp_callback_session_owners[owner_intent_id] = handle
         return handle
+
+    def ctp_callback_session_owner_scope_keys(
+        self, owner_handle: CtpCallbackSessionOwnerHandle
+    ) -> tuple[str, ...]:
+        """Read the immutable configured scope keys for this exact Store owner.
+
+        Persisted scope rows are descriptive data. This method requires the
+        same in-memory owner object issued by this Store and never reconstructs
+        an owner handle after a Store or process restart.
+        """
+
+        if (
+            type(owner_handle) is not CtpCallbackSessionOwnerHandle
+            or self._issued_ctp_callback_session_owners.get(owner_handle.owner_intent_id)
+            is not owner_handle
+        ):
+            raise ContractValidationError(
+                "exact same-Store CTP callback session owner handle is required"
+            )
+        with self._lock:
+            try:
+                owner_row = self._connection.execute(
+                    """
+                    SELECT account_key, scope_key
+                    FROM ctp_dispatch_callback_session_owners
+                    WHERE owner_intent_id = ?
+                    """,
+                    (owner_handle.owner_intent_id,),
+                ).fetchone()
+                scope_row = self._connection.execute(
+                    """
+                    SELECT account_key, source_scope_key, scope_count,
+                           scope_set_sha256, scope_keys_json
+                    FROM ctp_dispatch_callback_session_owner_scopes
+                    WHERE owner_intent_id = ?
+                    """,
+                    (owner_handle.owner_intent_id,),
+                ).fetchone()
+            except sqlite3.Error as error:
+                raise DurableStoreError("unable to read CTP callback owner scopes") from error
+        if (
+            owner_row is None
+            or str(owner_row["account_key"]) != owner_handle.account_key
+            or str(owner_row["scope_key"]) != owner_handle.scope_key
+        ):
+            raise DurableStoreError("durable CTP callback owner identity is inconsistent")
+        if (
+            scope_row is None
+            or str(scope_row["account_key"]) != owner_handle.account_key
+            or str(scope_row["source_scope_key"]) != owner_handle.scope_key
+        ):
+            raise DurableStoreError("durable CTP callback owner scope set is missing or inconsistent")
+        try:
+            if (
+                type(scope_row["scope_count"]) is not int
+                or type(scope_row["scope_set_sha256"]) is not str
+                or type(scope_row["scope_keys_json"]) is not str
+            ):
+                raise ValueError("persisted CTP callback owner scope-set field types changed")
+            scope_keys_json = scope_row["scope_keys_json"]
+            scope_set_payload = json.loads(scope_keys_json)
+            scope_count = scope_row["scope_count"]
+            scope_set_sha256 = scope_row["scope_set_sha256"]
+            if (
+                type(scope_set_payload) is not dict
+                or set(scope_set_payload) != {"schema", "scope_keys"}
+                or scope_set_payload.get("schema") != _CTP_CALLBACK_OWNER_SCOPE_SET_SCHEMA
+                or canonical_json(scope_set_payload) != scope_keys_json
+            ):
+                raise ValueError("persisted CTP callback owner scope-set envelope changed")
+            scope_keys = scope_set_payload["scope_keys"]
+            if (
+                type(scope_keys) is not list
+                or not 1 <= scope_count <= _MAX_CTP_CALLBACK_OWNER_SCOPES
+                or scope_count != len(scope_keys)
+                or any(not _is_prefixed_digest(key, "scope:") for key in scope_keys)
+                or len(set(scope_keys)) != len(scope_keys)
+                or scope_keys[0] != owner_handle.scope_key
+                or scope_keys[1:] != sorted(scope_keys[1:])
+                or not _is_sha256(scope_set_sha256)
+                or hashlib.sha256(scope_keys_json.encode("utf-8")).hexdigest()
+                != scope_set_sha256
+            ):
+                raise ValueError("persisted CTP callback owner scope set changed")
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise DurableStoreError("durable CTP callback owner scope set is unreadable") from error
+        return tuple(scope_keys)
 
     def _register_ctp_callback_session_adapter(
         self,
@@ -9712,6 +9898,49 @@ class SqliteExecutionStore:
                 BEGIN
                     SELECT RAISE(ABORT, 'CTP callback session owner is permanent');
                 END;
+                CREATE TABLE IF NOT EXISTS ctp_dispatch_callback_session_owner_scopes (
+                    owner_intent_id TEXT PRIMARY KEY
+                        CHECK(length(owner_intent_id) = 32
+                              AND owner_intent_id NOT GLOB '*[^0-9a-f]*'),
+                    account_key TEXT NOT NULL
+                        CHECK(length(account_key) = 72
+                              AND account_key GLOB 'account:*'
+                              AND substr(account_key, 9) NOT GLOB '*[^0-9a-f]*'),
+                    source_scope_key TEXT NOT NULL
+                        CHECK(length(source_scope_key) = 70
+                              AND source_scope_key GLOB 'scope:*'
+                              AND substr(source_scope_key, 7) NOT GLOB '*[^0-9a-f]*'),
+                    scope_count INTEGER NOT NULL
+                        CHECK(scope_count > 0 AND scope_count <= 256),
+                    scope_set_sha256 TEXT NOT NULL
+                        CHECK(length(scope_set_sha256) = 64
+                              AND scope_set_sha256 NOT GLOB '*[^0-9a-f]*'),
+                    scope_keys_json TEXT NOT NULL CHECK(length(scope_keys_json) <= 20000),
+                    created_at_ns INTEGER NOT NULL CHECK(created_at_ns > 0),
+                    FOREIGN KEY(owner_intent_id)
+                        REFERENCES ctp_dispatch_callback_session_owners(owner_intent_id)
+                );
+                CREATE TRIGGER IF NOT EXISTS ctp_callback_session_owner_scopes_owner_match
+                BEFORE INSERT ON ctp_dispatch_callback_session_owner_scopes
+                WHEN NOT EXISTS (
+                    SELECT 1 FROM ctp_dispatch_callback_session_owners
+                    WHERE owner_intent_id = NEW.owner_intent_id
+                      AND account_key = NEW.account_key
+                      AND scope_key = NEW.source_scope_key
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP callback scope set does not match its owner');
+                END;
+                CREATE TRIGGER IF NOT EXISTS ctp_callback_session_owner_scopes_immutable_update
+                BEFORE UPDATE ON ctp_dispatch_callback_session_owner_scopes
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP callback owner scopes are immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS ctp_callback_session_owner_scopes_immutable_delete
+                BEFORE DELETE ON ctp_dispatch_callback_session_owner_scopes
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP callback owner scopes are permanent');
+                END;
                 CREATE TABLE IF NOT EXISTS ctp_dispatch_callback_ingress (
                     owner_intent_id TEXT NOT NULL,
                     source_sequence INTEGER NOT NULL CHECK(source_sequence > 0),
@@ -10074,6 +10303,15 @@ class SqliteExecutionStore:
                 version = str(self._SCHEMA_VERSION)
             else:
                 version = str(row["value"])
+            scope_set_table = "ctp_dispatch_callback_session_owner_scopes"
+            if (
+                version == str(self._SCHEMA_VERSION)
+                and "execution_meta" in previous_tables
+                and scope_set_table not in previous_tables
+            ):
+                raise DurableStoreError(
+                    "current CTP callback owner scope-set schema is incomplete"
+                )
             execution_columns = {
                 str(item["name"])
                 for item in cursor.execute("PRAGMA table_info(execution_records)").fetchall()
@@ -10228,6 +10466,7 @@ class SqliteExecutionStore:
                 "20",
                 "21",
                 "22",
+                "23",
                 str(self._SCHEMA_VERSION),
             }:
                 raise DurableStoreError("unsupported execution store schema")
@@ -10273,12 +10512,17 @@ class SqliteExecutionStore:
                         f"ALTER TABLE ctp_dispatch_commands ADD COLUMN {name} {declaration}"
                     )
             if version != str(self._SCHEMA_VERSION):
-                # V20 already contains the complete CTP schema and its safety
-                # migrations. V21/V22 only add nullable admission/group fields
-                # and the group authorization audit table; V23 adds an adjacent
-                # financial ledger. Do not rerun historical CTP cutover
-                # migrations or downgrade existing READY/CLAIMED commands.
-                if version not in {"20", "21", "22"}:
+                scope_set_table = "ctp_dispatch_callback_session_owner_scopes"
+                if scope_set_table in previous_tables:
+                    raise DurableStoreError(
+                        "CTP callback owner scope-set schema is partial or unversioned"
+                    )
+                # V20 through V24 contain the current CTP transition lineage;
+                # V21/V22 add admission/group data, V23 adds the financial
+                # ledger, and V24 adds immutable callback-owner scope sets.
+                # Do not rerun historical CTP cutover migrations or downgrade
+                # existing READY/CLAIMED commands for these additive schemas.
+                if version not in {"20", "21", "22", "23"}:
                     self._migrate_ctp_account_family_legacy_fence(
                         cursor,
                         previous_tables=previous_tables,
@@ -10300,6 +10544,39 @@ class SqliteExecutionStore:
                             )
                         WHERE status IN ('READY', 'CLAIMED')
                         """
+                    )
+                legacy_callback_owners = cursor.execute(
+                    """
+                    SELECT owner_intent_id, account_key, scope_key, created_at_ns
+                    FROM ctp_dispatch_callback_session_owners
+                    """
+                ).fetchall()
+                for owner_row in legacy_callback_owners:
+                    source_scope_key = str(owner_row["scope_key"])
+                    scope_keys_json = canonical_json(
+                        {
+                            "schema": _CTP_CALLBACK_OWNER_SCOPE_SET_SCHEMA,
+                            "scope_keys": [source_scope_key],
+                        }
+                    )
+                    scope_set_sha256 = hashlib.sha256(
+                        scope_keys_json.encode("utf-8")
+                    ).hexdigest()
+                    cursor.execute(
+                        """
+                        INSERT INTO ctp_dispatch_callback_session_owner_scopes(
+                            owner_intent_id, account_key, source_scope_key, scope_count,
+                            scope_set_sha256, scope_keys_json, created_at_ns
+                        ) VALUES (?, ?, ?, 1, ?, ?, ?)
+                        """,
+                        (
+                            str(owner_row["owner_intent_id"]),
+                            str(owner_row["account_key"]),
+                            source_scope_key,
+                            scope_set_sha256,
+                            scope_keys_json,
+                            int(owner_row["created_at_ns"]),
+                        ),
                     )
                 cursor.execute(
                     "UPDATE execution_meta SET value = ? WHERE key = ?",

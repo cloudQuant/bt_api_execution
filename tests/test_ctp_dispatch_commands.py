@@ -12,6 +12,7 @@ from decimal import Decimal
 from hashlib import sha256
 
 import pytest
+from _legacy_execution_schema import drop_v24_callback_owner_scope_schema
 
 import bt_api_execution.store as execution_store_module
 from bt_api_execution import (
@@ -610,6 +611,7 @@ def test_v4_execution_store_migrates_to_verified_callback_ledger_v8(tmp_path):
     # per-action/session keys, and v8 adds callback ledger/projections.
     connection = sqlite3.connect(path)
     try:
+        drop_v24_callback_owner_scope_schema(connection)
         connection.execute("DROP TABLE ctp_dispatch_authority_uses")
         connection.execute("DROP TABLE ctp_dispatch_commands")
         connection.execute("DROP TABLE ctp_order_ref_watermarks")
@@ -629,7 +631,7 @@ def test_v4_execution_store_migrates_to_verified_callback_ledger_v8(tmp_path):
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-        assert version == "20"
+        assert version == "24"
         assert "ctp_dispatch_commands" in tables
         assert "ctp_order_ref_watermarks" in tables
         assert "ctp_dispatch_authority_uses" in tables
@@ -666,6 +668,7 @@ def test_v5_execution_store_migrates_one_use_authority_table(tmp_path):
     initial.close()
     connection = sqlite3.connect(path)
     try:
+        drop_v24_callback_owner_scope_schema(connection)
         connection.execute("DROP TABLE ctp_dispatch_authority_uses")
         connection.execute("UPDATE execution_meta SET value = '5' WHERE key = 'schema_version'")
         connection.commit()
@@ -683,7 +686,7 @@ def test_v5_execution_store_migrates_one_use_authority_table(tmp_path):
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-        assert version == "20"
+        assert version == "24"
         assert "ctp_dispatch_authority_uses" in tables
     finally:
         migrated.close()
@@ -719,6 +722,7 @@ def test_v6_staged_command_without_typed_keys_migrates_to_unknown(tmp_path):
             "correlation_version",
         ):
             connection.execute(f"ALTER TABLE ctp_dispatch_commands DROP COLUMN {column}")
+        drop_v24_callback_owner_scope_schema(connection)
         connection.execute("UPDATE execution_meta SET value = '6' WHERE key = 'schema_version'")
         connection.commit()
     finally:
@@ -757,6 +761,7 @@ def test_v7_typed_command_migrates_to_callback_ledger_without_reopening_dispatch
 
     connection = sqlite3.connect(path)
     try:
+        drop_v24_callback_owner_scope_schema(connection)
         connection.executescript(
             """
             DROP TRIGGER ctp_dispatch_callback_immutable_update;
@@ -784,7 +789,7 @@ def test_v7_typed_command_migrates_to_callback_ledger_without_reopening_dispatch
             migrated._connection.execute(
                 "SELECT value FROM execution_meta WHERE key = 'schema_version'"
             ).fetchone()[0]
-            == "20"
+            == "24"
         )
         assert (
             migrated._connection.execute(
@@ -809,6 +814,7 @@ def test_v8_store_migrates_orderref_cutover_state_fail_closed(tmp_path):
     # Remove only v9 cutover structures to model an existing v8 database.
     connection = sqlite3.connect(path)
     try:
+        drop_v24_callback_owner_scope_schema(connection)
         connection.executescript(
             """
             DROP TABLE ctp_order_ref_legacy_imports;
@@ -826,7 +832,7 @@ def test_v8_store_migrates_orderref_cutover_state_fail_closed(tmp_path):
         version = migrated._connection.execute(
             "SELECT value FROM execution_meta WHERE key = 'schema_version'"
         ).fetchone()["value"]
-        assert version == "20"
+        assert version == "24"
         command = migrated.read_ctp_dispatch_command(scope, staged.command_id)
         assert command is not None
         assert command.status == "UNKNOWN"
@@ -864,6 +870,7 @@ def test_v7_schema_migration_rolls_back_ddl_version_and_trigger_on_failure(tmp_p
     store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
     connection = store._connection
     try:
+        drop_v24_callback_owner_scope_schema(connection)
         connection.executescript(
             """
             DROP TRIGGER ctp_dispatch_callback_immutable_update;
@@ -3033,6 +3040,7 @@ def test_schema_v15_to_v19_preserves_unknown_command_and_permanent_owner_fence(t
         # Model the exact v15 schema by removing only the v16 trade/cumulative
         # tables and lowering the persisted version. Existing owner and UNKNOWN
         # facts remain in the database across the upgrade.
+        drop_v24_callback_owner_scope_schema(store._connection)
         store._connection.execute(
             "UPDATE execution_meta SET value = '15' WHERE key = 'schema_version'"
         )
@@ -3057,7 +3065,7 @@ def test_schema_v15_to_v19_preserves_unknown_command_and_permanent_owner_fence(t
             migrated._connection.execute(
                 "SELECT value FROM execution_meta WHERE key = 'schema_version'"
             ).fetchone()[0]
-            == "20"
+            == "24"
         )
         command = migrated.read_ctp_dispatch_command(scope, staged.command_id)
         assert command.status == "UNKNOWN"
@@ -3105,7 +3113,7 @@ def test_schema_v15_to_v19_preserves_unknown_command_and_permanent_owner_fence(t
             reopened._connection.execute(
                 "SELECT value FROM execution_meta WHERE key = 'schema_version'"
             ).fetchone()[0]
-            == "20"
+            == "24"
         )
         assert reopened.read_ctp_dispatch_command(scope, staged.command_id).status == "UNKNOWN"
         owner_row = reopened._connection.execute(
@@ -3129,6 +3137,7 @@ def test_schema_v16_to_v19_migrates_valid_completed_submit(tmp_path):
         staged = _stage_submit(store, scope, lease, reservation, "valid-submit-migration-command")
         completed = _dispatch_fake(store, scope, lease, staged)
         assert completed.status == "COMPLETED"
+        drop_v24_callback_owner_scope_schema(store._connection)
         store._connection.execute(
             "UPDATE execution_meta SET value = '16' WHERE key = 'schema_version'"
         )
@@ -3141,7 +3150,7 @@ def test_schema_v16_to_v19_migrates_valid_completed_submit(tmp_path):
             migrated._connection.execute(
                 "SELECT value FROM execution_meta WHERE key = 'schema_version'"
             ).fetchone()[0]
-            == "20"
+            == "24"
         )
         command = migrated.read_ctp_dispatch_command(scope, staged.command_id)
         assert command is not None and command.status == "COMPLETED"
@@ -3167,6 +3176,7 @@ def test_schema_v16_to_v19_rejects_malformed_identity_on_terminal_submit(
         )
         completed = _dispatch_fake(store, scope, lease, staged)
         assert completed.status == "COMPLETED"
+        drop_v24_callback_owner_scope_schema(store._connection)
         store._connection.execute(
             "UPDATE execution_meta SET value = '16' WHERE key = 'schema_version'"
         )
@@ -3219,6 +3229,7 @@ def test_schema_v16_to_v19_rejects_dispatch_foreign_key_mismatch(tmp_path):
         completed = _dispatch_fake(store, scope, lease, staged)
         assert completed.status == "COMPLETED"
         assert store._connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        drop_v24_callback_owner_scope_schema(store._connection)
         store._connection.execute(
             "UPDATE execution_meta SET value = '16' WHERE key = 'schema_version'"
         )
@@ -3279,6 +3290,7 @@ def test_schema_v16_to_v19_rejects_cross_account_legacy_cancel_graph(tmp_path):
         completed = _dispatch_fake(store, scope, lease, staged)
         assert completed.status == "COMPLETED"
         assert store._connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        drop_v24_callback_owner_scope_schema(store._connection)
         store._connection.execute(
             "UPDATE execution_meta SET value = '16' WHERE key = 'schema_version'"
         )
@@ -3585,6 +3597,7 @@ def test_schema_v15_source_lifecycle_fence_survives_and_blocks_stage_after_upgra
         fence_id = store.create_ctp_callback_source_lifecycle_fence(
             scope, first.command_id, writer_lease=lease
         )
+        drop_v24_callback_owner_scope_schema(store._connection)
         store._connection.execute(
             "UPDATE execution_meta SET value = '15' WHERE key = 'schema_version'"
         )
