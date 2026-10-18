@@ -12355,9 +12355,12 @@ class SqliteExecutionStore:
                 )
                 key = (owner_handle.owner_intent_id, seq)
                 previous = self._issued_ctp_callback_ingress_events.get(key)
-                if previous is not None and previous != event:
-                    raise DurableStoreError("CTP query event Store readback changed")
-                self._issued_ctp_callback_ingress_events[key] = event
+                if previous is not None:
+                    if previous.owner_handle is not owner_handle or previous != event:
+                        raise DurableStoreError("CTP query event Store readback changed")
+                    event = previous
+                else:
+                    self._issued_ctp_callback_ingress_events[key] = event
                 events.append(event)
                 event_digests.append({"sequence": seq, "record_digest_sha256": event.record_digest_sha256})
             if (
@@ -12387,8 +12390,19 @@ class SqliteExecutionStore:
                 observed_at_ns=now_mono_ns,
             )
             previous_window = self._issued_ctp_order_target_query_windows.get(query_fence.fence_id)
-            if previous_window is not None and previous_window != window:
-                raise ContractValidationError("CTP order-query window changed after readback")
+            if previous_window is not None:
+                if (
+                    type(previous_window) is not CtpOrderTargetQueryWindow
+                    or previous_window.owner_handle is not owner_handle
+                    or previous_window.observed_at_ns < query_fence.created_at_ns
+                    or previous_window.observed_at_ns > now_mono_ns
+                    or previous_window.observed_at_ns >= query_fence.expires_at_ns
+                    or previous_window != replace(
+                        window, observed_at_ns=previous_window.observed_at_ns
+                    )
+                ):
+                    raise ContractValidationError("CTP order-query window changed after readback")
+                return previous_window
             self._issued_ctp_order_target_query_windows[query_fence.fence_id] = window
             return window
 

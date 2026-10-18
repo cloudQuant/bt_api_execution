@@ -915,6 +915,76 @@ def test_expired_source_drift_and_writer_generation_fences_fail_closed(tmp_path,
 
 
 @pytest.mark.unit
+def test_query_window_readback_preserves_timestamp_but_rejects_source_change(
+    tmp_path, monkeypatch
+):
+    store, scope, _family_owner, lease, owner, adapter, binding, tags = _new_store_and_session(
+        tmp_path
+    )
+    try:
+        reservation = _reserve(store, scope, lease, binding)
+        fence = store.begin_ctp_order_target_query(
+            scope,
+            reservation.managed_intent_id,
+            owner_handle=owner,
+            writer_lease=lease,
+        )
+        _append_query_pair(adapter, owner, binding, tags, reservation)
+        _apply_query_pair(adapter)
+
+        clock = {"now": max(fence.created_at_ns + 1, time.monotonic_ns())}
+        monkeypatch.setattr(execution_store_module.time, "monotonic_ns", lambda: clock["now"])
+        first_window = store.read_ctp_order_target_query_window(
+            scope,
+            fence,
+            query_request_id=_REQUEST_ID,
+            owner_handle=owner,
+            writer_lease=lease,
+        )
+        first_observed_at_ns = first_window.observed_at_ns
+        first_events = first_window.events
+
+        clock["now"] += 1_000_000
+        repeated_window = store.read_ctp_order_target_query_window(
+            scope,
+            fence,
+            query_request_id=_REQUEST_ID,
+            owner_handle=owner,
+            writer_lease=lease,
+        )
+        assert repeated_window is first_window
+        assert repeated_window.observed_at_ns == first_observed_at_ns
+        assert repeated_window.events is first_events
+        assert all(
+            store._issued_ctp_callback_ingress_events[
+                (owner.owner_intent_id, event.source_sequence)
+            ] is event
+            for event in first_events
+        )
+
+        _append_query_pair(
+            adapter,
+            owner,
+            binding,
+            tags,
+            reservation,
+            start_sequence=first_window.end_source_sequence + 1,
+        )
+        _apply_query_pair(adapter)
+        clock["now"] += 1_000_000
+        with pytest.raises((ContractValidationError, InvalidStateTransition)):
+            store.read_ctp_order_target_query_window(
+                scope,
+                fence,
+                query_request_id=_REQUEST_ID,
+                owner_handle=owner,
+                writer_lease=lease,
+            )
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
 def test_permanent_query_observation_never_reopens_submit(tmp_path):
     store, scope, _family_owner, lease, owner, adapter, binding, tags = _new_store_and_session(tmp_path)
     try:
