@@ -15,7 +15,7 @@ import time
 import uuid
 from collections.abc import Mapping
 from contextlib import contextmanager, suppress
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass, fields, is_dataclass, replace
 from datetime import date
 from decimal import Decimal, InvalidOperation
 from enum import Enum
@@ -374,6 +374,10 @@ _CTP_ORDER_TERMINAL_STATES = frozenset({"FILLED", "CANCELLED", "REJECTED"})
 _CTP_CANCEL_ACTION_STATES = frozenset({"ACKNOWLEDGED", "REJECTED", "TERMINAL"})
 _CTP_CANCEL_ACTION_TERMINAL_STATES = frozenset({"REJECTED", "TERMINAL"})
 _CTP_ORDER_TARGET_MAX_TTL_NS = 5_000_000_000
+_CTP_ORDER_TARGET_QUERY_FENCE_TTL_NS = 30_000_000_000
+_CTP_ORDER_TARGET_QUERY_MAX_EVENTS = 256
+_CTP_ORDER_TARGET_QUERY_MAX_LIVE_FENCES = 32
+_CTP_ORDER_TARGET_QUERY_MAX_PROVENANCE = 256
 _CTP_CALLBACK_OWNER_POISON_CODES = frozenset(
     {
         "candidate_composition_failure",
@@ -731,8 +735,13 @@ class CtpVerifiedOrderTargetProjection:
     verifier_id: str
     verified_at_ns: int
     expires_at_ns: int
+    query_provenance: CtpOrderTargetQueryProvenance | None = None
 
     def __post_init__(self) -> None:
+        if self.query_provenance is not None and type(
+            self.query_provenance
+        ) is not CtpOrderTargetQueryProvenance:
+            raise ContractValidationError("invalid Store-issued CTP query provenance")
         for name in (
             "account_key",
             "scope_key",
@@ -821,7 +830,14 @@ class CtpVerifiedOrderTargetProjection:
             raise ContractValidationError("invalid CTP target freshness interval")
 
     def to_payload(self) -> dict[str, Any]:
-        return {name: getattr(self, name) for name in self.__dataclass_fields__}
+        payload = {
+            name: getattr(self, name)
+            for name in self.__dataclass_fields__
+            if name != "query_provenance"
+        }
+        if self.query_provenance is not None:
+            payload["query_provenance"] = self.query_provenance.to_payload()
+        return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -848,6 +864,227 @@ class CtpCallbackSessionOwnerHandle:
             self.scope_key, "scope:"
         ):
             raise ContractValidationError("invalid CTP callback owner scope")
+
+
+@dataclass(frozen=True, slots=True)
+class CtpOrderTargetQueryFence:
+    """One bounded Store window for a fresh exact-order query."""
+
+    fence_id: str
+    owner_handle: CtpCallbackSessionOwnerHandle
+    account_key: str
+    scope_key: str
+    trading_day: str
+    managed_intent_id: str
+    runtime_order_id: str
+    order_ref: str
+    writer_owner_id: str
+    writer_fencing_token: int
+    session_binding_sha256: str
+    session_generation_id: str
+    connection_generation: int
+    dispatch_front_id: int
+    dispatch_session_id: int
+    source_tags: tuple[str, str, str, str, int, int]
+    start_source_sequence: int
+    start_applied_sequence: int
+    created_at_ns: int
+    expires_at_ns: int
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.owner_handle) is not CtpCallbackSessionOwnerHandle
+            or not _is_local_queue_receipt_id(self.fence_id)
+            or not _is_prefixed_digest(self.account_key, "account:")
+            or not _is_prefixed_digest(self.scope_key, "scope:")
+            or self.owner_handle.account_key != self.account_key
+            or self.owner_handle.scope_key != self.scope_key
+        ):
+            raise ContractValidationError("invalid CTP order-query fence identity")
+        _validate_correlation_text(self.managed_intent_id, "managed intent id")
+        _validate_correlation_text(self.runtime_order_id, "runtime order id")
+        _validate_correlation_text(self.writer_owner_id, "writer owner id")
+        _validate_correlation_text(self.session_generation_id, "session generation id")
+        if (
+            type(self.trading_day) is not str
+            or len(self.trading_day) != 8
+            or not self.trading_day.isdigit()
+            or type(self.order_ref) is not str
+            or len(self.order_ref) != 12
+            or not self.order_ref.isascii()
+            or not self.order_ref.isdigit()
+            or not _is_sha256(self.session_binding_sha256)
+        ):
+            raise ContractValidationError("invalid CTP order-query fence binding")
+        for name in (
+            "writer_fencing_token",
+            "connection_generation",
+            "dispatch_front_id",
+            "dispatch_session_id",
+            "start_source_sequence",
+            "start_applied_sequence",
+            "created_at_ns",
+            "expires_at_ns",
+        ):
+            value = getattr(self, name)
+            minimum = 0 if name in {"connection_generation", "start_source_sequence"} else 1
+            if type(value) is not int or value < minimum:
+                raise ContractValidationError("invalid CTP order-query fence " + name)
+        if (
+            type(self.source_tags) is not tuple
+            or len(self.source_tags) != 6
+            or any(type(value) is not str or not value for value in self.source_tags[:4])
+            or type(self.source_tags[4]) is not int
+            or self.source_tags[4] <= 0
+            or type(self.source_tags[5]) is not int
+            or self.source_tags[5] < 0
+            or self.start_applied_sequence != self.start_source_sequence
+            or self.expires_at_ns <= self.created_at_ns
+            or self.expires_at_ns - self.created_at_ns
+            > _CTP_ORDER_TARGET_QUERY_FENCE_TTL_NS
+        ):
+            raise ContractValidationError("invalid CTP order-query fence window")
+
+
+@dataclass(frozen=True, slots=True)
+class CtpOrderTargetQueryWindow:
+    """Bounded, applied callback-inbox rows for one native order query."""
+
+    fence_id: str
+    owner_handle: CtpCallbackSessionOwnerHandle
+    query_request_id: int
+    start_source_sequence: int
+    end_source_sequence: int
+    applied_source_sequence: int
+    events: tuple[CtpCallbackIngressEventV1, ...]
+    window_sha256: str
+    observed_at_ns: int
+
+    def __post_init__(self) -> None:
+        if (
+            not _is_local_queue_receipt_id(self.fence_id)
+            or type(self.owner_handle) is not CtpCallbackSessionOwnerHandle
+            or type(self.query_request_id) is not int
+            or not 0 < self.query_request_id <= 2_147_483_647
+            or type(self.start_source_sequence) is not int
+            or self.start_source_sequence < 0
+            or type(self.end_source_sequence) is not int
+            or self.end_source_sequence <= self.start_source_sequence
+            or type(self.applied_source_sequence) is not int
+            or self.applied_source_sequence != self.end_source_sequence
+            or type(self.events) is not tuple
+            or not 1 <= len(self.events) <= _CTP_ORDER_TARGET_QUERY_MAX_EVENTS
+            or len(self.events) != self.end_source_sequence - self.start_source_sequence
+            or any(type(event) is not CtpCallbackIngressEventV1 for event in self.events)
+            or tuple(event.source_sequence for event in self.events)
+            != tuple(range(self.start_source_sequence + 1, self.end_source_sequence + 1))
+            or any(event.owner_handle is not self.owner_handle for event in self.events)
+            or not _is_sha256(self.window_sha256)
+            or type(self.observed_at_ns) is not int
+            or self.observed_at_ns <= 0
+        ):
+            raise ContractValidationError("invalid CTP order-query callback window")
+
+
+@dataclass(frozen=True, slots=True)
+class CtpOrderTargetQueryProvenance:
+    """Store-built provenance binding a target projection to applied inbox rows."""
+
+    fence_id: str
+    owner_intent_id: str
+    account_key: str
+    scope_key: str
+    trading_day: str
+    managed_intent_id: str
+    runtime_order_id: str
+    order_ref: str
+    writer_owner_id: str
+    writer_fencing_token: int
+    session_binding_sha256: str
+    session_generation_id: str
+    connection_generation: int
+    dispatch_front_id: int
+    dispatch_session_id: int
+    source_tags: tuple[str, str, str, str, int, int]
+    query_request_id: int
+    start_source_sequence: int
+    end_source_sequence: int
+    applied_source_sequence: int
+    source_event_count: int
+    query_event_count: int
+    window_sha256: str
+    issued_at_ns: int
+    expires_at_ns: int
+
+    def __post_init__(self) -> None:
+        if (
+            not _is_local_queue_receipt_id(self.fence_id)
+            or not _is_local_queue_receipt_id(self.owner_intent_id)
+            or not _is_prefixed_digest(self.account_key, "account:")
+            or not _is_prefixed_digest(self.scope_key, "scope:")
+        ):
+            raise ContractValidationError("invalid CTP query provenance identity")
+        for name in (
+            "managed_intent_id",
+            "runtime_order_id",
+            "writer_owner_id",
+            "session_generation_id",
+        ):
+            _validate_correlation_text(getattr(self, name), "CTP query provenance " + name)
+        if (
+            type(self.trading_day) is not str
+            or len(self.trading_day) != 8
+            or not self.trading_day.isdigit()
+            or type(self.order_ref) is not str
+            or len(self.order_ref) != 12
+            or not self.order_ref.isascii()
+            or not self.order_ref.isdigit()
+            or not _is_sha256(self.session_binding_sha256)
+            or not _is_sha256(self.window_sha256)
+        ):
+            raise ContractValidationError("invalid CTP query provenance binding")
+        for name in (
+            "writer_fencing_token",
+            "connection_generation",
+            "dispatch_front_id",
+            "dispatch_session_id",
+            "query_request_id",
+            "start_source_sequence",
+            "end_source_sequence",
+            "applied_source_sequence",
+            "source_event_count",
+            "query_event_count",
+            "issued_at_ns",
+            "expires_at_ns",
+        ):
+            value = getattr(self, name)
+            minimum = 0 if name in {"connection_generation", "start_source_sequence"} else 1
+            if type(value) is not int or value < minimum:
+                raise ContractValidationError("invalid CTP query provenance " + name)
+        if (
+            self.query_request_id > 2_147_483_647
+            or self.applied_source_sequence != self.end_source_sequence
+            or self.end_source_sequence - self.start_source_sequence
+            != self.source_event_count
+            or self.source_event_count != self.query_event_count
+            or self.source_event_count > _CTP_ORDER_TARGET_QUERY_MAX_EVENTS
+            or not self.issued_at_ns < self.expires_at_ns
+            or self.expires_at_ns - self.issued_at_ns > _CTP_ORDER_TARGET_MAX_TTL_NS
+            or type(self.source_tags) is not tuple
+            or len(self.source_tags) != 6
+            or any(type(value) is not str or not value for value in self.source_tags[:4])
+            or type(self.source_tags[4]) is not int
+            or self.source_tags[4] <= 0
+            or type(self.source_tags[5]) is not int
+            or self.source_tags[5] < 0
+        ):
+            raise ContractValidationError("invalid CTP query provenance window")
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            name: getattr(self, name)
+            for name in self.__dataclass_fields__
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -1880,6 +2117,7 @@ class CtpOrderTargetProjectionVerifier(Protocol):
         native_query_evidence: Any,
         *,
         now_ns: int,
+        query_window: CtpOrderTargetQueryWindow | None = None,
     ) -> CtpVerifiedOrderTargetProjection: ...
 
 
@@ -2257,6 +2495,7 @@ class _RejectCtpOrderTargetProjectionVerifier:
         native_query_evidence: Any,
         *,
         now_ns: int,
+        query_window: CtpOrderTargetQueryWindow | None = None,
     ) -> CtpVerifiedOrderTargetProjection:
         raise ContractValidationError("trusted CTP order-target query verifier is required")
 
@@ -2553,6 +2792,17 @@ class SqliteExecutionStore:
             self._issued_ctp_order_target_projections: dict[
                 str, CtpOrderTargetProjectionHandle
             ] = {}
+            self._issued_ctp_order_target_query_fences: dict[
+                str, CtpOrderTargetQueryFence
+            ] = {}
+            self._issued_ctp_order_target_query_windows: dict[
+                str, CtpOrderTargetQueryWindow
+            ] = {}
+            self._active_ctp_order_target_query_fences: dict[str, str] = {}
+            self._issued_ctp_order_target_query_provenance: dict[
+                str, CtpOrderTargetQueryProvenance
+            ] = {}
+            self._reserved_ctp_order_target_query_provenance: set[str] = set()
             self._issued_ctp_account_family_owners: dict[str, CtpAccountFamilyOwnerHandle] = {}
             self._issued_ctp_callback_session_owners: dict[str, CtpCallbackSessionOwnerHandle] = {}
             self._issued_ctp_callback_session_adapters: dict[str, object] = {}
@@ -2573,6 +2823,11 @@ class SqliteExecutionStore:
 
         with self._lock:
             self._connection.close()
+            self._issued_ctp_order_target_query_fences.clear()
+            self._issued_ctp_order_target_query_windows.clear()
+            self._active_ctp_order_target_query_fences.clear()
+            self._issued_ctp_order_target_query_provenance.clear()
+            self._reserved_ctp_order_target_query_provenance.clear()
 
     def journal_source_identity(self) -> dict[str, str | int]:
         """Return the persisted local journal lineage, not provider authority."""
@@ -11167,12 +11422,23 @@ class SqliteExecutionStore:
     def _ctp_order_target_projection_from_payload(
         payload: Any,
     ) -> CtpVerifiedOrderTargetProjection:
-        if not isinstance(payload, dict) or set(payload) != set(
-            CtpVerifiedOrderTargetProjection.__dataclass_fields__
-        ):
+        expected = set(CtpVerifiedOrderTargetProjection.__dataclass_fields__)
+        legacy = expected - {"query_provenance"}
+        if not isinstance(payload, dict) or set(payload) not in (expected, legacy):
             raise ContractValidationError("stored CTP target projection payload is invalid")
         try:
-            return CtpVerifiedOrderTargetProjection(**payload)
+            value = dict(payload)
+            raw_provenance = value.get("query_provenance")
+            if raw_provenance is not None:
+                provenance_fields = set(CtpOrderTargetQueryProvenance.__dataclass_fields__)
+                if not isinstance(raw_provenance, dict) or set(raw_provenance) != provenance_fields:
+                    raise ContractValidationError("stored CTP query provenance is invalid")
+                provenance_value = dict(raw_provenance)
+                tags = provenance_value.get("source_tags")
+                if type(tags) is list and len(tags) == 6:
+                    provenance_value["source_tags"] = tuple(tags)
+                value["query_provenance"] = CtpOrderTargetQueryProvenance(**provenance_value)
+            return CtpVerifiedOrderTargetProjection(**value)
         except (TypeError, ValueError) as error:
             raise ContractValidationError("stored CTP target projection is invalid") from error
 
@@ -11207,6 +11473,376 @@ class SqliteExecutionStore:
         ):
             raise ContractValidationError("verified CTP order target differs from I9 reservation")
 
+    @staticmethod
+    def _ctp_query_named_scalar(
+        payload: Mapping[str, Any], slot: int, expected_name: str
+    ) -> Any:
+        named = payload.get("named_args")
+        if type(named) is not list:
+            raise ContractValidationError("CTP query callback arguments are not captured")
+        matches = [
+            item
+            for item in named
+            if isinstance(item, dict) and item.get("argument_slot") == slot
+        ]
+        if len(matches) != 1:
+            raise ContractValidationError("CTP query callback argument slot is ambiguous")
+        item = matches[0]
+        if (
+            item.get("name") != expected_name
+            or item.get("present") is not True
+            or item.get("scalar_captured") is not True
+        ):
+            raise ContractValidationError("CTP query callback argument is incomplete")
+        return item.get("value")
+
+    def begin_ctp_order_target_query(
+        self,
+        scope: ExecutionScope,
+        managed_intent_id: str,
+        *,
+        owner_handle: CtpCallbackSessionOwnerHandle,
+        writer_lease: WriterLease,
+    ) -> CtpOrderTargetQueryFence:
+        """Open one bounded callback-inbox window for an exact order query.
+
+        This fence does not clear the one-way economic-query latch. It records
+        the current applied high-water mark so only a subsequent, exact native
+        query callback sequence can mint a cancel target.
+        """
+
+        account_key, trading_day, scope_key = self._validate_ctp_order_identity_scope(scope)
+        self._validate_command_identifier(managed_intent_id, "managed_intent_id")
+        if type(owner_handle) is not CtpCallbackSessionOwnerHandle:
+            raise ContractValidationError("exact CTP callback owner is required")
+        now_wall_ns = time.time_ns()
+        now_mono_ns = time.monotonic_ns()
+        with self._transaction() as cursor:
+            self._assert_active_writer_lease(cursor, scope, writer_lease, now_ns=now_wall_ns)
+            owner = self._require_ctp_callback_session_owner_handle(
+                cursor,
+                scope,
+                owner_handle,
+                allowed_states=frozenset({"ACTIVE"}),
+                writer_lease=writer_lease,
+                now_ns=now_wall_ns,
+            )
+            if self._issued_ctp_callback_session_owners.get(owner_handle.owner_intent_id) is not owner_handle:
+                raise ContractValidationError("exact same-Store CTP callback owner is required")
+            if cursor.execute(
+                "SELECT 1 FROM ctp_dispatch_callback_source_lifecycle_fences WHERE account_key = ?",
+                (account_key,),
+            ).fetchone() is not None:
+                raise InvalidStateTransition("CTP callback source is permanently fenced")
+            binding = self._active_ctp_callback_sessions.get(owner_handle.owner_intent_id)
+            if (
+                binding is None
+                or binding.owner_intent_id != owner_handle.owner_intent_id
+                or binding.account_key != account_key
+                or binding.scope_key != scope_key
+                or binding.trading_day != trading_day
+                or binding.session_generation_id != self._ctp_callback_session_generation_id(owner)
+                or binding.connection_generation != int(owner["active_connection_generation"])
+                or binding.dispatch_front_id != int(owner["front_id"])
+                or binding.dispatch_session_id != int(owner["session_id"])
+                or binding.source_instance_id != str(owner["source_instance_id"])
+                or binding.native_client_epoch != str(owner["native_client_epoch"])
+                or binding.native_api_source_id != str(owner["native_api_source_id"])
+                or binding.native_spi_source_id != str(owner["native_spi_source_id"])
+                or binding.native_api_generation != int(owner["native_api_generation"])
+                or binding.source_connection_generation != int(owner["connection_generation"])
+                or binding.source_high_watermark <= 0
+                or binding.source_high_watermark > int(owner["last_source_sequence"])
+                or binding.session_binding_sha256
+                != payload_sha256(self._ctp_callback_session_binding_payload(binding))
+                or str(owner["writer_owner_id"]) != writer_lease.owner_id
+                or int(owner["writer_fencing_token"]) != writer_lease.fencing_token
+            ):
+                raise InvalidStateTransition("active CTP query owner binding is stale")
+            # Reuse the Store's established readback for its immutable login row.
+            # The transaction holds this Store's RLock; this performs only same-connection
+            # SELECTs and never calls the SDK or TraderClient.
+            readback_binding, _, _ = self.read_ctp_callback_session_context_facts(owner_handle)
+            if readback_binding is not binding:
+                raise InvalidStateTransition("durable CTP query login binding changed")
+            reservation_row = cursor.execute(
+                """
+                SELECT account_key, trading_day, scope_key, managed_intent_id,
+                       runtime_order_id, order_ref, created_at_ns
+                FROM ctp_order_identity_reservations
+                WHERE account_key = ? AND trading_day = ? AND scope_key = ?
+                  AND managed_intent_id = ?
+                """,
+                (account_key, trading_day, scope_key, managed_intent_id),
+            ).fetchone()
+            if reservation_row is None:
+                raise ContractValidationError("exact CTP OrderRef reservation is required")
+            start_source = int(owner["last_source_sequence"])
+            applied = self._ctp_callback_applied_sequence(
+                cursor, owner_handle.owner_intent_id, start_source
+            )
+            if applied != start_source:
+                raise InvalidStateTransition("CTP callback inbox has unapplied events")
+
+            for expired_id, expired in tuple(self._issued_ctp_order_target_query_fences.items()):
+                if expired.expires_at_ns <= now_mono_ns:
+                    self._issued_ctp_order_target_query_fences.pop(expired_id, None)
+                    self._issued_ctp_order_target_query_windows.pop(expired_id, None)
+                    if (
+                        self._active_ctp_order_target_query_fences.get(
+                            expired.owner_handle.owner_intent_id
+                        )
+                        == expired_id
+                    ):
+                        self._active_ctp_order_target_query_fences.pop(
+                            expired.owner_handle.owner_intent_id, None
+                        )
+            for expired_id, provenance in tuple(
+                self._issued_ctp_order_target_query_provenance.items()
+            ):
+                if provenance.expires_at_ns <= now_mono_ns:
+                    self._issued_ctp_order_target_query_provenance.pop(expired_id, None)
+            if owner_handle.owner_intent_id in self._active_ctp_order_target_query_fences:
+                raise InvalidStateTransition("CTP owner already has a live order-query fence")
+            if len(self._issued_ctp_order_target_query_fences) >= _CTP_ORDER_TARGET_QUERY_MAX_LIVE_FENCES:
+                raise InvalidStateTransition("CTP order-query fence capacity is full")
+            fence_id = uuid.uuid4().hex
+            fence = CtpOrderTargetQueryFence(
+                fence_id=fence_id,
+                owner_handle=owner_handle,
+                account_key=account_key,
+                scope_key=scope_key,
+                trading_day=trading_day,
+                managed_intent_id=managed_intent_id,
+                runtime_order_id=str(reservation_row["runtime_order_id"]),
+                order_ref=str(reservation_row["order_ref"]),
+                writer_owner_id=writer_lease.owner_id,
+                writer_fencing_token=writer_lease.fencing_token,
+                session_binding_sha256=binding.session_binding_sha256,
+                session_generation_id=binding.session_generation_id,
+                connection_generation=binding.connection_generation,
+                dispatch_front_id=binding.dispatch_front_id,
+                dispatch_session_id=binding.dispatch_session_id,
+                source_tags=(
+                    binding.source_instance_id,
+                    binding.native_client_epoch,
+                    binding.native_api_source_id,
+                    binding.native_spi_source_id,
+                    binding.native_api_generation,
+                    binding.source_connection_generation,
+                ),
+                start_source_sequence=start_source,
+                start_applied_sequence=applied,
+                created_at_ns=now_mono_ns,
+                expires_at_ns=now_mono_ns + _CTP_ORDER_TARGET_QUERY_FENCE_TTL_NS,
+            )
+            self._issued_ctp_order_target_query_fences[fence_id] = fence
+            self._active_ctp_order_target_query_fences[owner_handle.owner_intent_id] = fence_id
+            return fence
+
+    def read_ctp_order_target_query_window(
+        self,
+        scope: ExecutionScope,
+        query_fence: CtpOrderTargetQueryFence,
+        *,
+        query_request_id: int,
+        owner_handle: CtpCallbackSessionOwnerHandle,
+        writer_lease: WriterLease,
+    ) -> CtpOrderTargetQueryWindow:
+        """Read back one contiguous, applied OnRspQryOrder callback window."""
+
+        account_key, trading_day, scope_key = self._validate_ctp_order_identity_scope(scope)
+        now_wall_ns = time.time_ns()
+        now_mono_ns = time.monotonic_ns()
+        if (
+            type(query_fence) is not CtpOrderTargetQueryFence
+            or self._issued_ctp_order_target_query_fences.get(query_fence.fence_id) is not query_fence
+            or type(owner_handle) is not CtpCallbackSessionOwnerHandle
+            or query_fence.owner_handle is not owner_handle
+            or self._active_ctp_order_target_query_fences.get(owner_handle.owner_intent_id)
+            != query_fence.fence_id
+            or type(query_request_id) is not int
+            or not 0 < query_request_id <= 2_147_483_647
+            or query_fence.expires_at_ns <= now_mono_ns
+            or (account_key, trading_day, scope_key)
+            != (query_fence.account_key, query_fence.trading_day, query_fence.scope_key)
+        ):
+            raise ContractValidationError("fresh exact CTP order-query fence is required")
+        events: list[CtpCallbackIngressEventV1] = []
+        with self._transaction() as cursor:
+            if (
+                self._issued_ctp_order_target_query_fences.get(query_fence.fence_id)
+                is not query_fence
+                or self._active_ctp_order_target_query_fences.get(owner_handle.owner_intent_id)
+                != query_fence.fence_id
+            ):
+                raise ContractValidationError("CTP order-query fence was already consumed")
+            self._assert_active_writer_lease(cursor, scope, writer_lease, now_ns=now_wall_ns)
+            owner = self._require_ctp_callback_session_owner_handle(
+                cursor,
+                scope,
+                owner_handle,
+                allowed_states=frozenset({"ACTIVE"}),
+                writer_lease=writer_lease,
+                now_ns=now_wall_ns,
+            )
+            binding = self._active_ctp_callback_sessions.get(owner_handle.owner_intent_id)
+            if (
+                binding is None
+                or query_fence.writer_owner_id != writer_lease.owner_id
+                or query_fence.writer_fencing_token != writer_lease.fencing_token
+                or str(owner["writer_owner_id"]) != writer_lease.owner_id
+                or int(owner["writer_fencing_token"]) != writer_lease.fencing_token
+                or binding.session_binding_sha256 != query_fence.session_binding_sha256
+                or binding.connection_generation != query_fence.connection_generation
+                or (
+                    binding.source_instance_id,
+                    binding.native_client_epoch,
+                    binding.native_api_source_id,
+                    binding.native_spi_source_id,
+                    binding.native_api_generation,
+                    binding.source_connection_generation,
+                ) != query_fence.source_tags
+            ):
+                raise InvalidStateTransition("CTP order-query source binding changed")
+            last_source = int(owner["last_source_sequence"])
+            if (
+                last_source <= query_fence.start_source_sequence
+                or last_source - query_fence.start_source_sequence > _CTP_ORDER_TARGET_QUERY_MAX_EVENTS
+            ):
+                raise InvalidStateTransition("CTP order-query callback window is empty or too large")
+            applied = self._ctp_callback_applied_sequence(
+                cursor, owner_handle.owner_intent_id, last_source
+            )
+            if applied != last_source:
+                raise InvalidStateTransition("CTP order-query callback window is not fully applied")
+            rows = cursor.execute(
+                """
+                SELECT * FROM ctp_dispatch_callback_ingress
+                WHERE owner_intent_id = ? AND source_sequence > ? AND source_sequence <= ?
+                ORDER BY source_sequence
+                """,
+                (owner_handle.owner_intent_id, query_fence.start_source_sequence, last_source),
+            ).fetchall()
+            if len(rows) != last_source - query_fence.start_source_sequence:
+                raise DurableStoreError("CTP order-query callback window has a sequence gap")
+            request_ids: list[int] = []
+            last_flags: list[bool] = []
+            event_digests: list[dict[str, Any]] = []
+            for expected_sequence, row in enumerate(
+                rows, start=query_fence.start_source_sequence + 1
+            ):
+                seq = int(row["source_sequence"])
+                payload_json = str(row["record_payload_json"])
+                try:
+                    payload = json.loads(payload_json)
+                except (TypeError, ValueError, json.JSONDecodeError) as error:
+                    raise DurableStoreError("CTP order-query callback record is unreadable") from error
+                row_tags = (
+                    str(row["source_instance_id"]),
+                    str(row["native_client_epoch"]),
+                    str(row["native_api_source_id"]),
+                    str(row["native_spi_source_id"]),
+                    int(row["native_api_generation"]),
+                    int(row["source_connection_generation"]),
+                )
+                if (
+                    seq != expected_sequence
+                    or str(row["callback_name"]) != "OnRspQryOrder"
+                    or str(row["callback_class"]) != "AUDIT_QUERY"
+                    or str(row["source_phase"]) != "ACTIVE"
+                    or row_tags != query_fence.source_tags
+                    or int(row["connection_generation"]) != query_fence.connection_generation
+                    or payload.get("callback_name") != "OnRspQryOrder"
+                    or payload.get("callback_class") != "AUDIT_QUERY"
+                    or payload.get("phase") != "ACTIVE"
+                    or payload.get("sequence") != seq
+                    or payload.get("digest") != str(row["record_digest_sha256"])
+                    or payload.get("capture_complete") is not True
+                    or canonical_json(payload) != payload_json
+                ):
+                    raise ContractValidationError("CTP callback window is not one exact order query")
+                request_id = self._ctp_query_named_scalar(payload, 2, "nRequestID")
+                is_last = self._ctp_query_named_scalar(payload, 3, "bIsLast")
+                if type(request_id) is not int or type(is_last) is not bool:
+                    raise ContractValidationError("CTP query callback cursor fields are invalid")
+                request_ids.append(request_id)
+                last_flags.append(is_last)
+                application = cursor.execute(
+                    """
+                    SELECT outcome, command_id, application_digest_sha256
+                    FROM ctp_dispatch_callback_ingress_applications
+                    WHERE owner_intent_id = ? AND source_sequence = ?
+                    """,
+                    (owner_handle.owner_intent_id, seq),
+                ).fetchone()
+                expected_application_digest = payload_sha256(
+                    {
+                        "application_type": "ctp_callback_ingress_audit.v1",
+                        "owner_intent_id": owner_handle.owner_intent_id,
+                        "source_sequence": seq,
+                        "record_digest_sha256": str(row["record_digest_sha256"]),
+                        "callback_class": "AUDIT_QUERY",
+                    }
+                )
+                if (
+                    application is None
+                    or str(application["outcome"]) != "AUDIT_ONLY"
+                    or application["command_id"] is not None
+                    or str(application["application_digest_sha256"])
+                    != expected_application_digest
+                ):
+                    raise ContractValidationError("CTP query callback lacks its exact audit receipt")
+                event = CtpCallbackIngressEventV1(
+                    owner_handle=owner_handle,
+                    source_sequence=seq,
+                    record_digest_sha256=str(row["record_digest_sha256"]),
+                    callback_name="OnRspQryOrder",
+                    callback_class="AUDIT_QUERY",
+                    source_phase="ACTIVE",
+                    source_tags=row_tags,
+                    connection_generation=int(row["connection_generation"]),
+                    record_payload_json=payload_json,
+                )
+                key = (owner_handle.owner_intent_id, seq)
+                previous = self._issued_ctp_callback_ingress_events.get(key)
+                if previous is not None and previous != event:
+                    raise DurableStoreError("CTP query event Store readback changed")
+                self._issued_ctp_callback_ingress_events[key] = event
+                events.append(event)
+                event_digests.append({"sequence": seq, "record_digest_sha256": event.record_digest_sha256})
+            if (
+                any(request_id != query_request_id for request_id in request_ids)
+                or last_flags[:-1] != [False] * (len(last_flags) - 1)
+                or last_flags[-1] is not True
+            ):
+                raise ContractValidationError("CTP callback rows do not form one terminal query")
+            window_payload = {
+                "fence_id": query_fence.fence_id,
+                "owner_intent_id": owner_handle.owner_intent_id,
+                "query_request_id": query_request_id,
+                "start_source_sequence": query_fence.start_source_sequence,
+                "end_source_sequence": last_source,
+                "applied_source_sequence": applied,
+                "events": event_digests,
+            }
+            window = CtpOrderTargetQueryWindow(
+                fence_id=query_fence.fence_id,
+                owner_handle=owner_handle,
+                query_request_id=query_request_id,
+                start_source_sequence=query_fence.start_source_sequence,
+                end_source_sequence=last_source,
+                applied_source_sequence=applied,
+                events=tuple(events),
+                window_sha256=payload_sha256(window_payload),
+                observed_at_ns=now_mono_ns,
+            )
+            previous_window = self._issued_ctp_order_target_query_windows.get(query_fence.fence_id)
+            if previous_window is not None and previous_window != window:
+                raise ContractValidationError("CTP order-query window changed after readback")
+            self._issued_ctp_order_target_query_windows[query_fence.fence_id] = window
+            return window
+
     def issue_ctp_order_target_projection(
         self,
         scope: ExecutionScope,
@@ -11214,6 +11850,10 @@ class SqliteExecutionStore:
         native_query_evidence: Any,
         *,
         verifier: CtpOrderTargetProjectionVerifier | None = None,
+        owner_handle: CtpCallbackSessionOwnerHandle | None = None,
+        writer_lease: WriterLease | None = None,
+        query_fence: CtpOrderTargetQueryFence | None = None,
+        query_window: CtpOrderTargetQueryWindow | None = None,
     ) -> CtpOrderTargetProjectionHandle:
         """Verify, append and read back one current CTP target for a reservation.
 
@@ -11226,6 +11866,20 @@ class SqliteExecutionStore:
         cancel authority.
         """
 
+        fenced = (owner_handle, writer_lease, query_fence, query_window)
+        if any(value is not None for value in fenced):
+            if any(value is None for value in fenced):
+                raise ContractValidationError("complete CTP query-window proof is required")
+            return self._issue_fenced_ctp_order_target_projection(
+                scope,
+                managed_intent_id,
+                native_query_evidence,
+                verifier=verifier,
+                owner_handle=owner_handle,
+                writer_lease=writer_lease,
+                query_fence=query_fence,
+                query_window=query_window,
+            )
         account_key, trading_day, scope_key = self._validate_ctp_order_identity_scope(scope)
         reservation = self.read_ctp_order_identity(scope, managed_intent_id)
         if type(reservation) is not CtpOrderIdentityReservation:
@@ -11252,6 +11906,8 @@ class SqliteExecutionStore:
             raise ContractValidationError("CTP order-target query verification failed")
         if type(projection) is not CtpVerifiedOrderTargetProjection:
             raise ContractValidationError("invalid typed CTP order-target verification result")
+        if projection.query_provenance is not None:
+            raise ContractValidationError("query provenance is issued only from a Store fence")
         self._validate_ctp_order_target_projection_binding(scope, reservation, projection)
         if (
             projection.verified_at_ns != check_started_ns
@@ -11336,6 +11992,320 @@ class SqliteExecutionStore:
             raise
         return handle
 
+    def _issue_fenced_ctp_order_target_projection(
+        self,
+        scope: ExecutionScope,
+        managed_intent_id: str,
+        native_query_evidence: Any,
+        *,
+        verifier: CtpOrderTargetProjectionVerifier | None,
+        owner_handle: CtpCallbackSessionOwnerHandle | None,
+        writer_lease: WriterLease | None,
+        query_fence: CtpOrderTargetQueryFence | None,
+        query_window: CtpOrderTargetQueryWindow | None,
+    ) -> CtpOrderTargetProjectionHandle:
+        if (
+            type(owner_handle) is not CtpCallbackSessionOwnerHandle
+            or type(writer_lease) is not WriterLease
+            or type(query_fence) is not CtpOrderTargetQueryFence
+            or type(query_window) is not CtpOrderTargetQueryWindow
+            or query_window.fence_id != query_fence.fence_id
+            or query_window.owner_handle is not owner_handle
+            or query_fence.owner_handle is not owner_handle
+            or query_fence.managed_intent_id != managed_intent_id
+            or query_window.start_source_sequence != query_fence.start_source_sequence
+            or query_window.observed_at_ns < query_fence.created_at_ns
+            or query_window.observed_at_ns >= query_fence.expires_at_ns
+        ):
+            raise ContractValidationError("exact same-Store CTP query window is required")
+        # Consume the fence before invoking any external verifier. A verifier
+        # exception or ambiguous readback cannot make the query reusable.
+        with self._lock:
+            if (
+                self._issued_ctp_order_target_query_fences.get(query_fence.fence_id)
+                is not query_fence
+                or self._issued_ctp_order_target_query_windows.get(query_fence.fence_id)
+                is not query_window
+                or self._active_ctp_order_target_query_fences.get(owner_handle.owner_intent_id)
+                != query_fence.fence_id
+            ):
+                raise ContractValidationError("CTP query window was already consumed")
+            consumed_fence = self._issued_ctp_order_target_query_fences.pop(
+                query_fence.fence_id, None
+            )
+            consumed_window = self._issued_ctp_order_target_query_windows.pop(
+                query_fence.fence_id, None
+            )
+            self._active_ctp_order_target_query_fences.pop(owner_handle.owner_intent_id, None)
+            if consumed_fence is not query_fence or consumed_window is not query_window:
+                raise ContractValidationError("CTP query window was already consumed")
+
+        account_key, trading_day, scope_key = self._validate_ctp_order_identity_scope(scope)
+        check_started_ns = time.monotonic_ns()
+        if query_fence.expires_at_ns <= check_started_ns:
+            raise ContractValidationError("CTP order-query fence expired before verification")
+        now_wall_ns = time.time_ns()
+        with self._transaction() as cursor:
+            self._assert_active_writer_lease(cursor, scope, writer_lease, now_ns=now_wall_ns)
+            owner = self._require_ctp_callback_session_owner_handle(
+                cursor,
+                scope,
+                owner_handle,
+                allowed_states=frozenset({"ACTIVE"}),
+                writer_lease=writer_lease,
+                now_ns=now_wall_ns,
+            )
+            reservation_row = cursor.execute(
+                """
+                SELECT account_key, trading_day, scope_key, managed_intent_id,
+                       runtime_order_id, order_ref, created_at_ns
+                FROM ctp_order_identity_reservations
+                WHERE account_key = ? AND trading_day = ? AND scope_key = ?
+                  AND managed_intent_id = ?
+                """,
+                (account_key, trading_day, scope_key, managed_intent_id),
+            ).fetchone()
+            if reservation_row is None:
+                raise ContractValidationError("CTP target has no same-store OrderRef reservation")
+            reservation = self._ctp_order_identity_from_row(reservation_row)
+            if (
+                reservation.runtime_order_id != query_fence.runtime_order_id
+                or reservation.order_ref != query_fence.order_ref
+                or not bool(owner["economic_query_observed"])
+                or int(owner["last_source_sequence"]) != query_window.end_source_sequence
+                or self._ctp_callback_applied_sequence(
+                    cursor, owner_handle.owner_intent_id, query_window.end_source_sequence
+                ) != query_window.applied_source_sequence
+            ):
+                raise InvalidStateTransition("CTP query evidence changed before verification")
+            binding = self._active_ctp_callback_sessions.get(owner_handle.owner_intent_id)
+            if binding is None or self._ctp_query_binding_tuple(binding) != self._ctp_query_fence_binding_tuple(
+                query_fence
+            ):
+                raise InvalidStateTransition("CTP query session changed before verification")
+
+        authority = _REJECT_CTP_ORDER_TARGET_PROJECTION_VERIFIER if verifier is None else verifier
+        verify_target = getattr(authority, "verify_order_target", None)
+        if not callable(verify_target):
+            raise ContractValidationError("trusted CTP order-target query verifier is required")
+        try:
+            projection = verify_target(
+                scope,
+                reservation,
+                native_query_evidence,
+                now_ns=check_started_ns,
+                query_window=query_window,
+            )
+        except Exception as error:
+            raise ContractValidationError("CTP order-target query verification failed") from error
+        if (
+            type(projection) is not CtpVerifiedOrderTargetProjection
+            or projection.query_provenance is not None
+        ):
+            raise ContractValidationError("invalid typed CTP order-target verification result")
+        self._validate_ctp_order_target_projection_binding(scope, reservation, projection)
+        if (
+            projection.verified_at_ns != check_started_ns
+            or projection.expires_at_ns <= check_started_ns
+            or projection.session_generation_id != query_fence.session_generation_id
+            or projection.connection_generation != query_fence.connection_generation
+            or projection.query_front_id != query_fence.dispatch_front_id
+            or projection.query_session_id != query_fence.dispatch_session_id
+            or projection.query_request_id != query_window.query_request_id
+        ):
+            raise ContractValidationError("CTP order-target query differs from its fenced window")
+        effective_expires_ns = min(projection.expires_at_ns, query_fence.expires_at_ns)
+        if effective_expires_ns <= check_started_ns:
+            raise ContractValidationError("CTP order-target query expired before persistence")
+        projection = replace(projection, expires_at_ns=effective_expires_ns)
+        provenance = CtpOrderTargetQueryProvenance(
+            fence_id=query_fence.fence_id,
+            owner_intent_id=owner_handle.owner_intent_id,
+            account_key=query_fence.account_key,
+            scope_key=query_fence.scope_key,
+            trading_day=query_fence.trading_day,
+            managed_intent_id=query_fence.managed_intent_id,
+            runtime_order_id=query_fence.runtime_order_id,
+            order_ref=query_fence.order_ref,
+            writer_owner_id=query_fence.writer_owner_id,
+            writer_fencing_token=query_fence.writer_fencing_token,
+            session_binding_sha256=query_fence.session_binding_sha256,
+            session_generation_id=query_fence.session_generation_id,
+            connection_generation=query_fence.connection_generation,
+            dispatch_front_id=query_fence.dispatch_front_id,
+            dispatch_session_id=query_fence.dispatch_session_id,
+            source_tags=query_fence.source_tags,
+            query_request_id=query_window.query_request_id,
+            start_source_sequence=query_window.start_source_sequence,
+            end_source_sequence=query_window.end_source_sequence,
+            applied_source_sequence=query_window.applied_source_sequence,
+            source_event_count=len(query_window.events),
+            query_event_count=sum(
+                1 for event in query_window.events if event.callback_name == "OnRspQryOrder"
+            ),
+            window_sha256=query_window.window_sha256,
+            issued_at_ns=check_started_ns,
+            expires_at_ns=effective_expires_ns,
+        )
+        projection = replace(projection, query_provenance=provenance)
+        self._validate_ctp_order_target_projection_binding(scope, reservation, projection)
+        projection_payload = projection.to_payload()
+        projection_json = canonical_json(projection_payload)
+        projection_digest = payload_sha256(projection_payload)
+        projection_id = uuid.uuid4().hex
+        created_at_wall_ns = time.time_ns()
+        persist_check_ns = time.monotonic_ns()
+        if persist_check_ns >= effective_expires_ns:
+            raise ContractValidationError("CTP order-target query expired before persistence")
+        with self._lock:
+            for key, old in tuple(self._issued_ctp_order_target_query_provenance.items()):
+                if old.expires_at_ns <= persist_check_ns:
+                    self._issued_ctp_order_target_query_provenance.pop(key, None)
+            if (
+                len(self._issued_ctp_order_target_query_provenance)
+                + len(self._reserved_ctp_order_target_query_provenance)
+                >= _CTP_ORDER_TARGET_QUERY_MAX_PROVENANCE
+            ):
+                raise InvalidStateTransition("CTP query provenance capacity is full")
+            self._reserved_ctp_order_target_query_provenance.add(query_fence.fence_id)
+        try:
+            with self._transaction() as cursor:
+                self._assert_active_writer_lease(
+                    cursor, scope, writer_lease, now_ns=time.time_ns()
+                )
+                owner = self._require_ctp_callback_session_owner_handle(
+                    cursor,
+                    scope,
+                    owner_handle,
+                    allowed_states=frozenset({"ACTIVE"}),
+                    writer_lease=writer_lease,
+                    now_ns=time.time_ns(),
+                )
+                current = cursor.execute(
+                    """
+                    SELECT account_key, trading_day, scope_key, managed_intent_id,
+                           runtime_order_id, order_ref, created_at_ns
+                    FROM ctp_order_identity_reservations
+                    WHERE account_key = ? AND trading_day = ? AND scope_key = ?
+                      AND managed_intent_id = ?
+                    """,
+                    (account_key, trading_day, scope_key, managed_intent_id),
+                ).fetchone()
+                current_reservation = (
+                    None if current is None else self._ctp_order_identity_from_row(current)
+                )
+                binding = self._active_ctp_callback_sessions.get(owner_handle.owner_intent_id)
+                if (
+                    current_reservation != reservation
+                    or binding is None
+                    or self._ctp_query_binding_tuple(binding)
+                    != self._ctp_query_fence_binding_tuple(query_fence)
+                    or not bool(owner["economic_query_observed"])
+                    or int(owner["last_source_sequence"]) != query_window.end_source_sequence
+                    or self._ctp_callback_applied_sequence(
+                        cursor, owner_handle.owner_intent_id, query_window.end_source_sequence
+                    ) != query_window.applied_source_sequence
+                ):
+                    raise InvalidStateTransition("CTP order-query provenance changed before persistence")
+                cursor.execute(
+                    """
+                    INSERT INTO ctp_order_target_projections(
+                        account_key, projection_id, runtime_order_id, scope_key, trading_day,
+                        managed_intent_id, order_ref, session_generation_id,
+                        connection_generation, query_front_id, query_session_id,
+                        query_request_id, projection_payload_json, projection_sha256,
+                        verified_at_ns, expires_at_ns, created_at_ns
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        account_key,
+                        projection_id,
+                        reservation.runtime_order_id,
+                        scope_key,
+                        trading_day,
+                        managed_intent_id,
+                        reservation.order_ref,
+                        projection.session_generation_id,
+                        projection.connection_generation,
+                        projection.query_front_id,
+                        projection.query_session_id,
+                        projection.query_request_id,
+                        projection_json,
+                        projection_digest,
+                        projection.verified_at_ns,
+                        projection.expires_at_ns,
+                        created_at_wall_ns,
+                    ),
+                )
+        except DurableStoreError as error:
+            with self._lock:
+                self._reserved_ctp_order_target_query_provenance.discard(query_fence.fence_id)
+            if isinstance(error.__cause__, sqlite3.IntegrityError):
+                raise ContractValidationError(
+                    "CTP native query identity is duplicate or already persisted"
+                ) from error
+            raise
+        except Exception:
+            with self._lock:
+                self._reserved_ctp_order_target_query_provenance.discard(query_fence.fence_id)
+            raise
+        handle = CtpOrderTargetProjectionHandle(
+            projection_id=projection_id,
+            projection_sha256=projection_digest,
+            projection=projection,
+        )
+        with self._lock:
+            self._reserved_ctp_order_target_query_provenance.discard(query_fence.fence_id)
+            self._issued_ctp_order_target_projections[projection_id] = handle
+            self._issued_ctp_order_target_query_provenance[query_fence.fence_id] = provenance
+        try:
+            self.read_ctp_order_target_projection(scope, handle)
+        except Exception:
+            with self._lock:
+                self._issued_ctp_order_target_projections.pop(projection_id, None)
+                self._issued_ctp_order_target_query_provenance.pop(query_fence.fence_id, None)
+            raise
+        return handle
+
+    @staticmethod
+    def _ctp_query_binding_tuple(
+        binding: CtpCallbackSessionBindingV1,
+    ) -> tuple[Any, ...]:
+        return (
+            binding.owner_intent_id,
+            binding.account_key,
+            binding.scope_key,
+            binding.trading_day,
+            binding.session_binding_sha256,
+            binding.session_generation_id,
+            binding.connection_generation,
+            binding.dispatch_front_id,
+            binding.dispatch_session_id,
+            (
+                binding.source_instance_id,
+                binding.native_client_epoch,
+                binding.native_api_source_id,
+                binding.native_spi_source_id,
+                binding.native_api_generation,
+                binding.source_connection_generation,
+            ),
+        )
+
+    @staticmethod
+    def _ctp_query_fence_binding_tuple(fence: CtpOrderTargetQueryFence) -> tuple[Any, ...]:
+        return (
+            fence.owner_handle.owner_intent_id,
+            fence.account_key,
+            fence.scope_key,
+            fence.trading_day,
+            fence.session_binding_sha256,
+            fence.session_generation_id,
+            fence.connection_generation,
+            fence.dispatch_front_id,
+            fence.dispatch_session_id,
+            fence.source_tags,
+        )
+
     def _read_ctp_order_target_projection_row(
         self,
         scope: ExecutionScope,
@@ -11417,7 +12387,10 @@ class SqliteExecutionStore:
             or int(row["expires_at_ns"]) != projection.expires_at_ns
         ):
             raise ContractValidationError("persisted CTP target projection readback differs")
-        return stored_projection
+        # Preserve the exact issued proof object after verifying the durable
+        # projection payload equals it. Query provenance uses Store object
+        # identity as an additional same-process capability check.
+        return projection
 
     def read_ctp_order_target_projection(
         self,
@@ -11557,7 +12530,185 @@ class SqliteExecutionStore:
             raise ContractValidationError(
                 "persisted CTP cancel target differs from its query projection"
             )
+        owner = cursor.execute(
+            """
+            SELECT * FROM ctp_dispatch_callback_session_owners
+            WHERE account_key = ?
+            """,
+            (account_key,),
+        ).fetchone()
+        if owner is not None and bool(owner["economic_query_observed"]):
+            self._require_ctp_query_projection_provenance(
+                cursor,
+                scope,
+                projection,
+                owner,
+                now_ns=now_ns,
+            )
+        elif projection.query_provenance is not None:
+            raise ContractValidationError("CTP query provenance has no latched callback owner")
         return projection
+
+    def _require_ctp_query_projection_provenance(
+        self,
+        cursor: sqlite3.Cursor,
+        scope: ExecutionScope,
+        projection: CtpVerifiedOrderTargetProjection,
+        owner: sqlite3.Row,
+        *,
+        now_ns: int,
+    ) -> None:
+        provenance = projection.query_provenance
+        if (
+            type(provenance) is not CtpOrderTargetQueryProvenance
+            or self._issued_ctp_order_target_query_provenance.get(provenance.fence_id)
+            is not provenance
+            or provenance.expires_at_ns <= now_ns
+            or not bool(owner["economic_query_observed"])
+        ):
+            raise InvalidStateTransition("fresh Store-issued exact-query provenance is required")
+        account_key, trading_day, scope_key = self._validate_ctp_order_identity_scope(scope)
+        binding = self._active_ctp_callback_sessions.get(provenance.owner_intent_id)
+        owner_intent_id = str(owner["owner_intent_id"])
+        if (
+            owner_intent_id != provenance.owner_intent_id
+            or provenance.account_key != account_key
+            or provenance.scope_key != scope_key
+            or provenance.trading_day != trading_day
+            or provenance.writer_owner_id != str(owner["writer_owner_id"])
+            or provenance.writer_fencing_token != int(owner["writer_fencing_token"])
+            or provenance.session_generation_id != self._ctp_callback_session_generation_id(owner)
+            or provenance.dispatch_front_id != int(owner["front_id"])
+            or provenance.dispatch_session_id != int(owner["session_id"])
+            or binding is None
+            or binding.owner_intent_id != owner_intent_id
+            or binding.account_key != account_key
+            or binding.scope_key != scope_key
+            or binding.trading_day != trading_day
+            or binding.session_binding_sha256 != provenance.session_binding_sha256
+            or binding.session_generation_id != provenance.session_generation_id
+            or binding.connection_generation != provenance.connection_generation
+            or binding.dispatch_front_id != provenance.dispatch_front_id
+            or binding.dispatch_session_id != provenance.dispatch_session_id
+            or (
+                binding.source_instance_id,
+                binding.native_client_epoch,
+                binding.native_api_source_id,
+                binding.native_spi_source_id,
+                binding.native_api_generation,
+                binding.source_connection_generation,
+            ) != provenance.source_tags
+            or projection.account_key != account_key
+            or projection.scope_key != scope_key
+            or projection.trading_day != trading_day
+            or projection.managed_intent_id != provenance.managed_intent_id
+            or projection.runtime_order_id != provenance.runtime_order_id
+            or projection.order_ref != provenance.order_ref
+            or projection.session_generation_id != provenance.session_generation_id
+            or projection.connection_generation != provenance.connection_generation
+            or projection.query_front_id != provenance.dispatch_front_id
+            or projection.query_session_id != provenance.dispatch_session_id
+            or projection.query_request_id != provenance.query_request_id
+            or projection.verified_at_ns != provenance.issued_at_ns
+            or projection.expires_at_ns != provenance.expires_at_ns
+        ):
+            raise ContractValidationError("CTP query provenance differs from the active owner")
+        last_source = int(owner["last_source_sequence"])
+        if (
+            last_source != provenance.end_source_sequence
+            or self._ctp_callback_applied_sequence(cursor, owner_intent_id, last_source)
+            != provenance.applied_source_sequence
+            or provenance.applied_source_sequence != last_source
+        ):
+            raise InvalidStateTransition("CTP query source advanced after its target projection")
+        reservation = cursor.execute(
+            """
+            SELECT account_key, trading_day, scope_key, managed_intent_id,
+                   runtime_order_id, order_ref, created_at_ns
+            FROM ctp_order_identity_reservations
+            WHERE account_key = ? AND trading_day = ? AND scope_key = ?
+              AND managed_intent_id = ? AND runtime_order_id = ? AND order_ref = ?
+            """,
+            (
+                account_key,
+                trading_day,
+                scope_key,
+                provenance.managed_intent_id,
+                provenance.runtime_order_id,
+                provenance.order_ref,
+            ),
+        ).fetchone()
+        if reservation is None:
+            raise ContractValidationError("CTP query target reservation is no longer exact")
+        rows = cursor.execute(
+            """
+            SELECT source_sequence, record_digest_sha256, callback_name, callback_class,
+                   source_phase, source_instance_id, native_client_epoch, native_api_source_id,
+                   native_spi_source_id, native_api_generation, source_connection_generation,
+                   connection_generation, record_payload_json
+            FROM ctp_dispatch_callback_ingress
+            WHERE owner_intent_id = ? AND source_sequence > ? AND source_sequence <= ?
+            ORDER BY source_sequence
+            """,
+            (
+                owner_intent_id,
+                provenance.start_source_sequence,
+                provenance.end_source_sequence,
+            ),
+        ).fetchall()
+        if len(rows) != provenance.source_event_count:
+            raise ContractValidationError("CTP query provenance callback count changed")
+        for index, row in enumerate(rows):
+            sequence = provenance.start_source_sequence + index + 1
+            row_tags = (
+                str(row["source_instance_id"]),
+                str(row["native_client_epoch"]),
+                str(row["native_api_source_id"]),
+                str(row["native_spi_source_id"]),
+                int(row["native_api_generation"]),
+                int(row["source_connection_generation"]),
+            )
+            if (
+                int(row["source_sequence"]) != sequence
+                or str(row["callback_name"]) != "OnRspQryOrder"
+                or str(row["callback_class"]) != "AUDIT_QUERY"
+                or str(row["source_phase"]) != "ACTIVE"
+                or row_tags != provenance.source_tags
+                or int(row["connection_generation"]) != provenance.connection_generation
+            ):
+                raise ContractValidationError("CTP query provenance no longer matches source rows")
+            payload = json.loads(str(row["record_payload_json"]))
+            if (
+                payload.get("digest") != str(row["record_digest_sha256"])
+                or payload.get("sequence") != sequence
+                or self._ctp_query_named_scalar(payload, 2, "nRequestID")
+                != provenance.query_request_id
+            ):
+                raise ContractValidationError("CTP query provenance request binding changed")
+            application = cursor.execute(
+                """
+                SELECT outcome, command_id, application_digest_sha256
+                FROM ctp_dispatch_callback_ingress_applications
+                WHERE owner_intent_id = ? AND source_sequence = ?
+                """,
+                (owner_intent_id, sequence),
+            ).fetchone()
+            expected_digest = payload_sha256(
+                {
+                    "application_type": "ctp_callback_ingress_audit.v1",
+                    "owner_intent_id": owner_intent_id,
+                    "source_sequence": sequence,
+                    "record_digest_sha256": str(row["record_digest_sha256"]),
+                    "callback_class": "AUDIT_QUERY",
+                }
+            )
+            if (
+                application is None
+                or str(application["outcome"]) != "AUDIT_ONLY"
+                or application["command_id"] is not None
+                or str(application["application_digest_sha256"]) != expected_digest
+            ):
+                raise ContractValidationError("CTP query provenance audit receipt changed")
 
     def require_fresh_ctp_cancel_target_for_command(
         self, scope: ExecutionScope, command_id: str
@@ -13179,6 +14330,10 @@ class SqliteExecutionStore:
                     raise ContractValidationError(
                         "CTP staged session binding differs from active Store session"
                     )
+                if bool(session_owner["economic_query_observed"]) and operation != "CANCEL":
+                    raise InvalidStateTransition(
+                        "CTP economic query results permanently fence new submits"
+                    )
             if operation == "SUBMIT":
                 reservation = cursor.execute(
                     """
@@ -13587,7 +14742,7 @@ class SqliteExecutionStore:
                 now_ns=now_ns,
             )
             session = self._active_ctp_callback_sessions.get(owner_handle.owner_intent_id)
-            if session is None or bool(owner["economic_query_observed"]):
+            if session is None:
                 raise InvalidStateTransition("active CTP callback session is unavailable")
             row = cursor.execute(
                 """
@@ -13598,6 +14753,17 @@ class SqliteExecutionStore:
             ).fetchone()
             if row is None or str(row["status"]) != "READY":
                 raise InvalidStateTransition("CTP command is not staged before native claim")
+            if bool(owner["economic_query_observed"]):
+                if str(row["operation"]) != "CANCEL":
+                    raise InvalidStateTransition(
+                        "CTP economic query results permanently fence new submits"
+                    )
+                self._require_fresh_ctp_cancel_target_row(
+                    cursor,
+                    scope,
+                    row,
+                    now_ns=time.monotonic_ns(),
+                )
             if (
                 row["callback_owner_intent_id"] not in (None, owner_handle.owner_intent_id)
                 or int(row["native_call_inflight"]) != 0
@@ -13702,7 +14868,6 @@ class SqliteExecutionStore:
             )
             if (
                 session is None
-                or bool(owner["economic_query_observed"])
                 or staged_command.status != "READY"
                 or not staged_payload_matches
                 or not immutable_identity_matches
@@ -13712,6 +14877,17 @@ class SqliteExecutionStore:
                 or row["local_queue_receipt_queued"] == 0
             ):
                 raise InvalidStateTransition("CTP command is no longer pre-native and READY")
+            if bool(owner["economic_query_observed"]):
+                if current.operation != "CANCEL":
+                    raise InvalidStateTransition(
+                        "CTP economic query results permanently fence new submits"
+                    )
+                self._require_fresh_ctp_cancel_target_row(
+                    cursor,
+                    scope,
+                    row,
+                    now_ns=time.monotonic_ns(),
+                )
             self._require_command_session_binding(row, session)
             cursor.execute(
                 """
@@ -15590,10 +16766,6 @@ class SqliteExecutionStore:
                     raise InvalidStateTransition(
                         "active CTP callback session binding is not live in this Store"
                     )
-                if bool(session_owner["economic_query_observed"]):
-                    raise InvalidStateTransition(
-                        "CTP economic query results require a typed evaluator before send"
-                    )
                 if self._ctp_callback_applied_sequence(
                     cursor,
                     _callback_session_owner.owner_intent_id,
@@ -15612,6 +16784,12 @@ class SqliteExecutionStore:
             if int(row["correlation_version"]) != 2:
                 raise InvalidStateTransition("legacy CTP command version is audit-only")
             if session_owner is not None:
+                if bool(session_owner["economic_query_observed"]) and str(
+                    row["operation"]
+                ) != "CANCEL":
+                    raise InvalidStateTransition(
+                        "CTP economic query results permanently fence new submits"
+                    )
                 if (
                     str(session_owner["scope_key"]) != scope_key
                     or str(row["trading_day"]) != str(session_owner["trading_day"])
@@ -15767,7 +16945,6 @@ class SqliteExecutionStore:
                 if (
                     fresh_owner is None
                     or str(fresh_owner["owner_state"]) != "ACTIVE"
-                    or bool(fresh_owner["economic_query_observed"])
                     or fresh_binding is None
                     or fresh_binding != active_binding
                     or str(fresh_owner["owner_intent_id"])
@@ -15775,6 +16952,12 @@ class SqliteExecutionStore:
                 ):
                     raise InvalidStateTransition(
                         "active CTP callback session changed during claim verification"
+                    )
+                if bool(fresh_owner["economic_query_observed"]) and str(
+                    row_after_verification["operation"]
+                ) != "CANCEL":
+                    raise InvalidStateTransition(
+                        "CTP economic query results permanently fence new submits"
                     )
                 self._require_command_session_binding(row_after_verification, fresh_binding)
             if str(row_after_verification["operation"]) == "CANCEL":
@@ -16009,7 +17192,6 @@ class SqliteExecutionStore:
                     session = self._active_ctp_callback_sessions.get(owner_handle.owner_intent_id)
                     if (
                         session is None
-                        or bool(owner["economic_query_observed"])
                         or binding.expires_at_ns <= now_ns
                         or binding.owner_intent_id != owner_handle.owner_intent_id
                         or binding.account_key != account_key
@@ -16034,6 +17216,10 @@ class SqliteExecutionStore:
                     if row is None or str(row["status"]) != "CLAIMED":
                         raise InvalidStateTransition("bound CTP command is no longer CLAIMED")
                     command = self._ctp_dispatch_command_from_row(row)
+                    if bool(owner["economic_query_observed"]) and command.operation != "CANCEL":
+                        raise InvalidStateTransition(
+                            "CTP economic query results permanently fence new submits"
+                        )
                     correlation = command.correlation_key
                     if (
                         correlation is None
