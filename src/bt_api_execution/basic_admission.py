@@ -423,6 +423,7 @@ class ExecutionAdmissionValidatorRegistry:
 
 @dataclass(frozen=True, slots=True)
 class _HeldPermit:
+    context: ExecutionAdmissionContextV1
     context_fingerprint: str
     intent_fingerprint: str
     account_key: str
@@ -440,6 +441,12 @@ class _HeldPermit:
     dispatch_port: object
 
 
+@dataclass(frozen=True, slots=True)
+class _ClaimedAuthorization:
+    authorization: ExecutionAdmissionAuthorizationV1
+    held: _HeldPermit
+
+
 class ExecutionBasicAdmissionGate:
     """Issue and consume context-, capability-, intent-, and owner-bound permits."""
 
@@ -451,6 +458,7 @@ class ExecutionBasicAdmissionGate:
         permit_ttl_ns: int = 5_000_000_000,
         clock_ns: Callable[[], int] = time.time_ns,
         max_active_permits: int = 10_000,
+        retain_claimed_authorizations: bool = False,
     ) -> None:
         if type(store) is not SqliteExecutionStore:
             raise ContractValidationError("basic admission requires the execution SQLite store")
@@ -460,6 +468,8 @@ class ExecutionBasicAdmissionGate:
             raise ContractValidationError("invalid execution admission permit TTL")
         if type(max_active_permits) is not int or not 1 <= max_active_permits <= 1_000_000:
             raise ContractValidationError("invalid execution admission capacity")
+        if type(retain_claimed_authorizations) is not bool:
+            raise ContractValidationError("invalid claimed authorization retention setting")
         if not callable(clock_ns):
             raise ContractValidationError("execution admission clock is required")
         self._store = store
@@ -467,8 +477,11 @@ class ExecutionBasicAdmissionGate:
         self._permit_ttl_ns = permit_ttl_ns
         self._clock_ns = clock_ns
         self._max_active_permits = max_active_permits
+        self._retain_claimed_authorizations = retain_claimed_authorizations
         self._lock = threading.RLock()
         self._permits: dict[str, _HeldPermit] = {}
+        self._claiming: dict[str, object] = {}
+        self._claimed_authorizations: dict[str, _ClaimedAuthorization] = {}
 
     def reserve_for_dispatch(
         self,
@@ -486,6 +499,7 @@ class ExecutionBasicAdmissionGate:
         )
         reference = uuid.uuid4().hex
         held = _HeldPermit(
+            context=context,
             context_fingerprint=context.fingerprint,
             intent_fingerprint=intent.fingerprint,
             account_key=intent.scope.account_key,
@@ -504,7 +518,10 @@ class ExecutionBasicAdmissionGate:
         )
         with self._lock:
             self._purge_expired_locked(now_ns)
-            if len(self._permits) >= self._max_active_permits:
+            active_count = len(self._permits)
+            if self._retain_claimed_authorizations:
+                active_count += len(self._claiming) + len(self._claimed_authorizations)
+            if active_count >= self._max_active_permits:
                 raise ExecutionBasicAdmissionDenied("execution admission capacity is full")
             self._permits[reference] = held
         return reference
@@ -564,60 +581,157 @@ class ExecutionBasicAdmissionGate:
 
         if type(reference) is not str or not _REFERENCE.fullmatch(reference):
             raise ExecutionBasicAdmissionDenied("basic admission reference is invalid")
+        claim_token = object()
         with self._lock:
             held = self._permits.pop(reference, None)
+            if held is not None:
+                self._claiming[reference] = claim_token
         if held is None:
             raise ExecutionBasicAdmissionDenied("basic admission reference is unknown or consumed")
 
-        now_ns = self._now()
-        if now_ns >= held.expires_at_ns:
-            raise ExecutionBasicAdmissionDenied("basic admission reference expired")
-        self._validate_request(context, intent, dispatch_port, writer_lease, now_ns=now_ns)
-        if (
-            held.context_fingerprint != context.fingerprint
-            or held.intent_fingerprint != intent.fingerprint
-            or held.account_key != intent.scope.account_key
-            or held.strategy_id != intent.scope.strategy_id
-            or held.action != (context.action, intent.side.value, intent.position_effect.value)
-            or held.owner_id != writer_lease.owner_id
-            or held.fencing_token != writer_lease.fencing_token
-            or held.dispatch_port is not dispatch_port
-        ):
-            raise ExecutionBasicAdmissionDenied("basic admission binding changed")
+        try:
+            now_ns = self._now()
+            with self._lock:
+                self._purge_expired_locked(now_ns)
+            if now_ns >= held.expires_at_ns:
+                raise ExecutionBasicAdmissionDenied("basic admission reference expired")
+            self._validate_request(context, intent, dispatch_port, writer_lease, now_ns=now_ns)
+            if (
+                held.context_fingerprint != context.fingerprint
+                or held.intent_fingerprint != intent.fingerprint
+                or held.account_key != intent.scope.account_key
+                or held.strategy_id != intent.scope.strategy_id
+                or held.action != (context.action, intent.side.value, intent.position_effect.value)
+                or held.owner_id != writer_lease.owner_id
+                or held.fencing_token != writer_lease.fencing_token
+                or held.dispatch_port is not dispatch_port
+            ):
+                raise ExecutionBasicAdmissionDenied("basic admission binding changed")
 
+            parameters, binding, validator = self._validators.validate(
+                context, intent, dispatch_port, now_ns=now_ns
+            )
+            capability_fingerprint = validator.capability_fingerprint()
+            if (
+                validator.validator_id != held.validator_id
+                or validator.version != held.validator_version
+                or capability_fingerprint != held.capability_fingerprint
+                or binding != held.parameter_binding
+                or payload_sha256(parameters.to_payload())
+                != payload_sha256(held.parameters.to_payload())
+            ):
+                raise ExecutionBasicAdmissionDenied("provider capability changed after admission")
+            # Recheck expiry and fencing after the pure policy evaluation as part
+            # of the final dispatch claim. The facade calls this only after its
+            # pre-dispatch guards, immediately before invoking the authorized port.
+            final_now_ns = self._now()
+            if final_now_ns >= held.expires_at_ns:
+                raise ExecutionBasicAdmissionDenied("basic admission reference expired")
+            self._store.assert_writer_lease(intent.scope, writer_lease)
+            authorization = ExecutionAdmissionAuthorizationV1(
+                permit_reference=reference,
+                context_fingerprint=context.fingerprint,
+                intent_fingerprint=intent.fingerprint,
+                validator_id=validator.validator_id,
+                validator_version=validator.version,
+                capability_fingerprint=capability_fingerprint,
+                owner_id=writer_lease.owner_id,
+                fencing_token=writer_lease.fencing_token,
+                issued_at_ns=held.issued_at_ns,
+                expires_at_ns=held.expires_at_ns,
+                parameters=parameters,
+            )
+            with self._lock:
+                if self._claiming.get(reference) is not claim_token:
+                    raise ExecutionBasicAdmissionDenied("basic admission claim is no longer current")
+                self._claiming.pop(reference)
+                if self._retain_claimed_authorizations:
+                    self._claimed_authorizations[reference] = _ClaimedAuthorization(
+                        authorization=authorization,
+                        held=held,
+                    )
+            return authorization
+        finally:
+            with self._lock:
+                if self._claiming.get(reference) is claim_token:
+                    self._claiming.pop(reference)
+
+    def verify_claimed_authorization(
+        self,
+        authorization: ExecutionAdmissionAuthorizationV1,
+        intent: OrderIntent,
+        dispatch_port: object,
+        writer_lease: WriterLease,
+    ) -> ExecutionAdmissionAuthorizationV1:
+        """Revalidate an exact prior claim without consuming or renewing it."""
+
+        if not self._retain_claimed_authorizations:
+            raise ExecutionBasicAdmissionDenied("claimed authorization retention is disabled")
+        if type(authorization) is not ExecutionAdmissionAuthorizationV1:
+            raise ExecutionBasicAdmissionDenied("claimed authorization is invalid")
+        reference = authorization.permit_reference
+        if type(reference) is not str or not _REFERENCE.fullmatch(reference):
+            raise ExecutionBasicAdmissionDenied("claimed authorization reference is invalid")
+        now_ns = self._now()
+        with self._lock:
+            claimed = self._claimed_authorizations.get(reference)
+        if claimed is None or claimed.authorization is not authorization:
+            raise ExecutionBasicAdmissionDenied("claimed authorization is unknown or not exact")
+        held = claimed.held
+        context = held.context
+        if now_ns >= held.expires_at_ns:
+            raise ExecutionBasicAdmissionDenied("claimed authorization expired")
+        if (
+            authorization.context_fingerprint != held.context_fingerprint
+            or authorization.intent_fingerprint != held.intent_fingerprint
+            or authorization.validator_id != held.validator_id
+            or authorization.validator_version != held.validator_version
+            or authorization.capability_fingerprint != held.capability_fingerprint
+            or authorization.owner_id != held.owner_id
+            or authorization.fencing_token != held.fencing_token
+            or authorization.issued_at_ns != held.issued_at_ns
+            or authorization.expires_at_ns != held.expires_at_ns
+            or payload_sha256(authorization.parameters.to_payload())
+            != payload_sha256(held.parameters.to_payload())
+            or dispatch_port is not held.dispatch_port
+            or type(intent) is not OrderIntent
+            or intent.scope != context.execution_scope
+            or intent.fingerprint != held.intent_fingerprint
+            or intent.scope.account_key != held.account_key
+            or intent.scope.strategy_id != held.strategy_id
+            or held.action != (context.action, intent.side.value, intent.position_effect.value)
+            or type(writer_lease) is not WriterLease
+            or writer_lease.owner_id != held.owner_id
+            or writer_lease.fencing_token != held.fencing_token
+        ):
+            raise ExecutionBasicAdmissionDenied("claimed authorization binding changed")
+
+        self._validate_request(context, intent, dispatch_port, writer_lease, now_ns=now_ns)
         parameters, binding, validator = self._validators.validate(
             context, intent, dispatch_port, now_ns=now_ns
         )
-        capability_fingerprint = validator.capability_fingerprint()
         if (
             validator.validator_id != held.validator_id
             or validator.version != held.validator_version
-            or capability_fingerprint != held.capability_fingerprint
+            or validator.capability_fingerprint() != held.capability_fingerprint
             or binding != held.parameter_binding
             or payload_sha256(parameters.to_payload())
             != payload_sha256(held.parameters.to_payload())
+            or payload_sha256(parameters.to_payload())
+            != payload_sha256(authorization.parameters.to_payload())
         ):
             raise ExecutionBasicAdmissionDenied("provider capability changed after admission")
-        # Recheck expiry and fencing after the pure policy evaluation as part
-        # of the final dispatch claim. The facade calls this only after its
-        # pre-dispatch guards, immediately before invoking the authorized port.
-        final_now_ns = self._now()
-        if final_now_ns >= held.expires_at_ns:
-            raise ExecutionBasicAdmissionDenied("basic admission reference expired")
         self._store.assert_writer_lease(intent.scope, writer_lease)
-        return ExecutionAdmissionAuthorizationV1(
-            permit_reference=reference,
-            context_fingerprint=context.fingerprint,
-            intent_fingerprint=intent.fingerprint,
-            validator_id=validator.validator_id,
-            validator_version=validator.version,
-            capability_fingerprint=capability_fingerprint,
-            owner_id=writer_lease.owner_id,
-            fencing_token=writer_lease.fencing_token,
-            issued_at_ns=held.issued_at_ns,
-            expires_at_ns=held.expires_at_ns,
-            parameters=parameters,
-        )
+        final_now_ns = self._now()
+        with self._lock:
+            if (
+                self._claimed_authorizations.get(reference) is not claimed
+                or claimed.authorization is not authorization
+            ):
+                raise ExecutionBasicAdmissionDenied("claimed authorization is no longer current")
+            if final_now_ns >= held.expires_at_ns:
+                raise ExecutionBasicAdmissionDenied("claimed authorization expired")
+        return authorization
 
     def revoke(self, reference: str) -> bool:
         """Drop an unclaimed in-memory reference; validators have no external reserve."""
@@ -663,6 +777,14 @@ class ExecutionBasicAdmissionGate:
         ]
         for reference in expired:
             del self._permits[reference]
+        if self._retain_claimed_authorizations:
+            expired_claims = [
+                reference
+                for reference, claimed in self._claimed_authorizations.items()
+                if claimed.held.expires_at_ns <= now_ns
+            ]
+            for reference in expired_claims:
+                del self._claimed_authorizations[reference]
 
 
 __all__ = [
