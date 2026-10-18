@@ -34,7 +34,7 @@ from .approved_target import (
     has_reserved_approval_tags,
 )
 from .basic_admission import ExecutionAdmissionContextV1, ExecutionBasicAdmissionGate
-from .cancellation import ManagedCancellationFacade
+from .cancellation import CancelBeforeDispatchCallable, ManagedCancellationFacade
 from .contracts import (
     CancelIntent,
     ExecutionScope,
@@ -145,8 +145,10 @@ class ExecutionOrderEntryService:
     ``store`` stays caller-owned.  ``targets`` maps canonical base
     ``WireScope`` templates to durable execution scopes; a request can only
     reach a scope that the composition root registered.  ``dispatch`` is the
-    trusted provider adapter: an object exposing ``submit(intent)`` and
-    ``cancel(intent)``, or a plain callable used for submission.
+    trusted provider submit adapter. ``cancel_dispatch`` optionally supplies
+    a separate cancel adapter, falling back to ``dispatch``.
+    ``cancel_before_dispatch`` is a trusted per-intent hook that runs before
+    the Risk owner claims a cancellation dispatch.
 
     ``allow_unprotected`` exists only for deployments that explicitly declare
     no risk admission gate.  It is never read from the service manifest.
@@ -160,6 +162,7 @@ class ExecutionOrderEntryService:
         targets: Mapping[WireScope, ExecutionScope],
         dispatch: object,
         *,
+        cancel_dispatch: object | None = None,
         admission_gate: object | None = None,
         basic_admission_gate: ExecutionBasicAdmissionGate | None = None,
         cancel_admission_gate: object | None = None,
@@ -167,6 +170,7 @@ class ExecutionOrderEntryService:
         paper_owner_domain: PaperOwnerDomainV1 | None = None,
         approved_target_authority: ApprovedTargetAuthorityV1 | None = None,
         cancel_quota_admission: CancelQuotaAdmissionCallable | None = None,
+        cancel_before_dispatch: CancelBeforeDispatchCallable | None = None,
         allow_unprotected: bool = False,
         writer_id: str = _DEFAULT_WRITER_ID,
         lease_ttl_ns: int = _DEFAULT_LEASE_TTL_NS,
@@ -180,7 +184,8 @@ class ExecutionOrderEntryService:
             and callable(getattr(dispatch, "submit_authorized", None))
         ):
             raise ContractValidationError("execution order entry requires a dispatch port")
-        if not _has_dispatch(dispatch, "cancel"):
+        selected_cancel_dispatch = dispatch if cancel_dispatch is None else cancel_dispatch
+        if not _has_dispatch(selected_cancel_dispatch, "cancel"):
             raise ContractValidationError("execution order entry requires a cancel dispatch port")
         if type(allow_unprotected) is not bool:
             raise ContractValidationError("invalid allow_unprotected")
@@ -222,6 +227,8 @@ class ExecutionOrderEntryService:
             )
         if cancel_quota_admission is not None and not callable(cancel_quota_admission):
             raise ContractValidationError("cancellation quota admission must be callable")
+        if cancel_before_dispatch is not None and not callable(cancel_before_dispatch):
+            raise ContractValidationError("cancellation before-dispatch hook must be callable")
         if group_coordinator_authority is not None and not callable(
             getattr(group_coordinator_authority, "hold_group_leg_authorization", None)
         ):
@@ -247,6 +254,7 @@ class ExecutionOrderEntryService:
             if (
                 type(paper_owner_domain) is not PaperOwnerDomainV1
                 or type(dispatch) is not PaperMatchingPort
+                or selected_cancel_dispatch is not dispatch
                 or dispatch.owner_domain is not paper_owner_domain
                 or basic_admission_gate is None
                 or allow_unprotected
@@ -277,18 +285,24 @@ class ExecutionOrderEntryService:
                     raise ContractValidationError(
                         "paper Risk adapter does not match the trusted owner composition"
                     )
-        elif type(dispatch) is PaperMatchingPort or any(
-            execution_scope.provider == PAPER_PROVIDER for execution_scope in copied.values()
+        elif (
+            type(dispatch) is PaperMatchingPort
+            or type(selected_cancel_dispatch) is PaperMatchingPort
+            or any(
+                execution_scope.provider == PAPER_PROVIDER for execution_scope in copied.values()
+            )
         ):
             raise ContractValidationError("paper execution requires an explicit owner domain")
 
         self._store = store
         self._targets = MappingProxyType(copied)
         self._dispatch = dispatch
+        self._cancel_dispatch = selected_cancel_dispatch
         self._admission_gate = admission_gate
         self._basic_admission_gate = basic_admission_gate
         self._cancel_admission_gate = cancel_admission_gate
         self._cancel_quota_admission = cancel_quota_admission
+        self._cancel_before_dispatch = cancel_before_dispatch
         self._group_coordinator_authority = group_coordinator_authority
         self._paper_owner_domain = paper_owner_domain
         self._approved_target_authority = approved_target_authority
@@ -898,7 +912,11 @@ class ExecutionOrderEntryService:
 
         _, cancel_facade = self._facade_pair(execution_scope)
         try:
-            record = cancel_facade.cancel(intent, self._dispatch)
+            record = cancel_facade.cancel(
+                intent,
+                self._cancel_dispatch,
+                before_dispatch=self._cancel_before_dispatch,
+            )
         except IntentConflictError:
             return self._cancel_failure_with_record(
                 "INTENT_CONFLICT", intent.cancel_id, execution_scope
@@ -1062,13 +1080,18 @@ class ExecutionOrderEntryService:
                         if admission_result is not None or monotonic_ns() >= deadline:
                             raise AdmissionRequired("cancel quota admission returned an invalid result")
 
+                    def before_cancel_dispatch(checked_intent: CancelIntent) -> None:
+                        admit_quota(checked_intent)
+                        if self._cancel_before_dispatch is not None:
+                            self._cancel_before_dispatch(checked_intent)
+
                     cancel_facade.cancel(
                         cancel_intent,
-                        self._dispatch,
+                        self._cancel_dispatch,
                         # Quota waits happen before the single-use Risk claim.
                         # claim_before_dispatch then revalidates permit TTL in
                         # the Risk owner's transaction after this wait.
-                        before_dispatch=admit_quota,
+                        before_dispatch=before_cancel_dispatch,
                     )
                 except (AdmissionRequired, IntentConflictError, InvalidStateTransition):
                     # The durable cancel record is authoritative; read it
