@@ -663,7 +663,7 @@ class ManagedExecutionFacade:
                 writer_lease=writer_lease,
             )
         try:
-            record = self._store.record_observation(
+            record, event = self._store.record_observation_with_event(
                 observation,
                 scope=self._scope,
                 source="provider",
@@ -682,7 +682,17 @@ class ManagedExecutionFacade:
                 "invalid_provider_evidence",
                 writer_lease=writer_lease,
             )
-        return self._settle_after_evidenced_outcome(record, writer_lease=writer_lease)
+        settled_record, _settlement_ok = self._settle_after_evidenced_outcome_result(
+            record, writer_lease=writer_lease
+        )
+        observed_record, _event, _observation_ok = (
+            self._after_evidenced_observation_result(
+                settled_record,
+                event,
+                writer_lease=writer_lease,
+            )
+        )
+        return observed_record
 
     def reconcile(self, observation: ProviderObservation) -> ExecutionRecord:
         """Apply typed provider evidence without issuing another provider request.
@@ -728,12 +738,12 @@ class ManagedExecutionFacade:
     ) -> ExecutionEvent | None:
         """Persist one observation and return only its newly appended outbox event.
 
-        Exact retries return ``None``. Invalid evidence and permit-settlement
-        failures first persist a review-required latch, then raise
-        :class:`InvalidStateTransition` so callers cannot confuse them with a
-        duplicate. The returned event is the same immutable row created by the
-        store transaction; this method does not publish to monitor or call a
-        provider port.
+        Exact retries return ``None``. Invalid evidence, permit-settlement,
+        and optional observation-reconciliation failures first persist a
+        review-required latch, then raise :class:`InvalidStateTransition` so
+        callers cannot confuse them with a duplicate. The returned event is
+        the same immutable row created by the store transaction; this method
+        does not publish to monitor or call a provider port.
         """
 
         _record, event, review_required = self._record_provider_observation_with_event(observation)
@@ -775,7 +785,15 @@ class ManagedExecutionFacade:
             settle_permit=previous_state in _PERMIT_SETTLEMENT_SOURCE_STATES,
             writer_lease=writer_lease,
         )
-        return settled_record, event if settlement_ok else None, not settlement_ok
+        observed_record, observed_event, observation_ok = (
+            self._after_evidenced_observation_result(
+                settled_record,
+                event,
+                writer_lease=writer_lease,
+            )
+        )
+        operation_ok = settlement_ok and observation_ok
+        return observed_record, observed_event if operation_ok else None, not operation_ok
 
     def reconcile_with_port(
         self,
@@ -1396,6 +1414,43 @@ class ManagedExecutionFacade:
                     False,
                 )
         return record, True
+
+    def _after_evidenced_observation_result(
+        self,
+        record: ExecutionRecord,
+        event: ExecutionEvent | None,
+        *,
+        writer_lease: WriterLease,
+    ) -> tuple[ExecutionRecord, ExecutionEvent | None, bool]:
+        """Notify an optional gate hook for each newly persisted provider event.
+
+        Unlike ``after_evidenced_outcome``, this hook is observation-scoped and
+        may run for later callbacks after the admission permit was already
+        settled. It receives the event returned by the same store transaction;
+        exact replays have no event and are never notified. The hook must only
+        reconcile durable evidence and must not dispatch another provider
+        request.
+        """
+
+        if event is None:
+            return record, None, True
+        try:
+            callback = getattr(self._admission_gate, "after_evidenced_observation", None)
+            if not callable(callback):
+                return record, event, True
+            self._store.assert_writer_lease(self._scope, writer_lease)
+            callback(record, event, writer_lease=writer_lease)
+        except WriterLeaseUnavailable:
+            raise
+        except Exception:
+            marked = self._store.mark_review_required(
+                record.intent_id,
+                self._scope,
+                "evidenced_observation_reconciliation_failed",
+                writer_lease=writer_lease,
+            )
+            return marked, None, False
+        return record, event, True
 
     @staticmethod
     def _dispatch(
