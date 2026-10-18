@@ -66,6 +66,7 @@ _MAX_RECOVERY_SNAPSHOT_ORDERS = 512
 _MAX_RECOVERY_SNAPSHOT_EVENTS = 20_000
 _MAX_RECOVERY_PAGE_SIZE = 128
 _MAX_CTP_DISPATCH_TRADE_FACT_PAGE_SIZE = 100
+_MAX_CTP_OWNER_CALLBACK_SNAPSHOT_TRADE_FACTS = 4096
 _MAX_CTP_CALLBACK_OWNER_SCOPES = 256
 _CTP_CALLBACK_OWNER_SCOPE_SET_SCHEMA = "ctp-callback-owner-scope-set.v1"
 _OWNER_CANCEL_OPEN_STATES = frozenset(
@@ -1710,6 +1711,143 @@ class CtpDispatchTradeFactPage:
                 or self.next_cursor.owner_intent_id != last.owner_intent_id
             ):
                 raise ContractValidationError("CTP trade-fact cursor differs from page tail")
+
+
+_CTP_OWNER_CALLBACK_NOT_READY_REASONS = frozenset(
+    {
+        "COMMAND_NOT_FOUND",
+        "NOT_SUBMIT_COMMAND",
+        "COMMAND_UNKNOWN",
+        "ACCOUNT_FENCED",
+        "CALLBACK_OWNER_UNAVAILABLE",
+        "PROVIDER_ORDER_NOT_READY",
+        "ORDER_CALLBACK_INCOMPLETE",
+        "ORDER_CALLBACK_MISMATCH",
+        "TRADE_FACTS_OVER_LIMIT",
+        "TRADE_PREFIX_MISMATCH",
+        "CANCEL_COMMAND_MISMATCH",
+        "CANCEL_COMMAND_NOT_READY",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class CtpOwnerCallbackObservationNotReadyV1:
+    """A precise reason that one durable callback snapshot is not ready."""
+
+    reason_code: str
+
+    def __post_init__(self) -> None:
+        if type(self.reason_code) is not str or self.reason_code not in (
+            _CTP_OWNER_CALLBACK_NOT_READY_REASONS
+        ):
+            raise ContractValidationError("invalid CTP owner callback not-ready reason")
+
+
+@dataclass(frozen=True, slots=True)
+class CtpOwnerCallbackObservationSnapshotV1:
+    """One same-transaction, source-bound order/trade observation snapshot.
+
+    This read model contains only the exact submit callback, durable trade
+    facts, and their source anchors. Commission remains explicitly incomplete;
+    local queue completion and cancel action state are separate from provider
+    order state.
+    """
+
+    account_key: str
+    scope_key: str
+    trading_day: str
+    command_id: str
+    owner_intent_id: str
+    session_generation_id: str
+    callback_stream_id: str
+    command_status: str
+    local_dispatch_outcome: str
+    order_source_sequence: int
+    ingress_record_digest_sha256: str
+    source_digest_sha256: str
+    exchange_id: str
+    order_sys_id: str
+    order_ref: str
+    request_id: int
+    front_id: int
+    session_id: int
+    provider_state: str
+    volume_traded: int
+    filled_quantity: int
+    trade_notional: Decimal
+    trade_fact_count: int
+    cumulative_commission: None = None
+    commission_quality: str = "INCOMPLETE"
+    cancel_command_id: str | None = None
+    cancel_action_state: str | None = None
+
+    def __post_init__(self) -> None:
+        for name in (
+            "account_key",
+            "scope_key",
+            "command_id",
+            "owner_intent_id",
+            "session_generation_id",
+            "callback_stream_id",
+            "exchange_id",
+            "order_sys_id",
+        ):
+            _validate_correlation_text(getattr(self, name), name)
+        if (
+            type(self.trading_day) is not str
+            or len(self.trading_day) != 8
+            or not self.trading_day.isascii()
+            or not self.trading_day.isdigit()
+        ):
+            raise ContractValidationError("invalid CTP owner callback trading day")
+        if (
+            type(self.order_ref) is not str
+            or len(self.order_ref) != 12
+            or not self.order_ref.isascii()
+            or not self.order_ref.isdigit()
+        ):
+            raise ContractValidationError("invalid CTP owner callback OrderRef")
+        if not _is_sha256(self.ingress_record_digest_sha256) or not _is_sha256(
+            self.source_digest_sha256
+        ):
+            raise ContractValidationError("invalid CTP owner callback source digest")
+        if (
+            self.command_status != "COMPLETED"
+            or self.local_dispatch_outcome != "QUEUED"
+            or type(self.order_source_sequence) is not int
+            or self.order_source_sequence <= 0
+            or type(self.request_id) is not int
+            or self.request_id <= 0
+            or type(self.front_id) is not int
+            or self.front_id <= 0
+            or type(self.session_id) is not int
+            or self.session_id <= 0
+            or type(self.provider_state) is not str
+            or self.provider_state not in _CTP_ORDER_PROJECTION_STATES
+            or type(self.volume_traded) is not int
+            or self.volume_traded < 0
+            or type(self.filled_quantity) is not int
+            or self.filled_quantity != self.volume_traded
+            or type(self.trade_notional) is not Decimal
+            or not self.trade_notional.is_finite()
+            or self.trade_notional < 0
+            or type(self.trade_fact_count) is not int
+            or not 0 <= self.trade_fact_count <= _MAX_CTP_OWNER_CALLBACK_SNAPSHOT_TRADE_FACTS
+            or self.cumulative_commission is not None
+            or self.commission_quality != "INCOMPLETE"
+        ):
+            raise ContractValidationError("invalid CTP owner callback observation snapshot")
+        if self.cancel_command_id is None:
+            if self.cancel_action_state is not None:
+                raise ContractValidationError("cancel state lacks its exact CTP command id")
+        else:
+            _validate_correlation_text(self.cancel_command_id, "cancel command id")
+            if (
+                type(self.cancel_action_state) is not str
+                or self.cancel_action_state not in _CTP_CANCEL_ACTION_STATES
+            ):
+                raise ContractValidationError("invalid CTP owner callback cancel state")
 
 
 class CtpDispatchCallbackVerifier(Protocol):
@@ -14135,6 +14273,1055 @@ class SqliteExecutionStore:
                 owner_intent_id=last.owner_intent_id,
             )
         return CtpDispatchTradeFactPage(trades=trades, next_cursor=next_cursor)
+
+    def read_ctp_owner_callback_observation_snapshot(
+        self,
+        scope: ExecutionScope,
+        command_id: str,
+        *,
+        cancel_command_id: str | None = None,
+    ) -> CtpOwnerCallbackObservationSnapshotV1 | CtpOwnerCallbackObservationNotReadyV1:
+        """Read one V2 submit's callback and trade facts from one SQLite snapshot.
+
+        The command, callback owner, applied source rows, provider projection,
+        cumulative order observations and bounded trade pages are read under one
+        deferred transaction on this Store connection. The transaction always
+        rolls back because this method is strictly read-only. UNKNOWN commands
+        and open account fences are reported as not-ready and remain untouched.
+        """
+
+        account_key, trading_day, scope_key = self._validate_ctp_order_identity_scope(scope)
+        self._validate_command_identifier(command_id, "command_id")
+        if cancel_command_id is not None:
+            self._validate_command_identifier(cancel_command_id, "cancel_command_id")
+
+        def not_ready(reason: str) -> CtpOwnerCallbackObservationNotReadyV1:
+            return CtpOwnerCallbackObservationNotReadyV1(reason_code=reason)
+
+        def source_payload(row: sqlite3.Row, binding: CtpCallbackSessionBindingV1) -> dict[str, Any]:
+            raw = row["record_payload_json"]
+            if type(raw) is not str or not raw:
+                raise ValueError("invalid ingress payload")
+            if len(raw.encode("utf-8")) > 32 * 1024:
+                raise ValueError("oversized ingress payload")
+            payload = json.loads(raw)
+            if (
+                type(payload) is not dict
+                or canonical_json(payload) != raw
+                or set(payload)
+                != {
+                    "schema",
+                    "owner_intent_id",
+                    "callback_name",
+                    "callback_class",
+                    "phase",
+                    "source_instance_id",
+                    "native_client_epoch",
+                    "native_api_source_id",
+                    "native_spi_source_id",
+                    "native_api_generation",
+                    "source_connection_generation",
+                    "connection_generation",
+                    "sequence",
+                    "monotonic_ns",
+                    "named_args",
+                    "flattened_fields",
+                    "capture_complete",
+                    "missing_getters",
+                    "digest",
+                }
+                or payload.get("schema") != "ctp_trader_callback_ingress.v2"
+                or type(payload.get("digest")) is not str
+                or not _is_sha256(payload["digest"])
+                or payload.get("callback_class") != "ROUTEABLE"
+                or payload.get("phase") != "ACTIVE"
+                or type(payload.get("sequence")) is not int
+                or payload["sequence"] <= 0
+                or type(payload.get("monotonic_ns")) is not int
+                or payload["monotonic_ns"] <= 0
+                or type(payload.get("native_api_generation")) is not int
+                or payload["native_api_generation"] <= 0
+                or type(payload.get("source_connection_generation")) is not int
+                or payload["source_connection_generation"] < 0
+                or type(payload.get("connection_generation")) is not int
+                or payload["connection_generation"] < 0
+                or type(payload.get("named_args")) is not list
+                or type(payload.get("flattened_fields")) is not list
+            ):
+                raise ValueError("non-canonical ingress envelope")
+            unsigned = dict(payload)
+            digest = unsigned.pop("digest")
+            encoded = json.dumps(
+                unsigned,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+            if (
+                hashlib.sha256(encoded).hexdigest() != digest
+                or digest != row["record_digest_sha256"]
+                or payload.get("owner_intent_id") != row["owner_intent_id"]
+                or payload.get("sequence") != row["source_sequence"]
+                or payload.get("callback_name") != row["callback_name"]
+                or payload.get("callback_class") != row["callback_class"]
+                or payload.get("phase") != row["source_phase"]
+                or payload.get("capture_complete") is not True
+                or payload.get("missing_getters") != []
+            ):
+                raise ValueError("ingress digest or row binding differs")
+            for field_name in (
+                "source_instance_id",
+                "native_client_epoch",
+                "native_api_source_id",
+                "native_spi_source_id",
+                "native_api_generation",
+                "source_connection_generation",
+                "connection_generation",
+            ):
+                if payload.get(field_name) != row[field_name]:
+                    raise ValueError("ingress source tag differs from row")
+            expected_tags = {
+                "source_instance_id": binding.source_instance_id,
+                "native_client_epoch": binding.native_client_epoch,
+                "native_api_source_id": binding.native_api_source_id,
+                "native_spi_source_id": binding.native_spi_source_id,
+                "native_api_generation": binding.native_api_generation,
+                "source_connection_generation": binding.source_connection_generation,
+                "connection_generation": binding.connection_generation,
+            }
+            if any(payload.get(name) != value for name, value in expected_tags.items()):
+                raise ValueError("ingress source tags differ from active owner")
+            return payload
+
+        def flattened_fields(payload: Mapping[str, Any], slot: int) -> dict[str, Any]:
+            items = payload.get("flattened_fields")
+            if type(items) is not list:
+                raise ValueError("invalid flattened callback fields")
+            result: dict[str, Any] = {}
+            for item in items:
+                if type(item) is not dict:
+                    raise ValueError("invalid flattened callback field")
+                if type(item.get("argument_slot")) is not int or item["argument_slot"] < 0:
+                    raise ValueError("invalid flattened callback argument slot")
+                if item["argument_slot"] != slot:
+                    continue
+                name = item.get("field_name")
+                if type(name) is not str or not name or name in result:
+                    raise ValueError("duplicate or invalid callback field")
+                if item.get("present") is True:
+                    if item.get("scalar_captured") is not True:
+                        raise ValueError("callback field was not captured as a scalar")
+                    result[name] = item.get("value")
+                elif item.get("scalar_captured") is True:
+                    raise ValueError("absent callback field has a captured scalar")
+            return result
+
+        def application_matches(
+            row: sqlite3.Row,
+            *,
+            owner_id: str,
+            source_sequence: int,
+            ingress_digest: str,
+            command: str,
+            evidence_variants: tuple[Mapping[str, Any], ...],
+        ) -> bool:
+            if (
+                row is None
+                or str(row["outcome"]) != "APPLIED"
+                or row["command_id"] != command
+            ):
+                return False
+            expected = {
+                payload_sha256(
+                    {
+                        "application_type": "ctp_callback_ingress_routed.v1",
+                        "owner_intent_id": owner_id,
+                        "source_sequence": source_sequence,
+                        "record_digest_sha256": ingress_digest,
+                        "command_id": command,
+                        "outcome": "APPLIED",
+                        "evidence": dict(evidence),
+                    }
+                )
+                for evidence in evidence_variants
+            }
+            return str(row["application_digest_sha256"]) in expected
+
+        with self._lock:
+            cursor = self._connection.cursor()
+            began = False
+            try:
+                cursor.execute("BEGIN")
+                began = True
+                command_row = cursor.execute(
+                    """
+                    SELECT * FROM ctp_dispatch_commands
+                    WHERE account_key = ? AND scope_key = ? AND trading_day = ?
+                      AND command_id = ?
+                    """,
+                    (account_key, scope_key, trading_day, command_id),
+                ).fetchone()
+                if command_row is None:
+                    return not_ready("COMMAND_NOT_FOUND")
+                command = self._ctp_dispatch_command_from_row(command_row)
+                if command.operation != "SUBMIT":
+                    return not_ready("NOT_SUBMIT_COMMAND")
+                if command.status == "UNKNOWN":
+                    return not_ready("COMMAND_UNKNOWN")
+                if self._ctp_dispatch_has_open_account_fence(cursor, account_key):
+                    return not_ready("ACCOUNT_FENCED")
+                if (
+                    command.status != "COMPLETED"
+                    or command.local_queue_receipt_queued is not True
+                    or command.native_receipt_payload is None
+                    or command.correlation_key is None
+                    or command.correlation_key.version != 2
+                ):
+                    return not_ready("PROVIDER_ORDER_NOT_READY")
+
+                correlation = command.correlation_key
+                request_quantity = command.request_payload.get("VolumeTotalOriginal")
+                if type(request_quantity) is not int or request_quantity <= 0:
+                    return not_ready("ORDER_CALLBACK_MISMATCH")
+                if (
+                    correlation.account_key != account_key
+                    or correlation.scope_key != scope_key
+                    or correlation.trading_day != trading_day
+                    or correlation.command_id != command_id
+                    or correlation.operation != "SUBMIT"
+                ):
+                    return not_ready("ORDER_CALLBACK_MISMATCH")
+                projection = self.read_ctp_dispatch_projection(scope, command_id)
+                if (
+                    projection is None
+                    or projection.operation != "SUBMIT"
+                    or projection.command_status != "COMPLETED"
+                    or projection.local_dispatch_outcome != "QUEUED"
+                    or projection.submit_action is None
+                    or projection.submit_action.managed_intent_id
+                    != correlation.reservation_managed_intent_id
+                    or projection.submit_action.runtime_order_id != correlation.runtime_order_id
+                    or projection.submit_action.order_ref != correlation.order_ref
+                    or projection.submit_action.order_state.provider_state is None
+                    or projection.submit_action.order_state.source_kind != "CALLBACK"
+                ):
+                    return not_ready("PROVIDER_ORDER_NOT_READY")
+
+                owner_id = command_row["callback_owner_intent_id"]
+                if type(owner_id) is not str or not owner_id:
+                    return not_ready("CALLBACK_OWNER_UNAVAILABLE")
+                owner_handle = self._issued_ctp_callback_session_owners.get(owner_id)
+                if (
+                    type(owner_handle) is not CtpCallbackSessionOwnerHandle
+                    or owner_handle.account_key != account_key
+                    or owner_handle.scope_key != scope_key
+                    or owner_handle.owner_intent_id != owner_id
+                ):
+                    return not_ready("CALLBACK_OWNER_UNAVAILABLE")
+                try:
+                    binding, broker_id, user_id = self.read_ctp_callback_session_context_facts(
+                        owner_handle
+                    )
+                    self._require_command_session_binding(command_row, binding)
+                except (ContractValidationError, DurableStoreError, InvalidStateTransition):
+                    return not_ready("CALLBACK_OWNER_UNAVAILABLE")
+                if (
+                    binding.owner_intent_id != owner_id
+                    or binding.account_key != account_key
+                    or binding.scope_key != scope_key
+                    or binding.trading_day != trading_day
+                    or binding.session_generation_id != correlation.session_generation_id
+                    or binding.dispatch_front_id != correlation.dispatch_front_id
+                    or binding.dispatch_session_id != correlation.dispatch_session_id
+                    or command.session_binding_sha256 != binding.session_binding_sha256
+                ):
+                    return not_ready("CALLBACK_OWNER_UNAVAILABLE")
+                owner_row = cursor.execute(
+                    """
+                    SELECT * FROM ctp_dispatch_callback_session_owners
+                    WHERE owner_intent_id = ? AND account_key = ? AND scope_key = ?
+                    """,
+                    (owner_id, account_key, scope_key),
+                ).fetchone()
+                if (
+                    owner_row is None
+                    or str(owner_row["owner_state"]) != "ACTIVE"
+                    or str(owner_row["trading_day"]) != binding.trading_day
+                    or int(owner_row["front_id"]) != binding.dispatch_front_id
+                    or int(owner_row["session_id"]) != binding.dispatch_session_id
+                    or int(owner_row["active_connection_generation"])
+                    != binding.connection_generation
+                    or any(
+                        owner_row[name] != value
+                        for name, value in (
+                            ("source_instance_id", binding.source_instance_id),
+                            ("native_client_epoch", binding.native_client_epoch),
+                            ("native_api_source_id", binding.native_api_source_id),
+                            ("native_spi_source_id", binding.native_spi_source_id),
+                            ("native_api_generation", binding.native_api_generation),
+                            ("connection_generation", binding.source_connection_generation),
+                        )
+                    )
+                    or command_row["callback_owner_intent_id"] != owner_id
+                ):
+                    return not_ready("CALLBACK_OWNER_UNAVAILABLE")
+
+                from .ctp_native_callbacks import (
+                    CtpNativeSessionContext,
+                    map_ctp_native_order_action_callback,
+                    map_ctp_native_order_return,
+                    map_ctp_native_trade_fact_v2,
+                )
+
+                account_fingerprint = "acct_" + hashlib.sha256(
+                    f"{broker_id}:{user_id}".encode("ascii")
+                ).hexdigest()[:16]
+                session_context = CtpNativeSessionContext(
+                    account_key=account_key,
+                    scope_key=scope_key,
+                    trading_day=trading_day,
+                    session_epoch=binding.native_client_epoch,
+                    session_generation_id=binding.session_generation_id,
+                    account_fingerprint=account_fingerprint,
+                    native_api_generation=binding.native_api_generation,
+                    connection_generation=binding.connection_generation,
+                    dispatch_front_id=binding.dispatch_front_id,
+                    dispatch_session_id=binding.dispatch_session_id,
+                )
+
+                order_rows = cursor.execute(
+                    """
+                    SELECT ingress.*
+                    FROM ctp_dispatch_callback_ingress AS ingress
+                    JOIN ctp_dispatch_callback_ingress_applications AS application
+                      ON application.owner_intent_id = ingress.owner_intent_id
+                     AND application.source_sequence = ingress.source_sequence
+                    WHERE ingress.owner_intent_id = ?
+                      AND ingress.callback_name = 'OnRtnOrder'
+                      AND application.command_id = ?
+                      AND application.outcome = 'APPLIED'
+                    ORDER BY ingress.source_sequence ASC LIMIT ?
+                    """,
+                    (
+                        owner_id,
+                        command_id,
+                        _MAX_CTP_OWNER_CALLBACK_SNAPSHOT_TRADE_FACTS + 1,
+                    ),
+                ).fetchall()
+                if len(order_rows) > _MAX_CTP_OWNER_CALLBACK_SNAPSHOT_TRADE_FACTS:
+                    return not_ready("ORDER_CALLBACK_INCOMPLETE")
+                order_observations: list[dict[str, Any]] = []
+                for ingress_row in order_rows:
+                    try:
+                        payload = source_payload(ingress_row, binding)
+                        fields = flattened_fields(payload, 0)
+                    except (TypeError, ValueError, KeyError, json.JSONDecodeError):
+                        return not_ready("ORDER_CALLBACK_MISMATCH")
+                    if fields.get("OrderRef") != correlation.order_ref:
+                        continue
+                    if (
+                        fields.get("TradingDay") != trading_day
+                        or fields.get("BrokerID") != broker_id
+                        or fields.get("UserID") != user_id
+                    ):
+                        return not_ready("ORDER_CALLBACK_MISMATCH")
+                    try:
+                        envelope = map_ctp_native_order_return(correlation, session_context, fields)
+                    except ContractValidationError:
+                        return not_ready("ORDER_CALLBACK_MISMATCH")
+                    callback_key = envelope.callback_key
+                    callback_payload = envelope.to_payload()
+                    callback_payload["ingress_source"] = {
+                        "owner_intent_id": owner_id,
+                        "source_sequence": int(ingress_row["source_sequence"]),
+                        "record_digest_sha256": str(ingress_row["record_digest_sha256"]),
+                    }
+                    callback_payload_digest = payload_sha256(callback_payload)
+                    callback_key_payload = callback_key.to_payload()
+                    callback_key_json = canonical_json(callback_key_payload)
+                    callback_key_digest = payload_sha256(callback_key_payload)
+                    callback_row = cursor.execute(
+                        """
+                        SELECT * FROM ctp_dispatch_callback_ledger
+                        WHERE account_key = ? AND session_generation_id = ?
+                          AND callback_stream_id = ? AND callback_event_id = ?
+                        """,
+                        (
+                            account_key,
+                            binding.session_generation_id,
+                            callback_key.stream_id,
+                            callback_key.event_id,
+                        ),
+                    ).fetchone()
+                    application_row = cursor.execute(
+                        """
+                        SELECT * FROM ctp_dispatch_callback_ingress_applications
+                        WHERE owner_intent_id = ? AND source_sequence = ?
+                        """,
+                        (owner_id, int(ingress_row["source_sequence"])),
+                    ).fetchone()
+                    correlation_digest = payload_sha256(correlation.to_payload())
+                    if (
+                        callback_row is None
+                        or str(callback_row["command_id"]) != command_id
+                        or str(callback_row["account_key"]) != account_key
+                        or str(callback_row["scope_key"]) != scope_key
+                        or str(callback_row["trading_day"]) != trading_day
+                        or str(callback_row["operation"]) != "SUBMIT"
+                        or str(callback_row["managed_action_id"])
+                        != correlation.managed_action_id
+                        or str(callback_row["runtime_order_id"]) != correlation.runtime_order_id
+                        or str(callback_row["order_ref"]) != correlation.order_ref
+                        or str(callback_row["session_generation_id"])
+                        != binding.session_generation_id
+                        or str(callback_row["callback_stream_id"]) != callback_key.stream_id
+                        or str(callback_row["callback_event_id"]) != callback_key.event_id
+                        or str(callback_row["callback_family"]) != "ORDER"
+                        or str(callback_row["callback_key_json"]) != callback_key_json
+                        or str(callback_row["callback_key_sha256"]) != callback_key_digest
+                        or str(callback_row["callback_payload_sha256"])
+                        != callback_payload_digest
+                        or str(callback_row["correlation_key_sha256"]) != correlation_digest
+                        or not _is_sha256(callback_row["source_digest_sha256"])
+                        or type(callback_row["verifier_id"]) is not str
+                        or not callback_row["verifier_id"]
+                        or type(callback_row["verified_at_ns"]) is not int
+                        or type(callback_row["applied_at_ns"]) is not int
+                        or not application_matches(
+                            application_row,
+                            owner_id=owner_id,
+                            source_sequence=int(ingress_row["source_sequence"]),
+                            ingress_digest=str(ingress_row["record_digest_sha256"]),
+                            command=command_id,
+                            evidence_variants=(
+                                {
+                                    "callback_key_sha256": callback_key_digest,
+                                    "callback_payload_sha256": callback_payload_digest,
+                                    "source_digest_sha256": str(
+                                        callback_row["source_digest_sha256"]
+                                    ),
+                                    "duplicate": False,
+                                },
+                                {
+                                    "callback_key_sha256": callback_key_digest,
+                                    "callback_payload_sha256": callback_payload_digest,
+                                    "source_digest_sha256": str(
+                                        callback_row["source_digest_sha256"]
+                                    ),
+                                    "duplicate": True,
+                                },
+                            ),
+                        )
+                    ):
+                        return not_ready("ORDER_CALLBACK_MISMATCH")
+                    volume = fields.get("VolumeTraded")
+                    if type(volume) is not int or volume < 0:
+                        return not_ready("ORDER_CALLBACK_INCOMPLETE")
+                    if volume > request_quantity:
+                        return not_ready("ORDER_CALLBACK_MISMATCH")
+                    cumulative_row = cursor.execute(
+                        """
+                        SELECT * FROM ctp_dispatch_order_cumulative_ledger
+                        WHERE owner_intent_id = ? AND source_sequence = ?
+                        """,
+                        (owner_id, int(ingress_row["source_sequence"])),
+                    ).fetchone()
+                    if (
+                        cumulative_row is None
+                        or str(cumulative_row["account_key"]) != account_key
+                        or str(cumulative_row["scope_key"]) != scope_key
+                        or str(cumulative_row["trading_day"]) != trading_day
+                        or str(cumulative_row["command_id"]) != command_id
+                        or str(cumulative_row["runtime_order_id"]) != correlation.runtime_order_id
+                        or str(cumulative_row["order_ref"]) != correlation.order_ref
+                        or type(cumulative_row["native_volume_traded"]) is not int
+                        or int(cumulative_row["native_volume_traded"]) != volume
+                        or str(cumulative_row["ingress_record_digest_sha256"])
+                        != str(ingress_row["record_digest_sha256"])
+                        or str(cumulative_row["callback_key_sha256"]) != callback_key_digest
+                    ):
+                        return not_ready("ORDER_CALLBACK_MISMATCH")
+                    # Preserve every verified order observation for trade-prefix
+                    # validation. Early callbacks may precede assignment of the
+                    # exchange identity; only the latest callback can anchor the
+                    # returned consumer observation.
+                    order_observations.append(
+                        {
+                            "source_sequence": int(ingress_row["source_sequence"]),
+                            "volume": volume,
+                            "event_id": callback_key.event_id,
+                            "stream_id": callback_key.stream_id,
+                            "source_digest_sha256": str(callback_row["source_digest_sha256"]),
+                            "ingress_digest_sha256": str(ingress_row["record_digest_sha256"]),
+                            "callback_key_sha256": callback_key_digest,
+                            "projection_state": str(callback_row["projection_state"]),
+                            "exchange_id": callback_key.exchange_id,
+                            "order_sys_id": callback_key.order_sys_id,
+                            "request_id": callback_key.native_request_id,
+                            "front_id": callback_key.correlation_key.dispatch_front_id,
+                            "session_id": callback_key.correlation_key.dispatch_session_id,
+                            "cumulative_row": cumulative_row,
+                        }
+                    )
+                if not order_observations:
+                    return not_ready("PROVIDER_ORDER_NOT_READY")
+                order_observations.sort(key=lambda item: item["source_sequence"])
+                latest_order = order_observations[-1]
+                if latest_order["exchange_id"] is None or latest_order["order_sys_id"] is None:
+                    return not_ready("ORDER_CALLBACK_INCOMPLETE")
+
+                trades: list[CtpDispatchTradeFactRead] = []
+                after: CtpDispatchTradeFactCursor | None = None
+                while True:
+                    page = self.read_ctp_dispatch_trade_facts(
+                        scope,
+                        command_id,
+                        after=after,
+                        limit=_MAX_CTP_DISPATCH_TRADE_FACT_PAGE_SIZE,
+                    )
+                    if len(trades) + len(page.trades) > _MAX_CTP_OWNER_CALLBACK_SNAPSHOT_TRADE_FACTS:
+                        return not_ready("TRADE_FACTS_OVER_LIMIT")
+                    trades.extend(page.trades)
+                    if page.next_cursor is None:
+                        break
+                    after = page.next_cursor
+                    if len(trades) >= _MAX_CTP_OWNER_CALLBACK_SNAPSHOT_TRADE_FACTS:
+                        return not_ready("TRADE_FACTS_OVER_LIMIT")
+
+                running_trade_quantity = 0
+                trade_notional_parts: list[tuple[int, int]] = []
+                trade_exchange_ids: set[str] = set()
+                trade_order_sys_ids: set[str] = set()
+                for trade in trades:
+                    if (
+                        trade.account_key != account_key
+                        or trade.scope_key != scope_key
+                        or trade.trading_day != trading_day
+                        or trade.command_id != command_id
+                        or trade.managed_intent_id != correlation.reservation_managed_intent_id
+                        or trade.runtime_order_id != correlation.runtime_order_id
+                        or trade.order_ref != correlation.order_ref
+                        or trade.owner_intent_id != owner_id
+                        or trade.session_generation_id != binding.session_generation_id
+                        or trade.callback_stream_id != session_context.stream_id
+                    ):
+                        return not_ready("TRADE_PREFIX_MISMATCH")
+                    try:
+                        fact_payload = json.loads(trade.fact_payload_json)
+                        fact_scope = fact_payload.get("source_scope")
+                        native_trade_fields = fact_payload.get("native_fields")
+                        ingress_row = cursor.execute(
+                            """
+                            SELECT * FROM ctp_dispatch_callback_ingress
+                            WHERE owner_intent_id = ? AND source_sequence = ?
+                            """,
+                            (owner_id, trade.source_sequence),
+                        ).fetchone()
+                        application_row = cursor.execute(
+                            """
+                            SELECT * FROM ctp_dispatch_callback_ingress_applications
+                            WHERE owner_intent_id = ? AND source_sequence = ?
+                            """,
+                            (owner_id, trade.source_sequence),
+                        ).fetchone()
+                        if ingress_row is None or application_row is None:
+                            return not_ready("TRADE_PREFIX_MISMATCH")
+                        ingress_payload = source_payload(ingress_row, binding)
+                        ingress_fields = flattened_fields(ingress_payload, 0)
+                        if (
+                            str(ingress_row["callback_name"]) != "OnRtnTrade"
+                            or str(ingress_row["callback_class"]) != "ROUTEABLE"
+                            or str(ingress_row["source_phase"]) != "ACTIVE"
+                            or str(ingress_row["record_digest_sha256"])
+                            != trade.ingress_record_digest_sha256
+                            or type(fact_scope) is not dict
+                            or fact_scope != session_context.to_payload()
+                            or type(native_trade_fields) is not dict
+                        ):
+                            return not_ready("TRADE_PREFIX_MISMATCH")
+                        mapped_trade = map_ctp_native_trade_fact_v2(
+                            session_context, ingress_fields
+                        )
+                        if (
+                            mapped_trade.event_id != trade.callback_event_id
+                            or dict(mapped_trade.native_fields) != native_trade_fields
+                        ):
+                            return not_ready("TRADE_PREFIX_MISMATCH")
+                    except (
+                        ContractValidationError,
+                        TypeError,
+                        ValueError,
+                        KeyError,
+                        json.JSONDecodeError,
+                    ):
+                        return not_ready("TRADE_PREFIX_MISMATCH")
+                    evidence_false = {
+                        "trade_event_id": trade.callback_event_id,
+                        "trade_fact_sha256": trade.fact_payload_sha256,
+                        "source_digest_sha256": trade.source_digest_sha256,
+                        "cumulative_trade_quantity": trade.cumulative_trade_quantity,
+                        "cumulative_order_quantity": trade.cumulative_order_quantity,
+                        "prefix_consistency": trade.prefix_consistency,
+                        "commission_quality": "INCOMPLETE",
+                        "duplicate": False,
+                    }
+                    if not application_matches(
+                        application_row,
+                        owner_id=owner_id,
+                        source_sequence=trade.source_sequence,
+                        ingress_digest=trade.ingress_record_digest_sha256,
+                        command=command_id,
+                        evidence_variants=(evidence_false,),
+                    ):
+                        return not_ready("TRADE_PREFIX_MISMATCH")
+                    expected_request = command.request_payload
+                    native_trade_fields = fact_payload["native_fields"]
+                    if (
+                        trade.exchange_id != latest_order["exchange_id"]
+                        or trade.order_sys_id != latest_order["order_sys_id"]
+                        or trade.instrument_id != expected_request.get("InstrumentID")
+                        or trade.exchange_id != expected_request.get("ExchangeID")
+                        or trade.direction != expected_request.get("Direction")
+                        or type(expected_request.get("CombOffsetFlag")) is not str
+                        or not expected_request.get("CombOffsetFlag")
+                        or trade.offset_flag != expected_request["CombOffsetFlag"][0]
+                        or type(expected_request.get("CombHedgeFlag")) is not str
+                        or not expected_request.get("CombHedgeFlag")
+                        or trade.hedge_flag != expected_request["CombHedgeFlag"][0]
+                        or native_trade_fields.get("OrderRef") != correlation.order_ref
+                    ):
+                        return not_ready("TRADE_PREFIX_MISMATCH")
+                    running_trade_quantity += trade.trade_quantity
+                    if (
+                        trade.cumulative_trade_quantity != running_trade_quantity
+                        or trade.cumulative_order_quantity
+                        != next(
+                            (
+                                observation["volume"]
+                                for observation in reversed(order_observations)
+                                if observation["source_sequence"] < trade.source_sequence
+                            ),
+                            None,
+                        )
+                    ):
+                        return not_ready("TRADE_PREFIX_MISMATCH")
+                    prior_order_quantity = trade.cumulative_order_quantity
+                    if prior_order_quantity is None:
+                        expected_prefix = "NO_ORDER_CUMULATIVE"
+                    elif prior_order_quantity == running_trade_quantity:
+                        expected_prefix = "MATCHED"
+                    elif prior_order_quantity > running_trade_quantity:
+                        expected_prefix = "ORDER_CUMULATIVE_AHEAD"
+                    else:
+                        expected_prefix = "TRADE_CUMULATIVE_AHEAD"
+                    if trade.prefix_consistency != expected_prefix:
+                        return not_ready("TRADE_PREFIX_MISMATCH")
+                    coefficient = int("".join(str(digit) for digit in trade.trade_price.as_tuple().digits))
+                    exponent = trade.trade_price.as_tuple().exponent
+                    trade_notional_parts.append((coefficient * trade.trade_quantity, exponent))
+                    trade_exchange_ids.add(trade.exchange_id)
+                    trade_order_sys_ids.add(trade.order_sys_id)
+
+                if len(trade_exchange_ids) > 1 or len(trade_order_sys_ids) > 1:
+                    return not_ready("TRADE_PREFIX_MISMATCH")
+                expected_quantity = request_quantity
+                for observation in order_observations:
+                    prior_trade_quantity = sum(
+                        trade.trade_quantity
+                        for trade in trades
+                        if trade.source_sequence < observation["source_sequence"]
+                    )
+                    cumulative = observation["cumulative_row"]
+                    if (
+                        type(cumulative["trade_volume_at_prefix"]) is not int
+                        or int(cumulative["trade_volume_at_prefix"]) != prior_trade_quantity
+                    ):
+                        return not_ready("TRADE_PREFIX_MISMATCH")
+                    volume = observation["volume"]
+                    if volume == prior_trade_quantity:
+                        expected_prefix = "MATCHED"
+                    elif volume > prior_trade_quantity:
+                        expected_prefix = "ORDER_CUMULATIVE_AHEAD"
+                    else:
+                        expected_prefix = "TRADE_CUMULATIVE_AHEAD"
+                    if str(cumulative["prefix_consistency"]) != expected_prefix:
+                        return not_ready("TRADE_PREFIX_MISMATCH")
+                if (
+                    latest_order["volume"] != running_trade_quantity
+                    or running_trade_quantity > expected_quantity
+                ):
+                    return not_ready("TRADE_PREFIX_MISMATCH")
+
+                order_state = projection.submit_action.order_state
+                order_projection_row = cursor.execute(
+                    """
+                    SELECT * FROM ctp_dispatch_order_projection
+                    WHERE account_key = ? AND runtime_order_id = ?
+                    """,
+                    (account_key, correlation.runtime_order_id),
+                ).fetchone()
+                if (
+                    order_projection_row is None
+                    or str(order_projection_row["scope_key"]) != scope_key
+                    or str(order_projection_row["trading_day"]) != trading_day
+                    or str(order_projection_row["managed_intent_id"])
+                    != correlation.reservation_managed_intent_id
+                    or str(order_projection_row["order_ref"]) != correlation.order_ref
+                    or str(order_projection_row["provider_state"]) != order_state.provider_state
+                    or str(order_projection_row["last_source_kind"]) != "CALLBACK"
+                    or str(order_projection_row["correlation_key_sha256"])
+                    != payload_sha256(correlation.to_payload())
+                    or str(order_projection_row["last_event_generation_id"])
+                    != binding.session_generation_id
+                    or str(order_projection_row["last_event_stream_id"]) != session_context.stream_id
+                    or not _is_sha256(order_projection_row["source_digest_sha256"])
+                ):
+                    return not_ready("PROVIDER_ORDER_NOT_READY")
+                last_event_id = str(order_projection_row["last_event_id"])
+                matching_order_anchor = next(
+                    (
+                        item
+                        for item in order_observations
+                        if item["event_id"] == last_event_id
+                        and item["source_digest_sha256"]
+                        == str(order_projection_row["source_digest_sha256"])
+                    ),
+                    None,
+                )
+                matching_trade_anchor = next(
+                    (
+                        trade
+                        for trade in trades
+                        if trade.callback_event_id == last_event_id
+                        and trade.source_digest_sha256
+                        == str(order_projection_row["source_digest_sha256"])
+                    ),
+                    None,
+                )
+                if matching_order_anchor is not None:
+                    if matching_order_anchor["projection_state"] != order_state.provider_state:
+                        return not_ready("PROVIDER_ORDER_NOT_READY")
+                elif matching_trade_anchor is not None:
+                    trade_projection_state = (
+                        "FILLED"
+                        if matching_trade_anchor.cumulative_trade_quantity == expected_quantity
+                        else "PARTIALLY_FILLED"
+                    )
+                    if trade_projection_state != order_state.provider_state:
+                        return not_ready("PROVIDER_ORDER_NOT_READY")
+                else:
+                    return not_ready("PROVIDER_ORDER_NOT_READY")
+
+                cancel_state: str | None = None
+                if cancel_command_id is not None:
+                    cancel_row = cursor.execute(
+                        """
+                        SELECT * FROM ctp_dispatch_commands
+                        WHERE account_key = ? AND scope_key = ? AND trading_day = ?
+                          AND command_id = ?
+                        """,
+                        (account_key, scope_key, trading_day, cancel_command_id),
+                    ).fetchone()
+                    if cancel_row is None:
+                        return not_ready("CANCEL_COMMAND_MISMATCH")
+                    cancel_command = self._ctp_dispatch_command_from_row(cancel_row)
+                    if cancel_command.operation != "CANCEL":
+                        return not_ready("CANCEL_COMMAND_MISMATCH")
+                    if cancel_command.status == "UNKNOWN":
+                        return not_ready("CANCEL_COMMAND_NOT_READY")
+                    cancel_correlation = cancel_command.correlation_key
+                    if (
+                        cancel_command.status != "COMPLETED"
+                        or cancel_command.local_queue_receipt_queued is not True
+                        or cancel_command.native_receipt_payload is None
+                        or cancel_correlation is None
+                        or cancel_correlation.version != 2
+                        or cancel_correlation.account_key != account_key
+                        or cancel_correlation.scope_key != scope_key
+                        or cancel_correlation.trading_day != trading_day
+                        or cancel_correlation.runtime_order_id != correlation.runtime_order_id
+                        or cancel_correlation.order_ref != correlation.order_ref
+                        or cancel_correlation.cancel_target_exchange_id
+                        != latest_order["exchange_id"]
+                        or cancel_correlation.cancel_target_order_sys_id
+                        != latest_order["order_sys_id"]
+                        or cancel_correlation.cancel_target_front_id != latest_order["front_id"]
+                        or cancel_correlation.cancel_target_session_id != latest_order["session_id"]
+                        or cancel_row["callback_owner_intent_id"] != owner_id
+                        or cancel_command.session_binding_sha256 != binding.session_binding_sha256
+                    ):
+                        return not_ready("CANCEL_COMMAND_MISMATCH")
+                    try:
+                        self._require_command_session_binding(cancel_row, binding)
+                    except ContractValidationError:
+                        return not_ready("CANCEL_COMMAND_MISMATCH")
+                    cancel_projection = self.read_ctp_dispatch_projection(
+                        scope, cancel_command_id
+                    )
+                    if (
+                        cancel_projection is None
+                        or cancel_projection.operation != "CANCEL"
+                        or cancel_projection.command_status != "COMPLETED"
+                        or cancel_projection.local_dispatch_outcome != "QUEUED"
+                        or cancel_projection.cancel_action is None
+                        or cancel_projection.cancel_action.action_state is None
+                        or cancel_projection.cancel_action.source_kind != "CALLBACK"
+                    ):
+                        return not_ready("CANCEL_COMMAND_NOT_READY")
+                    target = cancel_projection.cancel_action.target_order
+                    if (
+                        target.runtime_order_id != correlation.runtime_order_id
+                        or target.order_ref != correlation.order_ref
+                        or target.exchange_id != latest_order["exchange_id"]
+                        or target.order_sys_id != latest_order["order_sys_id"]
+                        or target.front_id != latest_order["front_id"]
+                        or target.session_id != latest_order["session_id"]
+                    ):
+                        return not_ready("CANCEL_COMMAND_MISMATCH")
+                    cancel_projection_row = cursor.execute(
+                        """
+                        SELECT * FROM ctp_dispatch_cancel_projection
+                        WHERE account_key = ? AND scope_key = ? AND managed_action_id = ?
+                        """,
+                        (account_key, scope_key, cancel_correlation.managed_action_id),
+                    ).fetchone()
+                    if (
+                        cancel_projection_row is None
+                        or str(cancel_projection_row["last_source_kind"]) != "CALLBACK"
+                        or str(cancel_projection_row["provider_state"])
+                        != cancel_projection.cancel_action.action_state
+                        or str(cancel_projection_row["last_event_generation_id"])
+                        != binding.session_generation_id
+                        or str(cancel_projection_row["last_event_stream_id"])
+                        != session_context.stream_id
+                    ):
+                        return not_ready("CANCEL_COMMAND_NOT_READY")
+                    cancel_callback_row = cursor.execute(
+                        """
+                        SELECT * FROM ctp_dispatch_callback_ledger
+                        WHERE account_key = ? AND session_generation_id = ?
+                          AND callback_stream_id = ? AND callback_event_id = ?
+                        """,
+                        (
+                            account_key,
+                            binding.session_generation_id,
+                            str(cancel_projection_row["last_event_stream_id"]),
+                            str(cancel_projection_row["last_event_id"]),
+                        ),
+                    ).fetchone()
+                    if (
+                        cancel_callback_row is None
+                        or str(cancel_callback_row["command_id"]) != cancel_command_id
+                        or str(cancel_callback_row["operation"]) != "CANCEL"
+                        or str(cancel_callback_row["callback_family"]) != "CANCEL_ACTION"
+                        or str(cancel_callback_row["source_digest_sha256"])
+                        != str(cancel_projection_row["source_digest_sha256"])
+                        or str(cancel_callback_row["projection_state"])
+                        != cancel_projection.cancel_action.action_state
+                        or str(cancel_callback_row["correlation_key_sha256"])
+                        != payload_sha256(cancel_correlation.to_payload())
+                    ):
+                        return not_ready("CANCEL_COMMAND_MISMATCH")
+                    stored_key = json.loads(str(cancel_callback_row["callback_key_json"]))
+                    if (
+                        type(stored_key) is not dict
+                        or canonical_json(stored_key) != str(cancel_callback_row["callback_key_json"])
+                        or payload_sha256(stored_key)
+                        != str(cancel_callback_row["callback_key_sha256"])
+                        or stored_key.get("event_id") != str(cancel_projection_row["last_event_id"])
+                        or stored_key.get("stream_id") != session_context.stream_id
+                        or stored_key.get("order_ref") != correlation.order_ref
+                        or stored_key.get("exchange_id") != latest_order["exchange_id"]
+                        or stored_key.get("order_sys_id") != latest_order["order_sys_id"]
+                        or stored_key.get("target_front_id") != latest_order["front_id"]
+                        or stored_key.get("target_session_id") != latest_order["session_id"]
+                        or stored_key.get("native_action_ref") != cancel_correlation.native_action_ref
+                        or stored_key.get("native_request_id") != cancel_correlation.native_request_id
+                    ):
+                        return not_ready("CANCEL_COMMAND_MISMATCH")
+                    event_suffix = f":{cancel_correlation.native_request_id}:{cancel_correlation.native_action_ref}"
+                    action_rows = cursor.execute(
+                        """
+                        SELECT ingress.*
+                        FROM ctp_dispatch_callback_ingress AS ingress
+                        JOIN ctp_dispatch_callback_ingress_applications AS application
+                          ON application.owner_intent_id = ingress.owner_intent_id
+                         AND application.source_sequence = ingress.source_sequence
+                        WHERE ingress.owner_intent_id = ?
+                          AND ingress.callback_name IN ('OnRspOrderAction', 'OnErrRtnOrderAction')
+                          AND application.command_id = ?
+                          AND application.outcome = 'APPLIED'
+                        ORDER BY ingress.source_sequence DESC LIMIT ?
+                        """,
+                        (
+                            owner_id,
+                            cancel_command_id,
+                            _MAX_CTP_OWNER_CALLBACK_SNAPSHOT_TRADE_FACTS + 1,
+                        ),
+                    ).fetchall()
+                    if len(action_rows) > _MAX_CTP_OWNER_CALLBACK_SNAPSHOT_TRADE_FACTS:
+                        return not_ready("CANCEL_COMMAND_NOT_READY")
+                    cancel_anchor_found = False
+                    for action_ingress in action_rows:
+                        try:
+                            action_payload = source_payload(action_ingress, binding)
+                            action_fields = flattened_fields(action_payload, 0)
+                            if (
+                                action_fields.get("OrderRef") != correlation.order_ref
+                                or action_fields.get("OrderActionRef")
+                                != cancel_correlation.native_action_ref
+                            ):
+                                continue
+                            if (
+                                action_fields.get("TradingDay") not in (None, trading_day)
+                                or action_fields.get("BrokerID") != broker_id
+                                or action_fields.get("UserID") != user_id
+                            ):
+                                return not_ready("CANCEL_COMMAND_MISMATCH")
+                            action_response_info = flattened_fields(action_payload, 1)
+                            if action_ingress["callback_name"] == "OnRspOrderAction":
+                                action_request_id = self._ctp_callback_named_arg(action_payload, 2)
+                                action_is_last = self._ctp_callback_named_arg(action_payload, 3)
+                            else:
+                                action_request_id = None
+                                action_is_last = None
+                            envelope = map_ctp_native_order_action_callback(
+                                cancel_correlation,
+                                session_context,
+                                str(action_ingress["callback_name"]),
+                                action_fields,
+                                action_response_info,
+                                request_id=action_request_id,
+                                is_last=action_is_last,
+                            )
+                        except (ContractValidationError, TypeError, ValueError, KeyError):
+                            return not_ready("CANCEL_COMMAND_MISMATCH")
+                        if envelope.callback_key.event_id != str(
+                            cancel_projection_row["last_event_id"]
+                        ):
+                            continue
+                        if envelope.callback_key.to_payload() != stored_key:
+                            return not_ready("CANCEL_COMMAND_MISMATCH")
+                        action_payload_value = envelope.to_payload()
+                        action_payload_value["ingress_source"] = {
+                            "owner_intent_id": owner_id,
+                            "source_sequence": int(action_ingress["source_sequence"]),
+                            "record_digest_sha256": str(action_ingress["record_digest_sha256"]),
+                        }
+                        if (
+                            payload_sha256(action_payload_value)
+                            != str(cancel_callback_row["callback_payload_sha256"])
+                        ):
+                            return not_ready("CANCEL_COMMAND_MISMATCH")
+                        application_row = cursor.execute(
+                            """
+                            SELECT * FROM ctp_dispatch_callback_ingress_applications
+                            WHERE owner_intent_id = ? AND source_sequence = ?
+                            """,
+                            (owner_id, int(action_ingress["source_sequence"])),
+                        ).fetchone()
+                        key_digest = payload_sha256(envelope.callback_key.to_payload())
+                        if not application_matches(
+                            application_row,
+                            owner_id=owner_id,
+                            source_sequence=int(action_ingress["source_sequence"]),
+                            ingress_digest=str(action_ingress["record_digest_sha256"]),
+                            command=cancel_command_id,
+                            evidence_variants=(
+                                {
+                                    "callback_key_sha256": key_digest,
+                                    "callback_payload_sha256": payload_sha256(action_payload_value),
+                                    "source_digest_sha256": str(
+                                        cancel_callback_row["source_digest_sha256"]
+                                    ),
+                                    "duplicate": False,
+                                },
+                                {
+                                    "callback_key_sha256": key_digest,
+                                    "callback_payload_sha256": payload_sha256(action_payload_value),
+                                    "source_digest_sha256": str(
+                                        cancel_callback_row["source_digest_sha256"]
+                                    ),
+                                    "duplicate": True,
+                                },
+                            ),
+                        ):
+                            return not_ready("CANCEL_COMMAND_MISMATCH")
+                        cancel_anchor_found = True
+                        break
+                    if not cancel_anchor_found or not str(
+                        cancel_projection_row["last_event_id"]
+                    ).endswith(event_suffix):
+                        return not_ready("CANCEL_COMMAND_MISMATCH")
+                    cancel_state = cancel_projection.cancel_action.action_state
+
+                min_exponent = min(
+                    (exponent for _, exponent in trade_notional_parts),
+                    default=0,
+                )
+                scaled_notional = sum(
+                    coefficient * (10 ** (exponent - min_exponent))
+                    for coefficient, exponent in trade_notional_parts
+                )
+                trade_notional = Decimal(
+                    (
+                        0,
+                        tuple(int(digit) for digit in str(scaled_notional)),
+                        min_exponent,
+                    )
+                )
+                return CtpOwnerCallbackObservationSnapshotV1(
+                    account_key=account_key,
+                    scope_key=scope_key,
+                    trading_day=trading_day,
+                    command_id=command_id,
+                    owner_intent_id=owner_id,
+                    session_generation_id=binding.session_generation_id,
+                    callback_stream_id=session_context.stream_id,
+                    command_status=command.status,
+                    local_dispatch_outcome=projection.local_dispatch_outcome,
+                    order_source_sequence=latest_order["source_sequence"],
+                    ingress_record_digest_sha256=latest_order["ingress_digest_sha256"],
+                    source_digest_sha256=latest_order["source_digest_sha256"],
+                    exchange_id=latest_order["exchange_id"],
+                    order_sys_id=latest_order["order_sys_id"],
+                    order_ref=correlation.order_ref,
+                    request_id=latest_order["request_id"],
+                    front_id=latest_order["front_id"],
+                    session_id=latest_order["session_id"],
+                    provider_state=order_state.provider_state,
+                    volume_traded=latest_order["volume"],
+                    filled_quantity=running_trade_quantity,
+                    trade_notional=trade_notional,
+                    trade_fact_count=len(trades),
+                    cumulative_commission=None,
+                    commission_quality="INCOMPLETE",
+                    cancel_command_id=cancel_command_id,
+                    cancel_action_state=cancel_state,
+                )
+            except sqlite3.Error as error:
+                raise DurableStoreError("unable to read CTP owner callback snapshot") from error
+            finally:
+                rollback_error: sqlite3.Error | None = None
+                close_error: sqlite3.Error | None = None
+                if began:
+                    try:
+                        self._connection.rollback()
+                    except sqlite3.Error as error:
+                        rollback_error = error
+                try:
+                    cursor.close()
+                except sqlite3.Error as error:
+                    close_error = error
+                if rollback_error is not None:
+                    raise DurableStoreError(
+                        "unable to close CTP owner callback read snapshot"
+                    ) from rollback_error
+                if close_error is not None:
+                    raise DurableStoreError(
+                        "unable to close CTP owner callback snapshot cursor"
+                    ) from close_error
 
     def record_ctp_dispatch_queue_receipt(
         self,

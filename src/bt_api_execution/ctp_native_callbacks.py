@@ -902,7 +902,10 @@ def map_ctp_native_trade_fact_v2(
         raise ContractValidationError("native CTP trade price is invalid")
     if len(price.as_tuple().digits) > 32 or abs(price.adjusted()) > 32 or abs(exponent) > 32:
         raise ContractValidationError("native CTP trade price exceeds the field bound")
-    price_text = format(price.normalize(), "f")
+    # Canonical price identity must not round to the caller's Decimal context.
+    price_text = format(price, "f")
+    if "." in price_text:
+        price_text = price_text.rstrip("0").rstrip(".")
     if len(price_text) > 64:
         raise ContractValidationError("native CTP trade price exceeds the field bound")
 
