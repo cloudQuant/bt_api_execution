@@ -867,6 +867,48 @@ class CtpCallbackSessionOwnerHandle:
 
 
 @dataclass(frozen=True, slots=True)
+class CtpCallbackIngressDrainStatus:
+    """Read-only durable drain facts for one exact callback-session owner."""
+
+    owner_handle: CtpCallbackSessionOwnerHandle
+    owner_state: str
+    poison_code: str | None
+    last_source_sequence: int
+    applied_source_sequence: int
+    pending_count: int
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.owner_handle) is not CtpCallbackSessionOwnerHandle
+            or type(self.owner_state) is not str
+            or self.owner_state not in {"PREPARED", "ACTIVE", "POISONED"}
+            or (
+                self.owner_state == "POISONED"
+                and (
+                    type(self.poison_code) is not str
+                    or self.poison_code != "owner_stop"
+                )
+            )
+            or (
+                self.owner_state != "POISONED"
+                and self.poison_code is not None
+            )
+            or type(self.last_source_sequence) is not int
+            or self.last_source_sequence < 0
+            or type(self.applied_source_sequence) is not int
+            or self.applied_source_sequence < 0
+            or self.applied_source_sequence > self.last_source_sequence
+            or type(self.pending_count) is not int
+            or self.pending_count != self.last_source_sequence - self.applied_source_sequence
+        ):
+            raise ContractValidationError("invalid CTP callback ingress drain status")
+
+    @property
+    def drained(self) -> bool:
+        return self.pending_count == 0
+
+
+@dataclass(frozen=True, slots=True)
 class CtpOrderTargetQueryFence:
     """One bounded Store window for a fresh exact-order query."""
 
@@ -8313,6 +8355,165 @@ class SqliteExecutionStore:
             ),
         )
         return trade_volume, consistency
+
+    def read_ctp_callback_ingress_drain_status(
+        self,
+        owner_handle: CtpCallbackSessionOwnerHandle,
+        *,
+        writer_lease: WriterLease,
+    ) -> CtpCallbackIngressDrainStatus:
+        """Read whether this owner's durable callback inbox is fully applied.
+
+        The read is useful during bounded shutdown, including when native
+        startup stopped before the callback owner moved beyond ``PREPARED``.
+        It never consumes ingress or changes owner state. A poisoned owner is
+        reportable only when both the session and account-family rows carry the
+        exact normal-stop reason ``owner_stop``. This status is readback only;
+        it does not prove native shutdown or authorize closing native resources.
+        A status is returned only when the exact Store-issued owner, its active
+        writer/family fence, and both durable sequence ledgers are consistent.
+        """
+
+        if type(owner_handle) is not CtpCallbackSessionOwnerHandle:
+            raise ContractValidationError("typed CTP callback owner is required")
+        if type(writer_lease) is not WriterLease:
+            raise WriterLeaseUnavailable()
+        if (
+            writer_lease.scope_key != owner_handle.account_key
+            or type(writer_lease.owner_id) is not str
+            or not writer_lease.owner_id
+            or type(writer_lease.fencing_token) is not int
+            or writer_lease.fencing_token <= 0
+            or type(writer_lease.expires_at_ns) is not int
+            or writer_lease.expires_at_ns <= 0
+            or type(writer_lease.family_key) is not str
+            or not _is_prefixed_digest(writer_lease.family_key, _CTP_ACCOUNT_FAMILY_PREFIX)
+            or not _is_local_queue_receipt_id(writer_lease.family_owner_intent_id)
+        ):
+            raise WriterLeaseUnavailable()
+
+        with self._read_transaction() as cursor:
+            if (
+                self._issued_ctp_callback_session_owners.get(owner_handle.owner_intent_id)
+                is not owner_handle
+            ):
+                raise ContractValidationError("exact same-Store CTP callback owner is required")
+            owner = cursor.execute(
+                """
+                SELECT * FROM ctp_dispatch_callback_session_owners
+                WHERE owner_intent_id = ? AND account_key = ? AND scope_key = ?
+                """,
+                (
+                    owner_handle.owner_intent_id,
+                    owner_handle.account_key,
+                    owner_handle.scope_key,
+                ),
+            ).fetchone()
+            if owner is None:
+                raise ContractValidationError("CTP callback owner is not persisted")
+            owner_state = str(owner["owner_state"])
+            owner_poison_code = owner["poison_code"]
+            if owner_state in {"PREPARED", "ACTIVE"}:
+                if owner_poison_code is not None:
+                    raise InvalidStateTransition(
+                        "CTP callback session owner poison marker is inconsistent"
+                    )
+            elif owner_state == "POISONED":
+                if owner_poison_code != "owner_stop":
+                    raise InvalidStateTransition(
+                        "CTP callback session owner is poisoned outside normal stop"
+                    )
+            else:
+                raise InvalidStateTransition("CTP callback session owner is not live")
+            if (
+                str(owner["writer_owner_id"]) != writer_lease.owner_id
+                or type(owner["writer_fencing_token"]) is not int
+                or int(owner["writer_fencing_token"]) != writer_lease.fencing_token
+            ):
+                raise WriterLeaseUnavailable()
+
+            # Match the account-family and writer rows in this same snapshot.
+            # The durable expiry is authoritative: a runtime may retain its
+            # original immutable lease DTO across same-fence renewals.
+            self._assert_no_unmapped_ctp_account_family_history(cursor)
+            family_rows = cursor.execute(
+                "SELECT family_key, owner_intent_id, owner_state, poison_code "
+                "FROM ctp_account_family_owners WHERE account_key = ?",
+                (owner_handle.account_key,),
+            ).fetchall()
+            expected_family_state = "POISONED" if owner_state == "POISONED" else "ACTIVE"
+            expected_family_poison = "owner_stop" if owner_state == "POISONED" else None
+            if (
+                len(family_rows) != 1
+                or str(family_rows[0]["family_key"]) != writer_lease.family_key
+                or str(family_rows[0]["owner_intent_id"])
+                != writer_lease.family_owner_intent_id
+                or str(family_rows[0]["owner_state"]) != expected_family_state
+                or family_rows[0]["poison_code"] != expected_family_poison
+            ):
+                raise WriterLeaseUnavailable()
+            lease_row = cursor.execute(
+                "SELECT owner_id, fencing_token, expires_at_ns FROM execution_writer_leases "
+                "WHERE scope_key = ?",
+                (owner_handle.account_key,),
+            ).fetchone()
+            now_ns = time.time_ns()
+            if (
+                lease_row is None
+                or str(lease_row["owner_id"]) != writer_lease.owner_id
+                or type(lease_row["fencing_token"]) is not int
+                or int(lease_row["fencing_token"]) != writer_lease.fencing_token
+                or type(lease_row["expires_at_ns"]) is not int
+                or int(lease_row["expires_at_ns"]) <= now_ns
+            ):
+                raise WriterLeaseUnavailable()
+
+            last_source = owner["last_source_sequence"]
+            if type(last_source) is not int or last_source < 0:
+                raise DurableStoreError("CTP callback source sequence is malformed")
+            source_rows = cursor.execute(
+                """
+                SELECT COUNT(*) AS row_count, MIN(source_sequence) AS lowwater,
+                       MAX(source_sequence) AS highwater
+                FROM ctp_dispatch_callback_ingress WHERE owner_intent_id = ?
+                """,
+                (owner_handle.owner_intent_id,),
+            ).fetchone()
+            source_count = int(source_rows["row_count"])
+            if source_count != last_source or (
+                (last_source == 0 and (source_rows["lowwater"] is not None
+                                       or source_rows["highwater"] is not None))
+                or (last_source > 0 and (
+                    type(source_rows["lowwater"]) is not int
+                    or type(source_rows["highwater"]) is not int
+                    or int(source_rows["lowwater"]) != 1
+                    or int(source_rows["highwater"]) != last_source
+                ))
+            ):
+                raise DurableStoreError("CTP callback inbox source sequence is inconsistent")
+
+            applied = self._ctp_callback_applied_sequence(
+                cursor, owner_handle.owner_intent_id, last_source
+            )
+            invalid_application = cursor.execute(
+                """
+                SELECT 1
+                FROM ctp_dispatch_callback_ingress_applications
+                WHERE owner_intent_id = ? AND outcome NOT IN ('APPLIED', 'AUDIT_ONLY')
+                LIMIT 1
+                """,
+                (owner_handle.owner_intent_id,),
+            ).fetchone()
+            if invalid_application is not None:
+                raise DurableStoreError("CTP callback inbox application sequence is inconsistent")
+            return CtpCallbackIngressDrainStatus(
+                owner_handle=owner_handle,
+                owner_state=owner_state,
+                poison_code=owner_poison_code,
+                last_source_sequence=last_source,
+                applied_source_sequence=applied,
+                pending_count=last_source - applied,
+            )
 
     def read_next_ctp_callback_ingress(
         self, owner_handle: CtpCallbackSessionOwnerHandle
