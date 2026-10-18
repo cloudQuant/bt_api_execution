@@ -51,7 +51,11 @@ from .errors import (
     InvalidStateTransition,
     WriterLeaseUnavailable,
 )
-from .facade import AfterGroupClaimCallable, ManagedExecutionFacade
+from .facade import (
+    AfterGroupClaimCallable,
+    ManagedExecutionFacade,
+    _validate_borrowed_ctp_writer_lease,
+)
 from .group_contracts import (
     GroupCoordinatorAuthority,
     GroupLegAuthorization,
@@ -149,6 +153,8 @@ class ExecutionOrderEntryService:
     a separate cancel adapter, falling back to ``dispatch``.
     ``cancel_before_dispatch`` is a trusted per-intent hook that runs before
     the Risk owner claims a cancellation dispatch.
+    ``borrowed_writer_lease`` lets a CTP owner reuse its already-held account
+    lease; the service validates it but never acquires, renews, or releases it.
 
     ``allow_unprotected`` exists only for deployments that explicitly declare
     no risk admission gate.  It is never read from the service manifest.
@@ -174,6 +180,7 @@ class ExecutionOrderEntryService:
         allow_unprotected: bool = False,
         writer_id: str = _DEFAULT_WRITER_ID,
         lease_ttl_ns: int = _DEFAULT_LEASE_TTL_NS,
+        borrowed_writer_lease: WriterLease | None = None,
     ) -> None:
         if type(store) is not SqliteExecutionStore:
             raise ContractValidationError("execution order entry requires a borrowed SQLite store")
@@ -250,6 +257,15 @@ class ExecutionOrderEntryService:
                 raise ContractValidationError("targets must map to ExecutionScope values")
             copied[template] = execution_scope
 
+        if borrowed_writer_lease is not None:
+            for execution_scope in copied.values():
+                _validate_borrowed_ctp_writer_lease(
+                    store,
+                    execution_scope,
+                    writer_id,
+                    borrowed_writer_lease,
+                )
+
         if paper_owner_domain is not None:
             if (
                 type(paper_owner_domain) is not PaperOwnerDomainV1
@@ -310,6 +326,7 @@ class ExecutionOrderEntryService:
         self._allow_unprotected = allow_unprotected
         self._writer_id = writer_id
         self._lease_ttl_ns = lease_ttl_ns
+        self._borrowed_writer_lease = borrowed_writer_lease
         self._read_service = ExecutionReadService(store, copied)
         self._lock = threading.RLock()
         self._owner_cancel_lock = threading.RLock()
@@ -1258,6 +1275,7 @@ class ExecutionOrderEntryService:
                 basic_admission_gate=self._basic_admission_gate,
                 lease_ttl_ns=self._lease_ttl_ns,
                 allow_unprotected=self._allow_unprotected,
+                borrowed_writer_lease=self._borrowed_writer_lease,
             )
             cancel_facade = ManagedCancellationFacade(
                 self._store,

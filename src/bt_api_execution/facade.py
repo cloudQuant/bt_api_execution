@@ -41,15 +41,11 @@ from .group_contracts import (
     is_group_leg_intent_id,
     risk_account_scope_fingerprint,
 )
+from .store import SqliteExecutionStore, WriterLease
 
 if TYPE_CHECKING:
     from .ports import AdmissionGate, DispatchPort, ReconciliationPort
-    from .store import (
-        CtpAccountFamilyOwnerHandle,
-        ExecutionRecord,
-        SqliteExecutionStore,
-        WriterLease,
-    )
+    from .store import CtpAccountFamilyOwnerHandle, ExecutionRecord
 
 DispatchCallable = Callable[[OrderIntent], ProviderObservation]
 BeforeDispatchCallable = Callable[[OrderIntent], None]
@@ -70,6 +66,33 @@ _OBSERVATION_RECORDING_STATES = frozenset(
     }
 )
 _PERMIT_SETTLEMENT_SOURCE_STATES = frozenset({ExecutionState.DISPATCHING, ExecutionState.UNKNOWN})
+
+
+def _validate_borrowed_ctp_writer_lease(
+    store: SqliteExecutionStore,
+    scope: ExecutionScope,
+    writer_id: str,
+    lease: object,
+) -> WriterLease:
+    """Validate a caller-owned CTP lease without acquiring a new generation."""
+
+    if (
+        type(store) is not SqliteExecutionStore
+        or type(scope) is not ExecutionScope
+        or scope.provider != "ctp"
+        or type(lease) is not WriterLease
+        or type(writer_id) is not str
+        or not writer_id
+        or lease.owner_id != writer_id
+        or lease.scope_key != scope.account_key
+        or type(lease.family_key) is not str
+        or not lease.family_key
+        or type(lease.family_owner_intent_id) is not str
+        or not lease.family_owner_intent_id
+    ):
+        raise ContractValidationError("invalid borrowed CTP writer lease binding")
+    store.assert_writer_lease(scope, lease)
+    return lease
 
 
 def _is_typed_risk_admission_denial(error: BaseException) -> bool:
@@ -130,6 +153,7 @@ class ManagedExecutionFacade:
         lease_ttl_ns: int = 5_000_000_000,
         allow_unprotected: bool = False,
         pre_dispatch_guard: BeforeDispatchCallable | None = None,
+        borrowed_writer_lease: WriterLease | None = None,
     ) -> None:
         if not writer_id or writer_id != writer_id.strip() or len(writer_id) > 128:
             raise ContractValidationError("invalid writer_id")
@@ -146,6 +170,8 @@ class ManagedExecutionFacade:
             )
         if pre_dispatch_guard is not None and not callable(pre_dispatch_guard):
             raise ContractValidationError("invalid pre-dispatch guard")
+        if borrowed_writer_lease is not None:
+            _validate_borrowed_ctp_writer_lease(store, scope, writer_id, borrowed_writer_lease)
         self._store = store
         self._scope = scope
         self._writer_id = writer_id
@@ -154,6 +180,7 @@ class ManagedExecutionFacade:
         self._lease_ttl_ns = lease_ttl_ns
         self._allow_unprotected = allow_unprotected
         self._pre_dispatch_guard = pre_dispatch_guard
+        self._borrowed_writer_lease = borrowed_writer_lease
         self._last_writer_lease: WriterLease | None = None
         self._ctp_account_family_owner: CtpAccountFamilyOwnerHandle | None = None
         self._ctp_family_owner_lock = RLock()
@@ -168,6 +195,13 @@ class ManagedExecutionFacade:
 
     def acquire_writer_lease(self) -> WriterLease:
         """Acquire or renew the account-level writer lease before a mutation."""
+        if self._borrowed_writer_lease is not None:
+            return _validate_borrowed_ctp_writer_lease(
+                self._store,
+                self._scope,
+                self._writer_id,
+                self._borrowed_writer_lease,
+            )
         provider_is_ctp = self._scope.provider.lower() == "ctp"
         if provider_is_ctp and self._scope.provider != "ctp":
             raise ContractValidationError("CTP execution provider must use canonical lowercase")
@@ -208,8 +242,10 @@ class ManagedExecutionFacade:
         )
 
     def close(self) -> bool:
-        """Release only this facade's lease; the store remains caller-owned."""
+        """Release an owned lease; borrowed leases and the store remain caller-owned."""
 
+        if self._borrowed_writer_lease is not None:
+            return False
         lease = self._last_writer_lease
         if lease is None:
             return False
