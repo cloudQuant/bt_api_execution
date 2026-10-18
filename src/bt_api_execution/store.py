@@ -65,6 +65,7 @@ _MAX_RECOVERY_SCOPE_COUNT = 512
 _MAX_RECOVERY_SNAPSHOT_ORDERS = 512
 _MAX_RECOVERY_SNAPSHOT_EVENTS = 20_000
 _MAX_RECOVERY_PAGE_SIZE = 128
+_MAX_CTP_DISPATCH_TRADE_FACT_PAGE_SIZE = 100
 _OWNER_CANCEL_OPEN_STATES = frozenset(
     {
         ExecutionState.PENDING_ADMISSION,
@@ -1532,6 +1533,170 @@ class CtpDispatchTradeFactApplyResult:
     projection_state: str | None
     duplicate: bool
     account_fence_open: bool
+
+
+@dataclass(frozen=True, slots=True)
+class CtpDispatchTradeFactCursor:
+    """Stable, query-bound position in one durable CTP trade-fact ledger."""
+
+    scope_key: str
+    command_id: str
+    source_sequence: int
+    owner_intent_id: str
+
+    def __post_init__(self) -> None:
+        _validate_correlation_text(self.scope_key, "trade cursor scope key")
+        _validate_correlation_text(self.command_id, "trade cursor command id")
+        _validate_correlation_text(self.owner_intent_id, "trade cursor owner intent id")
+        if type(self.source_sequence) is not int or self.source_sequence <= 0:
+            raise ContractValidationError("invalid CTP trade cursor source sequence")
+
+
+@dataclass(frozen=True, slots=True)
+class CtpDispatchTradeFactRead:
+    """One verified trade fact read back from the immutable execution ledger.
+
+    ``cumulative_commission`` is the store's actual cumulative-fee column and
+    remains ``None`` while ``commission_quality`` is ``INCOMPLETE``. The raw
+    canonical fact JSON and its digest are retained for provenance.
+    """
+
+    account_key: str
+    scope_key: str
+    trading_day: str
+    command_id: str
+    managed_intent_id: str
+    runtime_order_id: str
+    order_ref: str
+    owner_intent_id: str
+    source_sequence: int
+    ingress_record_digest_sha256: str
+    session_generation_id: str
+    callback_stream_id: str
+    callback_event_id: str
+    exchange_id: str
+    trade_id: str
+    order_sys_id: str
+    instrument_id: str
+    direction: str
+    offset_flag: str
+    hedge_flag: str
+    trade_price: Decimal
+    trade_quantity: int
+    cumulative_trade_quantity: int
+    cumulative_order_quantity: int | None
+    prefix_consistency: str
+    cumulative_commission: None
+    commission_quality: str
+    fact_payload_json: str
+    fact_payload_sha256: str
+    source_digest_sha256: str
+    verifier_id: str
+    verified_at_ns: int
+    applied_at_ns: int
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "account_key",
+            "scope_key",
+            "command_id",
+            "managed_intent_id",
+            "runtime_order_id",
+            "order_ref",
+            "owner_intent_id",
+            "session_generation_id",
+            "callback_stream_id",
+            "callback_event_id",
+            "exchange_id",
+            "trade_id",
+            "order_sys_id",
+            "instrument_id",
+            "direction",
+            "offset_flag",
+            "hedge_flag",
+            "verifier_id",
+        ):
+            _validate_correlation_text(getattr(self, field_name), field_name)
+        if (
+            type(self.trading_day) is not str
+            or len(self.trading_day) != 8
+            or not self.trading_day.isascii()
+            or not self.trading_day.isdigit()
+        ):
+            raise ContractValidationError("invalid durable CTP trade trading day")
+        for field_name in (
+            "ingress_record_digest_sha256",
+            "fact_payload_sha256",
+            "source_digest_sha256",
+        ):
+            if not _is_sha256(getattr(self, field_name)):
+                raise ContractValidationError("invalid durable CTP trade digest")
+        if (
+            type(self.source_sequence) is not int
+            or self.source_sequence <= 0
+            or type(self.trade_price) is not Decimal
+            or not self.trade_price.is_finite()
+            or self.trade_price <= 0
+            or type(self.trade_quantity) is not int
+            or self.trade_quantity <= 0
+            or type(self.cumulative_trade_quantity) is not int
+            or self.cumulative_trade_quantity < self.trade_quantity
+            or (
+                self.cumulative_order_quantity is not None
+                and (
+                    type(self.cumulative_order_quantity) is not int
+                    or self.cumulative_order_quantity < 0
+                )
+            )
+            or type(self.prefix_consistency) is not str
+            or self.prefix_consistency
+            not in {
+                "NO_ORDER_CUMULATIVE",
+                "MATCHED",
+                "ORDER_CUMULATIVE_AHEAD",
+                "TRADE_CUMULATIVE_AHEAD",
+            }
+            or self.cumulative_commission is not None
+            or type(self.commission_quality) is not str
+            or self.commission_quality != "INCOMPLETE"
+            or type(self.fact_payload_json) is not str
+            or not self.fact_payload_json
+            or type(self.verified_at_ns) is not int
+            or self.verified_at_ns <= 0
+            or type(self.applied_at_ns) is not int
+            or self.applied_at_ns <= 0
+        ):
+            raise ContractValidationError("invalid durable CTP trade fact readback")
+
+
+@dataclass(frozen=True, slots=True)
+class CtpDispatchTradeFactPage:
+    """One bounded, stable-order page of durable CTP trade facts."""
+
+    trades: tuple[CtpDispatchTradeFactRead, ...]
+    next_cursor: CtpDispatchTradeFactCursor | None
+
+    def __post_init__(self) -> None:
+        if type(self.trades) is not tuple or any(
+            type(trade) is not CtpDispatchTradeFactRead for trade in self.trades
+        ):
+            raise ContractValidationError("typed CTP trade-fact page is required")
+        if self.next_cursor is not None and (
+            type(self.next_cursor) is not CtpDispatchTradeFactCursor or not self.trades
+        ):
+            raise ContractValidationError("invalid CTP trade-fact page cursor")
+        keys = tuple((trade.source_sequence, trade.owner_intent_id) for trade in self.trades)
+        if any(left >= right for left, right in zip(keys, keys[1:])):
+            raise ContractValidationError("CTP trade-fact page is not in stable source order")
+        if self.next_cursor is not None:
+            last = self.trades[-1]
+            if (
+                self.next_cursor.scope_key != last.scope_key
+                or self.next_cursor.command_id != last.command_id
+                or self.next_cursor.source_sequence != last.source_sequence
+                or self.next_cursor.owner_intent_id != last.owner_intent_id
+            ):
+                raise ContractValidationError("CTP trade-fact cursor differs from page tail")
 
 
 class CtpDispatchCallbackVerifier(Protocol):
@@ -13449,6 +13614,250 @@ class SqliteExecutionStore:
             )
         except (ContractValidationError, KeyError, TypeError, ValueError) as error:
             raise DurableStoreError("stored CTP dispatch projection is unreadable") from error
+
+    @staticmethod
+    def _ctp_dispatch_trade_fact_read_from_row(
+        row: sqlite3.Row,
+    ) -> CtpDispatchTradeFactRead:
+        """Validate stored fact provenance before exposing its typed read model."""
+
+        try:
+            payload_json = row["fact_payload_json"]
+            if type(payload_json) is not str or not payload_json:
+                raise ValueError("invalid CTP trade payload JSON")
+            payload = json.loads(payload_json)
+            payload_sha256_value = row["fact_payload_sha256"]
+            if (
+                type(payload) is not dict
+                or canonical_json(payload) != payload_json
+                or type(payload_sha256_value) is not str
+                or payload_sha256(payload) != payload_sha256_value
+                or set(payload)
+                != {
+                    "envelope_type",
+                    "source_callback",
+                    "event_identity_basis",
+                    "event_id",
+                    "source_scope",
+                    "native_fields",
+                }
+                or payload["envelope_type"] != "ctp_native_trade_fact.v2"
+                or payload["source_callback"] != "OnRtnTrade"
+                or payload["event_identity_basis"]
+                != "TradingDay-ExchangeID-TradeID"
+            ):
+                raise ValueError("stored CTP trade fact digest or version is invalid")
+
+            source_scope = payload["source_scope"]
+            native_fields = payload["native_fields"]
+            if type(source_scope) is not dict or type(native_fields) is not dict:
+                raise ValueError("stored CTP trade source projection is invalid")
+            required_source_scope_fields = {
+                "account_key",
+                "scope_key",
+                "trading_day",
+                "session_epoch",
+                "session_generation_id",
+                "account_fingerprint",
+                "native_api_generation",
+                "connection_generation",
+                "dispatch_front_id",
+                "dispatch_session_id",
+            }
+            if set(source_scope) != required_source_scope_fields:
+                raise ValueError("stored CTP trade session context is incomplete")
+            from .ctp_native_callbacks import CtpNativeSessionContext
+
+            session_context = CtpNativeSessionContext(**source_scope)
+            for field_name in ("account_key", "scope_key", "trading_day", "session_generation_id"):
+                if getattr(session_context, field_name) != row[field_name]:
+                    raise ValueError("stored CTP trade session differs from ledger")
+            if session_context.stream_id != row["callback_stream_id"]:
+                raise ValueError("stored CTP trade stream differs from session context")
+
+            text_field_columns = {
+                "InstrumentID": "instrument_id",
+                "OrderRef": "order_ref",
+                "ExchangeID": "exchange_id",
+                "TradeID": "trade_id",
+                "OrderSysID": "order_sys_id",
+                "TradingDay": "trading_day",
+                "Direction": "direction",
+                "OffsetFlag": "offset_flag",
+                "HedgeFlag": "hedge_flag",
+            }
+            for native_name, column_name in text_field_columns.items():
+                value = native_fields.get(native_name)
+                if type(value) is not str or value != row[column_name]:
+                    raise ValueError("stored CTP trade native identity differs from ledger")
+
+            trade_price = Decimal(str(row["trade_price"]))
+            native_price = native_fields.get("Price")
+            if (
+                type(native_price) is not str
+                or not trade_price.is_finite()
+                or trade_price <= 0
+                or Decimal(native_price) != trade_price
+            ):
+                raise ValueError("stored CTP trade price differs from fact payload")
+            trade_quantity = row["trade_volume"]
+            if (
+                type(native_fields.get("Volume")) is not int
+                or native_fields["Volume"] != trade_quantity
+            ):
+                raise ValueError("stored CTP trade quantity differs from fact payload")
+
+            event_id = payload["event_id"]
+            expected_event_id = "ctp-trade-v2:" + hashlib.sha256(
+                f"{row['trading_day']}:{row['exchange_id']}:{row['trade_id']}".encode("ascii")
+            ).hexdigest()
+            if type(event_id) is not str or event_id != row["callback_event_id"]:
+                raise ValueError("stored CTP trade event ID differs from ledger")
+            if event_id != expected_event_id:
+                raise ValueError("stored CTP trade event ID differs from native identity")
+            cumulative_trade_quantity = row["cumulative_trade_volume"]
+            cumulative_order_quantity = row["cumulative_order_volume"]
+            if (
+                type(cumulative_trade_quantity) is not int
+                or cumulative_trade_quantity < trade_quantity
+                or (
+                    cumulative_order_quantity is not None
+                    and (
+                        type(cumulative_order_quantity) is not int
+                        or cumulative_order_quantity < 0
+                    )
+                )
+            ):
+                raise ValueError("stored CTP trade cumulative quantities are invalid")
+            if cumulative_order_quantity is None:
+                expected_prefix_consistency = "NO_ORDER_CUMULATIVE"
+            elif cumulative_order_quantity == cumulative_trade_quantity:
+                expected_prefix_consistency = "MATCHED"
+            elif cumulative_order_quantity > cumulative_trade_quantity:
+                expected_prefix_consistency = "ORDER_CUMULATIVE_AHEAD"
+            else:
+                expected_prefix_consistency = "TRADE_CUMULATIVE_AHEAD"
+            if row["prefix_consistency"] != expected_prefix_consistency:
+                raise ValueError("stored CTP trade prefix differs from durable quantities")
+            if (
+                row["cumulative_commission"] is not None
+                or row["commission_quality"] != "INCOMPLETE"
+            ):
+                raise ValueError("stored CTP trade commission quality is invalid")
+
+            return CtpDispatchTradeFactRead(
+                account_key=row["account_key"],
+                scope_key=row["scope_key"],
+                trading_day=row["trading_day"],
+                command_id=row["command_id"],
+                managed_intent_id=row["managed_intent_id"],
+                runtime_order_id=row["runtime_order_id"],
+                order_ref=row["order_ref"],
+                owner_intent_id=row["owner_intent_id"],
+                source_sequence=row["source_sequence"],
+                ingress_record_digest_sha256=row["ingress_record_digest_sha256"],
+                session_generation_id=row["session_generation_id"],
+                callback_stream_id=row["callback_stream_id"],
+                callback_event_id=row["callback_event_id"],
+                exchange_id=row["exchange_id"],
+                trade_id=row["trade_id"],
+                order_sys_id=row["order_sys_id"],
+                instrument_id=row["instrument_id"],
+                direction=row["direction"],
+                offset_flag=row["offset_flag"],
+                hedge_flag=row["hedge_flag"],
+                trade_price=trade_price,
+                trade_quantity=trade_quantity,
+                cumulative_trade_quantity=cumulative_trade_quantity,
+                cumulative_order_quantity=cumulative_order_quantity,
+                prefix_consistency=row["prefix_consistency"],
+                cumulative_commission=row["cumulative_commission"],
+                commission_quality=row["commission_quality"],
+                fact_payload_json=payload_json,
+                fact_payload_sha256=payload_sha256_value,
+                source_digest_sha256=row["source_digest_sha256"],
+                verifier_id=row["verifier_id"],
+                verified_at_ns=row["verified_at_ns"],
+                applied_at_ns=row["applied_at_ns"],
+            )
+        except Exception as error:
+            raise DurableStoreError("stored CTP trade fact is unreadable") from error
+
+    def read_ctp_dispatch_trade_facts(
+        self,
+        scope: ExecutionScope,
+        command_id: str,
+        *,
+        after: CtpDispatchTradeFactCursor | None = None,
+        limit: int = _MAX_CTP_DISPATCH_TRADE_FACT_PAGE_SIZE,
+    ) -> CtpDispatchTradeFactPage:
+        """Read immutable verified CTP trade facts for one exact command.
+
+        Results are ordered by the durable ``(source_sequence,
+        owner_intent_id)`` key and are paged with a bounded limit. The cursor
+        is bound to the exact scope and command. Concurrent appends are not
+        part of a frozen snapshot; a fresh read may be needed to observe them.
+        This read does not claim account completeness and never changes
+        UNKNOWN/fence state.
+        """
+
+        account_key, trading_day, scope_key = self._validate_ctp_order_identity_scope(scope)
+        self._validate_command_identifier(command_id, "command_id")
+        if type(limit) is not int or not 1 <= limit <= _MAX_CTP_DISPATCH_TRADE_FACT_PAGE_SIZE:
+            raise ContractValidationError("invalid CTP trade-fact page size")
+        if after is not None and type(after) is not CtpDispatchTradeFactCursor:
+            raise ContractValidationError("typed CTP trade-fact cursor is required")
+        if after is not None and (after.scope_key != scope_key or after.command_id != command_id):
+            raise ContractValidationError("CTP trade-fact cursor differs from query scope")
+
+        query = """
+            SELECT
+                account_key, scope_key, trading_day, owner_intent_id, source_sequence,
+                ingress_record_digest_sha256, command_id, managed_intent_id,
+                runtime_order_id, order_ref, session_generation_id, callback_stream_id,
+                callback_event_id, exchange_id, trade_id, order_sys_id, instrument_id,
+                direction, offset_flag, hedge_flag, trade_price, trade_volume,
+                cumulative_trade_volume, cumulative_order_volume, prefix_consistency,
+                cumulative_commission, commission_quality, fact_payload_json,
+                fact_payload_sha256, source_digest_sha256, verifier_id,
+                verified_at_ns, applied_at_ns
+            FROM ctp_dispatch_trade_fact_ledger
+            WHERE account_key = ? AND scope_key = ? AND trading_day = ? AND command_id = ?
+        """
+        parameters: tuple[Any, ...] = (account_key, scope_key, trading_day, command_id)
+        if after is not None:
+            query += """
+                AND (source_sequence > ? OR
+                     (source_sequence = ? AND owner_intent_id > ?))
+            """
+            parameters += (after.source_sequence, after.source_sequence, after.owner_intent_id)
+        query += " ORDER BY source_sequence ASC, owner_intent_id ASC LIMIT ?"
+        parameters += (limit + 1,)
+        with self._lock:
+            try:
+                rows = self._connection.execute(query, parameters).fetchall()
+            except sqlite3.Error as error:
+                raise DurableStoreError("unable to read CTP trade facts") from error
+
+        has_more = len(rows) > limit
+        try:
+            trades = tuple(
+                self._ctp_dispatch_trade_fact_read_from_row(row) for row in rows[:limit]
+            )
+        except DurableStoreError:
+            raise
+        except Exception as error:
+            raise DurableStoreError("stored CTP trade facts are unreadable") from error
+        next_cursor = None
+        if has_more:
+            last = trades[-1]
+            next_cursor = CtpDispatchTradeFactCursor(
+                scope_key=last.scope_key,
+                command_id=last.command_id,
+                source_sequence=last.source_sequence,
+                owner_intent_id=last.owner_intent_id,
+            )
+        return CtpDispatchTradeFactPage(trades=trades, next_cursor=next_cursor)
 
     def record_ctp_dispatch_queue_receipt(
         self,

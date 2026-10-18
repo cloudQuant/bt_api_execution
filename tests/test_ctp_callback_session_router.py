@@ -4,6 +4,7 @@ import hashlib
 import json
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
+from decimal import Decimal
 
 import pytest
 
@@ -18,9 +19,11 @@ from bt_api_execution import (
     CtpVerifiedCallbackEvidence,
     CtpVerifiedOrderTargetProjection,
     CtpVerifiedTradeFactEvidence,
+    DurableStoreError,
     ExecutionScope,
     InvalidStateTransition,
     SqliteExecutionStore,
+    canonical_json,
     payload_sha256,
 )
 
@@ -867,6 +870,236 @@ def test_session_pre_native_failure_atomically_unknowns_and_poisons_across_resta
             reopened.acquire_ctp_account_family_owner(scope)
     finally:
         reopened.close()
+
+
+def _logical_store_snapshot(store):
+    tables = store._connection.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' "
+        "ORDER BY name"
+    ).fetchall()
+    snapshot = []
+    for table_row in tables:
+        table_name = table_row["name"]
+        quoted_table = '"' + table_name.replace('"', '""') + '"'
+        columns = store._connection.execute(f"PRAGMA table_info({quoted_table})").fetchall()
+        column_names = [column["name"] for column in columns]
+        order_by = ", ".join('"' + name.replace('"', '""') + '"' for name in column_names)
+        rows = store._connection.execute(
+            f"SELECT * FROM {quoted_table} ORDER BY {order_by}"
+        ).fetchall()
+        snapshot.append((table_name, tuple(tuple(row) for row in rows)))
+    return tuple(snapshot)
+
+
+def _seed_durable_ctp_trade_readback(path):
+    scope = _scope()
+    store = SqliteExecutionStore(path)
+    lease = _lease(store, scope)
+    owner = _active_owner(store, scope, lease)
+    binding = store._active_ctp_callback_sessions[owner.owner_intent_id]
+    reservation = _reserve(store, scope, lease, binding.session_generation_id, "readback-intent")
+    command_id = "readback-command"
+    _queue_and_complete(
+        store,
+        scope,
+        lease,
+        owner,
+        reservation,
+        command_id,
+        {
+            "BrokerID": "broker",
+            "InvestorID": "user",
+            "UserID": "user",
+            "InstrumentID": "rb2710",
+            "ExchangeID": "SHFE",
+            "OrderRef": reservation.order_ref,
+            "Direction": "0",
+            "CombOffsetFlag": "0",
+            "CombHedgeFlag": "1",
+            "LimitPrice": 100.0,
+            "VolumeTotalOriginal": 4,
+            "OrderPriceType": "2",
+            "TimeCondition": "3",
+        },
+        91,
+    )
+    adapter = _adapter_for(store, owner)
+    applied_results = []
+    for sequence, trade_id, volume, price in (
+        (4, "trade-readback-1", 1, 99.25),
+        (5, "trade-readback-1", 1, 99.25),
+        (6, "trade-readback-2", 2, 98.5),
+    ):
+        store.append_ctp_callback_ingress(
+            owner,
+            _record(
+                owner,
+                "OnRtnTrade",
+                sequence,
+                phase="ACTIVE",
+                callback_class="ROUTEABLE",
+                fields=_trade_fields(
+                    order_ref=reservation.order_ref,
+                    trade_id=trade_id,
+                    volume=volume,
+                    price=price,
+                ),
+            ),
+        )
+        applied_results.append(
+            adapter.apply_next_ingress(
+                callback_verifier=_CallbackVerifier(),
+                trade_fact_verifier=_TradeVerifier(),
+            )
+        )
+    return store, scope, command_id, binding, reservation, applied_results
+
+
+@pytest.mark.unit
+def test_store_reads_scoped_durable_ctp_trade_facts_without_mutation(tmp_path):
+    path = tmp_path / "session-router-trade-readback.sqlite3"
+    store, scope, command_id, binding, reservation, applied_results = (
+        _seed_durable_ctp_trade_readback(path)
+    )
+    try:
+        assert [result.duplicate for result in applied_results] == [False, True, False]
+        assert [result.cumulative_trade_quantity for result in applied_results] == [1, 1, 3]
+        before_reads = _logical_store_snapshot(store)
+
+        first_page = store.read_ctp_dispatch_trade_facts(scope, command_id, limit=1)
+        assert len(first_page.trades) == 1
+        assert first_page.next_cursor is not None
+        first_trade = first_page.trades[0]
+        assert first_trade.source_sequence == 4
+        assert first_trade.trade_id == "trade-readback-1"
+        assert first_trade.order_ref == reservation.order_ref
+        assert first_trade.command_id == command_id
+        assert first_trade.scope_key == scope.key
+        assert first_trade.account_key == scope.account_key
+        assert first_trade.session_generation_id == binding.session_generation_id
+        assert first_trade.trade_price == Decimal("99.25")
+        assert first_trade.trade_quantity == 1
+        assert first_trade.cumulative_trade_quantity == 1
+        assert first_trade.cumulative_commission is None
+        assert first_trade.commission_quality == "INCOMPLETE"
+        assert store.read_ctp_dispatch_trade_facts(scope, "other-command").trades == ()
+
+        second_page = store.read_ctp_dispatch_trade_facts(
+            scope, command_id, after=first_page.next_cursor, limit=1
+        )
+        assert len(second_page.trades) == 1
+        assert second_page.next_cursor is None
+        second_trade = second_page.trades[0]
+        assert second_trade.source_sequence == 6
+        assert second_trade.trade_id == "trade-readback-2"
+        assert second_trade.trade_price == Decimal("98.5")
+        assert second_trade.trade_quantity == 2
+        assert second_trade.cumulative_trade_quantity == 3
+        assert second_trade.cumulative_commission is None
+        assert second_trade.commission_quality == "INCOMPLETE"
+
+        for trade in first_page.trades + second_page.trades:
+            payload = json.loads(trade.fact_payload_json)
+            native_fields = payload["native_fields"]
+            assert payload_sha256(payload) == trade.fact_payload_sha256
+            assert payload["event_id"] == trade.callback_event_id
+            assert payload["source_scope"]["account_key"] == trade.account_key
+            assert payload["source_scope"]["scope_key"] == trade.scope_key
+            assert payload["source_scope"]["session_generation_id"] == (
+                trade.session_generation_id
+            )
+            assert native_fields["TradeID"] == trade.trade_id
+            assert native_fields["OrderRef"] == trade.order_ref
+            assert native_fields["ExchangeID"] == trade.exchange_id
+            assert Decimal(native_fields["Price"]) == trade.trade_price
+            assert native_fields["Volume"] == trade.trade_quantity
+
+        other_scope = ExecutionScope(
+            scope.provider,
+            scope.environment,
+            scope.account_ref,
+            "strategy.router.other",
+            scope.trading_day,
+        )
+        assert store.read_ctp_dispatch_trade_facts(other_scope, command_id).trades == ()
+        with pytest.raises(ContractValidationError):
+            store.read_ctp_dispatch_trade_facts(
+                other_scope, command_id, after=first_page.next_cursor
+            )
+        assert _logical_store_snapshot(store) == before_reads
+        persisted_trades = first_page.trades + second_page.trades
+    finally:
+        store.close()
+
+    reopened = SqliteExecutionStore(path)
+    try:
+        before_reopen_read = _logical_store_snapshot(reopened)
+        reopened_page = reopened.read_ctp_dispatch_trade_facts(scope, command_id, limit=100)
+        assert reopened_page.next_cursor is None
+        assert reopened_page.trades == persisted_trades
+        assert _logical_store_snapshot(reopened) == before_reopen_read
+    finally:
+        reopened.close()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "corruption",
+    ("missing_source_field", "callback_stream_id", "prefix_consistency"),
+)
+def test_store_rejects_inconsistent_durable_ctp_trade_readback(tmp_path, corruption):
+    store, scope, command_id, _, _, _ = _seed_durable_ctp_trade_readback(
+        tmp_path / f"corrupt-trade-readback-{corruption}.sqlite3"
+    )
+    try:
+        row = store._connection.execute(
+            "SELECT owner_intent_id, source_sequence, callback_stream_id, "
+            "fact_payload_json FROM ctp_dispatch_trade_fact_ledger "
+            "WHERE command_id = ? ORDER BY source_sequence LIMIT 1",
+            (command_id,),
+        ).fetchone()
+        with store._lock:
+            store._connection.execute(
+                "DROP TRIGGER IF EXISTS ctp_dispatch_trade_fact_immutable_update"
+            )
+            if corruption == "missing_source_field":
+                payload = json.loads(row["fact_payload_json"])
+                del payload["source_scope"]["session_epoch"]
+                payload_json = canonical_json(payload)
+                store._connection.execute(
+                    "UPDATE ctp_dispatch_trade_fact_ledger "
+                    "SET fact_payload_json = ?, fact_payload_sha256 = ? "
+                    "WHERE owner_intent_id = ? AND source_sequence = ?",
+                    (
+                        payload_json,
+                        payload_sha256(payload),
+                        row["owner_intent_id"],
+                        row["source_sequence"],
+                    ),
+                )
+            elif corruption == "callback_stream_id":
+                store._connection.execute(
+                    "UPDATE ctp_dispatch_trade_fact_ledger SET callback_stream_id = ? "
+                    "WHERE owner_intent_id = ? AND source_sequence = ?",
+                    (
+                        "ctp-native:" + "0" * 64,
+                        row["owner_intent_id"],
+                        row["source_sequence"],
+                    ),
+                )
+            else:
+                store._connection.execute(
+                    "UPDATE ctp_dispatch_trade_fact_ledger "
+                    "SET cumulative_order_volume = NULL, prefix_consistency = 'MATCHED' "
+                    "WHERE owner_intent_id = ? AND source_sequence = ?",
+                    (row["owner_intent_id"], row["source_sequence"]),
+                )
+        before_read = _logical_store_snapshot(store)
+        with pytest.raises(DurableStoreError, match="stored CTP trade fact is unreadable"):
+            store.read_ctp_dispatch_trade_facts(scope, command_id)
+        assert _logical_store_snapshot(store) == before_read
+    finally:
+        store.close()
 
 
 @pytest.mark.unit
