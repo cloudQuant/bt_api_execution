@@ -156,7 +156,10 @@ class ManagedCancellationFacade:
         """Dispatch a cancellation at most once after durable admission.
 
         Repeated calls return their durable record without another provider
-        call.  Unknown results must be resolved only by :meth:`reconcile`.
+        call.  For an existing ACKED, UNKNOWN, or DISPATCHING row, an optional
+        ``reconcile_cancel(intent)`` dispatcher method may read local callback
+        evidence; only exact terminal observations reach :meth:`reconcile`.
+        Unknown results otherwise remain latched.
         ``before_dispatch`` runs before the single-use Risk claim, while
         ``before_provider_dispatch`` runs after that claim and immediately
         before the provider call.
@@ -176,6 +179,44 @@ class ManagedCancellationFacade:
         if record.state is ExecutionState.PENDING_ADMISSION:
             record = self._admit(intent, writer_lease)
         if record.state is not ExecutionState.PENDING_DISPATCH:
+            if (
+                record.state
+                in {
+                    ExecutionState.ACKED,
+                    ExecutionState.DISPATCHING,
+                    ExecutionState.UNKNOWN,
+                }
+                and record.dispatch_attempts == 1
+            ):
+                try:
+                    reconcile_cancel = getattr(dispatcher, "reconcile_cancel", None)
+                except Exception:
+                    reconcile_cancel = None
+                if callable(reconcile_cancel):
+                    try:
+                        observation = reconcile_cancel(intent)
+                    except Exception:
+                        # Callback reconciliation is optional and read-only.
+                        # Preserve the durable unresolved latch when the owner
+                        # is unavailable or has no terminal fact.
+                        observation = None
+                    if (
+                        type(observation) is CancelObservation
+                        and observation.cancel_id == intent.cancel_id
+                        and observation.target_intent_id == intent.target_intent_id
+                        and observation.provider_order_id == intent.provider_order_id
+                        and observation.state
+                        in {ExecutionState.CANCELLED, ExecutionState.REJECTED}
+                    ):
+                        replay_state = record.state
+                        record = self.reconcile(observation)
+                        if replay_state is ExecutionState.ACKED:
+                            # ACKED already settled its dispatch permit, but
+                            # it did not resolve the terminal Risk claim.
+                            return self._resolve_terminal_if_supported(
+                                record, intent=intent, writer_lease=writer_lease
+                            )
+                        return record
             return self._resolve_terminal_if_supported(record, writer_lease=writer_lease)
         record, claimed = self._store.claim_cancel_for_dispatch(
             intent.cancel_id, self._scope, writer_lease=writer_lease
