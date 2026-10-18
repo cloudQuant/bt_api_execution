@@ -915,7 +915,26 @@ class ManagedExecutionFacade:
                         intent, writer_lease=writer_lease
                     )
                 else:
-                    risk_permit = gate.reserve(intent)
+                    authenticated_reserve = getattr(
+                        gate, "reserve_for_authenticated_execution", None
+                    )
+                    if callable(authenticated_reserve):
+                        if (
+                            basic_gate is None
+                            or type(admission_context) is not ExecutionAdmissionContextV1
+                            or basic_reference is None
+                        ):
+                            raise AdmissionRequired(
+                                "authenticated Risk reservation requires Basic admission"
+                            )
+                        risk_permit = authenticated_reserve(
+                            intent,
+                            admission_context=admission_context,
+                            writer_lease=writer_lease,
+                            dispatch_port=dispatcher,
+                        )
+                    else:
+                        risk_permit = gate.reserve(intent)
         except ExecutionBasicAdmissionDenied:
             if basic_reference is not None and basic_gate is not None:
                 basic_gate.revoke(basic_reference)
