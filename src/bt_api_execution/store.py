@@ -1172,6 +1172,57 @@ class CtpCallbackSessionBindingV1:
 
 
 @dataclass(frozen=True, slots=True)
+class CtpCallbackLoginOrderRefFactsV1:
+    """Read-only facts from one exact active owner's successful login callback.
+
+    These facts bind the observed native ``MaxOrderRef`` to the Store-issued
+    login/session binding and its immutable ingress row. They do not establish
+    a complete legacy OrderRef inventory, an account-wide writer fence, or an
+    OrderRef cutover proof, and they do not authorize a reservation.
+    """
+
+    owner_handle: CtpCallbackSessionOwnerHandle
+    binding: CtpCallbackSessionBindingV1
+    broker_id: str
+    user_id: str
+    native_max_order_ref: str
+    login_source_sequence: int
+    login_record_digest_sha256: str
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.owner_handle) is not CtpCallbackSessionOwnerHandle
+            or type(self.binding) is not CtpCallbackSessionBindingV1
+            or self.binding.owner_intent_id != self.owner_handle.owner_intent_id
+            or self.binding.account_key != self.owner_handle.account_key
+            or self.binding.scope_key != self.owner_handle.scope_key
+            or type(self.broker_id) is not str
+            or not self.broker_id
+            or type(self.user_id) is not str
+            or not self.user_id
+            or type(self.native_max_order_ref) is not str
+            or not 1 <= len(self.native_max_order_ref) <= 12
+            or not self.native_max_order_ref.isascii()
+            or not self.native_max_order_ref.isdigit()
+            or type(self.login_source_sequence) is not int
+            or self.login_source_sequence <= 0
+            or self.login_source_sequence != self.binding.source_high_watermark
+            or not _is_sha256(self.login_record_digest_sha256)
+        ):
+            raise ContractValidationError("invalid CTP login OrderRef source facts")
+
+    @property
+    def native_max_order_ref_padded(self) -> str:
+        """Return the raw observed value in Store's explicit 12-digit format.
+
+        Padding is a representation conversion only. It does not supply any
+        missing legacy inventory or grant authority to seed/cut over.
+        """
+
+        return self.native_max_order_ref.zfill(12)
+
+
+@dataclass(frozen=True, slots=True)
 class CtpTraderCallbackIngressPoisonAckV2:
     """SDK-shaped acknowledgement for one durable monotonic poison write."""
 
@@ -8404,6 +8455,303 @@ class SqliteExecutionStore:
             ):
                 raise DurableStoreError("durable CTP login identity is invalid")
             return binding, broker_id, user_id
+
+    def read_ctp_callback_session_login_order_ref_facts(
+        self, owner_handle: CtpCallbackSessionOwnerHandle
+    ) -> CtpCallbackLoginOrderRefFactsV1:
+        """Read the exact successful login callback's native MaxOrderRef.
+
+        This is a source-fact readback only. It deliberately does not seed the
+        OrderRef ledger, inspect legacy inventories, establish an external
+        account-wide writer fence, or authorize a first reservation.
+        """
+
+        if (
+            type(owner_handle) is not CtpCallbackSessionOwnerHandle
+            or self._issued_ctp_callback_session_owners.get(owner_handle.owner_intent_id)
+            is not owner_handle
+        ):
+            raise ContractValidationError("exact same-Store CTP callback owner is required")
+
+        with self._lock:
+            # Reuse the existing exact ACTIVE-owner/login identity validation.
+            # RLock keeps its read and the detailed ingress/application checks
+            # below serialized with mutations through this Store instance.
+            try:
+                binding, broker_id, user_id = self.read_ctp_callback_session_context_facts(
+                    owner_handle
+                )
+            except sqlite3.Error as error:
+                raise DurableStoreError("unable to read CTP login OrderRef facts") from error
+            try:
+                login = self._connection.execute(
+                    """
+                    SELECT * FROM ctp_dispatch_callback_ingress
+                    WHERE owner_intent_id = ? AND callback_name = 'OnRspUserLogin'
+                    ORDER BY source_sequence DESC LIMIT 1
+                    """,
+                    (owner_handle.owner_intent_id,),
+                ).fetchone()
+            except sqlite3.Error as error:
+                raise DurableStoreError("unable to read CTP login OrderRef facts") from error
+
+            if login is None:
+                raise DurableStoreError("durable CTP login source row is unavailable")
+            login_sequence = login["source_sequence"]
+            login_source_tags = (
+                login["source_instance_id"],
+                login["native_client_epoch"],
+                login["native_api_source_id"],
+                login["native_spi_source_id"],
+                login["native_api_generation"],
+                login["source_connection_generation"],
+            )
+            if (
+                type(login_sequence) is not int
+                or login_sequence <= 0
+                or login_sequence != binding.source_high_watermark
+                or str(login["callback_name"]) != "OnRspUserLogin"
+                or str(login["callback_class"]) != "PRE_LOGIN"
+                or str(login["source_phase"]) != "PRE_LOGIN"
+                or type(login["connection_generation"]) is not int
+                or login["connection_generation"] != binding.connection_generation
+                or any(type(value) is not str or not value for value in login_source_tags[:4])
+                or type(login_source_tags[4]) is not int
+                or type(login_source_tags[5]) is not int
+                or login_source_tags
+                != (
+                    binding.source_instance_id,
+                    binding.native_client_epoch,
+                    binding.native_api_source_id,
+                    binding.native_spi_source_id,
+                    binding.native_api_generation,
+                    binding.source_connection_generation,
+                )
+            ):
+                raise DurableStoreError("durable CTP login source differs from its active binding")
+            binding_payload = self._ctp_callback_session_binding_payload(binding)
+            if payload_sha256(binding_payload) != binding.session_binding_sha256:
+                raise DurableStoreError("active CTP login session binding digest is invalid")
+
+            raw_payload_json = login["record_payload_json"]
+            if type(raw_payload_json) is not str or not raw_payload_json:
+                raise DurableStoreError("durable CTP login payload is unavailable")
+            try:
+                if len(raw_payload_json.encode("utf-8")) > 32 * 1024:
+                    raise ValueError
+                payload = json.loads(raw_payload_json)
+                if type(payload) is not dict:
+                    raise ValueError
+                expected_payload_fields = {
+                    "schema",
+                    "owner_intent_id",
+                    "callback_name",
+                    "callback_class",
+                    "phase",
+                    "source_instance_id",
+                    "native_client_epoch",
+                    "native_api_source_id",
+                    "native_spi_source_id",
+                    "native_api_generation",
+                    "source_connection_generation",
+                    "connection_generation",
+                    "sequence",
+                    "monotonic_ns",
+                    "named_args",
+                    "flattened_fields",
+                    "capture_complete",
+                    "missing_getters",
+                    "digest",
+                }
+                if (
+                    set(payload) != expected_payload_fields
+                    or payload["schema"] != "ctp_trader_callback_ingress.v2"
+                    or json.dumps(
+                        payload,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                        allow_nan=False,
+                    )
+                    != raw_payload_json
+                ):
+                    raise ValueError
+                row_digest = login["record_digest_sha256"]
+                digest = payload["digest"]
+                if (
+                    type(row_digest) is not str
+                    or not _is_sha256(row_digest)
+                    or type(digest) is not str
+                    or digest != row_digest
+                ):
+                    raise ValueError
+                unsigned_payload = dict(payload)
+                del unsigned_payload["digest"]
+                computed_digest = hashlib.sha256(
+                    json.dumps(
+                        unsigned_payload,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                        allow_nan=False,
+                    ).encode("utf-8")
+                ).hexdigest()
+                if computed_digest != row_digest:
+                    raise ValueError
+            except (TypeError, ValueError, KeyError, UnicodeError, json.JSONDecodeError):
+                raise DurableStoreError("durable CTP login payload failed canonical digest") from None
+
+            payload_source_tags = (
+                payload.get("source_instance_id"),
+                payload.get("native_client_epoch"),
+                payload.get("native_api_source_id"),
+                payload.get("native_spi_source_id"),
+                payload.get("native_api_generation"),
+                payload.get("source_connection_generation"),
+            )
+            if (
+                type(payload.get("owner_intent_id")) is not str
+                or payload["owner_intent_id"] != owner_handle.owner_intent_id
+                or type(payload.get("callback_name")) is not str
+                or payload["callback_name"] != "OnRspUserLogin"
+                or type(payload.get("callback_class")) is not str
+                or payload["callback_class"] != "PRE_LOGIN"
+                or type(payload.get("phase")) is not str
+                or payload["phase"] != "PRE_LOGIN"
+                or type(payload.get("sequence")) is not int
+                or payload["sequence"] != login_sequence
+                or type(payload.get("native_api_generation")) is not int
+                or type(payload.get("source_connection_generation")) is not int
+                or type(payload.get("connection_generation")) is not int
+                or payload["connection_generation"] != binding.connection_generation
+                or payload_source_tags
+                != (
+                    binding.source_instance_id,
+                    binding.native_client_epoch,
+                    binding.native_api_source_id,
+                    binding.native_spi_source_id,
+                    binding.native_api_generation,
+                    binding.source_connection_generation,
+                )
+                or payload.get("capture_complete") is not True
+                or payload.get("missing_getters") != []
+            ):
+                raise DurableStoreError("durable CTP login payload differs from its source binding")
+
+            def field_value(argument_slot: int, field_name: str) -> Any:
+                fields = payload.get("flattened_fields")
+                if type(fields) is not list:
+                    raise DurableStoreError("durable CTP login fields are malformed")
+                matches = [
+                    item
+                    for item in fields
+                    if type(item) is dict
+                    and type(item.get("argument_slot")) is int
+                    and item.get("argument_slot") == argument_slot
+                    and item.get("field_name") == field_name
+                ]
+                if (
+                    len(matches) != 1
+                    or matches[0].get("present") is not True
+                    or matches[0].get("scalar_captured") is not True
+                ):
+                    raise DurableStoreError("durable CTP login field is missing or ambiguous")
+                return matches[0].get("value")
+
+            def argument_value(slot: int, name: str) -> Any:
+                arguments = payload.get("named_args")
+                if type(arguments) is not list or len(arguments) != 4:
+                    raise DurableStoreError("durable CTP login arguments are malformed")
+                item = arguments[slot]
+                if (
+                    type(item) is not dict
+                    or type(item.get("argument_slot")) is not int
+                    or item["argument_slot"] != slot
+                    or item.get("name") != name
+                    or item.get("present") is not True
+                    or item.get("scalar_captured") is not True
+                ):
+                    raise DurableStoreError("durable CTP login terminal arguments are missing")
+                return item.get("value")
+
+            raw_broker_id = field_value(0, "BrokerID")
+            raw_user_id = field_value(0, "UserID")
+            raw_trading_day = field_value(0, "TradingDay")
+            raw_front_id = field_value(0, "FrontID")
+            raw_session_id = field_value(0, "SessionID")
+            native_max_order_ref = field_value(0, "MaxOrderRef")
+            error_id = field_value(1, "ErrorID")
+            request_id = argument_value(2, "nRequestID")
+            is_last = argument_value(3, "bIsLast")
+            if (
+                type(error_id) is not int
+                or error_id != 0
+                or type(request_id) is not int
+                or request_id <= 0
+                or type(is_last) is not bool
+                or is_last is not True
+                or type(raw_broker_id) is not str
+                or not raw_broker_id
+                or raw_broker_id != broker_id
+                or type(raw_user_id) is not str
+                or not raw_user_id
+                or raw_user_id != user_id
+                or type(raw_trading_day) is not str
+                or raw_trading_day != binding.trading_day
+                or type(raw_front_id) is not int
+                or raw_front_id <= 0
+                or raw_front_id != binding.dispatch_front_id
+                or type(raw_session_id) is not int
+                or raw_session_id <= 0
+                or raw_session_id != binding.dispatch_session_id
+            ):
+                raise DurableStoreError("durable CTP login is not an exact successful terminal response")
+            if (
+                type(native_max_order_ref) is not str
+                or not 1 <= len(native_max_order_ref) <= 12
+                or not native_max_order_ref.isascii()
+                or not native_max_order_ref.isdigit()
+            ):
+                raise DurableStoreError("durable CTP login has an invalid native MaxOrderRef")
+
+            try:
+                application = self._connection.execute(
+                    """
+                    SELECT outcome, command_id, application_digest_sha256
+                    FROM ctp_dispatch_callback_ingress_applications
+                    WHERE owner_intent_id = ? AND source_sequence = ?
+                    """,
+                    (owner_handle.owner_intent_id, login_sequence),
+                ).fetchone()
+            except sqlite3.Error as error:
+                raise DurableStoreError("unable to read CTP login application receipt") from error
+            expected_application_digest = payload_sha256(
+                {
+                    "application_type": "ctp_callback_prelogin_bound.v1",
+                    "owner_intent_id": owner_handle.owner_intent_id,
+                    "source_sequence": login_sequence,
+                    "record_digest_sha256": row_digest,
+                    "callback_class": "PRE_LOGIN",
+                }
+            )
+            if (
+                application is None
+                or str(application["outcome"]) != "AUDIT_ONLY"
+                or application["command_id"] is not None
+                or str(application["application_digest_sha256"])
+                != expected_application_digest
+            ):
+                raise DurableStoreError("CTP login row lacks its exact activation receipt")
+
+            return CtpCallbackLoginOrderRefFactsV1(
+                owner_handle=owner_handle,
+                binding=binding,
+                broker_id=broker_id,
+                user_id=user_id,
+                native_max_order_ref=native_max_order_ref,
+                login_source_sequence=login_sequence,
+                login_record_digest_sha256=row_digest,
+            )
 
     def find_ctp_dispatch_command_for_ingress(
         self, event: CtpCallbackIngressEventV1
