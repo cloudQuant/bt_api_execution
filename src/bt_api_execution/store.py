@@ -18584,8 +18584,15 @@ class SqliteExecutionStore:
         callback_json = canonical_json(callback.to_payload())
         callback_digest = payload_sha256(json.loads(callback_json))
         correlation_digest = payload_sha256(staged.correlation_key.to_payload())
+        successful_insert_response = (
+            staged.operation == "SUBMIT"
+            and callback.callback_family == "ORDER"
+            and callback_payload_value.get("source_callback") == "OnRspOrderInsert"
+            and evidence.projection_state == "ACKNOWLEDGED"
+        )
         ingress_payload: Mapping[str, Any] | None = None
         ingress_binding: CtpCallbackSessionBindingV1 | None = None
+        request_insert_ack_only = False
         with self._transaction() as cursor:
             applied_at_ns = time.time_ns()
             self._assert_active_writer_lease(cursor, scope, writer_lease, now_ns=applied_at_ns)
@@ -18634,6 +18641,37 @@ class SqliteExecutionStore:
                     raise InvalidStateTransition(
                         "CTP session callback command is not ready for ledger commit"
                     )
+                if (
+                    current.operation == "SUBMIT"
+                    and _callback_ingress_event.callback_name == "OnRspOrderInsert"
+                    and callback.callback_family == "ORDER"
+                    and callback_payload_value.get("source_callback")
+                    == "OnRspOrderInsert"
+                    and evidence.projection_state == "ACKNOWLEDGED"
+                ):
+                    # A successful insert response is durable request evidence,
+                    # not proof that the exchange accepted the order. Bind the
+                    # non-projecting case to the exact persisted SPI record.
+                    raw_error_id = self._ctp_callback_field(ingress_payload, 1, "ErrorID")
+                    raw_request_id = self._ctp_callback_field(ingress_payload, 0, "RequestID")
+                    response_request_id = self._ctp_callback_named_arg(ingress_payload, 2)
+                    response_is_last = self._ctp_callback_named_arg(ingress_payload, 3)
+                    request_insert_ack_only = (
+                        type(raw_error_id) is int
+                        and raw_error_id == 0
+                        and type(raw_request_id) is int
+                        and raw_request_id == current.correlation_key.native_request_id
+                        and type(response_request_id) is int
+                        and response_request_id == current.correlation_key.native_request_id
+                        and response_is_last is True
+                        and type(callback_payload_value.get("response_error_id")) is int
+                        and callback_payload_value.get("response_error_id") == 0
+                        and callback_payload_value.get("response_is_last") is True
+                    )
+            if successful_insert_response and not request_insert_ack_only:
+                raise ContractValidationError(
+                    "successful CTP insert response requires exact durable ingress evidence"
+                )
             if source_lifecycle_fence_id is not None:
                 guard = cursor.execute(
                     """
@@ -18761,15 +18799,16 @@ class SqliteExecutionStore:
                 ),
             )
             if staged.operation == "SUBMIT":
-                self._upsert_ctp_order_projection(
-                    cursor,
-                    staged.correlation_key,
-                    evidence.projection_state,
-                    evidence.source_digest_sha256,
-                    source_kind="CALLBACK",
-                    updated_at_ns=applied_at_ns,
-                    callback_key=callback,
-                )
+                if not request_insert_ack_only:
+                    self._upsert_ctp_order_projection(
+                        cursor,
+                        staged.correlation_key,
+                        evidence.projection_state,
+                        evidence.source_digest_sha256,
+                        source_kind="CALLBACK",
+                        updated_at_ns=applied_at_ns,
+                        callback_key=callback,
+                    )
             else:
                 self._upsert_ctp_cancel_projection(
                     cursor,
