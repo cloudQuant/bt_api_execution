@@ -160,6 +160,10 @@ class ManagedCancellationFacade:
         ``before_dispatch`` runs before the single-use Risk claim, while
         ``before_provider_dispatch`` runs after that claim and immediately
         before the provider call.
+        A dispatcher implementing ``cancel_with_claim(intent, receipt)`` receives
+        the validated claim receipt and takes precedence over the legacy port.
+        That interface requires an admission gate; its receipt still needs any
+        provider-specific authorization checks before native dispatch.
         """
 
         if before_dispatch is not None and not callable(before_dispatch):
@@ -189,6 +193,8 @@ class ManagedCancellationFacade:
                     intent, "cancel_pre_dispatch_guard_failed", writer_lease
                 )
         self._store.assert_writer_lease(self._scope, writer_lease)
+        claim_receipt: CancelDispatchClaimReceiptV1 | None = None
+        expected_claim: CancelDispatchClaimReceiptV1 | None = None
         if self._admission_gate is not None:
             permit_reference = record.permit_reference
             claim = getattr(self._admission_gate, "claim_before_dispatch", None)
@@ -229,6 +235,7 @@ class ManagedCancellationFacade:
                     "cancel_admission_claim_outcome_unknown",
                     writer_lease=writer_lease,
                 )
+            claim_receipt = claim_result
         try:
             self._store.assert_writer_lease(self._scope, writer_lease)
         except WriterLeaseUnavailable:
@@ -245,8 +252,8 @@ class ManagedCancellationFacade:
             # a late call.
             self._store.assert_writer_lease(self._scope, writer_lease)
             if self._admission_gate is not None and (
-                type(claim_result) is not CancelDispatchClaimReceiptV1
-                or claim_result != expected_claim
+                type(claim_receipt) is not CancelDispatchClaimReceiptV1
+                or claim_receipt != expected_claim
             ):
                 return self._store.mark_cancel_unknown(
                     intent.cancel_id,
@@ -255,7 +262,7 @@ class ManagedCancellationFacade:
                     writer_lease=writer_lease,
                 )
         try:
-            observation = self._dispatch(dispatcher, intent)
+            observation = self._dispatch(dispatcher, intent, claim_receipt=claim_receipt)
         except Exception:
             return self._store.mark_cancel_unknown(
                 intent.cancel_id, self._scope, writer_lease=writer_lease
@@ -618,15 +625,26 @@ class ManagedCancellationFacade:
 
     @staticmethod
     def _dispatch(
-        dispatcher: CancelDispatchCallable | Any, intent: CancelIntent
+        dispatcher: CancelDispatchCallable | Any,
+        intent: CancelIntent,
+        *,
+        claim_receipt: CancelDispatchClaimReceiptV1 | None = None,
     ) -> CancelObservation:
-        method = getattr(dispatcher, "cancel", None)
-        if callable(method):
-            result = method(intent)
-        elif callable(dispatcher):
-            result = dispatcher(intent)
+        claim_dispatcher = getattr(dispatcher, "cancel_with_claim", None)
+        if callable(claim_dispatcher):
+            if type(claim_receipt) is not CancelDispatchClaimReceiptV1:
+                raise ContractValidationError(
+                    "claim-aware cancellation dispatcher requires a validated dispatch claim"
+                )
+            result = claim_dispatcher(intent, claim_receipt)
         else:
-            raise ContractValidationError("invalid cancellation dispatch port")
+            method = getattr(dispatcher, "cancel", None)
+            if callable(method):
+                result = method(intent)
+            elif callable(dispatcher):
+                result = dispatcher(intent)
+            else:
+                raise ContractValidationError("invalid cancellation dispatch port")
         if not isinstance(result, CancelObservation):
             raise ContractValidationError("cancellation dispatch port returned invalid observation")
         return result
