@@ -45,7 +45,10 @@ from .store import SqliteExecutionStore, WriterLease
 
 if TYPE_CHECKING:
     from .ports import AdmissionGate, DispatchPort, ReconciliationPort
-    from .store import CtpAccountFamilyOwnerHandle, ExecutionRecord
+    from .store import (
+        CtpAccountFamilyOwnerHandle,
+        ExecutionRecord,
+    )
 
 DispatchCallable = Callable[[OrderIntent], ProviderObservation]
 BeforeDispatchCallable = Callable[[OrderIntent], None]

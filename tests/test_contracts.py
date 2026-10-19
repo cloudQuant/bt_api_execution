@@ -61,7 +61,6 @@ def test_close_intent_requires_reduce_only_and_limit_requires_price() -> None:
             price=Decimal("50000"),
             position_effect=PositionEffect.CLOSE,
         )
-
     with pytest.raises(ContractValidationError, match="limit intent requires price"):
         OrderIntent(
             intent_id="limit-no-price",
@@ -159,7 +158,6 @@ def test_invalid_position_dimensions_are_rejected(
             position_side=position_side,
             position_bucket=position_bucket,
         )
-
 
 
 @pytest.mark.unit

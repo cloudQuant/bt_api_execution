@@ -507,6 +507,7 @@ class ExecutionOrderEntryService:
             manual_book_ref=scope.manual_book_ref,
             portfolio_ref=scope.portfolio_ref,
         )
+
         execution_scope = self._resolve_scope(account_scope)
         if execution_scope is None or execution_scope != intent.scope:
             return _scope_denied()
@@ -607,6 +608,53 @@ class ExecutionOrderEntryService:
                         ExecutionState.CANCELLED,
                         ExecutionState.REJECTED,
                     }
+                    open_states = {
+                        ExecutionState.ACKED,
+                        ExecutionState.PARTIALLY_FILLED,
+                    }
+                    if record.state in open_states:
+                        # Persist a source-verified open order, but do not let
+                        # normal-exit release either the group authority hold
+                        # or Risk dispatch latch. The callback may settle the
+                        # original permit; it must still raise until terminal
+                        # order/fill proof is available.
+                        if (
+                            len(claim_receipts) != 1
+                            or record.dispatch_attempts != 1
+                            or record.intent_id != intent.intent_id
+                            or record.scope_key != execution_scope.key
+                            or record.payload_sha256 != intent.fingerprint
+                            or record.group_binding != binding
+                            or record.unknown_reason is not None
+                            or record.review_required
+                        ):
+                            raise _GroupResolutionUnprovenError
+                        durable_record = self._store.get(intent.intent_id, scope=execution_scope)
+                        if type(durable_record) is not ExecutionRecord or durable_record != record:
+                            raise _GroupResolutionUnprovenError
+                        try:
+                            self._store.assert_writer_lease(execution_scope, writer_lease)
+                            assert_current_group_authorization(
+                                intent, binding, authorization, writer_lease
+                            )
+                            assert after_group_result is not None
+                            callback_result = after_group_result(
+                                intent,
+                                binding,
+                                authorization,
+                                writer_lease,
+                                claim_receipts[0],
+                                durable_record,
+                            )
+                            if callback_result is not None:
+                                raise _GroupResolutionUnprovenError
+                            self._store.assert_writer_lease(execution_scope, writer_lease)
+                            assert_current_group_authorization(
+                                intent, binding, authorization, writer_lease
+                            )
+                        except Exception as error:
+                            raise _GroupResolutionUnprovenError from error
+                        raise _GroupResolutionUnprovenError
                     if record.state in {
                         ExecutionState.ACKED,
                         ExecutionState.PARTIALLY_FILLED,
@@ -1301,7 +1349,6 @@ class ExecutionOrderEntryService:
         if len(matches) > 1:
             raise ContractValidationError("execution scope template is ambiguous")
         return matches[0] if matches else None
-
 
 def _has_dispatch(dispatch: object, method_name: str) -> bool:
     if callable(getattr(dispatch, method_name, None)):
