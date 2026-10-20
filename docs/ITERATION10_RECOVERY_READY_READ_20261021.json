@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "repository": "D:/bt_api_py/bt_api/bt_api_execution",
+  "branch": "dev",
+  "parent_commit": "79645cbe0c2ddab2761b5cb31b0ab9eff432cc1d",
+  "evidence_level": "SOURCE_FAKE_RECOVERY_READY_READ_ONLY",
+  "problem": "The recovery close queue path reads its exact staged READY command before recording the queue receipt. Its authorization recheck incorrectly rejected that unqueued child as another submit.",
+  "change": "Permit the exact unqueued recovery child in read_ctp_staged_command_for_session, matching the existing stage and queue checks. Preserve READY-only access, exact command/session/scope authorization and atomic one-use claim.",
+  "source_checkout_sha256": {
+    "src/bt_api_execution/store.py": "7c265f1b8803e0d3484a2ce42c48b78d51a59405eadfe18caf2809d59d5d7929",
+    "tests/test_ctp_position_recovery_authorization.py": "7d21ed1bb9deaebfd4d8a453c20dc7fc3bde3428fcfea8789ff133f6a928e8b9"
+  },
+  "verification": {
+    "root_static_review": "GO",
+    "test": "tests/test_ctp_position_recovery_authorization.py::test_recovery_close_authorization_is_one_use_at_atomic_ready_to_claim",
+    "passed": 1,
+    "exit_code": 0,
+    "duration_seconds": 7.06,
+    "coverage": [
+      "Read exact READY child before queue receipt without consuming authorization",
+      "Reject wrong scope and mismatched child token",
+      "Queue then concurrently claim authorization exactly once",
+      "Reject staged read after claim"
+    ],
+    "diff_check": "PASS",
+    "accepted_suites_repeated": false
+  },
+  "limits": {
+    "real_account_acceptance": false,
+    "formal_venue01_pass": false,
+    "formal_venue02_pass": false,
+    "full_vertical_acceptance": "Pending after this scoped commit"
+  }
+}

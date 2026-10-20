@@ -16,6 +16,7 @@ import sys
 import time
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -644,6 +645,7 @@ def _stage_recovery_child(
     session_generation_id=None,
     direction=None,
     offset_flag=None,
+    queue=True,
 ):
     receipt_id = hashlib.sha256(command_id.encode("ascii")).hexdigest()[:32]
     request_offset = (
@@ -713,18 +715,19 @@ def _stage_recovery_child(
         local_queue_receipt_id=receipt_id,
         recovery_close_authorization=authorization,
     )
-    parent.store.record_ctp_dispatch_queue_receipt(
-        call_scope,
-        command.command_id,
-        {
-            "kind": "command_receipt",
-            "command": "submit",
-            "receipt_id": receipt_id,
-            "queued": True,
-        },
-        writer_lease=parent.lease,
-        recovery_close_authorization=authorization,
-    )
+    if queue:
+        parent.store.record_ctp_dispatch_queue_receipt(
+            call_scope,
+            command.command_id,
+            {
+                "kind": "command_receipt",
+                "command": "submit",
+                "receipt_id": receipt_id,
+                "queued": True,
+            },
+            writer_lease=parent.lease,
+            recovery_close_authorization=authorization,
+        )
     return command, receipt_id
 
 
@@ -2205,10 +2208,65 @@ def test_recovery_close_authorization_is_one_use_at_atomic_ready_to_claim(tmp_pa
             reservation,
             authorization,
             command_id="recovery-claim-child-submit",
+            queue=False,
         )
         assert command.status == "READY"
+        assert command.local_queue_receipt_queued is None
         assert _recovery_authorization_use_count(parent.store) == 0
         assert _query_observed(parent.store, parent.owner) == 1
+
+        wrong_scope = ExecutionScope(
+            parent.scope.provider,
+            parent.scope.environment,
+            parent.scope.account_ref,
+            parent.scope.strategy_id + ".other",
+            parent.scope.trading_day,
+        )
+        with pytest.raises((ContractValidationError, InvalidStateTransition, WriterLeaseUnavailable)):
+            parent.store.read_ctp_staged_command_for_session(
+                wrong_scope,
+                command.command_id,
+                owner_handle=parent.owner,
+                writer_lease=parent.lease,
+                recovery_close_authorization=authorization,
+            )
+        wrong_child_authorization = replace(
+            authorization,
+            child_intent_id=child_intent.intent_id + ".other",
+        )
+        with pytest.raises((ContractValidationError, InvalidStateTransition)):
+            parent.store.read_ctp_staged_command_for_session(
+                parent.scope,
+                command.command_id,
+                owner_handle=parent.owner,
+                writer_lease=parent.lease,
+                recovery_close_authorization=wrong_child_authorization,
+            )
+
+        read_command = parent.store.read_ctp_staged_command_for_session(
+            parent.scope,
+            command.command_id,
+            owner_handle=parent.owner,
+            writer_lease=parent.lease,
+            recovery_close_authorization=authorization,
+        )
+        assert read_command.status == "READY"
+        assert read_command.local_queue_receipt_queued is None
+        assert read_command.command_id == command.command_id
+        assert _recovery_authorization_use_count(parent.store) == 0
+
+        parent.store.record_ctp_dispatch_queue_receipt(
+            parent.scope,
+            command.command_id,
+            {
+                "kind": "command_receipt",
+                "command": "submit",
+                "receipt_id": receipt_id,
+                "queued": True,
+            },
+            writer_lease=parent.lease,
+            recovery_close_authorization=authorization,
+        )
 
         def claim_once(_attempt):
             try:
@@ -2241,6 +2299,14 @@ def test_recovery_close_authorization_is_one_use_at_atomic_ready_to_claim(tmp_pa
             writer_lease=parent.lease,
         )
         assert binding is claim.binding
+        with pytest.raises((ContractValidationError, InvalidStateTransition)):
+            parent.store.read_ctp_staged_command_for_session(
+                parent.scope,
+                command.command_id,
+                owner_handle=parent.owner,
+                writer_lease=parent.lease,
+                recovery_close_authorization=authorization,
+            )
         with pytest.raises((ContractValidationError, InvalidStateTransition)):
             parent.store.claim_ctp_dispatch_command_for_session(
                 parent.scope,

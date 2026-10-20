@@ -19442,6 +19442,7 @@ class SqliteExecutionStore:
                         expected_command=command,
                         require_binding=True,
                         allow_facade_claimed_submit=True,
+                        allow_unqueued_recovery_child=True,
                     )
                 elif command.operation == "SUBMIT" and position_baseline_authorization is not None:
                     self._require_ctp_position_baseline_authorization(
