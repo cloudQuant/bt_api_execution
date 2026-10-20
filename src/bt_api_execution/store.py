@@ -12200,6 +12200,71 @@ class SqliteExecutionStore:
     ) -> CtpOrderTargetQueryWindow:
         """Read back one contiguous, applied OnRspQryOrder callback window."""
 
+        return self._read_ctp_query_callback_window(
+            scope,
+            query_fence,
+            query_request_id=query_request_id,
+            owner_handle=owner_handle,
+            writer_lease=writer_lease,
+            callback_name="OnRspQryOrder",
+            first_argument_name="pOrder",
+        )
+
+    def read_ctp_order_target_trade_query_window(
+        self,
+        scope: ExecutionScope,
+        query_fence: CtpOrderTargetQueryFence,
+        *,
+        query_request_id: int,
+        owner_handle: CtpCallbackSessionOwnerHandle,
+        writer_lease: WriterLease,
+    ) -> CtpOrderTargetQueryWindow:
+        """Read and close one exact applied OnRspQryTrade callback window.
+
+        The returned immutable window remains readable until its source moves
+        or its original fence expires. Clearing the active owner fence lets
+        normal later queries proceed without treating this audit window as a
+        reusable native query authorization.
+        """
+
+        window = self._read_ctp_query_callback_window(
+            scope,
+            query_fence,
+            query_request_id=query_request_id,
+            owner_handle=owner_handle,
+            writer_lease=writer_lease,
+            callback_name="OnRspQryTrade",
+            first_argument_name="pTrade",
+        )
+        with self._lock:
+            if (
+                self._issued_ctp_order_target_query_fences.get(query_fence.fence_id)
+                is not query_fence
+                or self._issued_ctp_order_target_query_windows.get(query_fence.fence_id)
+                is not window
+            ):
+                raise ContractValidationError("CTP trade-query window changed before close")
+            active_id = self._active_ctp_order_target_query_fences.get(
+                owner_handle.owner_intent_id
+            )
+            if active_id not in (None, query_fence.fence_id):
+                raise InvalidStateTransition("another CTP query fence replaced the trade window")
+            self._active_ctp_order_target_query_fences.pop(owner_handle.owner_intent_id, None)
+        return window
+
+    def _read_ctp_query_callback_window(
+        self,
+        scope: ExecutionScope,
+        query_fence: CtpOrderTargetQueryFence,
+        *,
+        query_request_id: int,
+        owner_handle: CtpCallbackSessionOwnerHandle,
+        writer_lease: WriterLease,
+        callback_name: str,
+        first_argument_name: str,
+    ) -> CtpOrderTargetQueryWindow:
+        """Read one exact terminal callback sequence under a query fence."""
+
         account_key, trading_day, scope_key = self._validate_ctp_order_identity_scope(scope)
         now_wall_ns = time.time_ns()
         now_mono_ns = time.monotonic_ns()
@@ -12209,7 +12274,14 @@ class SqliteExecutionStore:
             or type(owner_handle) is not CtpCallbackSessionOwnerHandle
             or query_fence.owner_handle is not owner_handle
             or self._active_ctp_order_target_query_fences.get(owner_handle.owner_intent_id)
-            != query_fence.fence_id
+            not in (
+                query_fence.fence_id,
+                None
+                if callback_name == "OnRspQryTrade"
+                and self._issued_ctp_order_target_query_windows.get(query_fence.fence_id)
+                is not None
+                else query_fence.fence_id,
+            )
             or type(query_request_id) is not int
             or not 0 < query_request_id <= 2_147_483_647
             or query_fence.expires_at_ns <= now_mono_ns
@@ -12223,7 +12295,14 @@ class SqliteExecutionStore:
                 self._issued_ctp_order_target_query_fences.get(query_fence.fence_id)
                 is not query_fence
                 or self._active_ctp_order_target_query_fences.get(owner_handle.owner_intent_id)
-                != query_fence.fence_id
+                not in (
+                    query_fence.fence_id,
+                    None
+                    if callback_name == "OnRspQryTrade"
+                    and self._issued_ctp_order_target_query_windows.get(query_fence.fence_id)
+                    is not None
+                    else query_fence.fence_id,
+                )
             ):
                 raise ContractValidationError("CTP order-query fence was already consumed")
             self._assert_active_writer_lease(cursor, scope, writer_lease, now_ns=now_wall_ns)
@@ -12297,12 +12376,12 @@ class SqliteExecutionStore:
                 )
                 if (
                     seq != expected_sequence
-                    or str(row["callback_name"]) != "OnRspQryOrder"
+                    or str(row["callback_name"]) != callback_name
                     or str(row["callback_class"]) != "AUDIT_QUERY"
                     or str(row["source_phase"]) != "ACTIVE"
                     or row_tags != query_fence.source_tags
                     or int(row["connection_generation"]) != query_fence.connection_generation
-                    or payload.get("callback_name") != "OnRspQryOrder"
+                    or payload.get("callback_name") != callback_name
                     or payload.get("callback_class") != "AUDIT_QUERY"
                     or payload.get("phase") != "ACTIVE"
                     or payload.get("sequence") != seq
@@ -12310,9 +12389,23 @@ class SqliteExecutionStore:
                     or payload.get("capture_complete") is not True
                     or canonical_json(payload) != payload_json
                 ):
-                    raise ContractValidationError("CTP callback window is not one exact order query")
+                    raise ContractValidationError("CTP callback window is not one exact query")
                 request_id = self._ctp_query_named_scalar(payload, 2, "nRequestID")
                 is_last = self._ctp_query_named_scalar(payload, 3, "bIsLast")
+                first_arg = payload.get("named_args")
+                first_arg = (
+                    first_arg[0]
+                    if type(first_arg) is list and first_arg
+                    else None
+                )
+                if (
+                    type(first_arg) is not dict
+                    or first_arg.get("name") != first_argument_name
+                    or first_arg.get("present") is not True
+                    or first_arg.get("scalar_captured") is not False
+                    or first_arg.get("value") is not None
+                ):
+                    raise ContractValidationError("CTP query callback row pointer is not captured safely")
                 if type(request_id) is not int or type(is_last) is not bool:
                     raise ContractValidationError("CTP query callback cursor fields are invalid")
                 request_ids.append(request_id)
@@ -12346,7 +12439,7 @@ class SqliteExecutionStore:
                     owner_handle=owner_handle,
                     source_sequence=seq,
                     record_digest_sha256=str(row["record_digest_sha256"]),
-                    callback_name="OnRspQryOrder",
+                    callback_name=callback_name,
                     callback_class="AUDIT_QUERY",
                     source_phase="ACTIVE",
                     source_tags=row_tags,

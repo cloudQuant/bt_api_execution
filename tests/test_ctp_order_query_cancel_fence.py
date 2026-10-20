@@ -448,6 +448,132 @@ def _apply_query_pair(adapter):
     assert second.economic_query_observed is True
 
 
+def _append_trade_query_terminal(
+    adapter,
+    owner,
+    binding,
+    tags,
+    *,
+    request_id=_REQUEST_ID,
+    sequence=None,
+):
+    if sequence is None:
+        sequence = binding.source_high_watermark + 1
+    _append_callback(
+        adapter,
+        owner,
+        tags,
+        "OnRspQryTrade",
+        sequence,
+        (None, SimpleNamespace(ErrorID=0, ErrorMsg=""), request_id, True),
+        source_generation=binding.connection_generation,
+        phase=CtpTraderCallbackPhase.ACTIVE,
+    )
+    result = adapter.apply_next_ingress(
+        callback_verifier=None, trade_fact_verifier=None
+    )
+    assert result is not None and result.callback_name == "OnRspQryTrade"
+    assert result.economic_query_observed is True
+    return sequence
+
+
+@pytest.mark.unit
+def test_trade_query_window_distinguishes_empty_terminal_from_absent_or_invalid_callback(
+    tmp_path,
+):
+    store, scope, _family_owner, lease, owner, adapter, binding, tags = _new_store_and_session(
+        tmp_path
+    )
+    try:
+        reservation = _reserve(store, scope, lease, binding, "trade-window-empty")
+        fence = store.begin_ctp_order_target_query(
+            scope,
+            reservation.managed_intent_id,
+            owner_handle=owner,
+            writer_lease=lease,
+        )
+        sequence = _append_trade_query_terminal(
+            adapter, owner, binding, tags
+        )
+
+        window = store.read_ctp_order_target_trade_query_window(
+            scope,
+            fence,
+            query_request_id=_REQUEST_ID,
+            owner_handle=owner,
+            writer_lease=lease,
+        )
+        assert window.fence_id == fence.fence_id
+        assert len(window.events) == 1
+        assert window.events[0].callback_name == "OnRspQryTrade"
+        assert window.events[0].source_sequence == sequence
+        assert store._active_ctp_order_target_query_fences.get(
+            owner.owner_intent_id
+        ) is None
+        assert store.read_ctp_order_target_trade_query_window(
+            scope,
+            fence,
+            query_request_id=_REQUEST_ID,
+            owner_handle=owner,
+            writer_lease=lease,
+        ) is window
+
+        # A completed trade audit no longer holds the per-owner query fence.
+        later_fence = store.begin_ctp_order_target_query(
+            scope,
+            reservation.managed_intent_id,
+            owner_handle=owner,
+            writer_lease=lease,
+        )
+        assert later_fence is not fence
+    finally:
+        store.close()
+
+    for variant in ("absent", "wrong-request", "missing-terminal", "unapplied"):
+        store, scope, _family_owner, lease, owner, adapter, binding, tags = _new_store_and_session(
+            tmp_path, f"trade-window-{variant}.sqlite3"
+        )
+        try:
+            reservation = _reserve(
+                store, scope, lease, binding, "trade-window-" + variant
+            )
+            fence = store.begin_ctp_order_target_query(
+                scope,
+                reservation.managed_intent_id,
+                owner_handle=owner,
+                writer_lease=lease,
+            )
+            if variant != "absent":
+                sequence = binding.source_high_watermark + 1
+                request_id = _REQUEST_ID + 1 if variant == "wrong-request" else _REQUEST_ID
+                is_last = variant != "missing-terminal"
+                _append_callback(
+                    adapter,
+                    owner,
+                    tags,
+                    "OnRspQryTrade",
+                    sequence,
+                    (None, SimpleNamespace(ErrorID=0, ErrorMsg=""), request_id, is_last),
+                    source_generation=binding.connection_generation,
+                    phase=CtpTraderCallbackPhase.ACTIVE,
+                )
+                if variant != "unapplied":
+                    result = adapter.apply_next_ingress(
+                        callback_verifier=None, trade_fact_verifier=None
+                    )
+                    assert result is not None
+            with pytest.raises((ContractValidationError, InvalidStateTransition)):
+                store.read_ctp_order_target_trade_query_window(
+                    scope,
+                    fence,
+                    query_request_id=_REQUEST_ID,
+                    owner_handle=owner,
+                    writer_lease=lease,
+                )
+        finally:
+            store.close()
+
+
 def _begin_window_and_projection(
     store,
     scope,
