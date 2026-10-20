@@ -15,8 +15,8 @@ import time
 import uuid
 from collections.abc import Mapping
 from contextlib import contextmanager, suppress
-from dataclasses import dataclass, fields, is_dataclass, replace
-from datetime import date
+from dataclasses import dataclass, field as dataclass_field, fields, is_dataclass, replace
+from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 from enum import Enum
 from functools import lru_cache
@@ -270,6 +270,12 @@ _CTP_ACCOUNT_STORE_TABLES = frozenset(
         "ctp_dispatch_cancel_postconditions",
         "ctp_dispatch_cancel_terminal_observations",
         "ctp_dispatch_cancel_postcondition_resolutions",
+        "ctp_dispatch_position_evidence_windows",
+        "ctp_position_baseline_submit_authorizations",
+        "ctp_position_baseline_submit_authorization_uses",
+        "ctp_position_dispatch_authorization_bindings",
+        "ctp_position_recovery_close_authorizations",
+        "ctp_position_recovery_close_authorization_uses",
     }
 )
 _CTP_ACCOUNT_STORE_INDEXES = frozenset(
@@ -293,6 +299,8 @@ _CTP_ACCOUNT_STORE_INDEXES = frozenset(
         "ctp_dispatch_managed_action_unique",
         "ctp_dispatch_native_action_ref_unique",
         "ctp_dispatch_local_queue_receipt_unique",
+        "ctp_position_window_intent_latest",
+        "ctp_position_recovery_close_auth_child",
     }
 )
 _CTP_ACCOUNT_STORE_TRIGGERS = frozenset(
@@ -349,6 +357,18 @@ _CTP_ACCOUNT_STORE_TRIGGERS = frozenset(
         "ctp_dispatch_cancel_terminal_observations_immutable_delete",
         "ctp_dispatch_cancel_postcondition_resolutions_immutable_update",
         "ctp_dispatch_cancel_postcondition_resolutions_immutable_delete",
+        "ctp_position_evidence_windows_immutable_update",
+        "ctp_position_evidence_windows_immutable_delete",
+        "ctp_position_baseline_authorizations_immutable_update",
+        "ctp_position_baseline_authorizations_immutable_delete",
+        "ctp_position_baseline_uses_immutable_update",
+        "ctp_position_baseline_uses_immutable_delete",
+        "ctp_position_dispatch_authorization_bindings_immutable_update",
+        "ctp_position_dispatch_authorization_bindings_immutable_delete",
+        "ctp_position_recovery_close_authorizations_immutable_update",
+        "ctp_position_recovery_close_authorizations_immutable_delete",
+        "ctp_position_recovery_close_uses_immutable_update",
+        "ctp_position_recovery_close_uses_immutable_delete",
         "ctp_dispatch_commands_immutable",
         "ctp_dispatch_queue_receipt_once",
     }
@@ -378,6 +398,9 @@ _CTP_ORDER_TARGET_QUERY_FENCE_TTL_NS = 30_000_000_000
 _CTP_ORDER_TARGET_QUERY_MAX_EVENTS = 256
 _CTP_ORDER_TARGET_QUERY_MAX_LIVE_FENCES = 32
 _CTP_ORDER_TARGET_QUERY_MAX_PROVENANCE = 256
+_CTP_POSITION_QUERY_FENCE_TTL_NS = 30_000_000_000
+_CTP_POSITION_QUERY_MAX_EVENTS = 256
+_CTP_POSITION_QUERY_MAX_WINDOWS = 256
 _CTP_CALLBACK_OWNER_POISON_CODES = frozenset(
     {
         "candidate_composition_failure",
@@ -1026,6 +1049,483 @@ class CtpOrderTargetQueryWindow:
             or self.observed_at_ns <= 0
         ):
             raise ContractValidationError("invalid CTP order-query callback window")
+
+
+@dataclass(frozen=True, slots=True)
+class CtpPositionEvidenceWindowFence:
+    """One-use native-query authority for a position snapshot under an OPEN intent."""
+
+    fence_id: str
+    owner_handle: CtpCallbackSessionOwnerHandle
+    account_key: str
+    scope_key: str
+    trading_day: str
+    managed_intent_id: str
+    runtime_order_id: str
+    order_ref: str
+    writer_owner_id: str
+    writer_fencing_token: int
+    session_binding_sha256: str
+    session_generation_id: str
+    connection_generation: int
+    source_tags: tuple[str, str, str, str, int, int]
+    start_source_sequence: int
+    created_at_utc: datetime
+    created_at_ns: int
+    expires_at_ns: int
+
+    def __post_init__(self) -> None:
+        if (
+            not _is_local_queue_receipt_id(self.fence_id)
+            or type(self.owner_handle) is not CtpCallbackSessionOwnerHandle
+            or not _is_prefixed_digest(self.account_key, "account:")
+            or not _is_prefixed_digest(self.scope_key, "scope:")
+            or self.owner_handle.account_key != self.account_key
+            or self.owner_handle.scope_key != self.scope_key
+        ):
+            raise ContractValidationError("invalid CTP position-query fence identity")
+        for name in ("managed_intent_id", "runtime_order_id", "writer_owner_id", "session_generation_id"):
+            _validate_correlation_text(getattr(self, name), "CTP position fence " + name)
+        if (
+            type(self.trading_day) is not str
+            or len(self.trading_day) != 8
+            or not self.trading_day.isascii()
+            or not self.trading_day.isdigit()
+            or type(self.order_ref) is not str
+            or len(self.order_ref) != 12
+            or not self.order_ref.isascii()
+            or not self.order_ref.isdigit()
+            or not _is_sha256(self.session_binding_sha256)
+            or type(self.source_tags) is not tuple
+            or len(self.source_tags) != 6
+            or any(type(value) is not str or not value for value in self.source_tags[:4])
+            or type(self.source_tags[4]) is not int
+            or self.source_tags[4] <= 0
+            or type(self.source_tags[5]) is not int
+            or self.source_tags[5] < 0
+            or type(self.created_at_utc) is not datetime
+            or self.created_at_utc.tzinfo is None
+            or self.created_at_utc.utcoffset() is None
+        ):
+            raise ContractValidationError("invalid CTP position-query fence binding")
+        for name in (
+            "writer_fencing_token",
+            "connection_generation",
+            "start_source_sequence",
+            "created_at_ns",
+            "expires_at_ns",
+        ):
+            value = getattr(self, name)
+            minimum = 0 if name in {"connection_generation", "start_source_sequence"} else 1
+            if type(value) is not int or value < minimum:
+                raise ContractValidationError("invalid CTP position-query fence " + name)
+        if (
+            self.expires_at_ns <= self.created_at_ns
+            or self.expires_at_ns - self.created_at_ns > _CTP_POSITION_QUERY_FENCE_TTL_NS
+        ):
+            raise ContractValidationError("invalid CTP position-query fence lifetime")
+
+
+@dataclass(frozen=True, slots=True)
+class CtpPositionEvidenceWindowRow:
+    """Immutable Store readback of one durable position-query callback window."""
+
+    owner_intent_id: str
+    managed_intent_id: str
+    runtime_order_id: str
+    order_ref: str
+    fence_id: str
+    window_id: str
+    query_request_id: int
+    account_fingerprint: str
+    trading_day: str
+    connection_generation: int
+    session_binding_sha256: str
+    source_tags: tuple[str, str, str, str, int, int]
+    writer_owner_id: str
+    writer_fencing_token: int
+    start_source_sequence: int
+    end_source_sequence: int
+    first_callback_sequence: int
+    last_callback_sequence: int
+    callback_sequences: tuple[int, ...]
+    callback_digests: tuple[str, ...]
+    source_sequences: tuple[int, ...]
+    source_digests: tuple[str, ...]
+    source_hash: str
+    started_at_utc: datetime
+    completed_at_utc: datetime
+    expires_at_utc: datetime
+    started_monotonic: float
+    completed_monotonic: float
+    expires_monotonic: float
+    clock_domain_id: str
+    started_monotonic_ns: int
+    completed_monotonic_ns: int
+    expires_monotonic_ns: int
+    query_envelope: Mapping[str, Any]
+    positions: tuple[Mapping[str, Any], ...]
+    row_digest: str
+    created_at_ns: int
+    _store_seal: object = dataclass_field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if (
+            not _is_local_queue_receipt_id(self.owner_intent_id)
+            or not _is_local_queue_receipt_id(self.fence_id)
+            or not _is_local_queue_receipt_id(self.window_id)
+            or not _is_sha256(self.session_binding_sha256)
+            or not _is_sha256(self.source_hash)
+            or not _is_sha256(self.row_digest)
+        ):
+            raise ContractValidationError("invalid CTP position evidence window identity")
+        for name in ("managed_intent_id", "runtime_order_id", "writer_owner_id"):
+            _validate_correlation_text(getattr(self, name), "CTP position window " + name)
+        if (
+            type(self.order_ref) is not str
+            or len(self.order_ref) != 12
+            or not self.order_ref.isascii()
+            or not self.order_ref.isdigit()
+            or type(self.query_request_id) is not int
+            or not 0 < self.query_request_id <= 2_147_483_647
+            or type(self.account_fingerprint) is not str
+            or len(self.account_fingerprint) != 16
+            or any(char not in "0123456789abcdef" for char in self.account_fingerprint)
+            or type(self.trading_day) is not str
+            or len(self.trading_day) != 8
+            or not self.trading_day.isascii()
+            or not self.trading_day.isdigit()
+            or type(self.session_binding_sha256) is not str
+            or type(self.source_tags) is not tuple
+            or len(self.source_tags) != 6
+            or any(type(value) is not str or not value for value in self.source_tags[:4])
+            or type(self.source_tags[4]) is not int
+            or self.source_tags[4] <= 0
+            or type(self.source_tags[5]) is not int
+            or self.source_tags[5] < 0
+        ):
+            raise ContractValidationError("invalid CTP position evidence window binding")
+        for name in (
+            "connection_generation",
+            "writer_fencing_token",
+            "start_source_sequence",
+            "end_source_sequence",
+            "first_callback_sequence",
+            "last_callback_sequence",
+            "started_monotonic_ns",
+            "completed_monotonic_ns",
+            "expires_monotonic_ns",
+            "created_at_ns",
+        ):
+            value = getattr(self, name)
+            minimum = 0 if name in {"connection_generation", "start_source_sequence"} else 1
+            if type(value) is not int or value < minimum:
+                raise ContractValidationError("invalid CTP position evidence window " + name)
+        if (
+            type(self.callback_sequences) is not tuple
+            or not self.callback_sequences
+            or len(self.callback_sequences) > _CTP_POSITION_QUERY_MAX_EVENTS
+            or type(self.callback_sequences) is not tuple
+            or tuple(sorted(set(self.callback_sequences))) != self.callback_sequences
+            or self.callback_sequences[0] <= self.start_source_sequence
+            or self.callback_sequences[-1] > self.end_source_sequence
+            or self.first_callback_sequence != self.callback_sequences[0]
+            or self.last_callback_sequence != self.callback_sequences[-1]
+            or type(self.callback_digests) is not tuple
+            or len(self.callback_digests) != len(self.callback_sequences)
+            or any(not _is_sha256(digest) for digest in self.callback_digests)
+            or type(self.source_sequences) is not tuple
+            or self.source_sequences
+            != tuple(range(self.start_source_sequence + 1, self.end_source_sequence + 1))
+            or type(self.source_digests) is not tuple
+            or len(self.source_digests) != len(self.source_sequences)
+            or any(not _is_sha256(digest) for digest in self.source_digests)
+            or type(self.positions) is not tuple
+            or any(not isinstance(position, Mapping) for position in self.positions)
+            or not isinstance(self.query_envelope, Mapping)
+            or type(self.started_monotonic) not in (int, float)
+            or isinstance(self.started_monotonic, bool)
+            or type(self.completed_monotonic) not in (int, float)
+            or isinstance(self.completed_monotonic, bool)
+            or type(self.expires_monotonic) not in (int, float)
+            or isinstance(self.expires_monotonic, bool)
+            or type(self.clock_domain_id) is not str
+            or not self.clock_domain_id
+            or any(
+                type(value) is not datetime or value.tzinfo is None or value.utcoffset() is None
+                for value in (self.started_at_utc, self.completed_at_utc, self.expires_at_utc)
+            )
+            or not self.started_at_utc <= self.completed_at_utc < self.expires_at_utc
+            or not self.started_monotonic <= self.completed_monotonic < self.expires_monotonic
+            or not self.started_monotonic_ns <= self.completed_monotonic_ns
+            < self.expires_monotonic_ns
+            or self.created_at_ns <= 0
+        ):
+            raise ContractValidationError("invalid CTP position evidence window contents")
+
+
+@dataclass(frozen=True, slots=True)
+class CtpPositionEvidenceWindowHandle:
+    """Opaque same-Store handle for one finalized historical observation."""
+
+    window_id: str
+    row_digest: str
+    _store_seal: object = dataclass_field(repr=False, compare=False)
+
+
+@dataclass(frozen=True, slots=True)
+class CtpPositionBaselineSubmitAuthorization:
+    """One Store-issued use of a fresh pre-submit CTP position baseline."""
+
+    authorization_id: str
+    owner_intent_id: str
+    account_key: str
+    scope_key: str
+    trading_day: str
+    managed_intent_id: str
+    runtime_order_id: str
+    order_ref: str
+    window_id: str
+    row_digest: str
+    session_binding_sha256: str
+    session_generation_id: str
+    connection_generation: int
+    source_tags: tuple[str, str, str, str, int, int]
+    end_source_sequence: int
+    permit_reference_sha256: str
+    basic_admission_reference_sha256: str
+    writer_owner_id: str
+    writer_fencing_token: int
+    created_at_ns: int
+    expires_at_ns: int
+    _store_seal: object = dataclass_field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if (
+            not _is_local_queue_receipt_id(self.authorization_id)
+            or not _is_local_queue_receipt_id(self.owner_intent_id)
+            or not _is_local_queue_receipt_id(self.window_id)
+            or not _is_prefixed_digest(self.account_key, "account:")
+            or not _is_prefixed_digest(self.scope_key, "scope:")
+            or not _is_sha256(self.row_digest)
+            or not _is_sha256(self.session_binding_sha256)
+            or not _is_sha256(self.permit_reference_sha256)
+            or not _is_sha256(self.basic_admission_reference_sha256)
+        ):
+            raise ContractValidationError("invalid CTP position baseline authorization identity")
+        for name in ("managed_intent_id", "runtime_order_id", "writer_owner_id", "session_generation_id"):
+            _validate_correlation_text(getattr(self, name), "CTP position authorization " + name)
+        if (
+            type(self.trading_day) is not str
+            or len(self.trading_day) != 8
+            or not self.trading_day.isascii()
+            or not self.trading_day.isdigit()
+            or type(self.order_ref) is not str
+            or len(self.order_ref) != 12
+            or not self.order_ref.isascii()
+            or not self.order_ref.isdigit()
+            or type(self.source_tags) is not tuple
+            or len(self.source_tags) != 6
+            or any(type(value) is not str or not value for value in self.source_tags[:4])
+            or type(self.source_tags[4]) is not int
+            or self.source_tags[4] <= 0
+            or type(self.source_tags[5]) is not int
+            or self.source_tags[5] < 0
+            or type(self.connection_generation) is not int
+            or self.connection_generation <= 0
+            or type(self.end_source_sequence) is not int
+            or self.end_source_sequence <= 0
+            or type(self.writer_fencing_token) is not int
+            or self.writer_fencing_token <= 0
+            or type(self.created_at_ns) is not int
+            or self.created_at_ns <= 0
+            or type(self.expires_at_ns) is not int
+            or self.expires_at_ns <= self.created_at_ns
+        ):
+            raise ContractValidationError("invalid CTP position baseline authorization binding")
+
+
+@dataclass(frozen=True, slots=True)
+class CtpRecoveryCloseSourceFacts:
+    """Read-only Store projection for one parent-fill-attributed CTP reduction.
+
+    This DTO is descriptive only. A Risk allocation and a separate
+    ``CtpRecoveryCloseDispatchAuthorization`` are required before dispatch.
+    """
+
+    account_key: str
+    scope_key: str
+    book_id: str
+    trading_day: str
+    parent_intent_id: str
+    parent_order_intent_sha256: str
+    parent_permit_id: str
+    parent_command_id: str
+    parent_runtime_order_id: str
+    parent_order_ref: str
+    recovery_intent_id: str
+    runtime_order_id: str
+    order_ref: str
+    owner_intent_id: str
+    session_binding_sha256: str
+    session_generation_id: str
+    connection_generation: int
+    journal_incarnation_id: str
+    instrument: str
+    strategy_id: str
+    allocation_version: str
+    quantity_unit: str
+    parent_order_side: str
+    recovery_order_side: str
+    parent_position_side: str
+    parent_position_bucket: str
+    position_side: str
+    position_bucket: str
+    parent_filled_quantity: Decimal
+    attributable_position_quantity: Decimal
+    source_revision: int
+    source_evidence_sha256: str
+    parent_callback_source_sha256: str
+    baseline_window_id: str
+    baseline_window_digest_sha256: str
+    position_window_id: str
+    position_window_digest_sha256: str
+    parent_trade_ids: tuple[str, ...]
+    observed_at_ns: int
+    valid_until_ns: int
+    writer_owner_id: str
+    writer_fencing_token: int
+
+    def __post_init__(self) -> None:
+        for name in (
+            "account_key", "scope_key", "book_id", "trading_day", "parent_intent_id",
+            "parent_permit_id", "parent_command_id", "parent_runtime_order_id",
+            "parent_order_ref", "recovery_intent_id", "runtime_order_id", "order_ref",
+            "owner_intent_id", "session_generation_id", "journal_incarnation_id",
+            "instrument", "strategy_id", "allocation_version", "quantity_unit",
+            "writer_owner_id",
+        ):
+            value = getattr(self, name)
+            if type(value) is not str or not value or value != value.strip():
+                raise ContractValidationError("invalid CTP recovery source " + name)
+        for name in (
+            "parent_order_intent_sha256", "session_binding_sha256",
+            "source_evidence_sha256", "parent_callback_source_sha256",
+            "baseline_window_digest_sha256", "position_window_digest_sha256",
+        ):
+            if not _is_sha256(getattr(self, name)):
+                raise ContractValidationError("invalid CTP recovery source " + name)
+        for name in ("baseline_window_id", "position_window_id"):
+            if not _is_local_queue_receipt_id(getattr(self, name)):
+                raise ContractValidationError("invalid CTP recovery source " + name)
+        if (
+            len(self.trading_day) != 8 or not self.trading_day.isascii()
+            or not self.trading_day.isdigit()
+            or len(self.parent_order_ref) != 12 or not self.parent_order_ref.isdigit()
+            or len(self.order_ref) != 12 or not self.order_ref.isdigit()
+            or self.parent_order_side not in {"BUY", "SELL"}
+            or self.recovery_order_side not in {"BUY", "SELL"}
+            or self.parent_order_side == self.recovery_order_side
+            or self.parent_position_side not in {"NET", "LONG", "SHORT"}
+            or self.parent_position_bucket not in {"ALL", "TODAY", "YESTERDAY"}
+            or self.position_side not in {"LONG", "SHORT"}
+            or self.position_bucket not in {"TODAY", "YESTERDAY"}
+            or (self.parent_position_side == "NET" and self.parent_position_bucket != "ALL")
+            or (self.parent_position_side not in {"NET", self.position_side})
+            or (self.parent_position_bucket not in {"ALL", self.position_bucket})
+            or type(self.connection_generation) is not int or self.connection_generation <= 0
+            or type(self.source_revision) is not int or self.source_revision <= 0
+            or type(self.writer_fencing_token) is not int or self.writer_fencing_token <= 0
+            or type(self.observed_at_ns) is not int or self.observed_at_ns <= 0
+            or type(self.valid_until_ns) is not int or self.valid_until_ns <= self.observed_at_ns
+            or type(self.parent_trade_ids) is not tuple or not self.parent_trade_ids
+            or any(type(item) is not str or not item for item in self.parent_trade_ids)
+            or len(set(self.parent_trade_ids)) != len(self.parent_trade_ids)
+        ):
+            raise ContractValidationError("invalid CTP recovery source facts")
+        if (
+            type(self.parent_filled_quantity) is not Decimal
+            or type(self.attributable_position_quantity) is not Decimal
+        ):
+            raise ContractValidationError("CTP recovery source quantities must be exact Decimals")
+        parent_quantity = self.parent_filled_quantity
+        attributable_quantity = self.attributable_position_quantity
+        if (
+            not parent_quantity.is_finite() or not attributable_quantity.is_finite()
+            or parent_quantity <= 0 or attributable_quantity <= 0
+            or attributable_quantity > parent_quantity
+        ):
+            raise ContractValidationError("invalid CTP recovery source quantities")
+        object.__setattr__(self, "parent_filled_quantity", parent_quantity)
+        object.__setattr__(self, "attributable_position_quantity", attributable_quantity)
+
+
+@dataclass(frozen=True, slots=True)
+class CtpRecoveryCloseDispatchAuthorization:
+    """Store-issued one-use authorization for one proved recovery CLOSE."""
+
+    authorization_id: str
+    account_key: str
+    scope_key: str
+    owner_intent_id: str
+    parent_intent_id: str
+    child_intent_id: str
+    runtime_order_id: str
+    order_ref: str
+    position_window_id: str
+    position_window_digest_sha256: str
+    baseline_window_id: str
+    baseline_window_digest_sha256: str
+    session_binding_sha256: str
+    session_generation_id: str
+    connection_generation: int
+    journal_incarnation_id: str
+    parent_permit_id: str
+    recovery_permit_id: str
+    recovery_allocation_sha256: str
+    source_proof_sha256: str
+    source_evidence_sha256: str
+    source_revision: int
+    child_intent_sha256: str
+    writer_owner_id: str
+    writer_fencing_token: int
+    created_at_ns: int
+    expires_at_ns: int
+    _store_seal: object = dataclass_field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        for name in (
+            "account_key", "scope_key", "owner_intent_id", "parent_intent_id",
+            "child_intent_id", "runtime_order_id", "session_generation_id",
+            "journal_incarnation_id", "parent_permit_id", "recovery_permit_id",
+            "writer_owner_id",
+        ):
+            value = getattr(self, name)
+            if type(value) is not str or not value or value != value.strip():
+                raise ContractValidationError("invalid CTP recovery authorization " + name)
+        if not _is_local_queue_receipt_id(self.authorization_id):
+            raise ContractValidationError("invalid CTP recovery authorization id")
+        for name in ("position_window_id", "baseline_window_id"):
+            if not _is_local_queue_receipt_id(getattr(self, name)):
+                raise ContractValidationError("invalid CTP recovery authorization " + name)
+        for name in (
+            "position_window_digest_sha256", "baseline_window_digest_sha256",
+            "session_binding_sha256", "recovery_allocation_sha256",
+            "source_proof_sha256", "source_evidence_sha256", "child_intent_sha256",
+        ):
+            if not _is_sha256(getattr(self, name)):
+                raise ContractValidationError("invalid CTP recovery authorization " + name)
+        if (
+            type(self.order_ref) is not str or len(self.order_ref) != 12
+            or not self.order_ref.isascii() or not self.order_ref.isdigit()
+            or type(self.connection_generation) is not int or self.connection_generation <= 0
+            or type(self.source_revision) is not int or self.source_revision <= 0
+            or type(self.writer_fencing_token) is not int or self.writer_fencing_token <= 0
+            or type(self.created_at_ns) is not int or self.created_at_ns <= 0
+            or type(self.expires_at_ns) is not int or self.expires_at_ns <= self.created_at_ns
+            or self._store_seal is None
+        ):
+            raise ContractValidationError("invalid CTP recovery dispatch authorization")
 
 
 @dataclass(frozen=True, slots=True)
@@ -2862,14 +3362,19 @@ class SqliteExecutionStore:
     # Version 22 adds the immutable group-permit binding to execution rows.
     # Version 23 adds a fenced append-only financial baseline/event ledger.
     # Version 24 binds one immutable configured scope set to each new callback owner.
-    _SCHEMA_VERSION = 24
+    # Version 25 adds append-only position-query audit windows and one-use
+    # baseline-before-first-submit authorization records. Version 26 adds
+    # exact command bindings and one-use typed recovery-close dispatch proofs.
+    _SCHEMA_VERSION = 26
 
     def __init__(self, path: str | Path, *, busy_timeout_ms: int = 5_000) -> None:
         if type(busy_timeout_ms) is not int or busy_timeout_ms <= 0:
             raise ContractValidationError("invalid busy_timeout_ms")
         self.path = str(path)
         if self.path != ":memory:":
-            Path(self.path).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
+            target = Path(self.path).expanduser()
+            self._preflight_current_ctp_schema_before_write(target)
+            target.resolve().parent.mkdir(parents=True, exist_ok=True)
         try:
             self._connection = sqlite3.connect(
                 self.path,
@@ -2896,6 +3401,39 @@ class SqliteExecutionStore:
                 str, CtpOrderTargetQueryProvenance
             ] = {}
             self._reserved_ctp_order_target_query_provenance: set[str] = set()
+            self._issued_ctp_position_query_fences: dict[
+                str, CtpPositionEvidenceWindowFence
+            ] = {}
+            self._active_ctp_position_query_fences: dict[str, str] = {}
+            self._issued_ctp_position_window_handles: dict[
+                str, CtpPositionEvidenceWindowHandle
+            ] = {}
+            self._issued_ctp_position_window_rows: dict[
+                str, CtpPositionEvidenceWindowRow
+            ] = {}
+            self._issued_ctp_position_window_evidence: dict[str, Any] = {}
+            self._ctp_position_query_issuers: dict[str, object] = {}
+            self._ctp_position_query_request_ids: set[tuple[str, int]] = set()
+            self._ctp_position_window_seal = object()
+            self._issued_ctp_position_baseline_authorizations: dict[
+                str, CtpPositionBaselineSubmitAuthorization
+            ] = {}
+            self._ctp_position_baseline_authorization_seal = object()
+            self._issued_ctp_recovery_source_facts: dict[str, CtpRecoveryCloseSourceFacts] = {}
+            self._issued_ctp_recovery_source_proofs: dict[str, Any] = {}
+            self._issued_ctp_recovery_parent_snapshots: dict[
+                str, CtpOwnerCallbackObservationSnapshotV1
+            ] = {}
+            self._issued_ctp_recovery_parent_permits: dict[str, Any] = {}
+            self._issued_ctp_recovery_source_authorities: dict[int, object] = {}
+            self._issued_ctp_recovery_authorizations: dict[
+                str, CtpRecoveryCloseDispatchAuthorization
+            ] = {}
+            self._issued_ctp_recovery_allocation_verifiers: dict[str, Any] = {}
+            self._issued_ctp_recovery_allocations: dict[str, Any] = {}
+            self._issued_ctp_recovery_intents: dict[str, Any] = {}
+            self._ctp_recovery_authorization_seal = object()
+            self._ctp_recovery_source_authority_seal = object()
             self._issued_ctp_account_family_owners: dict[str, CtpAccountFamilyOwnerHandle] = {}
             self._issued_ctp_callback_session_owners: dict[str, CtpCallbackSessionOwnerHandle] = {}
             self._issued_ctp_callback_session_adapters: dict[str, object] = {}
@@ -2921,6 +3459,23 @@ class SqliteExecutionStore:
             self._active_ctp_order_target_query_fences.clear()
             self._issued_ctp_order_target_query_provenance.clear()
             self._reserved_ctp_order_target_query_provenance.clear()
+            self._issued_ctp_position_query_fences.clear()
+            self._active_ctp_position_query_fences.clear()
+            self._issued_ctp_position_window_handles.clear()
+            self._issued_ctp_position_window_rows.clear()
+            self._issued_ctp_position_window_evidence.clear()
+            self._ctp_position_query_issuers.clear()
+            self._ctp_position_query_request_ids.clear()
+            self._issued_ctp_position_baseline_authorizations.clear()
+            self._issued_ctp_recovery_source_facts.clear()
+            self._issued_ctp_recovery_source_proofs.clear()
+            self._issued_ctp_recovery_parent_snapshots.clear()
+            self._issued_ctp_recovery_parent_permits.clear()
+            self._issued_ctp_recovery_source_authorities.clear()
+            self._issued_ctp_recovery_authorizations.clear()
+            self._issued_ctp_recovery_allocation_verifiers.clear()
+            self._issued_ctp_recovery_allocations.clear()
+            self._issued_ctp_recovery_intents.clear()
 
     def journal_source_identity(self) -> dict[str, str | int]:
         """Return the persisted local journal lineage, not provider authority."""
@@ -6780,6 +7335,82 @@ class SqliteExecutionStore:
         )
 
     @classmethod
+    def _preflight_current_ctp_schema_before_write(cls, path: Path) -> None:
+        """Reject damaged current CTP schemas before a writable open can repair them.
+
+        ``_create_schema`` intentionally uses ``CREATE IF NOT EXISTS`` for
+        migrations.  When an already-current journal is missing a durable
+        authority object, however, that behavior would silently create an
+        empty replacement and hide that the journal was damaged.  Inspect the
+        version marker read-only here; older versions remain on the existing
+        migration path.
+        """
+
+        if not path.is_file():
+            return
+        connection: sqlite3.Connection | None = None
+        try:
+            resolved_path = path.resolve(strict=True)
+            connection = sqlite3.connect(
+                f"{resolved_path.as_uri()}?mode=ro",
+                uri=True,
+                isolation_level=None,
+                timeout=1.0,
+            )
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA query_only = ON")
+            connection.execute("BEGIN")
+            database_row = connection.execute("PRAGMA database_list").fetchone()
+            if (
+                database_row is None
+                or database_row[1] != "main"
+                or os.path.normcase(str(Path(str(database_row[2])).resolve(strict=True)))
+                != os.path.normcase(str(resolved_path))
+            ):
+                raise DurableStoreError("execution store opened an unexpected database file")
+            tables = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+            if "execution_meta" not in tables:
+                return
+            meta_columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(execution_meta)").fetchall()
+            }
+            if not {"key", "value"}.issubset(meta_columns):
+                return
+            version_row = connection.execute(
+                "SELECT value FROM execution_meta WHERE key = 'schema_version'"
+            ).fetchone()
+            if version_row is None or str(version_row[0]) != str(cls._SCHEMA_VERSION):
+                return
+            if tables - {"sqlite_sequence"} != _CTP_ACCOUNT_STORE_TABLES:
+                raise DurableStoreError(
+                    "current CTP execution store schema is incomplete or unknown"
+                )
+            if (
+                cls._ctp_store_schema_objects(connection)
+                != cls._code_owned_ctp_store_schema_objects()
+            ):
+                raise DurableStoreError(
+                    "current CTP execution store schema definitions do not match code"
+                )
+        except DurableStoreError:
+            raise
+        except (OSError, sqlite3.Error) as error:
+            raise DurableStoreError(
+                "unable to inspect current CTP execution store schema"
+            ) from error
+        finally:
+            if connection is not None:
+                with suppress(sqlite3.Error):
+                    connection.rollback()
+                connection.close()
+
+    @classmethod
     @lru_cache(maxsize=1)
     def _code_owned_ctp_store_schema_objects(cls) -> tuple[tuple[str, ...], ...]:
         """Build the exact current schema from code in an isolated memory DB."""
@@ -6881,29 +7512,63 @@ class SqliteExecutionStore:
                 for row in connection.execute("SELECT key, value FROM execution_meta").fetchall()
             }
             schema_version = metadata.get("schema_version")
-            if schema_version not in {"23", str(cls._SCHEMA_VERSION)}:
+            if schema_version not in {"23", "24", "25", str(cls._SCHEMA_VERSION)}:
                 raise DurableStoreError("existing CTP execution store schema is not current")
             non_internal_tables = tables - {"sqlite_sequence"}
             legacy_scope_set_table = "ctp_dispatch_callback_session_owner_scopes"
-            expected_tables = (
-                _CTP_ACCOUNT_STORE_TABLES - {legacy_scope_set_table}
-                if schema_version == "23"
-                else _CTP_ACCOUNT_STORE_TABLES
-            )
+            position_tables = {
+                "ctp_dispatch_position_evidence_windows",
+                "ctp_position_baseline_submit_authorizations",
+                "ctp_position_baseline_submit_authorization_uses",
+            }
+            recovery_tables = {
+                "ctp_position_dispatch_authorization_bindings",
+                "ctp_position_recovery_close_authorizations",
+                "ctp_position_recovery_close_authorization_uses",
+            }
+            expected_tables = _CTP_ACCOUNT_STORE_TABLES
+            if schema_version in {"23", "24"}:
+                expected_tables = expected_tables - position_tables
+            if schema_version in {"23", "24", "25"}:
+                expected_tables = expected_tables - recovery_tables
+            if schema_version == "23":
+                expected_tables = expected_tables - {legacy_scope_set_table}
             if non_internal_tables != expected_tables:
                 raise DurableStoreError(
                     "existing CTP execution store schema is incomplete or unknown"
                 )
             expected_schema_objects = cls._code_owned_ctp_store_schema_objects()
-            if schema_version == "23":
+            if schema_version in {"23", "24", "25"}:
+                legacy_position_objects = recovery_tables | {
+                    "ctp_position_recovery_close_auth_child",
+                    "ctp_position_dispatch_authorization_bindings_immutable_update",
+                    "ctp_position_dispatch_authorization_bindings_immutable_delete",
+                    "ctp_position_recovery_authorizations_immutable_update",
+                    "ctp_position_recovery_authorizations_immutable_delete",
+                    "ctp_position_recovery_uses_immutable_update",
+                    "ctp_position_recovery_uses_immutable_delete",
+                }
+                if schema_version in {"23", "24"}:
+                    legacy_position_objects |= position_tables | {
+                        "ctp_position_window_intent_latest",
+                        "ctp_position_evidence_windows_immutable_update",
+                        "ctp_position_evidence_windows_immutable_delete",
+                        "ctp_position_baseline_authorizations_immutable_update",
+                        "ctp_position_baseline_authorizations_immutable_delete",
+                        "ctp_position_baseline_uses_immutable_update",
+                        "ctp_position_baseline_uses_immutable_delete",
+                    }
                 legacy_scope_objects = {
                     legacy_scope_set_table,
                     "ctp_callback_session_owner_scopes_owner_match",
                     "ctp_callback_session_owner_scopes_immutable_update",
                     "ctp_callback_session_owner_scopes_immutable_delete",
                 }
+                omitted_objects = legacy_position_objects | (
+                    legacy_scope_objects if schema_version == "23" else set()
+                )
                 expected_schema_objects = tuple(
-                    item for item in expected_schema_objects if item[1] not in legacy_scope_objects
+                    item for item in expected_schema_objects if item[1] not in omitted_objects
                 )
             if (
                 cls._ctp_store_schema_objects(connection)
@@ -6926,16 +7591,31 @@ class SqliteExecutionStore:
                     "SELECT name FROM sqlite_master WHERE type = 'trigger'"
                 ).fetchall()
             }
-            expected_triggers = (
-                _CTP_ACCOUNT_STORE_TRIGGERS
-                - {
-                    "ctp_callback_session_owner_scopes_owner_match",
-                    "ctp_callback_session_owner_scopes_immutable_update",
-                    "ctp_callback_session_owner_scopes_immutable_delete",
+            expected_triggers = _CTP_ACCOUNT_STORE_TRIGGERS
+            if schema_version in {"23", "24", "25"}:
+                expected_triggers = expected_triggers - {
+                    "ctp_position_dispatch_authorization_bindings_immutable_update",
+                    "ctp_position_dispatch_authorization_bindings_immutable_delete",
+                    "ctp_position_recovery_authorizations_immutable_update",
+                    "ctp_position_recovery_authorizations_immutable_delete",
+                    "ctp_position_recovery_uses_immutable_update",
+                    "ctp_position_recovery_uses_immutable_delete",
                 }
-                if schema_version == "23"
-                else _CTP_ACCOUNT_STORE_TRIGGERS
-            )
+                if schema_version in {"23", "24"}:
+                    expected_triggers = expected_triggers - {
+                        "ctp_position_evidence_windows_immutable_update",
+                        "ctp_position_evidence_windows_immutable_delete",
+                        "ctp_position_baseline_authorizations_immutable_update",
+                        "ctp_position_baseline_authorizations_immutable_delete",
+                        "ctp_position_baseline_uses_immutable_update",
+                        "ctp_position_baseline_uses_immutable_delete",
+                    }
+                if schema_version == "23":
+                    expected_triggers = expected_triggers - {
+                        "ctp_callback_session_owner_scopes_owner_match",
+                        "ctp_callback_session_owner_scopes_immutable_update",
+                        "ctp_callback_session_owner_scopes_immutable_delete",
+                    }
             if triggers != expected_triggers:
                 raise DurableStoreError(
                     "CTP execution store trigger schema is incomplete or unknown"
@@ -6949,7 +7629,12 @@ class SqliteExecutionStore:
             explicit_indexes = {
                 name for name in indexes if not name.startswith("sqlite_autoindex_")
             }
-            if explicit_indexes != _CTP_ACCOUNT_STORE_INDEXES:
+            expected_indexes = _CTP_ACCOUNT_STORE_INDEXES
+            if schema_version in {"23", "24", "25"}:
+                expected_indexes = expected_indexes - {"ctp_position_recovery_close_auth_child"}
+            if schema_version in {"23", "24"}:
+                expected_indexes = expected_indexes - {"ctp_position_window_intent_latest"}
+            if explicit_indexes != expected_indexes:
                 raise DurableStoreError("CTP execution store index schema is incomplete or unknown")
             identity_rows = connection.execute(
                 "SELECT * FROM ctp_account_store_identity"
@@ -9128,7 +9813,7 @@ class SqliteExecutionStore:
             raise ContractValidationError("Store-issued CTP callback ingress event is required")
         if event.callback_class not in {"AUDIT_QUERY", "AUDIT_INFORMATIONAL"}:
             raise ContractValidationError("CTP callback event is not audit-only")
-        account_key, _, scope_key = self._validate_ctp_order_identity_scope(scope)
+        account_key, trading_day, scope_key = self._validate_ctp_order_identity_scope(scope)
         if (
             account_key != event.owner_handle.account_key
             or scope_key != event.owner_handle.scope_key
@@ -11232,6 +11917,245 @@ class SqliteExecutionStore:
                 BEGIN
                     SELECT RAISE(ABORT, 'CTP cancel postcondition resolution is immutable');
                 END;
+                CREATE TABLE IF NOT EXISTS ctp_dispatch_position_evidence_windows (
+                    account_key TEXT NOT NULL,
+                    scope_key TEXT NOT NULL,
+                    owner_intent_id TEXT NOT NULL,
+                    managed_intent_id TEXT NOT NULL,
+                    runtime_order_id TEXT NOT NULL,
+                    order_ref TEXT NOT NULL
+                        CHECK(length(order_ref) = 12 AND order_ref NOT GLOB '*[^0-9]*'),
+                    window_id TEXT NOT NULL
+                        CHECK(length(window_id) = 32 AND window_id NOT GLOB '*[^0-9a-f]*'),
+                    fence_id TEXT NOT NULL
+                        CHECK(length(fence_id) = 32 AND fence_id NOT GLOB '*[^0-9a-f]*'),
+                    query_request_id INTEGER NOT NULL CHECK(query_request_id > 0),
+                    trading_day TEXT NOT NULL
+                        CHECK(length(trading_day) = 8 AND trading_day NOT GLOB '*[^0-9]*'),
+                    source_hash TEXT NOT NULL CHECK(length(source_hash) = 64),
+                    row_digest_sha256 TEXT NOT NULL CHECK(length(row_digest_sha256) = 64),
+                    start_source_sequence INTEGER NOT NULL CHECK(start_source_sequence >= 0),
+                    end_source_sequence INTEGER NOT NULL CHECK(end_source_sequence > start_source_sequence),
+                    window_payload_json TEXT NOT NULL,
+                    writer_owner_id TEXT NOT NULL,
+                    writer_fencing_token INTEGER NOT NULL CHECK(writer_fencing_token > 0),
+                    created_at_ns INTEGER NOT NULL CHECK(created_at_ns > 0),
+                    PRIMARY KEY(account_key, window_id),
+                    UNIQUE(owner_intent_id, query_request_id),
+                    UNIQUE(account_key, fence_id),
+                    FOREIGN KEY(owner_intent_id)
+                        REFERENCES ctp_dispatch_callback_session_owners(owner_intent_id),
+                    FOREIGN KEY(account_key, runtime_order_id)
+                        REFERENCES ctp_order_identity_reservations(account_key, runtime_order_id)
+                );
+                CREATE INDEX IF NOT EXISTS ctp_position_window_intent_latest
+                    ON ctp_dispatch_position_evidence_windows(
+                        account_key, scope_key, managed_intent_id, created_at_ns, window_id
+                    );
+                CREATE TRIGGER IF NOT EXISTS ctp_position_evidence_windows_immutable_update
+                BEFORE UPDATE ON ctp_dispatch_position_evidence_windows
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP position evidence window is immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS ctp_position_evidence_windows_immutable_delete
+                BEFORE DELETE ON ctp_dispatch_position_evidence_windows
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP position evidence window is permanent');
+                END;
+                CREATE TABLE IF NOT EXISTS ctp_position_baseline_submit_authorizations (
+                    account_key TEXT NOT NULL,
+                    authorization_id TEXT NOT NULL
+                        CHECK(length(authorization_id) = 32
+                              AND authorization_id NOT GLOB '*[^0-9a-f]*'),
+                    scope_key TEXT NOT NULL,
+                    owner_intent_id TEXT NOT NULL,
+                    managed_intent_id TEXT NOT NULL,
+                    runtime_order_id TEXT NOT NULL,
+                    order_ref TEXT NOT NULL
+                        CHECK(length(order_ref) = 12 AND order_ref NOT GLOB '*[^0-9]*'),
+                    window_id TEXT NOT NULL,
+                    row_digest_sha256 TEXT NOT NULL CHECK(length(row_digest_sha256) = 64),
+                    permit_reference_sha256 TEXT NOT NULL
+                        CHECK(length(permit_reference_sha256) = 64),
+                    basic_admission_reference_sha256 TEXT NOT NULL
+                        CHECK(length(basic_admission_reference_sha256) = 64),
+                    session_binding_sha256 TEXT NOT NULL
+                        CHECK(length(session_binding_sha256) = 64),
+                    source_end_sequence INTEGER NOT NULL CHECK(source_end_sequence > 0),
+                    writer_owner_id TEXT NOT NULL,
+                    writer_fencing_token INTEGER NOT NULL CHECK(writer_fencing_token > 0),
+                    created_at_ns INTEGER NOT NULL CHECK(created_at_ns > 0),
+                    expires_at_ns INTEGER NOT NULL CHECK(expires_at_ns > created_at_ns),
+                    PRIMARY KEY(account_key, authorization_id),
+                    UNIQUE(account_key, scope_key, managed_intent_id),
+                    FOREIGN KEY(account_key, window_id)
+                        REFERENCES ctp_dispatch_position_evidence_windows(account_key, window_id),
+                    FOREIGN KEY(owner_intent_id)
+                        REFERENCES ctp_dispatch_callback_session_owners(owner_intent_id)
+                );
+                CREATE TRIGGER IF NOT EXISTS ctp_position_baseline_authorizations_immutable_update
+                BEFORE UPDATE ON ctp_position_baseline_submit_authorizations
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP position baseline authorization is immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS ctp_position_baseline_authorizations_immutable_delete
+                BEFORE DELETE ON ctp_position_baseline_submit_authorizations
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP position baseline authorization is permanent');
+                END;
+                CREATE TABLE IF NOT EXISTS ctp_position_baseline_submit_authorization_uses (
+                    account_key TEXT NOT NULL,
+                    authorization_id TEXT NOT NULL,
+                    command_id TEXT NOT NULL,
+                    command_binding_sha256 TEXT NOT NULL
+                        CHECK(length(command_binding_sha256) = 64),
+                    writer_owner_id TEXT NOT NULL,
+                    writer_fencing_token INTEGER NOT NULL CHECK(writer_fencing_token > 0),
+                    consumed_at_ns INTEGER NOT NULL CHECK(consumed_at_ns > 0),
+                    PRIMARY KEY(account_key, authorization_id),
+                    UNIQUE(account_key, command_id),
+                    FOREIGN KEY(account_key, authorization_id)
+                        REFERENCES ctp_position_baseline_submit_authorizations(
+                            account_key, authorization_id
+                        ),
+                    FOREIGN KEY(account_key, command_id)
+                        REFERENCES ctp_dispatch_commands(account_key, command_id)
+                );
+                CREATE TRIGGER IF NOT EXISTS ctp_position_baseline_uses_immutable_update
+                BEFORE UPDATE ON ctp_position_baseline_submit_authorization_uses
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP position baseline authorization use is immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS ctp_position_baseline_uses_immutable_delete
+                BEFORE DELETE ON ctp_position_baseline_submit_authorization_uses
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP position baseline authorization use is permanent');
+                END;
+                CREATE TABLE IF NOT EXISTS ctp_position_dispatch_authorization_bindings (
+                    account_key TEXT NOT NULL,
+                    scope_key TEXT NOT NULL,
+                    command_id TEXT NOT NULL,
+                    authorization_kind TEXT NOT NULL
+                        CHECK(authorization_kind IN ('POSITION_BASELINE', 'RECOVERY_CLOSE')),
+                    authorization_id TEXT NOT NULL
+                        CHECK(length(authorization_id) = 32
+                              AND authorization_id NOT GLOB '*[^0-9a-f]*'),
+                    authorization_sha256 TEXT NOT NULL CHECK(length(authorization_sha256) = 64),
+                    owner_intent_id TEXT NOT NULL,
+                    managed_intent_id TEXT NOT NULL,
+                    runtime_order_id TEXT NOT NULL,
+                    order_ref TEXT NOT NULL
+                        CHECK(length(order_ref) = 12 AND order_ref NOT GLOB '*[^0-9]*'),
+                    window_id TEXT NOT NULL,
+                    row_digest_sha256 TEXT NOT NULL CHECK(length(row_digest_sha256) = 64),
+                    session_binding_sha256 TEXT NOT NULL CHECK(length(session_binding_sha256) = 64),
+                    session_generation_id TEXT NOT NULL,
+                    connection_generation INTEGER NOT NULL CHECK(connection_generation > 0),
+                    writer_owner_id TEXT NOT NULL,
+                    writer_fencing_token INTEGER NOT NULL CHECK(writer_fencing_token > 0),
+                    created_at_ns INTEGER NOT NULL CHECK(created_at_ns > 0),
+                    PRIMARY KEY(account_key, command_id),
+                    UNIQUE(account_key, authorization_kind, authorization_id),
+                    FOREIGN KEY(account_key, command_id)
+                        REFERENCES ctp_dispatch_commands(account_key, command_id),
+                    FOREIGN KEY(owner_intent_id)
+                        REFERENCES ctp_dispatch_callback_session_owners(owner_intent_id)
+                );
+                CREATE TRIGGER IF NOT EXISTS ctp_position_dispatch_authorization_bindings_immutable_update
+                BEFORE UPDATE ON ctp_position_dispatch_authorization_bindings
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP dispatch authorization binding is immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS ctp_position_dispatch_authorization_bindings_immutable_delete
+                BEFORE DELETE ON ctp_position_dispatch_authorization_bindings
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP dispatch authorization binding is permanent');
+                END;
+                CREATE TABLE IF NOT EXISTS ctp_position_recovery_close_authorizations (
+                    account_key TEXT NOT NULL,
+                    authorization_id TEXT NOT NULL
+                        CHECK(length(authorization_id) = 32
+                              AND authorization_id NOT GLOB '*[^0-9a-f]*'),
+                    scope_key TEXT NOT NULL,
+                    owner_intent_id TEXT NOT NULL,
+                    parent_intent_id TEXT NOT NULL,
+                    child_intent_id TEXT NOT NULL,
+                    runtime_order_id TEXT NOT NULL,
+                    order_ref TEXT NOT NULL
+                        CHECK(length(order_ref) = 12 AND order_ref NOT GLOB '*[^0-9]*'),
+                    position_window_id TEXT NOT NULL,
+                    position_window_digest_sha256 TEXT NOT NULL
+                        CHECK(length(position_window_digest_sha256) = 64),
+                    session_binding_sha256 TEXT NOT NULL CHECK(length(session_binding_sha256) = 64),
+                    session_generation_id TEXT NOT NULL,
+                    connection_generation INTEGER NOT NULL CHECK(connection_generation > 0),
+                    journal_incarnation_id TEXT NOT NULL
+                        CHECK(length(journal_incarnation_id) = 32),
+                    parent_permit_id TEXT NOT NULL,
+                    recovery_permit_id TEXT NOT NULL,
+                    recovery_allocation_sha256 TEXT NOT NULL
+                        CHECK(length(recovery_allocation_sha256) = 64),
+                    source_proof_sha256 TEXT NOT NULL CHECK(length(source_proof_sha256) = 64),
+                    source_evidence_sha256 TEXT NOT NULL CHECK(length(source_evidence_sha256) = 64),
+                    source_revision INTEGER NOT NULL CHECK(source_revision > 0),
+                    child_intent_sha256 TEXT NOT NULL CHECK(length(child_intent_sha256) = 64),
+                    writer_owner_id TEXT NOT NULL,
+                    writer_fencing_token INTEGER NOT NULL CHECK(writer_fencing_token > 0),
+                    created_at_ns INTEGER NOT NULL CHECK(created_at_ns > 0),
+                    expires_at_ns INTEGER NOT NULL CHECK(expires_at_ns > created_at_ns),
+                    authorization_payload_json TEXT NOT NULL,
+                    PRIMARY KEY(account_key, authorization_id),
+                    UNIQUE(account_key, scope_key, child_intent_id),
+                    FOREIGN KEY(account_key, position_window_id)
+                        REFERENCES ctp_dispatch_position_evidence_windows(account_key, window_id),
+                    FOREIGN KEY(owner_intent_id)
+                        REFERENCES ctp_dispatch_callback_session_owners(owner_intent_id),
+                    FOREIGN KEY(scope_key, parent_intent_id)
+                        REFERENCES execution_records(scope_key, intent_id),
+                    FOREIGN KEY(scope_key, child_intent_id)
+                        REFERENCES execution_records(scope_key, intent_id)
+                );
+                CREATE TRIGGER IF NOT EXISTS ctp_position_recovery_authorizations_immutable_update
+                BEFORE UPDATE ON ctp_position_recovery_close_authorizations
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP recovery-close authorization is immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS ctp_position_recovery_authorizations_immutable_delete
+                BEFORE DELETE ON ctp_position_recovery_close_authorizations
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP recovery-close authorization is permanent');
+                END;
+                CREATE TABLE IF NOT EXISTS ctp_position_recovery_close_authorization_uses (
+                    account_key TEXT NOT NULL,
+                    authorization_id TEXT NOT NULL,
+                    command_id TEXT NOT NULL,
+                    command_binding_sha256 TEXT NOT NULL CHECK(length(command_binding_sha256) = 64),
+                    writer_owner_id TEXT NOT NULL,
+                    writer_fencing_token INTEGER NOT NULL CHECK(writer_fencing_token > 0),
+                    consumed_at_ns INTEGER NOT NULL CHECK(consumed_at_ns > 0),
+                    PRIMARY KEY(account_key, authorization_id),
+                    UNIQUE(account_key, command_id),
+                    FOREIGN KEY(account_key, authorization_id)
+                        REFERENCES ctp_position_recovery_close_authorizations(
+                            account_key, authorization_id
+                        ),
+                    FOREIGN KEY(account_key, command_id)
+                        REFERENCES ctp_dispatch_commands(account_key, command_id)
+                );
+                CREATE TRIGGER IF NOT EXISTS ctp_position_recovery_uses_immutable_update
+                BEFORE UPDATE ON ctp_position_recovery_close_authorization_uses
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP recovery-close authorization use is immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS ctp_position_recovery_uses_immutable_delete
+                BEFORE DELETE ON ctp_position_recovery_close_authorization_uses
+                BEGIN
+                    SELECT RAISE(ABORT, 'CTP recovery-close authorization use is permanent');
+                END;
+                CREATE INDEX IF NOT EXISTS ctp_position_recovery_close_auth_child
+                    ON ctp_position_recovery_close_authorizations(
+                        account_key, scope_key, parent_intent_id, child_intent_id, created_at_ns
+                    );
                 """,
             )
             row = cursor.execute(
@@ -11409,6 +12333,8 @@ class SqliteExecutionStore:
                 "21",
                 "22",
                 "23",
+                "24",
+                "25",
                 str(self._SCHEMA_VERSION),
             }:
                 raise DurableStoreError("unsupported execution store schema")
@@ -11455,16 +12381,24 @@ class SqliteExecutionStore:
                     )
             if version != str(self._SCHEMA_VERSION):
                 scope_set_table = "ctp_dispatch_callback_session_owner_scopes"
-                if scope_set_table in previous_tables:
+                scope_set_was_versioned = version in {"24", "25"}
+                scope_set_was_present = scope_set_table in previous_tables
+                if scope_set_was_present and not scope_set_was_versioned:
                     raise DurableStoreError(
                         "CTP callback owner scope-set schema is partial or unversioned"
                     )
-                # V20 through V24 contain the current CTP transition lineage;
+                if scope_set_was_versioned and not scope_set_was_present:
+                    raise DurableStoreError(
+                        "versioned CTP callback owner scope-set schema is missing"
+                    )
+                # V20 through V26 contain the current CTP transition lineage;
                 # V21/V22 add admission/group data, V23 adds the financial
-                # ledger, and V24 adds immutable callback-owner scope sets.
+                # ledger, V24 adds immutable callback-owner scope sets, and
+                # V25 adds append-only position evidence and baseline authority;
+                # V26 adds one-use recovery-close authority.
                 # Do not rerun historical CTP cutover migrations or downgrade
                 # existing READY/CLAIMED commands for these additive schemas.
-                if version not in {"20", "21", "22", "23"}:
+                if version not in {"20", "21", "22", "23", "24", "25"}:
                     self._migrate_ctp_account_family_legacy_fence(
                         cursor,
                         previous_tables=previous_tables,
@@ -11495,6 +12429,50 @@ class SqliteExecutionStore:
                 ).fetchall()
                 for owner_row in legacy_callback_owners:
                     source_scope_key = str(owner_row["scope_key"])
+                    if scope_set_was_present:
+                        scope_row = cursor.execute(
+                            "SELECT account_key, source_scope_key, scope_count, "
+                            "scope_set_sha256, scope_keys_json "
+                            "FROM ctp_dispatch_callback_session_owner_scopes "
+                            "WHERE owner_intent_id = ?",
+                            (str(owner_row["owner_intent_id"]),),
+                        ).fetchone()
+                        if scope_row is None or (
+                            str(scope_row["account_key"]) != str(owner_row["account_key"])
+                            or str(scope_row["source_scope_key"]) != source_scope_key
+                            or type(scope_row["scope_count"]) is not int
+                            or type(scope_row["scope_set_sha256"]) is not str
+                            or type(scope_row["scope_keys_json"]) is not str
+                        ):
+                            raise DurableStoreError(
+                                "versioned CTP callback owner scope set is incomplete"
+                            )
+                        try:
+                            scope_payload = json.loads(str(scope_row["scope_keys_json"]))
+                            scope_keys = scope_payload["scope_keys"]
+                            if (
+                                type(scope_payload) is not dict
+                                or set(scope_payload) != {"schema", "scope_keys"}
+                                or scope_payload.get("schema") != _CTP_CALLBACK_OWNER_SCOPE_SET_SCHEMA
+                                or canonical_json(scope_payload) != str(scope_row["scope_keys_json"])
+                                or type(scope_keys) is not list
+                                or not 1 <= int(scope_row["scope_count"]) <= _MAX_CTP_CALLBACK_OWNER_SCOPES
+                                or len(scope_keys) != int(scope_row["scope_count"])
+                                or any(not _is_prefixed_digest(key, "scope:") for key in scope_keys)
+                                or len(set(scope_keys)) != len(scope_keys)
+                                or not scope_keys
+                                or scope_keys[0] != source_scope_key
+                                or scope_keys[1:] != sorted(scope_keys[1:])
+                                or hashlib.sha256(
+                                    str(scope_row["scope_keys_json"]).encode("utf-8")
+                                ).hexdigest() != str(scope_row["scope_set_sha256"])
+                            ):
+                                raise ValueError("invalid callback owner scope-set payload")
+                        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+                            raise DurableStoreError(
+                                "versioned CTP callback owner scope set is unreadable"
+                            ) from error
+                        continue
                     scope_keys_json = canonical_json(
                         {
                             "schema": _CTP_CALLBACK_OWNER_SCOPE_SET_SCHEMA,
@@ -12044,6 +13022,728 @@ class SqliteExecutionStore:
         ):
             raise ContractValidationError("CTP query callback argument is incomplete")
         return item.get("value")
+
+    @staticmethod
+    def _ctp_position_window_from_row(
+        database_row: sqlite3.Row, *, store_seal: object
+    ) -> CtpPositionEvidenceWindowRow:
+        """Validate and reconstruct one immutable position observation row."""
+
+        try:
+            payload_json = database_row["window_payload_json"]
+            digest = database_row["row_digest_sha256"]
+            if (
+                type(payload_json) is not str
+                or not payload_json
+                or not _is_sha256(digest)
+            ):
+                raise ValueError("invalid position window payload")
+            payload = json.loads(payload_json)
+            if (
+                type(payload) is not dict
+                or canonical_json(payload) != payload_json
+                or payload_sha256(payload) != digest
+                or payload.get("window_id") != database_row["window_id"]
+                or payload.get("owner_intent_id") != database_row["owner_intent_id"]
+                or payload.get("managed_intent_id") != database_row["managed_intent_id"]
+                or payload.get("runtime_order_id") != database_row["runtime_order_id"]
+                or payload.get("order_ref") != database_row["order_ref"]
+                or payload.get("fence_id") != database_row["fence_id"]
+                or payload.get("query_request_id") != database_row["query_request_id"]
+                or payload.get("trading_day") != database_row["trading_day"]
+                or payload.get("source_hash") != database_row["source_hash"]
+                or payload.get("start_source_sequence") != database_row["start_source_sequence"]
+                or payload.get("end_source_sequence") != database_row["end_source_sequence"]
+                or payload.get("writer_owner_id") != database_row["writer_owner_id"]
+                or payload.get("writer_fencing_token") != database_row["writer_fencing_token"]
+                or payload.get("created_at_ns") != database_row["created_at_ns"]
+            ):
+                raise ValueError("position window payload and ledger row disagree")
+            tuple_fields = (
+                "source_tags",
+                "callback_sequences",
+                "callback_digests",
+                "source_sequences",
+                "source_digests",
+            )
+            for name in tuple_fields:
+                if type(payload.get(name)) is not list:
+                    raise ValueError("position window sequence field is invalid")
+                payload[name] = tuple(payload[name])
+            positions = payload.get("positions")
+            envelope = payload.get("query_envelope")
+            if type(positions) is not list or type(envelope) is not dict:
+                raise ValueError("position window evidence body is invalid")
+            return CtpPositionEvidenceWindowRow(
+                owner_intent_id=payload["owner_intent_id"],
+                managed_intent_id=payload["managed_intent_id"],
+                runtime_order_id=payload["runtime_order_id"],
+                order_ref=payload["order_ref"],
+                fence_id=payload["fence_id"],
+                window_id=payload["window_id"],
+                query_request_id=payload["query_request_id"],
+                account_fingerprint=payload["account_fingerprint"],
+                trading_day=payload["trading_day"],
+                connection_generation=payload["connection_generation"],
+                session_binding_sha256=payload["session_binding_sha256"],
+                source_tags=payload["source_tags"],
+                writer_owner_id=payload["writer_owner_id"],
+                writer_fencing_token=payload["writer_fencing_token"],
+                start_source_sequence=payload["start_source_sequence"],
+                end_source_sequence=payload["end_source_sequence"],
+                first_callback_sequence=payload["first_callback_sequence"],
+                last_callback_sequence=payload["last_callback_sequence"],
+                callback_sequences=payload["callback_sequences"],
+                callback_digests=payload["callback_digests"],
+                source_sequences=payload["source_sequences"],
+                source_digests=payload["source_digests"],
+                source_hash=payload["source_hash"],
+                started_at_utc=datetime.fromisoformat(payload["started_at_utc"]),
+                completed_at_utc=datetime.fromisoformat(payload["completed_at_utc"]),
+                expires_at_utc=datetime.fromisoformat(payload["expires_at_utc"]),
+                started_monotonic=payload["started_monotonic"],
+                completed_monotonic=payload["completed_monotonic"],
+                expires_monotonic=payload["expires_monotonic"],
+                clock_domain_id=payload["clock_domain_id"],
+                started_monotonic_ns=payload["started_monotonic_ns"],
+                completed_monotonic_ns=payload["completed_monotonic_ns"],
+                expires_monotonic_ns=payload["expires_monotonic_ns"],
+                query_envelope=MappingProxyType(envelope),
+                positions=tuple(MappingProxyType(position) for position in positions),
+                row_digest=digest,
+                created_at_ns=payload["created_at_ns"],
+                _store_seal=store_seal,
+            )
+        except (ContractValidationError, DurableStoreError):
+            raise
+        except Exception as error:
+            raise DurableStoreError("stored CTP position evidence window is unreadable") from error
+
+    def begin_ctp_position_evidence_window(
+        self,
+        scope: ExecutionScope,
+        managed_intent_id: str,
+        *,
+        owner_handle: CtpCallbackSessionOwnerHandle,
+        writer_lease: WriterLease,
+    ) -> CtpPositionEvidenceWindowFence:
+        """Fence one fresh native QueryInvestorPosition under the active owner."""
+
+        account_key, trading_day, scope_key = self._validate_ctp_order_identity_scope(scope)
+        self._validate_command_identifier(managed_intent_id, "managed_intent_id")
+        if type(owner_handle) is not CtpCallbackSessionOwnerHandle:
+            raise ContractValidationError("exact CTP callback owner is required")
+        now_wall_ns = time.time_ns()
+        now_mono_ns = time.monotonic_ns()
+        with self._transaction() as cursor:
+            self._assert_active_writer_lease(cursor, scope, writer_lease, now_ns=now_wall_ns)
+            owner = self._require_ctp_callback_session_owner_handle(
+                cursor,
+                scope,
+                owner_handle,
+                allowed_states=frozenset({"ACTIVE"}),
+                writer_lease=writer_lease,
+                now_ns=now_wall_ns,
+            )
+            if self._issued_ctp_callback_session_owners.get(owner_handle.owner_intent_id) is not owner_handle:
+                raise ContractValidationError("exact same-Store CTP callback owner is required")
+            if cursor.execute(
+                "SELECT 1 FROM ctp_dispatch_callback_source_lifecycle_fences WHERE account_key = ?",
+                (account_key,),
+            ).fetchone() is not None:
+                raise InvalidStateTransition("CTP callback source is permanently fenced")
+            binding = self._active_ctp_callback_sessions.get(owner_handle.owner_intent_id)
+            if (
+                binding is None
+                or binding.owner_intent_id != owner_handle.owner_intent_id
+                or binding.account_key != account_key
+                or binding.scope_key != scope_key
+                or binding.trading_day != trading_day
+                or binding.session_generation_id != self._ctp_callback_session_generation_id(owner)
+                or binding.connection_generation != int(owner["active_connection_generation"])
+                or binding.source_high_watermark <= 0
+                or binding.source_high_watermark > int(owner["last_source_sequence"])
+                or binding.session_binding_sha256
+                != payload_sha256(self._ctp_callback_session_binding_payload(binding))
+                or str(owner["writer_owner_id"]) != writer_lease.owner_id
+                or int(owner["writer_fencing_token"]) != writer_lease.fencing_token
+            ):
+                raise InvalidStateTransition("active CTP position-query owner binding is stale")
+            readback_binding, _, _ = self.read_ctp_callback_session_context_facts(owner_handle)
+            if readback_binding is not binding:
+                raise InvalidStateTransition("durable CTP position-query login binding changed")
+            reservation = cursor.execute(
+                """
+                SELECT runtime_order_id, order_ref FROM ctp_order_identity_reservations
+                WHERE account_key = ? AND trading_day = ? AND scope_key = ?
+                  AND managed_intent_id = ?
+                """,
+                (account_key, trading_day, scope_key, managed_intent_id),
+            ).fetchone()
+            if reservation is None:
+                raise ContractValidationError("exact CTP OrderRef reservation is required")
+            start_source = int(owner["last_source_sequence"])
+            if self._ctp_callback_applied_sequence(
+                cursor, owner_handle.owner_intent_id, start_source
+            ) != start_source:
+                raise InvalidStateTransition("CTP callback inbox has unapplied events")
+            for expired_id, expired in tuple(self._issued_ctp_position_query_fences.items()):
+                if expired.expires_at_ns <= now_mono_ns:
+                    self._issued_ctp_position_query_fences.pop(expired_id, None)
+                    if self._active_ctp_position_query_fences.get(
+                        expired.owner_handle.owner_intent_id
+                    ) == expired_id:
+                        self._active_ctp_position_query_fences.pop(
+                            expired.owner_handle.owner_intent_id, None
+                        )
+            if owner_handle.owner_intent_id in self._active_ctp_position_query_fences:
+                raise InvalidStateTransition("CTP owner already has a live position-query fence")
+            if owner_handle.owner_intent_id in self._active_ctp_order_target_query_fences:
+                active_order_fence = self._issued_ctp_order_target_query_fences.get(
+                    self._active_ctp_order_target_query_fences[owner_handle.owner_intent_id]
+                )
+                if active_order_fence is not None and active_order_fence.expires_at_ns > now_mono_ns:
+                    raise InvalidStateTransition("CTP owner already has another live query fence")
+            window_count = cursor.execute(
+                "SELECT COUNT(*) AS window_count FROM ctp_dispatch_position_evidence_windows "
+                "WHERE account_key = ? AND owner_intent_id = ?",
+                (account_key, owner_handle.owner_intent_id),
+            ).fetchone()
+            if int(window_count["window_count"]) >= _CTP_POSITION_QUERY_MAX_WINDOWS:
+                raise InvalidStateTransition("CTP position evidence window capacity is full")
+            fence = CtpPositionEvidenceWindowFence(
+                fence_id=uuid.uuid4().hex,
+                owner_handle=owner_handle,
+                account_key=account_key,
+                scope_key=scope_key,
+                trading_day=trading_day,
+                managed_intent_id=managed_intent_id,
+                runtime_order_id=str(reservation["runtime_order_id"]),
+                order_ref=str(reservation["order_ref"]),
+                writer_owner_id=writer_lease.owner_id,
+                writer_fencing_token=writer_lease.fencing_token,
+                session_binding_sha256=binding.session_binding_sha256,
+                session_generation_id=binding.session_generation_id,
+                connection_generation=binding.connection_generation,
+                source_tags=(
+                    binding.source_instance_id,
+                    binding.native_client_epoch,
+                    binding.native_api_source_id,
+                    binding.native_spi_source_id,
+                    binding.native_api_generation,
+                    binding.source_connection_generation,
+                ),
+                start_source_sequence=start_source,
+                created_at_utc=datetime.now(timezone.utc),
+                created_at_ns=now_mono_ns,
+                expires_at_ns=now_mono_ns + _CTP_POSITION_QUERY_FENCE_TTL_NS,
+            )
+            self._issued_ctp_position_query_fences[fence.fence_id] = fence
+            self._active_ctp_position_query_fences[owner_handle.owner_intent_id] = fence.fence_id
+            return fence
+
+    def finalize_ctp_position_evidence_window(
+        self,
+        scope: ExecutionScope,
+        fence: CtpPositionEvidenceWindowFence,
+        evidence: Any,
+        *,
+        owner_handle: CtpCallbackSessionOwnerHandle,
+        writer_lease: WriterLease,
+    ) -> CtpPositionEvidenceWindowHandle:
+        """Seal Store provenance only when native evidence matches applied callbacks."""
+
+        from bt_api_ctp.containers.ctp.ctp_position_evidence import (
+            _ctp_position_evidence_store_facts,
+        )
+
+        account_key, trading_day, scope_key = self._validate_ctp_order_identity_scope(scope)
+        now_wall_ns = time.time_ns()
+        now_mono_ns = time.monotonic_ns()
+        if (
+            type(fence) is not CtpPositionEvidenceWindowFence
+            or self._issued_ctp_position_query_fences.get(fence.fence_id) is not fence
+            or type(owner_handle) is not CtpCallbackSessionOwnerHandle
+            or fence.owner_handle is not owner_handle
+            or self._active_ctp_position_query_fences.get(owner_handle.owner_intent_id)
+            != fence.fence_id
+            or fence.expires_at_ns <= now_mono_ns
+            or (account_key, trading_day, scope_key)
+            != (fence.account_key, fence.trading_day, fence.scope_key)
+        ):
+            raise ContractValidationError("fresh exact CTP position-query fence is required")
+        try:
+            facts = _ctp_position_evidence_store_facts(evidence)
+        except Exception as error:
+            raise ContractValidationError("sealed CTP position query evidence is required") from error
+        if (
+            type(facts) is not dict
+            or facts.get("query_issuer") is None
+            or type(facts.get("query_request_id")) is not int
+            or type(facts.get("account_fingerprint")) is not str
+            or type(facts.get("source_tags")) is not tuple
+            or not isinstance(facts.get("query_envelope"), Mapping)
+            or type(facts.get("rows")) is not tuple
+            or not _is_sha256(facts.get("source_hash"))
+        ):
+            raise ContractValidationError("sealed CTP position evidence facts are malformed")
+        # The private CTP bridge owns the exact evidence issuer object. Keep one
+        # issuer for the active owner and reject evidence built by another client.
+        previous_issuer = self._ctp_position_query_issuers.get(owner_handle.owner_intent_id)
+        if previous_issuer is not None and previous_issuer is not facts["query_issuer"]:
+            raise ContractValidationError("CTP position evidence came from a different query issuer")
+        with self._transaction() as cursor:
+            self._assert_active_writer_lease(cursor, scope, writer_lease, now_ns=now_wall_ns)
+            owner = self._require_ctp_callback_session_owner_handle(
+                cursor,
+                scope,
+                owner_handle,
+                allowed_states=frozenset({"ACTIVE"}),
+                writer_lease=writer_lease,
+                now_ns=now_wall_ns,
+            )
+            binding = self._active_ctp_callback_sessions.get(owner_handle.owner_intent_id)
+            if (
+                binding is None
+                or str(owner["owner_state"]) != "ACTIVE"
+                or binding.session_binding_sha256 != fence.session_binding_sha256
+                or binding.connection_generation != fence.connection_generation
+                or binding.source_instance_id != fence.source_tags[0]
+                or binding.native_client_epoch != fence.source_tags[1]
+                or binding.native_api_source_id != fence.source_tags[2]
+                or binding.native_spi_source_id != fence.source_tags[3]
+                or binding.native_api_generation != fence.source_tags[4]
+                or binding.source_connection_generation != fence.source_tags[5]
+                or (account_key, trading_day, scope_key)
+                != (fence.account_key, fence.trading_day, fence.scope_key)
+            ):
+                raise InvalidStateTransition("CTP session changed during position query")
+            applied_sequence = self._ctp_callback_applied_sequence(
+                cursor, owner_handle.owner_intent_id, int(owner["last_source_sequence"])
+            )
+            if applied_sequence != int(owner["last_source_sequence"]):
+                raise InvalidStateTransition("CTP position query callbacks are not fully applied")
+            source_rows = cursor.execute(
+                """
+                SELECT * FROM ctp_dispatch_callback_ingress
+                WHERE owner_intent_id = ? AND source_sequence > ? AND source_sequence <= ?
+                ORDER BY source_sequence ASC
+                """,
+                (owner_handle.owner_intent_id, fence.start_source_sequence, applied_sequence),
+            ).fetchall()
+            if (
+                not source_rows
+                or len(source_rows) > _CTP_POSITION_QUERY_MAX_EVENTS
+                or len(source_rows) != applied_sequence - fence.start_source_sequence
+            ):
+                raise InvalidStateTransition("CTP position query source window is incomplete")
+            source_sequences: list[int] = []
+            source_digests: list[str] = []
+            query_events: list[tuple[sqlite3.Row, dict[str, Any], bool]] = []
+            for source_row in source_rows:
+                sequence = int(source_row["source_sequence"])
+                source_sequences.append(sequence)
+                source_digests.append(str(source_row["record_digest_sha256"]))
+                if (
+                    str(source_row["source_instance_id"]) != fence.source_tags[0]
+                    or str(source_row["native_client_epoch"]) != fence.source_tags[1]
+                    or str(source_row["native_api_source_id"]) != fence.source_tags[2]
+                    or str(source_row["native_spi_source_id"]) != fence.source_tags[3]
+                    or int(source_row["native_api_generation"]) != fence.source_tags[4]
+                    or int(source_row["source_connection_generation"]) != fence.source_tags[5]
+                    or int(source_row["connection_generation"]) != fence.connection_generation
+                ):
+                    raise InvalidStateTransition("CTP position query source identity changed")
+                try:
+                    payload = json.loads(str(source_row["record_payload_json"]))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    raise DurableStoreError("CTP position query source row is unreadable") from None
+                if (
+                    type(payload) is not dict
+                    or payload.get("capture_complete") is not True
+                    or payload.get("missing_getters") != []
+                ):
+                    raise InvalidStateTransition("CTP position query callback capture is incomplete")
+                if str(source_row["callback_name"]) == "OnRspQryInvestorPosition":
+                    if (
+                        str(source_row["callback_class"]) != "AUDIT_QUERY"
+                        or str(source_row["source_phase"]) != "ACTIVE"
+                    ):
+                        raise InvalidStateTransition(
+                            "position query callback is outside the active audit-query source"
+                        )
+                    query_events.append((source_row, payload, False))
+                elif str(source_row["callback_class"]) == "AUDIT_QUERY":
+                    raise InvalidStateTransition("another economic query overlaps the position window")
+            if not query_events:
+                raise ContractValidationError("position query callbacks were not captured")
+            request_id = facts["query_request_id"]
+            terminal_flags: list[bool] = []
+            position_payloads: list[dict[str, Any]] = []
+            for source_row, payload, _ in query_events:
+                request_id_value = self._ctp_query_named_scalar(payload, 2, "nRequestID")
+                terminal = self._ctp_query_named_scalar(payload, 3, "bIsLast")
+                error_id = self._ctp_callback_field(payload, 1, "ErrorID")
+                if (
+                    request_id_value != request_id
+                    or type(error_id) is not int
+                    or error_id != 0
+                    or type(terminal) is not bool
+                ):
+                    raise ContractValidationError("position query callback identity or ErrorID is invalid")
+                terminal_flags.append(terminal)
+                first_arg = next(
+                    (item for item in payload["named_args"] if item.get("argument_slot") == 0),
+                    None,
+                )
+                if (
+                    type(first_arg) is not dict
+                    or type(first_arg.get("present")) is not bool
+                    or type(first_arg.get("pointer_is_null")) is not bool
+                    or first_arg.get("scalar_captured") is not False
+                    or first_arg.get("value") is not None
+                ):
+                    raise ContractValidationError("position callback row presence is unproven")
+                flattened = {
+                    str(item["field_name"]): item["value"]
+                    for item in payload["flattened_fields"]
+                    if type(item) is dict
+                    and item.get("argument_slot") == 0
+                    and item.get("present") is True
+                    and item.get("scalar_captured") is True
+                }
+                if not flattened:
+                    if first_arg["pointer_is_null"] is not True:
+                        raise ContractValidationError(
+                            "nonnull position callback row has no captured fields"
+                        )
+                    if first_arg["present"] is not True:
+                        raise ContractValidationError("position callback null pointer is not present")
+                    if terminal is not True:
+                        raise ContractValidationError(
+                            "position query returned a null nonterminal row"
+                        )
+                    continue
+                if first_arg["pointer_is_null"] is True or first_arg["present"] is not True:
+                    raise ContractValidationError("position callback pointer and fields disagree")
+                if first_arg["present"]:
+                    required_position_fields = {
+                        "InstrumentID",
+                        "ExchangeID",
+                        "TradingDay",
+                        "PositionDate",
+                        "YdPosition",
+                        "Position",
+                        "TodayPosition",
+                        "PosiDirection",
+                        "HedgeFlag",
+                    }
+                    if not required_position_fields.issubset(flattened):
+                        raise ContractValidationError("position callback row fields are incomplete")
+                    position_payloads.append(
+                        {name: flattened[name] for name in required_position_fields}
+                    )
+            if terminal_flags.count(True) != 1 or terminal_flags[-1] is not True:
+                raise ContractValidationError("position query terminal marker is invalid")
+            terminal_query_sequence = int(query_events[-1][0]["source_sequence"])
+            if (
+                terminal_query_sequence != applied_sequence
+                or str(source_rows[-1]["callback_name"]) != "OnRspQryInvestorPosition"
+                or int(source_rows[-1]["source_sequence"]) != terminal_query_sequence
+            ):
+                raise InvalidStateTransition(
+                    "position query was followed by another callback before sealing"
+                )
+            envelope = facts["query_envelope"]
+            if (
+                envelope.get("request_id") != request_id
+                or envelope.get("request_type") != "positions"
+                or envelope.get("complete") is not True
+                or envelope.get("is_last_seen") is not True
+                or envelope.get("timed_out") is not False
+                or envelope.get("unsupported") is not False
+                or envelope.get("late_callback_count") != 0
+                or envelope.get("error_code") not in (None, 0)
+                or envelope.get("submit_code") not in (None, 0)
+            ):
+                raise ContractValidationError("CTP position query envelope is incomplete")
+            if facts["source_tags"] != fence.source_tags:
+                raise ContractValidationError("CTP position query source tags changed")
+            binding, broker_id, user_id = self.read_ctp_callback_session_context_facts(owner_handle)
+            expected_account_fingerprint = hashlib.sha256(
+                f"{broker_id}:{user_id}".encode("ascii")
+            ).hexdigest()[:16]
+            if (
+                facts["account_fingerprint"] != expected_account_fingerprint
+                or facts["trading_day"] != trading_day
+                or facts["connection_generation"] != fence.connection_generation
+                or facts["broker_id"] != broker_id
+                or facts["investor_id"] != user_id
+            ):
+                raise ContractValidationError("CTP position query account/session binding changed")
+            evidence_rows = facts["rows"]
+            if len(position_payloads) != len(evidence_rows):
+                raise ContractValidationError("CTP position callback rows differ from query evidence")
+            position_field_names = (
+                "InstrumentID",
+                "ExchangeID",
+                "TradingDay",
+                "PositionDate",
+                "YdPosition",
+                "Position",
+                "TodayPosition",
+                "PosiDirection",
+                "HedgeFlag",
+            )
+            for callback_row, evidence_row in zip(position_payloads, evidence_rows, strict=True):
+                if any(
+                    callback_row.get(name) != evidence_row.get(name)
+                    for name in position_field_names
+                ):
+                    raise ContractValidationError("position callback payload differs from sealed query rows")
+            if (
+                facts["started_at_utc"] < fence.created_at_utc
+                or facts["started_monotonic"] * 1_000_000_000 < fence.created_at_ns
+                or facts["expires_at_utc"] <= datetime.now(timezone.utc)
+                or facts["expires_monotonic"] <= time.monotonic()
+                or facts["clock_domain_id"] != "python.time.monotonic"
+            ):
+                raise ContractValidationError("CTP position query is outside its live evidence window")
+            if cursor.execute(
+                "SELECT 1 FROM ctp_dispatch_position_evidence_windows "
+                "WHERE owner_intent_id = ? AND query_request_id = ?",
+                (owner_handle.owner_intent_id, request_id),
+            ).fetchone() is not None:
+                raise IntentConflictError("CTP position query request id was already persisted")
+            callback_sequences = tuple(int(row["source_sequence"]) for row, _, _ in query_events)
+            callback_digests = tuple(str(row["record_digest_sha256"]) for row, _, _ in query_events)
+            if len(callback_sequences) != len(query_events):
+                raise DurableStoreError("CTP position callback sequence is inconsistent")
+            window_id = uuid.uuid4().hex
+            created_at_ns = time.time_ns()
+            evidence_payload = evidence.as_dict(include_rows=True)
+            row_payload: dict[str, Any] = {
+                "window_id": window_id,
+                "owner_intent_id": owner_handle.owner_intent_id,
+                "managed_intent_id": fence.managed_intent_id,
+                "runtime_order_id": fence.runtime_order_id,
+                "order_ref": fence.order_ref,
+                "fence_id": fence.fence_id,
+                "query_request_id": request_id,
+                "account_fingerprint": facts["account_fingerprint"],
+                "trading_day": trading_day,
+                "connection_generation": fence.connection_generation,
+                "session_binding_sha256": fence.session_binding_sha256,
+                "source_tags": list(fence.source_tags),
+                "writer_owner_id": writer_lease.owner_id,
+                "writer_fencing_token": writer_lease.fencing_token,
+                "start_source_sequence": fence.start_source_sequence,
+                "end_source_sequence": applied_sequence,
+                "first_callback_sequence": callback_sequences[0],
+                "last_callback_sequence": callback_sequences[-1],
+                "callback_sequences": list(callback_sequences),
+                "callback_digests": list(callback_digests),
+                "source_sequences": source_sequences,
+                "source_digests": source_digests,
+                "source_hash": facts["source_hash"],
+                "started_at_utc": facts["started_at_utc"].isoformat(),
+                "completed_at_utc": facts["completed_at_utc"].isoformat(),
+                "expires_at_utc": facts["expires_at_utc"].isoformat(),
+                "started_monotonic": facts["started_monotonic"],
+                "completed_monotonic": facts["completed_monotonic"],
+                "expires_monotonic": facts["expires_monotonic"],
+                "clock_domain_id": facts["clock_domain_id"],
+                "started_monotonic_ns": int(facts["started_monotonic"] * 1_000_000_000),
+                "completed_monotonic_ns": int(facts["completed_monotonic"] * 1_000_000_000),
+                "expires_monotonic_ns": int(facts["expires_monotonic"] * 1_000_000_000),
+                "query_envelope": evidence_payload["query_envelope"],
+                "positions": evidence_payload["rows"],
+                "evidence_payload": evidence_payload,
+                "created_at_ns": created_at_ns,
+            }
+            row_digest = payload_sha256(row_payload)
+            payload_json = canonical_json(row_payload)
+            cursor.execute(
+                """
+                INSERT INTO ctp_dispatch_position_evidence_windows(
+                    account_key, scope_key, owner_intent_id, managed_intent_id,
+                    runtime_order_id, order_ref, window_id, fence_id, query_request_id,
+                    trading_day, source_hash, row_digest_sha256,
+                    start_source_sequence, end_source_sequence, window_payload_json,
+                    writer_owner_id, writer_fencing_token, created_at_ns
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    account_key,
+                    scope_key,
+                    owner_handle.owner_intent_id,
+                    fence.managed_intent_id,
+                    fence.runtime_order_id,
+                    fence.order_ref,
+                    window_id,
+                    fence.fence_id,
+                    request_id,
+                    trading_day,
+                    facts["source_hash"],
+                    row_digest,
+                    fence.start_source_sequence,
+                    applied_sequence,
+                    payload_json,
+                    writer_lease.owner_id,
+                    writer_lease.fencing_token,
+                    created_at_ns,
+                ),
+            )
+            db_row = cursor.execute(
+                "SELECT * FROM ctp_dispatch_position_evidence_windows WHERE account_key = ? AND window_id = ?",
+                (account_key, window_id),
+            ).fetchone()
+            row = self._ctp_position_window_from_row(db_row, store_seal=self._ctp_position_window_seal)
+            handle = CtpPositionEvidenceWindowHandle(
+                window_id=window_id,
+                row_digest=row_digest,
+                _store_seal=self._ctp_position_window_seal,
+            )
+            self._issued_ctp_position_window_handles[window_id] = handle
+            self._issued_ctp_position_window_rows[window_id] = row
+            self._issued_ctp_position_window_evidence[window_id] = evidence
+            self._ctp_position_query_issuers[owner_handle.owner_intent_id] = facts["query_issuer"]
+            self._ctp_position_query_request_ids.add((owner_handle.owner_intent_id, request_id))
+            self._issued_ctp_position_query_fences.pop(fence.fence_id, None)
+            self._active_ctp_position_query_fences.pop(owner_handle.owner_intent_id, None)
+            return handle
+
+    def read_ctp_position_evidence_window(
+        self,
+        scope: ExecutionScope,
+        handle: CtpPositionEvidenceWindowHandle,
+        *,
+        owner_handle: CtpCallbackSessionOwnerHandle,
+        writer_lease: WriterLease,
+    ) -> CtpPositionEvidenceWindowRow:
+        """Read one exact finalized position window under its current owner."""
+
+        account_key, trading_day, scope_key = self._validate_ctp_order_identity_scope(scope)
+        if (
+            type(handle) is not CtpPositionEvidenceWindowHandle
+            or handle._store_seal is not self._ctp_position_window_seal
+            or self._issued_ctp_position_window_handles.get(handle.window_id) is not handle
+            or type(owner_handle) is not CtpCallbackSessionOwnerHandle
+            or self._issued_ctp_callback_session_owners.get(owner_handle.owner_intent_id) is not owner_handle
+        ):
+            raise ContractValidationError("exact same-Store CTP position window and owner are required")
+        now_ns = time.time_ns()
+        with self._transaction() as cursor:
+            self._assert_active_writer_lease(cursor, scope, writer_lease, now_ns=now_ns)
+            owner = self._require_ctp_callback_session_owner_handle(
+                cursor,
+                scope,
+                owner_handle,
+                allowed_states=frozenset({"ACTIVE"}),
+                writer_lease=writer_lease,
+                now_ns=now_ns,
+            )
+            binding = self._active_ctp_callback_sessions.get(owner_handle.owner_intent_id)
+            if (
+                binding is None
+                or binding.account_key != account_key
+                or binding.scope_key != scope_key
+                or binding.trading_day != trading_day
+                or binding.connection_generation != int(owner["active_connection_generation"])
+            ):
+                raise InvalidStateTransition("CTP position window owner session changed")
+            row = cursor.execute(
+                "SELECT * FROM ctp_dispatch_position_evidence_windows WHERE account_key = ? AND window_id = ?",
+                (account_key, handle.window_id),
+            ).fetchone()
+            if row is None:
+                raise DurableStoreError("CTP position evidence window disappeared")
+            result = self._ctp_position_window_from_row(
+                row, store_seal=self._ctp_position_window_seal
+            )
+            if (
+                result.row_digest != handle.row_digest
+                or result.owner_intent_id != owner_handle.owner_intent_id
+                or result.trading_day != trading_day
+                or result.session_binding_sha256 != binding.session_binding_sha256
+                or result.writer_owner_id != writer_lease.owner_id
+                or result.writer_fencing_token != writer_lease.fencing_token
+            ):
+                raise ContractValidationError("CTP position window provenance differs from current owner")
+            cached = self._issued_ctp_position_window_rows.get(handle.window_id)
+            if cached is not None and cached.row_digest != result.row_digest:
+                raise DurableStoreError("CTP position window readback changed")
+            self._issued_ctp_position_window_rows[handle.window_id] = result
+            return result
+
+    def read_ctp_position_evidence_windows(
+        self,
+        scope: ExecutionScope,
+        managed_intent_id: str,
+        *,
+        owner_handle: CtpCallbackSessionOwnerHandle,
+        writer_lease: WriterLease,
+    ) -> tuple[CtpPositionEvidenceWindowRow, ...]:
+        """Read all finalized immutable position windows for one live owner intent."""
+
+        account_key, trading_day, scope_key = self._validate_ctp_order_identity_scope(scope)
+        self._validate_command_identifier(managed_intent_id, "managed_intent_id")
+        now_ns = time.time_ns()
+        with self._transaction() as cursor:
+            self._assert_active_writer_lease(cursor, scope, writer_lease, now_ns=now_ns)
+            owner = self._require_ctp_callback_session_owner_handle(
+                cursor,
+                scope,
+                owner_handle,
+                allowed_states=frozenset({"ACTIVE"}),
+                writer_lease=writer_lease,
+                now_ns=now_ns,
+            )
+            binding = self._active_ctp_callback_sessions.get(owner_handle.owner_intent_id)
+            if (
+                binding is None
+                or binding.account_key != account_key
+                or binding.scope_key != scope_key
+                or binding.trading_day != trading_day
+                or binding.connection_generation != int(owner["active_connection_generation"])
+            ):
+                raise InvalidStateTransition("CTP position window owner session changed")
+            rows = cursor.execute(
+                """
+                SELECT * FROM ctp_dispatch_position_evidence_windows
+                WHERE account_key = ? AND scope_key = ? AND trading_day = ?
+                  AND owner_intent_id = ? AND managed_intent_id = ?
+                ORDER BY created_at_ns ASC, window_id ASC
+                """,
+                (account_key, scope_key, trading_day, owner_handle.owner_intent_id, managed_intent_id),
+            ).fetchall()
+            if len(rows) > _CTP_POSITION_QUERY_MAX_WINDOWS:
+                raise DurableStoreError("CTP position evidence window count exceeds policy")
+            result = tuple(
+                self._ctp_position_window_from_row(row, store_seal=self._ctp_position_window_seal)
+                for row in rows
+            )
+            for item in result:
+                if (
+                    item.session_binding_sha256 != binding.session_binding_sha256
+                    or item.connection_generation != binding.connection_generation
+                    or item.writer_owner_id != writer_lease.owner_id
+                    or item.writer_fencing_token != writer_lease.fencing_token
+                ):
+                    raise ContractValidationError("CTP position evidence history crosses owner custody")
+                issued = self._issued_ctp_position_window_handles.get(item.window_id)
+                if issued is None:
+                    issued = CtpPositionEvidenceWindowHandle(
+                        item.window_id, item.row_digest, self._ctp_position_window_seal
+                    )
+                    self._issued_ctp_position_window_handles[item.window_id] = issued
+                elif issued.row_digest != item.row_digest:
+                    raise DurableStoreError("CTP position window handle changed")
+                previous = self._issued_ctp_position_window_rows.get(item.window_id)
+                if previous is not None and previous.row_digest != item.row_digest:
+                    raise DurableStoreError("CTP position window history changed")
+                self._issued_ctp_position_window_rows[item.window_id] = item
+            return result
 
     def begin_ctp_order_target_query(
         self,
@@ -14813,6 +16513,2196 @@ class SqliteExecutionStore:
         except (TypeError, ValueError, json.JSONDecodeError) as error:
             raise DurableStoreError("stored CTP command is unreadable") from error
 
+    @staticmethod
+    def _ctp_position_authorization_payload(
+        authorization: CtpPositionBaselineSubmitAuthorization,
+    ) -> dict[str, Any]:
+        return {
+            name: getattr(authorization, name)
+            for name in authorization.__dataclass_fields__
+            if name != "_store_seal"
+        }
+
+    @staticmethod
+    def _ctp_window_field_value(position: Mapping[str, Any], name: str) -> Any:
+        fields = position.get("fields")
+        if not isinstance(fields, Mapping):
+            raise ContractValidationError("stored CTP position fields are unavailable")
+        field = fields.get(name)
+        if not isinstance(field, Mapping) or field.get("state") != "value":
+            raise ContractValidationError("stored CTP position field is not known")
+        return field.get("value")
+
+    @classmethod
+    def _ctp_position_window_instrument_rows(
+        cls, window: CtpPositionEvidenceWindowRow, instrument: str
+    ) -> tuple[Mapping[str, Any], ...]:
+        matching: list[Mapping[str, Any]] = []
+        for position in window.positions:
+            if not isinstance(position, Mapping) or position.get("errors") not in ([], ()):
+                raise ContractValidationError("stored CTP position row is incomplete")
+            instrument_id = cls._ctp_window_field_value(position, "InstrumentID")
+            if type(instrument_id) is not str or not instrument_id:
+                raise ContractValidationError("stored CTP position instrument is invalid")
+            if instrument_id != instrument:
+                continue
+            total = cls._ctp_window_field_value(position, "Position")
+            today = cls._ctp_window_field_value(position, "TodayPosition")
+            yesterday = cls._ctp_window_field_value(position, "YdPosition")
+            direction = cls._ctp_window_field_value(position, "PosiDirection")
+            hedge = cls._ctp_window_field_value(position, "HedgeFlag")
+            if (
+                any(type(value) is not int or value < 0 for value in (total, today, yesterday))
+                or total != today + yesterday
+                or direction not in {"2", "3"}
+                or type(hedge) is not str
+            ):
+                raise ContractValidationError("stored CTP position quantities are invalid")
+            matching.append(position)
+        return tuple(matching)
+
+    def _require_ctp_position_baseline_authorization(
+        self,
+        cursor: sqlite3.Cursor,
+        scope: ExecutionScope,
+        authorization: CtpPositionBaselineSubmitAuthorization,
+        *,
+        writer_lease: WriterLease,
+        now_ns: int,
+        expected_command: CtpDispatchCommand | None = None,
+        require_binding: bool = False,
+        allow_facade_claimed_submit: bool = False,
+        expected_managed_intent_id: str | None = None,
+        expected_order_ref: str | None = None,
+    ) -> tuple[sqlite3.Row, CtpPositionEvidenceWindowRow, CtpCallbackSessionBindingV1]:
+        account_key, trading_day, scope_key = self._validate_ctp_order_identity_scope(scope)
+        if (
+            type(authorization) is not CtpPositionBaselineSubmitAuthorization
+            or self._issued_ctp_position_baseline_authorizations.get(
+                authorization.authorization_id
+            )
+            is not authorization
+            or authorization._store_seal is not self._ctp_position_baseline_authorization_seal
+            or authorization.expires_at_ns <= now_ns
+            or (authorization.account_key, authorization.scope_key, authorization.trading_day)
+            != (account_key, scope_key, trading_day)
+            or authorization.writer_owner_id != writer_lease.owner_id
+            or authorization.writer_fencing_token != writer_lease.fencing_token
+        ):
+            raise ContractValidationError("fresh same-Store CTP position baseline authorization is required")
+        payload = self._ctp_position_authorization_payload(authorization)
+        digest = payload_sha256(payload)
+        stored = cursor.execute(
+            "SELECT * FROM ctp_position_baseline_submit_authorizations "
+            "WHERE account_key = ? AND authorization_id = ?",
+            (account_key, authorization.authorization_id),
+        ).fetchone()
+        if stored is None or (
+            str(stored["scope_key"]) != scope_key
+            or str(stored["owner_intent_id"]) != authorization.owner_intent_id
+            or str(stored["managed_intent_id"]) != authorization.managed_intent_id
+            or str(stored["runtime_order_id"]) != authorization.runtime_order_id
+            or str(stored["order_ref"]) != authorization.order_ref
+            or str(stored["window_id"]) != authorization.window_id
+            or str(stored["row_digest_sha256"]) != authorization.row_digest
+            or str(stored["permit_reference_sha256"]) != authorization.permit_reference_sha256
+            or str(stored["basic_admission_reference_sha256"])
+            != authorization.basic_admission_reference_sha256
+            or str(stored["session_binding_sha256"]) != authorization.session_binding_sha256
+            or int(stored["source_end_sequence"]) != authorization.end_source_sequence
+            or str(stored["writer_owner_id"]) != writer_lease.owner_id
+            or int(stored["writer_fencing_token"]) != writer_lease.fencing_token
+            or int(stored["created_at_ns"]) != authorization.created_at_ns
+            or int(stored["expires_at_ns"]) != authorization.expires_at_ns
+        ):
+            raise ContractValidationError("durable CTP position baseline authorization changed")
+        owner_handle = self._issued_ctp_callback_session_owners.get(
+            authorization.owner_intent_id
+        )
+        if owner_handle is None:
+            raise InvalidStateTransition("position baseline callback owner is not live")
+        owner = self._require_ctp_callback_session_owner_handle(
+            cursor,
+            scope,
+            owner_handle,
+            allowed_states=frozenset({"ACTIVE"}),
+            writer_lease=writer_lease,
+            now_ns=now_ns,
+        )
+        binding = self._active_ctp_callback_sessions.get(owner_handle.owner_intent_id)
+        if (
+            binding is None
+            or owner_handle.owner_intent_id != authorization.owner_intent_id
+            or binding.session_binding_sha256 != authorization.session_binding_sha256
+            or binding.session_generation_id != authorization.session_generation_id
+            or binding.connection_generation != authorization.connection_generation
+            or binding.trading_day != trading_day
+            or int(owner["economic_query_observed"]) != 1
+            or int(owner["last_source_sequence"]) != authorization.end_source_sequence
+            or self._ctp_callback_applied_sequence(
+                cursor, owner_handle.owner_intent_id, int(owner["last_source_sequence"])
+            ) != int(owner["last_source_sequence"])
+        ):
+            raise InvalidStateTransition("position baseline source is no longer current")
+        window_handle = self._issued_ctp_position_window_handles.get(authorization.window_id)
+        if (
+            window_handle is None
+            or window_handle._store_seal is not self._ctp_position_window_seal
+            or window_handle.row_digest != authorization.row_digest
+        ):
+            raise ContractValidationError("position baseline window handle is not current")
+        window_db = cursor.execute(
+            "SELECT * FROM ctp_dispatch_position_evidence_windows "
+            "WHERE account_key = ? AND window_id = ?",
+            (account_key, authorization.window_id),
+        ).fetchone()
+        if window_db is None:
+            raise DurableStoreError("durable CTP position baseline window is missing")
+        window = self._ctp_position_window_from_row(
+            window_db, store_seal=self._ctp_position_window_seal
+        )
+        if (
+            window.row_digest != authorization.row_digest
+            or window.owner_intent_id != owner_handle.owner_intent_id
+            or window.managed_intent_id != authorization.managed_intent_id
+            or window.runtime_order_id != authorization.runtime_order_id
+            or window.order_ref != authorization.order_ref
+            or window.trading_day != trading_day
+            or window.session_binding_sha256 != binding.session_binding_sha256
+            or window.connection_generation != binding.connection_generation
+            or window.source_tags != authorization.source_tags
+            or window.end_source_sequence != authorization.end_source_sequence
+            or window.expires_at_utc <= datetime.now(timezone.utc)
+            or window.expires_monotonic_ns <= time.monotonic_ns()
+            or window.writer_owner_id != writer_lease.owner_id
+            or window.writer_fencing_token != writer_lease.fencing_token
+        ):
+            raise ContractValidationError("position baseline window is stale or mismatched")
+        execution = cursor.execute(
+            "SELECT * FROM execution_records WHERE scope_key = ? AND intent_id = ?",
+            (scope_key, authorization.managed_intent_id),
+        ).fetchone()
+        if execution is None:
+            raise ContractValidationError("position baseline intent is not persisted")
+        record = self._record_from_row(execution)
+        intent = order_intent_from_payload(json.loads(str(execution["payload_json"])))
+        command_managed_intent_id = (
+            expected_command.reservation_managed_intent_id
+            if expected_command is not None
+            else expected_managed_intent_id
+        )
+        command_order_ref = (
+            expected_command.order_ref
+            if expected_command is not None
+            else expected_order_ref
+        )
+        pending_unclaimed = (
+            record.state is ExecutionState.PENDING_DISPATCH
+            and record.dispatch_attempts == 0
+        )
+        facade_claimed_once = (
+            allow_facade_claimed_submit
+            and record.state is ExecutionState.DISPATCHING
+            and record.dispatch_attempts == 1
+            and command_managed_intent_id == authorization.managed_intent_id
+            and command_order_ref == authorization.order_ref
+        )
+        if (
+            record.intent_id != authorization.managed_intent_id
+            or record.scope_key != scope_key
+            or not (pending_unclaimed or facade_claimed_once)
+            or record.provider_order_id is not None
+            or record.filled_quantity != Decimal("0")
+            or record.average_price is not None
+            or record.cumulative_commission is not None
+            or record.review_required
+            or record.unknown_reason is not None
+            or record.permit_reference is None
+            or record.basic_admission_reference is None
+            or record.admission_context_sha256 is None
+            or len(record.basic_admission_reference) != 32
+            or any(char not in "0123456789abcdef" for char in record.basic_admission_reference)
+            or not isinstance(record.permit_reference, str)
+            or hashlib.sha256(record.permit_reference.encode("utf-8")).hexdigest()
+            != authorization.permit_reference_sha256
+            or hashlib.sha256(record.basic_admission_reference.encode("ascii")).hexdigest()
+            != authorization.basic_admission_reference_sha256
+            or intent.intent_id != record.intent_id
+            or intent.scope != scope
+            or intent.position_effect.value != "OPEN"
+            or intent.instrument == ""
+            or intent.intent_id != authorization.managed_intent_id
+        ):
+            raise InvalidStateTransition("position baseline does not bind a fresh admitted OPEN")
+        reservation = cursor.execute(
+            "SELECT runtime_order_id, order_ref FROM ctp_order_identity_reservations "
+            "WHERE account_key = ? AND trading_day = ? AND scope_key = ? AND managed_intent_id = ?",
+            (account_key, trading_day, scope_key, authorization.managed_intent_id),
+        ).fetchone()
+        if reservation is None or (
+            str(reservation["runtime_order_id"]) != authorization.runtime_order_id
+            or str(reservation["order_ref"]) != authorization.order_ref
+        ):
+            raise ContractValidationError("position baseline OrderRef reservation changed")
+        if self._ctp_position_window_instrument_rows(window, intent.instrument):
+            for position in self._ctp_position_window_instrument_rows(window, intent.instrument):
+                if any(
+                    self._ctp_window_field_value(position, name) != 0
+                    for name in ("Position", "TodayPosition", "YdPosition")
+                ):
+                    raise InvalidStateTransition("pre-submit position baseline is not flat")
+        if expected_command is not None:
+            correlation = expected_command.correlation_key
+            if (
+                correlation is None
+                or expected_command.operation != "SUBMIT"
+                or expected_command.reservation_managed_intent_id != authorization.managed_intent_id
+                or correlation is None
+                or correlation.runtime_order_id != authorization.runtime_order_id
+                or expected_command.order_ref != authorization.order_ref
+                or expected_command.session_binding_sha256 != authorization.session_binding_sha256
+                or correlation.session_generation_id != authorization.session_generation_id
+                or str(expected_command.request_payload.get("InstrumentID")) != intent.instrument
+            ):
+                raise ContractValidationError("position baseline differs from submit command")
+        elif allow_facade_claimed_submit and (
+            expected_managed_intent_id != authorization.managed_intent_id
+            or expected_order_ref != authorization.order_ref
+        ):
+            raise ContractValidationError(
+                "facade-claimed baseline requires its exact staged intent and OrderRef"
+            )
+        if require_binding:
+            if expected_command is None:
+                raise ContractValidationError("position authorization command binding is missing")
+            dispatch_binding = cursor.execute(
+                "SELECT * FROM ctp_position_dispatch_authorization_bindings "
+                "WHERE account_key = ? AND command_id = ?",
+                (account_key, expected_command.command_id),
+            ).fetchone()
+            if dispatch_binding is None or (
+                str(dispatch_binding["authorization_kind"]) != "POSITION_BASELINE"
+                or str(dispatch_binding["authorization_id"]) != authorization.authorization_id
+                or str(dispatch_binding["authorization_sha256"]) != digest
+                or str(dispatch_binding["owner_intent_id"]) != authorization.owner_intent_id
+                or str(dispatch_binding["managed_intent_id"]) != authorization.managed_intent_id
+                or str(dispatch_binding["runtime_order_id"]) != authorization.runtime_order_id
+                or str(dispatch_binding["order_ref"]) != authorization.order_ref
+                or str(dispatch_binding["window_id"]) != authorization.window_id
+                or str(dispatch_binding["row_digest_sha256"]) != authorization.row_digest
+                or str(dispatch_binding["session_binding_sha256"])
+                != authorization.session_binding_sha256
+                or str(dispatch_binding["session_generation_id"])
+                != authorization.session_generation_id
+                or int(dispatch_binding["connection_generation"])
+                != authorization.connection_generation
+                or str(dispatch_binding["writer_owner_id"]) != writer_lease.owner_id
+                or int(dispatch_binding["writer_fencing_token"]) != writer_lease.fencing_token
+            ):
+                raise ContractValidationError("CTP submit command is not bound to its baseline proof")
+        return owner, window, binding
+
+    def _record_ctp_position_dispatch_authorization_binding(
+        self,
+        cursor: sqlite3.Cursor,
+        scope: ExecutionScope,
+        command: CtpDispatchCommand,
+        authorization: CtpPositionBaselineSubmitAuthorization,
+        *,
+        writer_lease: WriterLease,
+        created_at_ns: int,
+    ) -> None:
+        account_key, _, scope_key = self._validate_ctp_order_identity_scope(scope)
+        if (
+            command.operation != "SUBMIT"
+            or command.scope_key != scope_key
+            or command.reservation_managed_intent_id != authorization.managed_intent_id
+            or command.correlation_key is None
+            or command.correlation_key.runtime_order_id != authorization.runtime_order_id
+            or command.order_ref != authorization.order_ref
+            or command.session_binding_sha256 != authorization.session_binding_sha256
+        ):
+            raise ContractValidationError("position authorization does not bind this CTP command")
+        authorization_sha256 = payload_sha256(
+            self._ctp_position_authorization_payload(authorization)
+        )
+        cursor.execute(
+            "INSERT INTO ctp_position_dispatch_authorization_bindings("
+            "account_key, scope_key, command_id, authorization_kind, authorization_id, "
+            "authorization_sha256, owner_intent_id, managed_intent_id, runtime_order_id, "
+            "order_ref, window_id, row_digest_sha256, session_binding_sha256, "
+            "session_generation_id, connection_generation, writer_owner_id, "
+            "writer_fencing_token, created_at_ns) "
+            "VALUES (?, ?, ?, 'POSITION_BASELINE', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                account_key,
+                scope_key,
+                command.command_id,
+                authorization.authorization_id,
+                authorization_sha256,
+                authorization.owner_intent_id,
+                authorization.managed_intent_id,
+                authorization.runtime_order_id,
+                authorization.order_ref,
+                authorization.window_id,
+                authorization.row_digest,
+                authorization.session_binding_sha256,
+                authorization.session_generation_id,
+                authorization.connection_generation,
+                writer_lease.owner_id,
+                writer_lease.fencing_token,
+                created_at_ns,
+            ),
+        )
+
+    def _record_ctp_recovery_close_dispatch_binding(
+        self,
+        cursor: sqlite3.Cursor,
+        scope: ExecutionScope,
+        command: CtpDispatchCommand,
+        authorization: CtpRecoveryCloseDispatchAuthorization,
+        *,
+        writer_lease: WriterLease,
+        created_at_ns: int,
+    ) -> None:
+        account_key, trading_day, scope_key = self._validate_ctp_order_identity_scope(scope)
+        correlation = command.correlation_key
+        if (
+            command.operation != "SUBMIT"
+            or command.scope_key != scope_key
+            or command.reservation_managed_intent_id != authorization.child_intent_id
+            or correlation is None
+            or correlation.runtime_order_id != authorization.runtime_order_id
+            or command.order_ref != authorization.order_ref
+            or command.session_binding_sha256 != authorization.session_binding_sha256
+            or correlation.session_generation_id != authorization.session_generation_id
+            or command.trading_day != trading_day
+        ):
+            raise ContractValidationError("recovery authorization does not bind this CTP submit")
+        authorization_sha256 = payload_sha256(
+            self._ctp_recovery_authorization_payload(authorization)
+        )
+        cursor.execute(
+            "INSERT INTO ctp_position_dispatch_authorization_bindings("
+            "account_key, scope_key, command_id, authorization_kind, authorization_id, "
+            "authorization_sha256, owner_intent_id, managed_intent_id, runtime_order_id, "
+            "order_ref, window_id, row_digest_sha256, session_binding_sha256, "
+            "session_generation_id, connection_generation, writer_owner_id, "
+            "writer_fencing_token, created_at_ns) "
+            "VALUES (?, ?, ?, 'RECOVERY_CLOSE', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                account_key,
+                scope_key,
+                command.command_id,
+                authorization.authorization_id,
+                authorization_sha256,
+                authorization.owner_intent_id,
+                authorization.child_intent_id,
+                authorization.runtime_order_id,
+                authorization.order_ref,
+                authorization.position_window_id,
+                authorization.position_window_digest_sha256,
+                authorization.session_binding_sha256,
+                authorization.session_generation_id,
+                authorization.connection_generation,
+                writer_lease.owner_id,
+                writer_lease.fencing_token,
+                created_at_ns,
+            ),
+        )
+
+    def authorize_ctp_position_baseline_submit(
+        self,
+        scope: ExecutionScope,
+        managed_intent_id: str,
+        window_handle: CtpPositionEvidenceWindowHandle,
+        *,
+        owner_handle: CtpCallbackSessionOwnerHandle,
+        writer_lease: WriterLease,
+    ) -> CtpPositionBaselineSubmitAuthorization:
+        """Issue the sole baseline waiver for one never-dispatched OPEN intent."""
+
+        account_key, trading_day, scope_key = self._validate_ctp_order_identity_scope(scope)
+        self._validate_command_identifier(managed_intent_id, "managed_intent_id")
+        now_ns = time.time_ns()
+        now_mono_ns = time.monotonic_ns()
+        if (
+            type(window_handle) is not CtpPositionEvidenceWindowHandle
+            or window_handle._store_seal is not self._ctp_position_window_seal
+            or self._issued_ctp_position_window_handles.get(window_handle.window_id)
+            is not window_handle
+            or type(owner_handle) is not CtpCallbackSessionOwnerHandle
+        ):
+            raise ContractValidationError("exact Store-issued position-window handle is required")
+        with self._transaction() as cursor:
+            self._assert_active_writer_lease(cursor, scope, writer_lease, now_ns=now_ns)
+            owner = self._require_ctp_callback_session_owner_handle(
+                cursor,
+                scope,
+                owner_handle,
+                allowed_states=frozenset({"ACTIVE"}),
+                writer_lease=writer_lease,
+                now_ns=now_ns,
+            )
+            binding = self._active_ctp_callback_sessions.get(owner_handle.owner_intent_id)
+            if (
+                binding is None
+                or binding.account_key != account_key
+                or binding.scope_key != scope_key
+                or binding.trading_day != trading_day
+                or int(owner["economic_query_observed"]) != 1
+                or int(owner["last_source_sequence"]) != self._issued_ctp_position_window_rows[
+                    window_handle.window_id
+                ].end_source_sequence
+                or self._ctp_callback_applied_sequence(
+                    cursor, owner_handle.owner_intent_id, int(owner["last_source_sequence"])
+                ) != int(owner["last_source_sequence"])
+            ):
+                raise InvalidStateTransition("active CTP position baseline source is stale")
+            window_db = cursor.execute(
+                "SELECT * FROM ctp_dispatch_position_evidence_windows "
+                "WHERE account_key = ? AND window_id = ?",
+                (account_key, window_handle.window_id),
+            ).fetchone()
+            if window_db is None:
+                raise DurableStoreError("position baseline window is missing")
+            window = self._ctp_position_window_from_row(
+                window_db, store_seal=self._ctp_position_window_seal
+            )
+            if (
+                window.row_digest != window_handle.row_digest
+                or window.owner_intent_id != owner_handle.owner_intent_id
+                or window.managed_intent_id != managed_intent_id
+                or window.trading_day != trading_day
+                or window.session_binding_sha256 != binding.session_binding_sha256
+                or window.connection_generation != binding.connection_generation
+                or window.source_tags
+                != (
+                    binding.source_instance_id,
+                    binding.native_client_epoch,
+                    binding.native_api_source_id,
+                    binding.native_spi_source_id,
+                    binding.native_api_generation,
+                    binding.source_connection_generation,
+                )
+                or window.end_source_sequence != int(owner["last_source_sequence"])
+                or window.expires_at_utc <= datetime.now(timezone.utc)
+                or window.expires_monotonic_ns <= now_mono_ns
+                or window.writer_owner_id != writer_lease.owner_id
+                or window.writer_fencing_token != writer_lease.fencing_token
+            ):
+                raise ContractValidationError("position baseline window differs from current owner")
+            execution = cursor.execute(
+                "SELECT * FROM execution_records WHERE scope_key = ? AND intent_id = ?",
+                (scope_key, managed_intent_id),
+            ).fetchone()
+            if execution is None:
+                raise ContractValidationError("baseline intent is not persisted")
+            record = self._record_from_row(execution)
+            try:
+                intent = order_intent_from_payload(json.loads(str(execution["payload_json"])))
+            except (TypeError, ValueError, json.JSONDecodeError) as error:
+                raise DurableStoreError("baseline intent payload is unreadable") from error
+            if (
+                record.state is not ExecutionState.PENDING_DISPATCH
+                or record.dispatch_attempts != 0
+                or record.provider_order_id is not None
+                or record.filled_quantity != Decimal("0")
+                or record.average_price is not None
+                or record.cumulative_commission is not None
+                or record.review_required
+                or record.unknown_reason is not None
+                or record.permit_reference is None
+                or record.basic_admission_reference is None
+                or record.admission_context_sha256 is None
+                or len(record.basic_admission_reference) != 32
+                or any(char not in "0123456789abcdef" for char in record.basic_admission_reference)
+                or intent.intent_id != managed_intent_id
+                or intent.scope != scope
+                or intent.position_effect.value != "OPEN"
+            ):
+                raise InvalidStateTransition("baseline waiver requires the exact pending OPEN intent")
+            if cursor.execute(
+                "SELECT 1 FROM ctp_position_baseline_submit_authorizations "
+                "WHERE account_key = ? AND scope_key = ? AND managed_intent_id = ?",
+                (account_key, scope_key, managed_intent_id),
+            ).fetchone() is not None:
+                raise InvalidStateTransition("baseline authorization has already been issued")
+            other_unresolved = cursor.execute(
+                "SELECT intent_id FROM execution_records WHERE scope_key = ? "
+                "AND intent_id != ? AND (state IN (?, ?) OR review_required = 1) LIMIT 1",
+                (
+                    scope_key,
+                    managed_intent_id,
+                    ExecutionState.DISPATCHING.value,
+                    ExecutionState.UNKNOWN.value,
+                ),
+            ).fetchone()
+            if other_unresolved is not None:
+                raise InvalidStateTransition("another unresolved execution blocks baseline authorization")
+            unresolved_ctp = cursor.execute(
+                "SELECT command_id FROM ctp_dispatch_commands WHERE account_key = ? "
+                "AND (status = 'CLAIMED' OR (status = 'UNKNOWN' AND NOT EXISTS "
+                "(SELECT 1 FROM ctp_dispatch_unknown_resolutions AS r "
+                "WHERE r.account_key = ctp_dispatch_commands.account_key "
+                "AND r.command_id = ctp_dispatch_commands.command_id))) LIMIT 1",
+                (account_key,),
+            ).fetchone()
+            if unresolved_ctp is not None:
+                raise InvalidStateTransition("unresolved CTP command blocks baseline authorization")
+            if self._ctp_position_window_instrument_rows(window, intent.instrument):
+                for position in self._ctp_position_window_instrument_rows(window, intent.instrument):
+                    if any(
+                        self._ctp_window_field_value(position, name) != 0
+                        for name in ("Position", "TodayPosition", "YdPosition")
+                    ):
+                        raise InvalidStateTransition("pre-submit baseline is not flat for OPEN instrument")
+            reservation = cursor.execute(
+                "SELECT runtime_order_id, order_ref FROM ctp_order_identity_reservations "
+                "WHERE account_key = ? AND trading_day = ? AND scope_key = ? "
+                "AND managed_intent_id = ?",
+                (account_key, trading_day, scope_key, managed_intent_id),
+            ).fetchone()
+            if reservation is None or (
+                str(reservation["runtime_order_id"]) != window.runtime_order_id
+                or str(reservation["order_ref"]) != window.order_ref
+            ):
+                raise ContractValidationError("baseline OrderRef reservation differs from window")
+            authorization_id = uuid.uuid4().hex
+            expires_at_ns = now_ns + min(
+                _CTP_POSITION_QUERY_FENCE_TTL_NS,
+                max(0, window.expires_monotonic_ns - now_mono_ns),
+            )
+            if expires_at_ns <= now_ns:
+                raise InvalidStateTransition("position baseline evidence expired before authorization")
+            authorization = CtpPositionBaselineSubmitAuthorization(
+                authorization_id=authorization_id,
+                owner_intent_id=owner_handle.owner_intent_id,
+                account_key=account_key,
+                scope_key=scope_key,
+                trading_day=trading_day,
+                managed_intent_id=managed_intent_id,
+                runtime_order_id=window.runtime_order_id,
+                order_ref=window.order_ref,
+                window_id=window.window_id,
+                row_digest=window.row_digest,
+                session_binding_sha256=binding.session_binding_sha256,
+                session_generation_id=binding.session_generation_id,
+                connection_generation=binding.connection_generation,
+                source_tags=window.source_tags,
+                end_source_sequence=window.end_source_sequence,
+                permit_reference_sha256=hashlib.sha256(
+                    record.permit_reference.encode("utf-8")
+                ).hexdigest(),
+                basic_admission_reference_sha256=hashlib.sha256(
+                    record.basic_admission_reference.encode("ascii")
+                ).hexdigest(),
+                writer_owner_id=writer_lease.owner_id,
+                writer_fencing_token=writer_lease.fencing_token,
+                created_at_ns=now_ns,
+                expires_at_ns=expires_at_ns,
+                _store_seal=self._ctp_position_baseline_authorization_seal,
+            )
+            cursor.execute(
+                "INSERT INTO ctp_position_baseline_submit_authorizations("
+                "account_key, authorization_id, scope_key, owner_intent_id, managed_intent_id, "
+                "runtime_order_id, order_ref, window_id, row_digest_sha256, "
+                "permit_reference_sha256, basic_admission_reference_sha256, "
+                "session_binding_sha256, source_end_sequence, writer_owner_id, "
+                "writer_fencing_token, created_at_ns, expires_at_ns) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    account_key,
+                    authorization.authorization_id,
+                    scope_key,
+                    authorization.owner_intent_id,
+                    managed_intent_id,
+                    authorization.runtime_order_id,
+                    authorization.order_ref,
+                    authorization.window_id,
+                    authorization.row_digest,
+                    authorization.permit_reference_sha256,
+                    authorization.basic_admission_reference_sha256,
+                    authorization.session_binding_sha256,
+                    authorization.end_source_sequence,
+                    writer_lease.owner_id,
+                    writer_lease.fencing_token,
+                    now_ns,
+                    expires_at_ns,
+                ),
+            )
+            self._issued_ctp_position_baseline_authorizations[authorization_id] = authorization
+            return authorization
+
+    @staticmethod
+    def _ctp_recovery_risk_types() -> tuple[type, ...]:
+        try:
+            from bt_api_risk.core.admission import (
+                AccountScope,
+                DurableRiskGate,
+                IntentAction,
+                RecoveryCloseSourceProof,
+                RecoveryReductionAllocation,
+                RiskIntent,
+                RiskPermit,
+                VerifiedRecoveryCloseSource,
+            )
+        except Exception as error:
+            raise ContractValidationError("typed CTP recovery Risk contracts are unavailable") from error
+        return (
+            AccountScope,
+            DurableRiskGate,
+            IntentAction,
+            RecoveryCloseSourceProof,
+            RecoveryReductionAllocation,
+            RiskIntent,
+            RiskPermit,
+            VerifiedRecoveryCloseSource,
+        )
+
+    @staticmethod
+    def _ctp_recovery_order_side(intent: OrderIntent) -> str:
+        value = getattr(intent.side, "value", None)
+        if value not in {"BUY", "SELL"}:
+            raise ContractValidationError("CTP recovery parent order side is unavailable")
+        return str(value)
+
+    def _ctp_recovery_parent_command(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        account_key: str,
+        scope_key: str,
+        parent_intent_id: str,
+    ) -> tuple[sqlite3.Row, CtpDispatchCommand]:
+        rows = cursor.execute(
+            """
+            SELECT * FROM ctp_dispatch_commands
+            WHERE account_key = ? AND scope_key = ? AND operation = 'SUBMIT'
+              AND reservation_managed_intent_id = ?
+            ORDER BY created_at_ns, command_id
+            """,
+            (account_key, scope_key, parent_intent_id),
+        ).fetchall()
+        if len(rows) != 1:
+            raise InvalidStateTransition("recovery parent must have one exact CTP SUBMIT command")
+        row = rows[0]
+        command = self._ctp_dispatch_command_from_row(row)
+        if (
+            command.operation != "SUBMIT"
+            or command.status != "COMPLETED"
+            or command.local_queue_receipt_queued is not True
+            or command.correlation_key is None
+            or command.correlation_key.version != 2
+            or command.reservation_managed_intent_id != parent_intent_id
+        ):
+            raise InvalidStateTransition("recovery parent CTP submit is not durably complete")
+        return row, command
+
+    @staticmethod
+    def _ctp_recovery_trade_ids(
+        cursor: sqlite3.Cursor,
+        *,
+        account_key: str,
+        scope_key: str,
+        trading_day: str,
+        owner_intent_id: str,
+        command_id: str,
+    ) -> tuple[tuple[str, ...], tuple[str, ...], int]:
+        rows = cursor.execute(
+            """
+            SELECT * FROM ctp_dispatch_trade_fact_ledger
+            WHERE account_key = ? AND scope_key = ? AND trading_day = ?
+              AND owner_intent_id = ? AND command_id = ?
+            ORDER BY source_sequence, trade_id
+            """,
+            (account_key, scope_key, trading_day, owner_intent_id, command_id),
+        ).fetchall()
+        ids: list[str] = []
+        digests: list[str] = []
+        quantity = 0
+        prior_sequences: set[int] = set()
+        for row in rows:
+            try:
+                sequence = int(row["source_sequence"])
+                trade_id = str(row["trade_id"])
+                volume = int(row["trade_volume"])
+                fact_json = str(row["fact_payload_json"])
+                fact = json.loads(fact_json)
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+                raise DurableStoreError("stored CTP parent trade fact is unreadable") from error
+            if (
+                sequence <= 0 or sequence in prior_sequences
+                or not trade_id or trade_id in ids or volume <= 0
+                or canonical_json(fact) != fact_json
+                or payload_sha256(fact) != str(row["fact_payload_sha256"])
+                or str(row["prefix_consistency"]) != "MATCHED"
+                or str(row["commission_quality"]) != "INCOMPLETE"
+            ):
+                raise InvalidStateTransition("CTP parent TradeID source is incomplete or replayed")
+            prior_sequences.add(sequence)
+            ids.append(trade_id)
+            digests.append(str(row["fact_payload_sha256"]))
+            quantity += volume
+        if not rows or len(ids) != len(set(ids)):
+            raise InvalidStateTransition("CTP recovery requires complete positive parent TradeID facts")
+        return tuple(ids), tuple(digests), quantity
+
+    def _ctp_recovery_close_source_facts_cursor(
+        self,
+        cursor: sqlite3.Cursor,
+        scope: ExecutionScope,
+        parent_intent_id: str,
+        position_window_handle: CtpPositionEvidenceWindowHandle,
+        *,
+        owner_handle: CtpCallbackSessionOwnerHandle,
+        writer_lease: WriterLease,
+        parent_permit: Any,
+        parent_snapshot: CtpOwnerCallbackObservationSnapshotV1,
+        recovery_child_command: CtpDispatchCommand | None = None,
+        allow_unqueued_recovery_child: bool = False,
+    ) -> CtpRecoveryCloseSourceFacts:
+        account_key, trading_day, scope_key = self._validate_ctp_order_identity_scope(scope)
+        if (
+            type(position_window_handle) is not CtpPositionEvidenceWindowHandle
+            or position_window_handle._store_seal is not self._ctp_position_window_seal
+            or self._issued_ctp_position_window_handles.get(position_window_handle.window_id)
+            is not position_window_handle
+            or type(owner_handle) is not CtpCallbackSessionOwnerHandle
+            or self._issued_ctp_callback_session_owners.get(owner_handle.owner_intent_id)
+            is not owner_handle
+        ):
+            raise ContractValidationError("same-Store CTP recovery window and owner are required")
+        (
+            _account_scope_type,
+            _risk_gate_type,
+            _intent_action_type,
+            _proof_type,
+            _allocation_type,
+            _risk_intent_type,
+            risk_permit_type,
+            _verified_source_type,
+        ) = self._ctp_recovery_risk_types()
+        if type(parent_permit) is not risk_permit_type:
+            raise ContractValidationError("typed original Risk permit is required")
+        now_wall_ns = time.time_ns()
+        now_mono_ns = time.monotonic_ns()
+        owner = self._require_ctp_callback_session_owner_handle(
+            cursor,
+            scope,
+            owner_handle,
+            allowed_states=frozenset({"ACTIVE"}),
+            writer_lease=writer_lease,
+            now_ns=now_wall_ns,
+        )
+        binding = self._active_ctp_callback_sessions.get(owner_handle.owner_intent_id)
+        if binding is None or (
+            binding.account_key != account_key
+            or binding.scope_key != scope_key
+            or binding.trading_day != trading_day
+            or binding.session_generation_id != self._ctp_callback_session_generation_id(owner)
+            or binding.connection_generation != int(owner["active_connection_generation"])
+            or int(owner["economic_query_observed"]) != 1
+        ):
+            raise InvalidStateTransition("CTP recovery requires the active queried source session")
+        window_db = cursor.execute(
+            "SELECT * FROM ctp_dispatch_position_evidence_windows "
+            "WHERE account_key = ? AND window_id = ?",
+            (account_key, position_window_handle.window_id),
+        ).fetchone()
+        if window_db is None:
+            raise DurableStoreError("durable CTP recovery position window is missing")
+        window = self._ctp_position_window_from_row(
+            window_db, store_seal=self._ctp_position_window_seal
+        )
+        expected_tags = (
+            binding.source_instance_id,
+            binding.native_client_epoch,
+            binding.native_api_source_id,
+            binding.native_spi_source_id,
+            binding.native_api_generation,
+            binding.source_connection_generation,
+        )
+        if (
+            window.row_digest != position_window_handle.row_digest
+            or window.owner_intent_id != owner_handle.owner_intent_id
+            or window.managed_intent_id == parent_intent_id
+            or window.trading_day != trading_day
+            or window.session_binding_sha256 != binding.session_binding_sha256
+            or window.source_tags != expected_tags
+            or window.connection_generation != binding.connection_generation
+            or window.writer_owner_id != writer_lease.owner_id
+            or window.writer_fencing_token != writer_lease.fencing_token
+            or window.expires_at_utc <= datetime.now(timezone.utc)
+            or window.expires_monotonic_ns <= now_mono_ns
+            or window.completed_monotonic_ns > now_mono_ns
+            or window.end_source_sequence != int(owner["last_source_sequence"])
+            or self._ctp_callback_applied_sequence(
+                cursor, owner_handle.owner_intent_id, int(owner["last_source_sequence"])
+            ) != int(owner["last_source_sequence"])
+        ):
+            raise InvalidStateTransition("CTP recovery position window is stale or cross-generation")
+        reservation = cursor.execute(
+            """
+            SELECT * FROM ctp_order_identity_reservations
+            WHERE account_key = ? AND trading_day = ? AND scope_key = ?
+              AND managed_intent_id = ?
+            """,
+            (account_key, trading_day, scope_key, window.managed_intent_id),
+        ).fetchone()
+        if reservation is None or (
+            str(reservation["runtime_order_id"]) != window.runtime_order_id
+            or str(reservation["order_ref"]) != window.order_ref
+        ):
+            raise ContractValidationError("recovery QueryInvestorPosition lacks exact child OrderRef")
+        baseline_auth_rows = cursor.execute(
+            """
+            SELECT auth.*, use.command_id, use.command_binding_sha256,
+                   use.writer_owner_id AS use_writer_owner_id,
+                   use.writer_fencing_token AS use_writer_fencing_token
+            FROM ctp_position_baseline_submit_authorizations AS auth
+            JOIN ctp_position_baseline_submit_authorization_uses AS use
+              ON use.account_key = auth.account_key
+             AND use.authorization_id = auth.authorization_id
+            WHERE auth.account_key = ? AND auth.scope_key = ?
+              AND auth.managed_intent_id = ?
+            """,
+            (account_key, scope_key, parent_intent_id),
+        ).fetchall()
+        parent_execution = cursor.execute(
+            "SELECT * FROM execution_records WHERE scope_key = ? AND intent_id = ?",
+            (scope_key, parent_intent_id),
+        ).fetchone()
+        if parent_execution is None:
+            raise InvalidStateTransition("recovery parent execution record is unavailable")
+        parent_record = self._record_from_row(parent_execution)
+        parent_order_intent = order_intent_from_payload(
+            json.loads(str(parent_execution["payload_json"]))
+        )
+        if (
+            parent_record.payload_sha256 != parent_order_intent.fingerprint
+            or parent_record.intent_id != parent_intent_id
+            or parent_record.scope_key != scope_key
+            or parent_order_intent.scope != scope
+            or parent_order_intent.position_effect.value != "OPEN"
+            or parent_record.state not in {ExecutionState.CANCELLED, ExecutionState.FILLED}
+            or parent_record.dispatch_attempts <= 0
+            or parent_record.permit_reference != parent_permit.permit_id
+            or parent_permit.intent_id != parent_intent_id
+            or getattr(parent_permit.action, "value", None) != "increase"
+            or parent_record.unknown_reason is not None
+        ):
+            raise InvalidStateTransition("recovery parent is not a terminal admitted OPEN")
+        if (
+            parent_permit.scope.provider != scope.provider
+            or parent_permit.scope.environment != scope.environment
+            or parent_permit.scope.account_id != scope.account_ref
+            or parent_permit.strategy_id != scope.strategy_id
+            or parent_permit.instrument != parent_order_intent.instrument
+            or parent_permit.quantity != parent_order_intent.quantity
+            or not parent_permit.strategy_id
+            or not parent_permit.allocation_version
+            or not parent_permit.quantity_unit
+        ):
+            raise ContractValidationError("Risk permit and durable CTP OPEN identity differ")
+        parent_command_row, parent_command = self._ctp_recovery_parent_command(
+            cursor,
+            account_key=account_key,
+            scope_key=scope_key,
+            parent_intent_id=parent_intent_id,
+        )
+        correlation = parent_command.correlation_key
+        assert correlation is not None
+        if (
+            correlation.order_ref != parent_command.order_ref
+            or parent_command.trading_day != trading_day
+            or str(parent_command.request_payload.get("InstrumentID"))
+            != parent_order_intent.instrument
+            or str(parent_command.request_payload.get("CombOffsetFlag")) != "0"
+            or str(parent_command.request_payload.get("VolumeTotalOriginal"))
+            != str(int(parent_order_intent.quantity))
+        ):
+            raise ContractValidationError("CTP OPEN command differs from stored parent intent")
+        if len(baseline_auth_rows) != 1:
+            raise InvalidStateTransition("recovery parent has no unique consumed flat baseline")
+        baseline_auth = baseline_auth_rows[0]
+        if (
+            str(baseline_auth["command_id"]) != parent_command.command_id
+            or str(baseline_auth["runtime_order_id"]) != correlation.runtime_order_id
+            or str(baseline_auth["order_ref"]) != correlation.order_ref
+            or str(baseline_auth["owner_intent_id"]) != owner_handle.owner_intent_id
+            or str(baseline_auth["writer_owner_id"]) != writer_lease.owner_id
+            or int(baseline_auth["writer_fencing_token"]) != writer_lease.fencing_token
+            or str(baseline_auth["session_binding_sha256"]) != binding.session_binding_sha256
+            or int(baseline_auth["source_end_sequence"]) >= parent_snapshot.order_source_sequence
+        ):
+            raise InvalidStateTransition("recovery baseline is not the consumed pre-OPEN source")
+        baseline_db = cursor.execute(
+            "SELECT * FROM ctp_dispatch_position_evidence_windows "
+            "WHERE account_key = ? AND window_id = ?",
+            (account_key, str(baseline_auth["window_id"])),
+        ).fetchone()
+        if baseline_db is None:
+            raise DurableStoreError("durable CTP OPEN baseline window is missing")
+        baseline = self._ctp_position_window_from_row(
+            baseline_db, store_seal=self._ctp_position_window_seal
+        )
+        if (
+            baseline.row_digest != str(baseline_auth["row_digest_sha256"])
+            or baseline.owner_intent_id != owner_handle.owner_intent_id
+            or baseline.managed_intent_id != parent_intent_id
+            or baseline.runtime_order_id != correlation.runtime_order_id
+            or baseline.order_ref != correlation.order_ref
+            or baseline.trading_day != trading_day
+            or baseline.session_binding_sha256 != binding.session_binding_sha256
+            or baseline.connection_generation != binding.connection_generation
+            or baseline.end_source_sequence != int(baseline_auth["source_end_sequence"])
+            or baseline.end_source_sequence >= parent_snapshot.order_source_sequence
+            or baseline.created_at_ns >= window.created_at_ns
+        ):
+            raise InvalidStateTransition("recovery baseline window provenance changed")
+        for position in self._ctp_position_window_instrument_rows(
+            baseline, parent_order_intent.instrument
+        ):
+            if any(
+                self._ctp_window_field_value(position, field_name) != 0
+                for field_name in ("Position", "TodayPosition", "YdPosition")
+            ):
+                raise InvalidStateTransition("recovery source OPEN baseline was not flat")
+        if (
+            parent_snapshot.command_id != parent_command.command_id
+            or parent_snapshot.account_key != account_key
+            or parent_snapshot.scope_key != scope_key
+            or parent_snapshot.trading_day != trading_day
+            or parent_snapshot.owner_intent_id != owner_handle.owner_intent_id
+            or parent_snapshot.session_generation_id != binding.session_generation_id
+            or parent_snapshot.order_ref != correlation.order_ref
+            or parent_snapshot.provider_state not in {"CANCELLED", "FILLED"}
+            or parent_snapshot.command_status != "COMPLETED"
+            or parent_snapshot.local_dispatch_outcome != "QUEUED"
+            or parent_snapshot.filled_quantity <= 0
+            or parent_snapshot.trade_fact_count <= 0
+            or Decimal(parent_snapshot.filled_quantity) != parent_record.filled_quantity
+            or parent_record.filled_quantity > parent_order_intent.quantity
+            or parent_snapshot.order_source_sequence >= window.end_source_sequence
+        ):
+            raise InvalidStateTransition("recovery parent callback snapshot is incomplete or stale")
+        trade_ids, trade_digests, trade_quantity = self._ctp_recovery_trade_ids(
+            cursor,
+            account_key=account_key,
+            scope_key=scope_key,
+            trading_day=trading_day,
+            owner_intent_id=owner_handle.owner_intent_id,
+            command_id=parent_command.command_id,
+        )
+        expected_trade_direction = "0" if self._ctp_recovery_order_side(parent_order_intent) == "BUY" else "1"
+        request_hedge = parent_command.request_payload.get("CombHedgeFlag")
+        if type(request_hedge) is not str or len(request_hedge) != 1:
+            raise InvalidStateTransition("recovery parent hedge identity is unavailable")
+        trade_rows = cursor.execute(
+            """
+            SELECT * FROM ctp_dispatch_trade_fact_ledger
+            WHERE account_key = ? AND scope_key = ? AND trading_day = ?
+              AND owner_intent_id = ? AND command_id = ?
+            ORDER BY source_sequence, trade_id
+            """,
+            (account_key, scope_key, trading_day, owner_handle.owner_intent_id, parent_command.command_id),
+        ).fetchall()
+        for trade in trade_rows:
+            if (
+                str(trade["managed_intent_id"]) != parent_intent_id
+                or str(trade["runtime_order_id"]) != correlation.runtime_order_id
+                or str(trade["order_ref"]) != correlation.order_ref
+                or str(trade["session_generation_id"]) != binding.session_generation_id
+                or str(trade["instrument_id"]) != parent_order_intent.instrument
+                or str(trade["direction"]) != expected_trade_direction
+                or str(trade["offset_flag"]) != "0"
+                or str(trade["hedge_flag"]) != request_hedge
+                or str(trade["order_sys_id"]) != parent_snapshot.order_sys_id
+            ):
+                raise InvalidStateTransition("parent CTP TradeID attribution does not match the OPEN")
+        if trade_quantity != parent_snapshot.filled_quantity:
+            raise InvalidStateTransition("complete parent TradeID quantity differs from order callback")
+        other_trades = cursor.execute(
+            """
+            SELECT COUNT(*) AS n FROM ctp_dispatch_trade_fact_ledger
+            WHERE account_key = ? AND trading_day = ? AND instrument_id = ?
+              AND NOT (scope_key = ? AND command_id = ? AND owner_intent_id = ?)
+            """,
+            (
+                account_key, trading_day, parent_order_intent.instrument, scope_key,
+                parent_command.command_id, owner_handle.owner_intent_id,
+            ),
+        ).fetchone()
+        if int(other_trades["n"]) != 0:
+            raise InvalidStateTransition("other same-account CTP trades make attribution incomplete")
+        # A second managed submit for the same instrument invalidates the
+        # flat-baseline-to-fill attribution, even when it has no known fill.
+        same_account_commands = cursor.execute(
+            "SELECT * FROM ctp_dispatch_commands WHERE account_key = ? AND trading_day = ? "
+            "AND operation = 'SUBMIT'",
+            (account_key, trading_day),
+        ).fetchall()
+        for candidate_row in same_account_commands:
+            candidate = self._ctp_dispatch_command_from_row(candidate_row)
+            if (
+                candidate.command_id != parent_command.command_id
+                and str(candidate.request_payload.get("InstrumentID"))
+                == parent_order_intent.instrument
+            ):
+                if (
+                    recovery_child_command is not None
+                    and candidate.command_id == recovery_child_command.command_id
+                    and candidate == recovery_child_command
+                    and candidate.operation == "SUBMIT"
+                    and candidate.scope_key == scope_key
+                    and candidate.reservation_managed_intent_id == window.managed_intent_id
+                    and candidate.correlation_key is not None
+                    and candidate.correlation_key.runtime_order_id == window.runtime_order_id
+                    and candidate.order_ref == window.order_ref
+                    and candidate.session_binding_sha256 == window.session_binding_sha256
+                    and candidate.correlation_key.session_generation_id
+                    == binding.session_generation_id
+                    and candidate.trading_day == trading_day
+                    and candidate.status in {"READY", "CLAIMED"}
+                    and (
+                        (
+                            candidate.local_queue_receipt_id is not None
+                            and candidate.local_queue_receipt_queued is True
+                        )
+                        or (
+                            allow_unqueued_recovery_child
+                            and candidate.status == "READY"
+                            and candidate.local_queue_receipt_id is not None
+                            and candidate.local_queue_receipt_queued is None
+                        )
+                    )
+                ):
+                    continue
+                raise InvalidStateTransition("another same-account CTP submit prevents attribution")
+        direction = "2" if expected_trade_direction == "0" else "3"
+        position_side = "LONG" if direction == "2" else "SHORT"
+        parent_side = self._ctp_recovery_order_side(parent_order_intent)
+        recovery_side = "SELL" if parent_side == "BUY" else "BUY"
+        if parent_permit.position_side not in {"NET", position_side}:
+            raise InvalidStateTransition("parent Risk position side differs from its CTP OPEN")
+        if parent_permit.position_bucket not in {"ALL", "TODAY", "YESTERDAY"}:
+            raise InvalidStateTransition("parent Risk position bucket is invalid")
+        positions = self._ctp_position_window_instrument_rows(window, parent_order_intent.instrument)
+        if not positions:
+            raise InvalidStateTransition("fresh CTP recovery position query has no parent instrument")
+        selected: dict[str, int] = {"TODAY": 0, "YESTERDAY": 0}
+        instrument_total = 0
+        for position in positions:
+            row_direction = self._ctp_window_field_value(position, "PosiDirection")
+            hedge = self._ctp_window_field_value(position, "HedgeFlag")
+            position_date = self._ctp_window_field_value(position, "PositionDate")
+            amount = self._ctp_window_field_value(position, "Position")
+            if (
+                row_direction not in {"2", "3"}
+                or hedge != request_hedge
+                or position_date not in {"1", "2"}
+                or type(amount) is not int or amount < 0
+            ):
+                raise InvalidStateTransition("fresh CTP recovery position identity is ambiguous")
+            if amount and row_direction != direction:
+                raise InvalidStateTransition("opposite-side CTP position prevents attribution")
+            instrument_total += amount
+            if row_direction == direction:
+                selected["TODAY" if position_date == "1" else "YESTERDAY"] += amount
+        if instrument_total <= 0 or instrument_total > trade_quantity:
+            raise InvalidStateTransition("fresh CTP position exceeds the exact parent fill")
+        if selected["TODAY"] > 0 and parent_permit.position_bucket in {"ALL", "TODAY"}:
+            position_bucket = "TODAY"
+        elif selected["YESTERDAY"] > 0 and parent_permit.position_bucket in {"ALL", "YESTERDAY"}:
+            position_bucket = "YESTERDAY"
+        else:
+            raise InvalidStateTransition("no fresh position remains in the parent's permitted bucket")
+        attributable = selected[position_bucket]
+        if attributable <= 0 or Decimal(attributable) > Decimal(trade_quantity):
+            raise InvalidStateTransition("CTP position quantity is not attributable to parent fills")
+        journal_row = cursor.execute(
+            "SELECT value FROM execution_meta WHERE key = 'journal_incarnation_id'"
+        ).fetchone()
+        if journal_row is None:
+            raise DurableStoreError("execution journal incarnation is unavailable")
+        journal_incarnation_id = str(journal_row["value"])
+        if len(journal_incarnation_id) != 32 or any(
+            character not in "0123456789abcdef" for character in journal_incarnation_id
+        ):
+            raise DurableStoreError("execution journal incarnation is invalid")
+        observed_at_ns = int(window.completed_at_utc.timestamp() * 1_000_000_000)
+        valid_until_ns = int(window.expires_at_utc.timestamp() * 1_000_000_000)
+        source_revision = window.end_source_sequence
+        evidence_payload = {
+            "account_key": account_key,
+            "allocation_version": parent_permit.allocation_version,
+            "attributable_position_quantity": str(attributable),
+            "baseline_window_id": baseline.window_id,
+            "baseline_window_digest_sha256": baseline.row_digest,
+            "book_id": scope_key,
+            "connection_generation": binding.connection_generation,
+            "journal_incarnation_id": journal_incarnation_id,
+            "parent_callback_source_sha256": parent_snapshot.source_digest_sha256,
+            "parent_command_id": parent_command.command_id,
+            "parent_intent_id": parent_intent_id,
+            "parent_order_intent_sha256": parent_record.payload_sha256,
+            "parent_order_ref": correlation.order_ref,
+            "parent_permit_id": parent_permit.permit_id,
+            "parent_trade_ids": trade_ids,
+            "parent_trade_digests": trade_digests,
+            "parent_filled_quantity": str(parent_record.filled_quantity),
+            "parent_position_bucket": parent_permit.position_bucket,
+            "parent_position_side": parent_permit.position_side,
+            "parent_order_side": parent_side,
+            "position_bucket": position_bucket,
+            "position_side": position_side,
+            "position_window_id": window.window_id,
+            "position_window_digest_sha256": window.row_digest,
+            "recovery_intent_id": window.managed_intent_id,
+            "recovery_order_ref": window.order_ref,
+            "recovery_runtime_order_id": window.runtime_order_id,
+            "scope_key": scope_key,
+            "session_binding_sha256": binding.session_binding_sha256,
+            "session_generation_id": binding.session_generation_id,
+            "source_revision": source_revision,
+            "trading_day": trading_day,
+            "writer_fencing_token": writer_lease.fencing_token,
+            "writer_owner_id": writer_lease.owner_id,
+        }
+        return CtpRecoveryCloseSourceFacts(
+            account_key=account_key,
+            scope_key=scope_key,
+            book_id=scope_key,
+            trading_day=trading_day,
+            parent_intent_id=parent_intent_id,
+            parent_order_intent_sha256=parent_record.payload_sha256,
+            parent_permit_id=parent_permit.permit_id,
+            parent_command_id=parent_command.command_id,
+            parent_runtime_order_id=correlation.runtime_order_id,
+            parent_order_ref=correlation.order_ref,
+            recovery_intent_id=window.managed_intent_id,
+            runtime_order_id=window.runtime_order_id,
+            order_ref=window.order_ref,
+            owner_intent_id=owner_handle.owner_intent_id,
+            session_binding_sha256=binding.session_binding_sha256,
+            session_generation_id=binding.session_generation_id,
+            connection_generation=binding.connection_generation,
+            journal_incarnation_id=journal_incarnation_id,
+            instrument=parent_order_intent.instrument,
+            strategy_id=str(parent_permit.strategy_id),
+            allocation_version=str(parent_permit.allocation_version),
+            quantity_unit=str(parent_permit.quantity_unit),
+            parent_order_side=parent_side,
+            recovery_order_side=recovery_side,
+            parent_position_side=parent_permit.position_side,
+            parent_position_bucket=parent_permit.position_bucket,
+            position_side=position_side,
+            position_bucket=position_bucket,
+            parent_filled_quantity=parent_record.filled_quantity,
+            attributable_position_quantity=Decimal(attributable),
+            source_revision=source_revision,
+            source_evidence_sha256=payload_sha256(evidence_payload),
+            parent_callback_source_sha256=parent_snapshot.source_digest_sha256,
+            baseline_window_id=baseline.window_id,
+            baseline_window_digest_sha256=baseline.row_digest,
+            position_window_id=window.window_id,
+            position_window_digest_sha256=window.row_digest,
+            parent_trade_ids=trade_ids,
+            observed_at_ns=observed_at_ns,
+            valid_until_ns=valid_until_ns,
+            writer_owner_id=writer_lease.owner_id,
+            writer_fencing_token=writer_lease.fencing_token,
+        )
+
+    def _ctp_recovery_parent_snapshot(
+        self,
+        scope: ExecutionScope,
+        parent_intent_id: str,
+        owner_handle: CtpCallbackSessionOwnerHandle,
+        writer_lease: WriterLease,
+    ) -> tuple[str, CtpOwnerCallbackObservationSnapshotV1]:
+        account_key, _, scope_key = self._validate_ctp_order_identity_scope(scope)
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT command_id FROM ctp_dispatch_commands
+                   WHERE account_key = ? AND scope_key = ? AND operation = 'SUBMIT'
+                     AND reservation_managed_intent_id = ?
+                   ORDER BY created_at_ns, command_id""",
+                (account_key, scope_key, parent_intent_id),
+            ).fetchall()
+        if len(rows) != 1:
+            raise InvalidStateTransition("recovery parent must have one exact CTP SUBMIT command")
+        command_id = str(rows[0]["command_id"])
+        snapshot = self.read_ctp_owner_callback_observation_snapshot(scope, command_id)
+        if type(snapshot) is not CtpOwnerCallbackObservationSnapshotV1:
+            raise InvalidStateTransition("recovery parent callback/trade source is not complete")
+        if snapshot.owner_intent_id != owner_handle.owner_intent_id:
+            raise InvalidStateTransition("recovery parent source belongs to another CTP owner")
+        return command_id, snapshot
+
+    def read_ctp_recovery_close_source_facts(
+        self,
+        scope: ExecutionScope,
+        parent_intent_id: str,
+        position_window_handle: CtpPositionEvidenceWindowHandle,
+        *,
+        owner_handle: CtpCallbackSessionOwnerHandle,
+        writer_lease: WriterLease,
+        parent_permit: Any,
+    ) -> CtpRecoveryCloseSourceFacts:
+        """Read complete parent-fill/current-position facts under one Store fence."""
+
+        command_id, parent_snapshot = self._ctp_recovery_parent_snapshot(
+            scope, parent_intent_id, owner_handle, writer_lease
+        )
+        with self._transaction() as cursor:
+            self._assert_active_writer_lease(cursor, scope, writer_lease)
+            facts = self._ctp_recovery_close_source_facts_cursor(
+                cursor,
+                scope,
+                parent_intent_id,
+                position_window_handle,
+                owner_handle=owner_handle,
+                writer_lease=writer_lease,
+                parent_permit=parent_permit,
+                parent_snapshot=parent_snapshot,
+            )
+            if facts.parent_command_id != command_id:
+                raise InvalidStateTransition("recovery parent command changed during source read")
+        self._issued_ctp_recovery_source_facts[facts.source_evidence_sha256] = facts
+        self._issued_ctp_recovery_parent_snapshots[facts.source_evidence_sha256] = parent_snapshot
+        self._issued_ctp_recovery_parent_permits[facts.parent_permit_id] = parent_permit
+        return facts
+
+    def issue_ctp_recovery_close_source_proof(
+        self,
+        scope: ExecutionScope,
+        parent_intent_id: str,
+        recovery_intent: Any,
+        position_window_handle: CtpPositionEvidenceWindowHandle,
+        *,
+        owner_handle: CtpCallbackSessionOwnerHandle,
+        writer_lease: WriterLease,
+        parent_permit: Any,
+        parent_risk_intent: Any,
+    ) -> Any:
+        """Bind exact Store facts to the typed original and child Risk intents."""
+
+        (
+            account_scope_type,
+            _risk_gate_type,
+            intent_action_type,
+            proof_type,
+            _allocation_type,
+            risk_intent_type,
+            risk_permit_type,
+            _verified_source_type,
+        ) = self._ctp_recovery_risk_types()
+        if (
+            type(parent_permit) is not risk_permit_type
+            or type(parent_risk_intent) is not risk_intent_type
+            or type(recovery_intent) is not risk_intent_type
+            or type(parent_risk_intent.scope) is not account_scope_type
+            or type(recovery_intent.scope) is not account_scope_type
+            or parent_risk_intent.intent_id != parent_intent_id
+            or parent_risk_intent.intent_id != parent_permit.intent_id
+            or parent_risk_intent.scope != parent_permit.scope
+            or parent_risk_intent.action is not intent_action_type.INCREASE
+            or recovery_intent.action is not intent_action_type.REDUCE
+            or recovery_intent.scope != parent_permit.scope
+            or parent_risk_intent.instrument != parent_permit.instrument
+            or parent_risk_intent.quantity != parent_permit.quantity
+            or parent_risk_intent.quantity_unit != parent_permit.quantity_unit
+            or parent_risk_intent.strategy_id != parent_permit.strategy_id
+            or parent_risk_intent.allocation_version != parent_permit.allocation_version
+            or parent_risk_intent.position_side != parent_permit.position_side
+            or parent_risk_intent.position_bucket != parent_permit.position_bucket
+        ):
+            raise ContractValidationError("exact typed parent/child Risk intents are required")
+        facts = self.read_ctp_recovery_close_source_facts(
+            scope,
+            parent_intent_id,
+            position_window_handle,
+            owner_handle=owner_handle,
+            writer_lease=writer_lease,
+            parent_permit=parent_permit,
+        )
+        if (
+            facts.recovery_intent_id != recovery_intent.intent_id
+            or recovery_intent.instrument != facts.instrument
+            or recovery_intent.quantity != facts.attributable_position_quantity
+            or recovery_intent.quantity_unit != facts.quantity_unit
+            or recovery_intent.strategy_id != facts.strategy_id
+            or recovery_intent.allocation_version != facts.allocation_version
+            or recovery_intent.position_side != facts.position_side
+            or recovery_intent.position_bucket != facts.position_bucket
+        ):
+            raise ContractValidationError("child Risk intent differs from attributed CTP position")
+        proof = proof_type(
+            scope=parent_permit.scope,
+            book_id=facts.book_id,
+            parent_permit_id=parent_permit.permit_id,
+            parent_intent_id=parent_intent_id,
+            parent_intent_hash=parent_risk_intent.fingerprint,
+            recovery_intent_id=recovery_intent.intent_id,
+            recovery_intent_hash=recovery_intent.fingerprint,
+            source_evidence_sha256=facts.source_evidence_sha256,
+            source_revision=facts.source_revision,
+            parent_filled_quantity=facts.parent_filled_quantity,
+            attributable_position_quantity=facts.attributable_position_quantity,
+            instrument=facts.instrument,
+            strategy_id=facts.strategy_id,
+            allocation_version=facts.allocation_version,
+            quantity_unit=facts.quantity_unit,
+            parent_order_side=facts.parent_order_side,
+            recovery_order_side=facts.recovery_order_side,
+            parent_position_side=facts.parent_position_side,
+            parent_position_bucket=facts.parent_position_bucket,
+            position_side=facts.position_side,
+            position_bucket=facts.position_bucket,
+            observed_at_ns=facts.observed_at_ns,
+            valid_until_ns=facts.valid_until_ns,
+        )
+        self._issued_ctp_recovery_source_proofs[proof.fingerprint] = proof
+        return proof
+
+    def bind_ctp_recovery_close_source_authority(
+        self,
+        scope: ExecutionScope,
+        *,
+        owner_handle: CtpCallbackSessionOwnerHandle,
+        writer_lease: WriterLease,
+    ) -> Any:
+        """Return a source authority bound to this exact live Store owner/lease."""
+
+        account_key, _, scope_key = self._validate_ctp_order_identity_scope(scope)
+        if (
+            type(owner_handle) is not CtpCallbackSessionOwnerHandle
+            or self._issued_ctp_callback_session_owners.get(owner_handle.owner_intent_id)
+            is not owner_handle
+        ):
+            raise ContractValidationError("same-Store CTP owner is required for recovery source authority")
+        with self._transaction() as cursor:
+            self._assert_active_writer_lease(cursor, scope, writer_lease)
+            self._require_ctp_callback_session_owner_handle(
+                cursor,
+                scope,
+                owner_handle,
+                allowed_states=frozenset({"ACTIVE"}),
+                writer_lease=writer_lease,
+                now_ns=time.time_ns(),
+            )
+        store = self
+
+        class _BoundCtpRecoveryCloseSourceAuthority:
+            def __init__(self) -> None:
+                self._store = store
+                self._scope = scope
+                self._owner_handle = owner_handle
+                self._writer_lease = writer_lease
+                self._seal = store._ctp_recovery_source_authority_seal
+
+            @contextmanager
+            def recovery_close_source_guard(
+                self,
+                proof: Any,
+                *,
+                parent_permit: Any,
+                recovery_intent: Any,
+            ):
+                (
+                    account_scope_type,
+                    _gate_type,
+                    intent_action_type,
+                    proof_type,
+                    _allocation_type,
+                    risk_intent_type,
+                    risk_permit_type,
+                    verified_type,
+                ) = store._ctp_recovery_risk_types()
+                if (
+                    store._issued_ctp_recovery_source_authorities.get(id(self)) is not self
+                    or self._seal is not store._ctp_recovery_source_authority_seal
+                    or type(proof) is not proof_type
+                    or type(parent_permit) is not risk_permit_type
+                    or type(recovery_intent) is not risk_intent_type
+                    or proof.scope != parent_permit.scope
+                    or proof.scope != recovery_intent.scope
+                    or type(proof.scope) is not account_scope_type
+                    or proof.parent_permit_id != parent_permit.permit_id
+                    or proof.parent_intent_id != parent_permit.intent_id
+                    or proof.recovery_intent_id != recovery_intent.intent_id
+                    or proof.recovery_intent_hash != recovery_intent.fingerprint
+                    or recovery_intent.action is not intent_action_type.REDUCE
+                    or getattr(parent_permit.action, "value", None) != "increase"
+                    or proof.book_id != scope.key
+                ):
+                    raise ContractValidationError("recovery source proof has no exact typed Risk binding")
+                facts_issued = store._issued_ctp_recovery_source_facts.get(
+                    proof.source_evidence_sha256
+                )
+                if (
+                    type(facts_issued) is not CtpRecoveryCloseSourceFacts
+                    or facts_issued.source_evidence_sha256 != proof.source_evidence_sha256
+                    or facts_issued.parent_intent_id != proof.parent_intent_id
+                    or facts_issued.recovery_intent_id != proof.recovery_intent_id
+                    or facts_issued.scope_key != scope.key
+                ):
+                    raise ContractValidationError(
+                        "recovery proof was not issued from this Store source window"
+                    )
+                window_handle = store._issued_ctp_position_window_handles.get(
+                    facts_issued.position_window_id
+                )
+                if window_handle is None:
+                    raise InvalidStateTransition("recovery source position window is no longer live")
+                parent_command_id, snapshot = store._ctp_recovery_parent_snapshot(
+                    scope, proof.parent_intent_id, owner_handle, writer_lease
+                )
+                with store._transaction() as cursor:
+                    store._assert_active_writer_lease(cursor, scope, writer_lease)
+                    facts = store._ctp_recovery_close_source_facts_cursor(
+                        cursor,
+                        scope,
+                        proof.parent_intent_id,
+                        window_handle,
+                        owner_handle=owner_handle,
+                        writer_lease=writer_lease,
+                        parent_permit=parent_permit,
+                        parent_snapshot=snapshot,
+                    )
+                    if facts.parent_command_id != parent_command_id:
+                        raise InvalidStateTransition("recovery parent command changed under source guard")
+                    if (
+                        proof.book_id != facts.book_id
+                        or proof.parent_permit_id != facts.parent_permit_id
+                        or proof.parent_intent_id != facts.parent_intent_id
+                        or proof.recovery_intent_id != facts.recovery_intent_id
+                        or proof.source_evidence_sha256 != facts.source_evidence_sha256
+                        or proof.source_revision != facts.source_revision
+                        or proof.parent_filled_quantity != facts.parent_filled_quantity
+                        or proof.attributable_position_quantity != facts.attributable_position_quantity
+                        or proof.instrument != facts.instrument
+                        or proof.strategy_id != facts.strategy_id
+                        or proof.allocation_version != facts.allocation_version
+                        or proof.quantity_unit != facts.quantity_unit
+                        or proof.parent_order_side != facts.parent_order_side
+                        or proof.recovery_order_side != facts.recovery_order_side
+                        or proof.parent_position_side != facts.parent_position_side
+                        or proof.parent_position_bucket != facts.parent_position_bucket
+                        or proof.position_side != facts.position_side
+                        or proof.position_bucket != facts.position_bucket
+                        or proof.observed_at_ns != facts.observed_at_ns
+                        or proof.valid_until_ns != facts.valid_until_ns
+                        or recovery_intent.instrument != facts.instrument
+                        or recovery_intent.quantity != facts.attributable_position_quantity
+                        or recovery_intent.quantity_unit != facts.quantity_unit
+                        or recovery_intent.strategy_id != facts.strategy_id
+                        or recovery_intent.allocation_version != facts.allocation_version
+                        or recovery_intent.position_side != facts.position_side
+                        or recovery_intent.position_bucket != facts.position_bucket
+                    ):
+                        raise InvalidStateTransition("recovery source changed after Risk proof issuance")
+                    fence_digest = store._ctp_recovery_source_fence_sha256(facts)
+                    verified = verified_type(
+                        scope=proof.scope,
+                        book_id=proof.book_id,
+                        parent_permit_id=proof.parent_permit_id,
+                        parent_intent_id=proof.parent_intent_id,
+                        parent_intent_hash=proof.parent_intent_hash,
+                        recovery_intent_id=proof.recovery_intent_id,
+                        recovery_intent_hash=proof.recovery_intent_hash,
+                        source_proof_sha256=proof.fingerprint,
+                        source_evidence_sha256=proof.source_evidence_sha256,
+                        source_revision=proof.source_revision,
+                        parent_filled_quantity=proof.parent_filled_quantity,
+                        attributable_position_quantity=proof.attributable_position_quantity,
+                        instrument=proof.instrument,
+                        strategy_id=proof.strategy_id,
+                        allocation_version=proof.allocation_version,
+                        quantity_unit=proof.quantity_unit,
+                        parent_order_side=proof.parent_order_side,
+                        recovery_order_side=proof.recovery_order_side,
+                        parent_position_side=proof.parent_position_side,
+                        parent_position_bucket=proof.parent_position_bucket,
+                        position_side=proof.position_side,
+                        position_bucket=proof.position_bucket,
+                        observed_at_ns=proof.observed_at_ns,
+                        valid_until_ns=proof.valid_until_ns,
+                        writer_fence_sha256=fence_digest,
+                        attribution_complete=True,
+                    )
+                    yield verified
+
+        authority = _BoundCtpRecoveryCloseSourceAuthority()
+        self._issued_ctp_recovery_source_authorities[id(authority)] = authority
+        return authority
+
+    def _ctp_recovery_allocation_verifier(
+        self, verifier: Any, allocation: Any, recovery_intent: Any
+    ) -> tuple[Any, Any]:
+        (
+            _account_scope_type,
+            gate_type,
+            _action_type,
+            _proof_type,
+            allocation_type,
+            risk_intent_type,
+            _permit_type,
+            _verified_type,
+        ) = self._ctp_recovery_risk_types()
+        if type(allocation) is not allocation_type or type(recovery_intent) is not risk_intent_type:
+            raise ContractValidationError("typed Risk recovery allocation and intent are required")
+        if (
+            not callable(verifier)
+            or getattr(verifier, "__self__", None) is None
+            or type(verifier.__self__) is not gate_type
+            or getattr(verifier, "__func__", None)
+            is not gate_type.verify_recovery_reduction_allocation
+        ):
+            raise ContractValidationError("direct live DurableRiskGate allocation verifier is required")
+        canonical = verifier(allocation, intent=recovery_intent)
+        if type(canonical) is not allocation_type or canonical != allocation:
+            raise InvalidStateTransition("Risk recovery allocation did not verify canonically")
+        return verifier.__self__, canonical
+
+    @staticmethod
+    def _ctp_recovery_authorization_payload(
+        authorization: CtpRecoveryCloseDispatchAuthorization,
+    ) -> dict[str, Any]:
+        return {
+            name: getattr(authorization, name)
+            for name in authorization.__dataclass_fields__
+            if name != "_store_seal"
+        }
+
+    @staticmethod
+    def _ctp_recovery_source_fence_sha256(facts: CtpRecoveryCloseSourceFacts) -> str:
+        return payload_sha256(
+            {
+                "account_key": facts.account_key,
+                "baseline_window_id": facts.baseline_window_id,
+                "baseline_window_digest_sha256": facts.baseline_window_digest_sha256,
+                "connection_generation": facts.connection_generation,
+                "journal_incarnation_id": facts.journal_incarnation_id,
+                "owner_intent_id": facts.owner_intent_id,
+                "position_window_id": facts.position_window_id,
+                "position_window_digest_sha256": facts.position_window_digest_sha256,
+                "scope_key": facts.scope_key,
+                "session_binding_sha256": facts.session_binding_sha256,
+                "session_generation_id": facts.session_generation_id,
+                "source_evidence_sha256": facts.source_evidence_sha256,
+                "writer_fencing_token": facts.writer_fencing_token,
+                "writer_owner_id": facts.writer_owner_id,
+            }
+        )
+
+    def _require_ctp_recovery_close_authorization(
+        self,
+        cursor: sqlite3.Cursor,
+        scope: ExecutionScope,
+        authorization: CtpRecoveryCloseDispatchAuthorization,
+        *,
+        writer_lease: WriterLease,
+        now_ns: int,
+        expected_command: CtpDispatchCommand | None = None,
+        require_binding: bool = False,
+        allow_unqueued_recovery_child: bool = False,
+        allow_facade_claimed_submit: bool = False,
+        expected_managed_intent_id: str | None = None,
+        expected_order_ref: str | None = None,
+    ) -> tuple[sqlite3.Row, CtpPositionEvidenceWindowRow, CtpCallbackSessionBindingV1]:
+        account_key, trading_day, scope_key = self._validate_ctp_order_identity_scope(scope)
+        if (
+            type(authorization) is not CtpRecoveryCloseDispatchAuthorization
+            or self._issued_ctp_recovery_authorizations.get(authorization.authorization_id)
+            is not authorization
+            or authorization._store_seal is not self._ctp_recovery_authorization_seal
+            or authorization.expires_at_ns <= now_ns
+            or (authorization.account_key, authorization.scope_key) != (account_key, scope_key)
+            or authorization.writer_owner_id != writer_lease.owner_id
+            or authorization.writer_fencing_token != writer_lease.fencing_token
+        ):
+            raise ContractValidationError("fresh same-Store CTP recovery-close authorization is required")
+        stored = cursor.execute(
+            "SELECT * FROM ctp_position_recovery_close_authorizations "
+            "WHERE account_key = ? AND authorization_id = ?",
+            (account_key, authorization.authorization_id),
+        ).fetchone()
+        payload_json = canonical_json(self._ctp_recovery_authorization_payload(authorization))
+        if stored is None or (
+            str(stored["scope_key"]) != scope_key
+            or str(stored["owner_intent_id"]) != authorization.owner_intent_id
+            or str(stored["parent_intent_id"]) != authorization.parent_intent_id
+            or str(stored["child_intent_id"]) != authorization.child_intent_id
+            or str(stored["runtime_order_id"]) != authorization.runtime_order_id
+            or str(stored["order_ref"]) != authorization.order_ref
+            or str(stored["position_window_id"]) != authorization.position_window_id
+            or str(stored["position_window_digest_sha256"]) != authorization.position_window_digest_sha256
+            or str(stored["session_binding_sha256"]) != authorization.session_binding_sha256
+            or str(stored["session_generation_id"]) != authorization.session_generation_id
+            or int(stored["connection_generation"]) != authorization.connection_generation
+            or str(stored["journal_incarnation_id"]) != authorization.journal_incarnation_id
+            or str(stored["parent_permit_id"]) != authorization.parent_permit_id
+            or str(stored["recovery_permit_id"]) != authorization.recovery_permit_id
+            or str(stored["recovery_allocation_sha256"]) != authorization.recovery_allocation_sha256
+            or str(stored["source_proof_sha256"]) != authorization.source_proof_sha256
+            or str(stored["source_evidence_sha256"]) != authorization.source_evidence_sha256
+            or int(stored["source_revision"]) != authorization.source_revision
+            or str(stored["child_intent_sha256"]) != authorization.child_intent_sha256
+            or str(stored["writer_owner_id"]) != writer_lease.owner_id
+            or int(stored["writer_fencing_token"]) != writer_lease.fencing_token
+            or int(stored["created_at_ns"]) != authorization.created_at_ns
+            or int(stored["expires_at_ns"]) != authorization.expires_at_ns
+            or str(stored["authorization_payload_json"]) != payload_json
+        ):
+            raise ContractValidationError("durable CTP recovery authorization changed")
+        owner_handle = self._issued_ctp_callback_session_owners.get(authorization.owner_intent_id)
+        if owner_handle is None:
+            raise InvalidStateTransition("CTP recovery callback owner is no longer live")
+        owner = self._require_ctp_callback_session_owner_handle(
+            cursor,
+            scope,
+            owner_handle,
+            allowed_states=frozenset({"ACTIVE"}),
+            writer_lease=writer_lease,
+            now_ns=now_ns,
+        )
+        binding = self._active_ctp_callback_sessions.get(owner_handle.owner_intent_id)
+        if (
+            binding is None
+            or binding.session_binding_sha256 != authorization.session_binding_sha256
+            or binding.session_generation_id != authorization.session_generation_id
+            or binding.connection_generation != authorization.connection_generation
+            or binding.trading_day != trading_day
+            or int(owner["economic_query_observed"]) != 1
+            or int(owner["last_source_sequence"]) <= 0
+            or self._ctp_callback_applied_sequence(
+                cursor, owner_handle.owner_intent_id, int(owner["last_source_sequence"])
+            ) != int(owner["last_source_sequence"])
+        ):
+            raise InvalidStateTransition("CTP recovery authorization session or query source changed")
+        window_handle = self._issued_ctp_position_window_handles.get(authorization.position_window_id)
+        if (
+            window_handle is None
+            or window_handle._store_seal is not self._ctp_position_window_seal
+            or window_handle.row_digest != authorization.position_window_digest_sha256
+        ):
+            raise ContractValidationError("CTP recovery position window is not live in this Store")
+        window_db = cursor.execute(
+            "SELECT * FROM ctp_dispatch_position_evidence_windows "
+            "WHERE account_key = ? AND window_id = ?",
+            (account_key, authorization.position_window_id),
+        ).fetchone()
+        if window_db is None:
+            raise DurableStoreError("durable CTP recovery position window disappeared")
+        window = self._ctp_position_window_from_row(
+            window_db, store_seal=self._ctp_position_window_seal
+        )
+        if (
+            window.row_digest != authorization.position_window_digest_sha256
+            or window.owner_intent_id != authorization.owner_intent_id
+            or window.managed_intent_id != authorization.child_intent_id
+            or window.runtime_order_id != authorization.runtime_order_id
+            or window.order_ref != authorization.order_ref
+            or window.trading_day != trading_day
+            or window.session_binding_sha256 != binding.session_binding_sha256
+            or window.connection_generation != binding.connection_generation
+            or window.end_source_sequence != int(owner["last_source_sequence"])
+            or window.expires_at_utc <= datetime.now(timezone.utc)
+            or window.expires_monotonic_ns <= time.monotonic_ns()
+            or window.writer_owner_id != writer_lease.owner_id
+            or window.writer_fencing_token != writer_lease.fencing_token
+        ):
+            raise InvalidStateTransition("CTP recovery position window is stale or changed")
+        baseline_db = cursor.execute(
+            "SELECT * FROM ctp_dispatch_position_evidence_windows "
+            "WHERE account_key = ? AND window_id = ?",
+            (account_key, authorization.baseline_window_id),
+        ).fetchone()
+        if baseline_db is None:
+            raise DurableStoreError("durable CTP recovery baseline window disappeared")
+        baseline = self._ctp_position_window_from_row(
+            baseline_db, store_seal=self._ctp_position_window_seal
+        )
+        if (
+            baseline.row_digest != authorization.baseline_window_digest_sha256
+            or baseline.owner_intent_id != authorization.owner_intent_id
+            or baseline.managed_intent_id != authorization.parent_intent_id
+            or baseline.trading_day != trading_day
+            or baseline.session_binding_sha256 != binding.session_binding_sha256
+            or baseline.connection_generation != binding.connection_generation
+            or baseline.writer_owner_id != writer_lease.owner_id
+            or baseline.writer_fencing_token != writer_lease.fencing_token
+            or baseline.created_at_ns >= window.created_at_ns
+        ):
+            raise InvalidStateTransition("CTP recovery baseline binding changed")
+        issued_facts = self._issued_ctp_recovery_source_facts.get(
+            authorization.source_evidence_sha256
+        )
+        parent_snapshot = self._issued_ctp_recovery_parent_snapshots.get(
+            authorization.source_evidence_sha256
+        )
+        parent_permit = self._issued_ctp_recovery_parent_permits.get(
+            authorization.parent_permit_id
+        )
+        issued_proof = self._issued_ctp_recovery_source_proofs.get(
+            authorization.source_proof_sha256
+        )
+        allocation = self._issued_ctp_recovery_allocations.get(
+            authorization.authorization_id
+        )
+        allocation_verifier = self._issued_ctp_recovery_allocation_verifiers.get(
+            authorization.authorization_id
+        )
+        recovery_intent = self._issued_ctp_recovery_intents.get(
+            authorization.authorization_id
+        )
+        if (
+            type(issued_facts) is not CtpRecoveryCloseSourceFacts
+            or type(parent_snapshot) is not CtpOwnerCallbackObservationSnapshotV1
+            or type(issued_proof) is not self._ctp_recovery_risk_types()[3]
+            or parent_permit is None
+            or allocation is None
+            or allocation_verifier is None
+            or recovery_intent is None
+            or issued_facts.source_evidence_sha256 != authorization.source_evidence_sha256
+            or issued_facts.position_window_id != authorization.position_window_id
+            or issued_facts.baseline_window_id != authorization.baseline_window_id
+            or issued_proof.fingerprint != authorization.source_proof_sha256
+            or issued_proof.source_evidence_sha256 != authorization.source_evidence_sha256
+            or issued_proof.recovery_intent_id != authorization.child_intent_id
+            or recovery_intent.intent_id != authorization.child_intent_id
+        ):
+            raise InvalidStateTransition("CTP recovery Store-issued source or Risk binding is missing")
+        current_facts = self._ctp_recovery_close_source_facts_cursor(
+            cursor,
+            scope,
+            authorization.parent_intent_id,
+            window_handle,
+            owner_handle=owner_handle,
+            writer_lease=writer_lease,
+            parent_permit=parent_permit,
+            parent_snapshot=parent_snapshot,
+            recovery_child_command=expected_command,
+            allow_unqueued_recovery_child=allow_unqueued_recovery_child,
+        )
+        if current_facts != issued_facts:
+            raise InvalidStateTransition("CTP recovery source facts changed after allocation")
+        _gate, canonical_allocation = self._ctp_recovery_allocation_verifier(
+            allocation_verifier, allocation, recovery_intent
+        )
+        if (
+            canonical_allocation.fingerprint != authorization.recovery_allocation_sha256
+            or canonical_allocation.permit_id != authorization.recovery_permit_id
+            or canonical_allocation.parent_permit_id != authorization.parent_permit_id
+            or canonical_allocation.parent_intent_id != authorization.parent_intent_id
+            or canonical_allocation.parent_intent_hash != issued_proof.parent_intent_hash
+            or canonical_allocation.recovery_intent_id != authorization.child_intent_id
+            or canonical_allocation.recovery_intent_hash != recovery_intent.fingerprint
+            or canonical_allocation.book_id != current_facts.book_id
+            or canonical_allocation.instrument != current_facts.instrument
+            or canonical_allocation.strategy_id != current_facts.strategy_id
+            or canonical_allocation.allocation_version != current_facts.allocation_version
+            or canonical_allocation.parent_order_side != current_facts.parent_order_side
+            or canonical_allocation.parent_position_side != current_facts.parent_position_side
+            or canonical_allocation.parent_position_bucket != current_facts.parent_position_bucket
+            or canonical_allocation.position_side != current_facts.position_side
+            or canonical_allocation.position_bucket != current_facts.position_bucket
+            or canonical_allocation.order_side != current_facts.recovery_order_side
+            or canonical_allocation.quantity != current_facts.attributable_position_quantity
+            or canonical_allocation.quantity_unit != current_facts.quantity_unit
+            or canonical_allocation.parent_filled_quantity != current_facts.parent_filled_quantity
+            or canonical_allocation.attributable_position_quantity
+            != current_facts.attributable_position_quantity
+            or canonical_allocation.source_revision != current_facts.source_revision
+            or canonical_allocation.source_evidence_sha256
+            != current_facts.source_evidence_sha256
+            or canonical_allocation.source_proof_sha256 != issued_proof.fingerprint
+            or canonical_allocation.writer_fence_sha256
+            != self._ctp_recovery_source_fence_sha256(current_facts)
+            or canonical_allocation.observed_at_ns != current_facts.observed_at_ns
+            or canonical_allocation.valid_until_ns != current_facts.valid_until_ns
+        ):
+            raise InvalidStateTransition("Risk recovery allocation differs from current CTP source")
+        child_db = cursor.execute(
+            "SELECT * FROM execution_records WHERE scope_key = ? AND intent_id = ?",
+            (scope_key, authorization.child_intent_id),
+        ).fetchone()
+        if child_db is None:
+            raise ContractValidationError("recovery child execution row is unavailable")
+        child_record = self._record_from_row(child_db)
+        child_intent = order_intent_from_payload(json.loads(str(child_db["payload_json"])))
+        command_managed_intent_id = (
+            expected_command.reservation_managed_intent_id
+            if expected_command is not None
+            else expected_managed_intent_id
+        )
+        command_order_ref = (
+            expected_command.order_ref
+            if expected_command is not None
+            else expected_order_ref
+        )
+        pending_unclaimed = (
+            child_record.state is ExecutionState.PENDING_DISPATCH
+            and child_record.dispatch_attempts == 0
+        )
+        facade_claimed_once = (
+            allow_facade_claimed_submit
+            and child_record.state is ExecutionState.DISPATCHING
+            and child_record.dispatch_attempts == 1
+            and command_managed_intent_id == authorization.child_intent_id
+            and command_order_ref == authorization.order_ref
+        )
+        if (
+            not (pending_unclaimed or facade_claimed_once)
+            or child_record.filled_quantity != Decimal("0")
+            or child_record.provider_order_id is not None
+            or child_record.review_required
+            or child_record.unknown_reason is not None
+            or child_record.permit_reference is None
+            or child_record.permit_reference != authorization.recovery_permit_id
+            or child_record.basic_admission_reference is None
+            or child_record.admission_context_sha256 is None
+            or child_intent.intent_id != authorization.child_intent_id
+            or child_intent.scope != scope
+            or child_intent.position_effect.value
+            != ("CLOSE_TODAY" if current_facts.position_bucket == "TODAY" else "CLOSE_YESTERDAY")
+            or self._ctp_recovery_order_side(child_intent) != current_facts.recovery_order_side
+            or child_intent.instrument != current_facts.instrument
+            or child_intent.quantity != current_facts.attributable_position_quantity
+            or child_intent.position_side != current_facts.position_side
+            or child_intent.position_bucket != current_facts.position_bucket
+            or child_record.payload_sha256 != authorization.child_intent_sha256
+        ):
+            raise InvalidStateTransition("recovery authorization is not bound to a fresh close intent")
+        reservation = cursor.execute(
+            "SELECT runtime_order_id, order_ref FROM ctp_order_identity_reservations "
+            "WHERE account_key = ? AND trading_day = ? AND scope_key = ? AND managed_intent_id = ?",
+            (account_key, trading_day, scope_key, authorization.child_intent_id),
+        ).fetchone()
+        if reservation is None or (
+            str(reservation["runtime_order_id"]) != authorization.runtime_order_id
+            or str(reservation["order_ref"]) != authorization.order_ref
+        ):
+            raise ContractValidationError("recovery child OrderRef reservation changed")
+        if expected_command is not None:
+            correlation = expected_command.correlation_key
+            if (
+                correlation is None
+                or expected_command.operation != "SUBMIT"
+                or correlation.reservation_managed_intent_id != authorization.child_intent_id
+                or correlation.runtime_order_id != authorization.runtime_order_id
+                or expected_command.order_ref != authorization.order_ref
+                or expected_command.session_binding_sha256 != authorization.session_binding_sha256
+                or correlation.session_generation_id != authorization.session_generation_id
+                or str(expected_command.request_payload.get("InstrumentID")) != child_intent.instrument
+                or str(expected_command.request_payload.get("Direction"))
+                != ("0" if current_facts.recovery_order_side == "BUY" else "1")
+                or str(expected_command.request_payload.get("CombOffsetFlag"))
+                != ("3" if current_facts.position_bucket == "TODAY" else "4")
+                or str(expected_command.request_payload.get("VolumeTotalOriginal"))
+                != str(int(current_facts.attributable_position_quantity))
+            ):
+                raise ContractValidationError("recovery authorization differs from staged submit")
+        elif allow_facade_claimed_submit and (
+            expected_managed_intent_id != authorization.child_intent_id
+            or expected_order_ref != authorization.order_ref
+        ):
+            raise ContractValidationError(
+                "facade-claimed recovery authorization requires its exact child and OrderRef"
+            )
+        if require_binding:
+            if expected_command is None:
+                raise ContractValidationError("recovery dispatch binding is missing")
+            binding_row = cursor.execute(
+                "SELECT * FROM ctp_position_dispatch_authorization_bindings "
+                "WHERE account_key = ? AND command_id = ?",
+                (account_key, expected_command.command_id),
+            ).fetchone()
+            if binding_row is None or (
+                str(binding_row["authorization_kind"]) != "RECOVERY_CLOSE"
+                or str(binding_row["authorization_id"]) != authorization.authorization_id
+                or str(binding_row["authorization_sha256"])
+                != payload_sha256(self._ctp_recovery_authorization_payload(authorization))
+                or str(binding_row["owner_intent_id"]) != authorization.owner_intent_id
+                or str(binding_row["managed_intent_id"]) != authorization.child_intent_id
+                or str(binding_row["runtime_order_id"]) != authorization.runtime_order_id
+                or str(binding_row["order_ref"]) != authorization.order_ref
+                or str(binding_row["window_id"]) != authorization.position_window_id
+                or str(binding_row["row_digest_sha256"]) != authorization.position_window_digest_sha256
+                or str(binding_row["session_binding_sha256"]) != authorization.session_binding_sha256
+                or str(binding_row["session_generation_id"]) != authorization.session_generation_id
+                or int(binding_row["connection_generation"]) != authorization.connection_generation
+                or str(binding_row["writer_owner_id"]) != writer_lease.owner_id
+                or int(binding_row["writer_fencing_token"]) != writer_lease.fencing_token
+            ):
+                raise ContractValidationError("recovery command is not bound to its exact authorization")
+            use = cursor.execute(
+                "SELECT * FROM ctp_position_recovery_close_authorization_uses "
+                "WHERE account_key = ? AND authorization_id = ?",
+                (account_key, authorization.authorization_id),
+            ).fetchone()
+            expected_use_binding = payload_sha256(
+                {
+                    "authorization_sha256": payload_sha256(
+                        self._ctp_recovery_authorization_payload(authorization)
+                    ),
+                    "command_id": expected_command.command_id,
+                    "request_payload_sha256": expected_command.request_payload_sha256,
+                    "session_binding_sha256": expected_command.session_binding_sha256,
+                    "order_ref": expected_command.order_ref,
+                }
+            )
+            if expected_command.status == "CLAIMED":
+                if use is None or (
+                    str(use["command_id"]) != expected_command.command_id
+                    or str(use["command_binding_sha256"]) != expected_use_binding
+                    or str(use["writer_owner_id"]) != writer_lease.owner_id
+                    or int(use["writer_fencing_token"]) != writer_lease.fencing_token
+                    or int(use["consumed_at_ns"]) <= 0
+                ):
+                    raise InvalidStateTransition(
+                        "CTP recovery authorization was not consumed by this command claim"
+                    )
+            elif use is not None:
+                raise InvalidStateTransition("CTP recovery authorization was already consumed")
+        return stored, window, binding
+
+    def authorize_ctp_recovery_close_dispatch(
+        self,
+        scope: ExecutionScope,
+        parent_intent_id: str,
+        child_intent_id: str,
+        position_window_handle: CtpPositionEvidenceWindowHandle,
+        *,
+        owner_handle: CtpCallbackSessionOwnerHandle,
+        writer_lease: WriterLease,
+        recovery_allocation: Any,
+        recovery_allocation_verifier: Any,
+        recovery_intent: Any,
+    ) -> CtpRecoveryCloseDispatchAuthorization:
+        """Persist and issue one exact Risk-authorized recovery-close dispatch token."""
+
+        risk_gate, allocation = self._ctp_recovery_allocation_verifier(
+            recovery_allocation_verifier, recovery_allocation, recovery_intent
+        )
+        parent_permit = self._issued_ctp_recovery_parent_permits.get(
+            str(getattr(allocation, "parent_permit_id", ""))
+        )
+        if parent_permit is None:
+            raise ContractValidationError(
+                "the exact original Risk permit is not bound to this Store source"
+            )
+        facts = self.read_ctp_recovery_close_source_facts(
+            scope,
+            parent_intent_id,
+            position_window_handle,
+            owner_handle=owner_handle,
+            writer_lease=writer_lease,
+            parent_permit=parent_permit,
+        )
+        proof_type = self._ctp_recovery_risk_types()[3]
+        source_proof = self._issued_ctp_recovery_source_proofs.get(
+            str(getattr(allocation, "source_proof_sha256", ""))
+        )
+        if (
+            type(source_proof) is not proof_type
+            or source_proof.fingerprint != getattr(allocation, "source_proof_sha256", None)
+            or source_proof.scope != recovery_intent.scope
+            or source_proof.book_id != facts.book_id
+            or source_proof.parent_permit_id != facts.parent_permit_id
+            or source_proof.parent_intent_id != facts.parent_intent_id
+            or source_proof.recovery_intent_id != facts.recovery_intent_id
+            or source_proof.source_evidence_sha256 != facts.source_evidence_sha256
+            or source_proof.source_revision != facts.source_revision
+            or source_proof.parent_filled_quantity != facts.parent_filled_quantity
+            or source_proof.attributable_position_quantity
+            != facts.attributable_position_quantity
+            or source_proof.parent_order_side != facts.parent_order_side
+            or source_proof.recovery_order_side != facts.recovery_order_side
+            or source_proof.parent_position_side != facts.parent_position_side
+            or source_proof.parent_position_bucket != facts.parent_position_bucket
+            or source_proof.position_side != facts.position_side
+            or source_proof.position_bucket != facts.position_bucket
+            or source_proof.instrument != facts.instrument
+            or source_proof.strategy_id != facts.strategy_id
+            or source_proof.allocation_version != facts.allocation_version
+            or source_proof.quantity_unit != facts.quantity_unit
+        ):
+            raise ContractValidationError("Risk allocation lacks this Store-issued source proof")
+        if facts.recovery_intent_id != child_intent_id or recovery_intent.intent_id != child_intent_id:
+            raise ContractValidationError("recovery allocation and current position window name another child")
+        if (
+            recovery_intent.instrument != facts.instrument
+            or recovery_intent.quantity != facts.attributable_position_quantity
+            or recovery_intent.quantity_unit != facts.quantity_unit
+            or recovery_intent.strategy_id != facts.strategy_id
+            or recovery_intent.allocation_version != facts.allocation_version
+            or recovery_intent.position_side != facts.position_side
+            or recovery_intent.position_bucket != facts.position_bucket
+        ):
+            raise ContractValidationError("recovery child Risk intent differs from source position")
+        allocation_permit = getattr(allocation, "permit", None)
+        if (
+            allocation_permit is None
+            or allocation_permit.intent_id != child_intent_id
+            or allocation_permit.scope != recovery_intent.scope
+            or allocation_permit.action is not recovery_intent.action
+            or allocation_permit.quantity != recovery_intent.quantity
+            or allocation_permit.instrument != recovery_intent.instrument
+            or allocation.parent_permit_id != facts.parent_permit_id
+            or allocation.parent_intent_id != facts.parent_intent_id
+            or allocation.parent_intent_hash != source_proof.parent_intent_hash
+            or allocation.recovery_intent_id != facts.recovery_intent_id
+            or allocation.recovery_intent_hash != recovery_intent.fingerprint
+            or allocation.book_id != facts.book_id
+            or allocation.source_evidence_sha256 != facts.source_evidence_sha256
+            or allocation.source_revision != facts.source_revision
+            or allocation.source_proof_sha256 != source_proof.fingerprint
+            or allocation.writer_fence_sha256 != self._ctp_recovery_source_fence_sha256(facts)
+            or allocation.parent_order_side != facts.parent_order_side
+            or allocation.order_side != facts.recovery_order_side
+            or allocation.parent_position_side != facts.parent_position_side
+            or allocation.parent_position_bucket != facts.parent_position_bucket
+            or allocation.position_side != facts.position_side
+            or allocation.position_bucket != facts.position_bucket
+            or allocation.quantity != facts.attributable_position_quantity
+            or allocation.parent_filled_quantity != facts.parent_filled_quantity
+            or allocation.attributable_position_quantity != facts.attributable_position_quantity
+            or allocation.quantity_unit != facts.quantity_unit
+        ):
+            raise ContractValidationError("Risk allocation is not bound to the exact child intent")
+        account_key, trading_day, scope_key = self._validate_ctp_order_identity_scope(scope)
+        now_ns = time.time_ns()
+        with self._transaction() as cursor:
+            self._assert_active_writer_lease(cursor, scope, writer_lease, now_ns=now_ns)
+            facts_now = self._ctp_recovery_close_source_facts_cursor(
+                cursor,
+                scope,
+                parent_intent_id,
+                position_window_handle,
+                owner_handle=owner_handle,
+                writer_lease=writer_lease,
+                parent_permit=parent_permit,
+                parent_snapshot=self._issued_ctp_recovery_parent_snapshots[facts.source_evidence_sha256],
+            )
+            if facts_now != facts:
+                raise InvalidStateTransition("recovery source facts changed before authorization")
+            child_db = cursor.execute(
+                "SELECT * FROM execution_records WHERE scope_key = ? AND intent_id = ?",
+                (scope_key, child_intent_id),
+            ).fetchone()
+            if child_db is None:
+                raise ContractValidationError("recovery child must be durably admitted before authorization")
+            child_record = self._record_from_row(child_db)
+            child_order_intent = order_intent_from_payload(json.loads(str(child_db["payload_json"])))
+            if (
+                child_record.state is not ExecutionState.PENDING_DISPATCH
+                or child_record.dispatch_attempts != 0
+                or child_record.permit_reference != allocation_permit.permit_id
+                or child_order_intent.intent_id != child_intent_id
+                or child_order_intent.scope != scope
+                or child_order_intent.position_effect.value
+                != ("CLOSE_TODAY" if facts.position_bucket == "TODAY" else "CLOSE_YESTERDAY")
+                or self._ctp_recovery_order_side(child_order_intent)
+                != facts.recovery_order_side
+                or child_order_intent.instrument != facts.instrument
+                or child_order_intent.quantity != facts.attributable_position_quantity
+                or child_order_intent.position_side != facts.position_side
+                or child_order_intent.position_bucket != facts.position_bucket
+            ):
+                raise InvalidStateTransition("recovery authorization requires the original pending close")
+            reservation = cursor.execute(
+                "SELECT runtime_order_id, order_ref FROM ctp_order_identity_reservations "
+                "WHERE account_key = ? AND trading_day = ? AND scope_key = ? AND managed_intent_id = ?",
+                (account_key, trading_day, scope_key, child_intent_id),
+            ).fetchone()
+            if reservation is None or (
+                str(reservation["runtime_order_id"]) != facts.runtime_order_id
+                or str(reservation["order_ref"]) != facts.order_ref
+            ):
+                raise ContractValidationError("recovery child OrderRef must be reserved before authorization")
+            if cursor.execute(
+                "SELECT 1 FROM ctp_position_recovery_close_authorizations "
+                "WHERE account_key = ? AND scope_key = ? AND child_intent_id = ?",
+                (account_key, scope_key, child_intent_id),
+            ).fetchone() is not None:
+                raise InvalidStateTransition("recovery child already has a durable authorization")
+            auth_id = uuid.uuid4().hex
+            created_at_ns = time.time_ns()
+            expires_at_ns = min(facts.valid_until_ns, created_at_ns + _CTP_POSITION_QUERY_FENCE_TTL_NS)
+            if expires_at_ns <= created_at_ns:
+                raise InvalidStateTransition("fresh CTP recovery position source expired")
+            auth = CtpRecoveryCloseDispatchAuthorization(
+                authorization_id=auth_id,
+                account_key=account_key,
+                scope_key=scope_key,
+                owner_intent_id=owner_handle.owner_intent_id,
+                parent_intent_id=parent_intent_id,
+                child_intent_id=child_intent_id,
+                runtime_order_id=facts.runtime_order_id,
+                order_ref=facts.order_ref,
+                position_window_id=facts.position_window_id,
+                position_window_digest_sha256=facts.position_window_digest_sha256,
+                baseline_window_id=facts.baseline_window_id,
+                baseline_window_digest_sha256=facts.baseline_window_digest_sha256,
+                session_binding_sha256=facts.session_binding_sha256,
+                session_generation_id=facts.session_generation_id,
+                connection_generation=facts.connection_generation,
+                journal_incarnation_id=facts.journal_incarnation_id,
+                parent_permit_id=facts.parent_permit_id,
+                recovery_permit_id=allocation_permit.permit_id,
+                recovery_allocation_sha256=allocation.fingerprint,
+                source_proof_sha256=str(getattr(allocation, "source_proof_sha256")),
+                source_evidence_sha256=facts.source_evidence_sha256,
+                source_revision=facts.source_revision,
+                child_intent_sha256=child_order_intent.fingerprint,
+                writer_owner_id=writer_lease.owner_id,
+                writer_fencing_token=writer_lease.fencing_token,
+                created_at_ns=created_at_ns,
+                expires_at_ns=expires_at_ns,
+                _store_seal=self._ctp_recovery_authorization_seal,
+            )
+            payload_json = canonical_json(self._ctp_recovery_authorization_payload(auth))
+            cursor.execute(
+                """INSERT INTO ctp_position_recovery_close_authorizations(
+                    account_key, authorization_id, scope_key, owner_intent_id,
+                    parent_intent_id, child_intent_id, runtime_order_id, order_ref,
+                    position_window_id, position_window_digest_sha256,
+                    session_binding_sha256, session_generation_id, connection_generation,
+                    journal_incarnation_id, parent_permit_id, recovery_permit_id,
+                    recovery_allocation_sha256, source_proof_sha256, source_evidence_sha256,
+                    source_revision, child_intent_sha256, writer_owner_id,
+                    writer_fencing_token, created_at_ns, expires_at_ns,
+                    authorization_payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    account_key, auth.authorization_id, scope_key, auth.owner_intent_id,
+                    auth.parent_intent_id, auth.child_intent_id, auth.runtime_order_id,
+                    auth.order_ref, auth.position_window_id, auth.position_window_digest_sha256,
+                    auth.session_binding_sha256, auth.session_generation_id,
+                    auth.connection_generation, auth.journal_incarnation_id,
+                    auth.parent_permit_id, auth.recovery_permit_id,
+                    auth.recovery_allocation_sha256, auth.source_proof_sha256,
+                    auth.source_evidence_sha256, auth.source_revision,
+                    auth.child_intent_sha256, auth.writer_owner_id,
+                    auth.writer_fencing_token, auth.created_at_ns, auth.expires_at_ns,
+                    payload_json,
+                ),
+            )
+            # The binding is written at staging; this immutable authorization
+            # row is the durable source of that later binding.
+        self._issued_ctp_recovery_authorizations[auth.authorization_id] = auth
+        self._issued_ctp_recovery_allocation_verifiers[auth.authorization_id] = recovery_allocation_verifier
+        self._issued_ctp_recovery_allocations[auth.authorization_id] = allocation
+        self._issued_ctp_recovery_intents[auth.authorization_id] = recovery_intent
+        self._issued_ctp_recovery_parent_permits[auth.parent_permit_id] = self._issued_ctp_recovery_parent_permits.get(
+            auth.parent_permit_id
+        )
+        return auth
+
     def stage_ctp_dispatch_command(
         self,
         scope: ExecutionScope,
@@ -14835,6 +18725,8 @@ class SqliteExecutionStore:
         native_action_ref: Any = None,
         local_queue_receipt_id: str | None = None,
         cancel_target_projection: CtpOrderTargetProjectionHandle | None = None,
+        position_baseline_authorization: CtpPositionBaselineSubmitAuthorization | None = None,
+        recovery_close_authorization: CtpRecoveryCloseDispatchAuthorization | None = None,
     ) -> CtpDispatchCommand:
         """Persist one immutable CTP command; this does not enable dispatch.
 
@@ -14966,6 +18858,12 @@ class SqliteExecutionStore:
                 "SELECT * FROM ctp_dispatch_callback_session_owners WHERE account_key = ?",
                 (account_key,),
             ).fetchone()
+            if position_baseline_authorization is not None and recovery_close_authorization is not None:
+                raise ContractValidationError("CTP dispatch accepts only one position authorization")
+            if recovery_close_authorization is not None and type(
+                recovery_close_authorization
+            ) is not CtpRecoveryCloseDispatchAuthorization:
+                raise ContractValidationError("typed CTP recovery-close authorization is required")
             if session_owner is not None:
                 owner_intent_id = str(session_owner["owner_intent_id"])
                 active_binding = self._active_ctp_callback_sessions.get(owner_intent_id)
@@ -14987,9 +18885,62 @@ class SqliteExecutionStore:
                         "CTP staged session binding differs from active Store session"
                     )
                 if bool(session_owner["economic_query_observed"]) and operation != "CANCEL":
+                    if recovery_close_authorization is not None:
+                        self._require_ctp_recovery_close_authorization(
+                            cursor,
+                            scope,
+                            recovery_close_authorization,
+                            writer_lease=writer_lease,
+                            now_ns=now_ns,
+                            allow_facade_claimed_submit=True,
+                            expected_managed_intent_id=managed_intent_id,
+                            expected_order_ref=order_ref,
+                        )
+                        if (
+                            operation != "SUBMIT"
+                            or managed_intent_id != recovery_close_authorization.child_intent_id
+                            or order_ref != recovery_close_authorization.order_ref
+                            or session_digest
+                            != recovery_close_authorization.session_binding_sha256
+                            or session_generation_id
+                            != recovery_close_authorization.session_generation_id
+                        ):
+                            raise ContractValidationError(
+                                "recovery-close authorization differs from staged submit"
+                            )
+                    elif position_baseline_authorization is None:
+                        raise InvalidStateTransition(
+                            "CTP economic query results permanently fence new submits"
+                        )
+                    else:
+                        self._require_ctp_position_baseline_authorization(
+                            cursor,
+                            scope,
+                            position_baseline_authorization,
+                            writer_lease=writer_lease,
+                            now_ns=now_ns,
+                            allow_facade_claimed_submit=True,
+                            expected_managed_intent_id=managed_intent_id,
+                            expected_order_ref=order_ref,
+                        )
+                        if (
+                            operation != "SUBMIT"
+                            or managed_intent_id != position_baseline_authorization.managed_intent_id
+                            or order_ref != position_baseline_authorization.order_ref
+                            or session_digest
+                            != position_baseline_authorization.session_binding_sha256
+                            or session_generation_id
+                            != position_baseline_authorization.session_generation_id
+                        ):
+                            raise ContractValidationError(
+                                "position baseline authorization differs from staged submit"
+                            )
+                elif recovery_close_authorization is not None:
                     raise InvalidStateTransition(
-                        "CTP economic query results permanently fence new submits"
+                        "recovery-close authorization requires a query-latched active owner"
                     )
+                elif position_baseline_authorization is not None:
+                    raise InvalidStateTransition("position baseline authorization requires its latched owner")
             if operation == "SUBMIT":
                 reservation = cursor.execute(
                     """
@@ -15202,6 +19153,37 @@ class SqliteExecutionStore:
                 if stored != immutable:
                     raise IntentConflictError("CTP command_id conflicts with staged command")
                 command = self._ctp_dispatch_command_from_row(existing)
+                stored_position_binding = cursor.execute(
+                    "SELECT authorization_kind FROM ctp_position_dispatch_authorization_bindings "
+                    "WHERE account_key = ? AND command_id = ?",
+                    (account_key, command_id),
+                ).fetchone()
+                if position_baseline_authorization is not None:
+                    self._require_ctp_position_baseline_authorization(
+                        cursor,
+                        scope,
+                        position_baseline_authorization,
+                        writer_lease=writer_lease,
+                        now_ns=now_ns,
+                        expected_command=command,
+                        require_binding=True,
+                        allow_facade_claimed_submit=True,
+                    )
+                elif recovery_close_authorization is not None:
+                    self._require_ctp_recovery_close_authorization(
+                        cursor,
+                        scope,
+                        recovery_close_authorization,
+                        writer_lease=writer_lease,
+                        now_ns=now_ns,
+                        expected_command=command,
+                        require_binding=True,
+                        allow_facade_claimed_submit=True,
+                    )
+                elif stored_position_binding is not None:
+                    raise ContractValidationError(
+                        "staged CTP command requires its original position authorization"
+                    )
                 assert command.correlation_key is not None
                 self._require_ctp_native_action_ref_allocation(
                     cursor, existing, command.correlation_key
@@ -15345,6 +19327,41 @@ class SqliteExecutionStore:
                         now_ns,
                     ),
                 )
+            staged_row = cursor.execute(
+                "SELECT * FROM ctp_dispatch_commands WHERE account_key = ? AND command_id = ?",
+                (account_key, command_id),
+            ).fetchone()
+            assert staged_row is not None
+            command = self._ctp_dispatch_command_from_row(staged_row)
+            if position_baseline_authorization is not None:
+                self._record_ctp_position_dispatch_authorization_binding(
+                    cursor,
+                    scope,
+                    command,
+                    position_baseline_authorization,
+                    writer_lease=writer_lease,
+                    created_at_ns=now_ns,
+                )
+            elif recovery_close_authorization is not None:
+                self._record_ctp_recovery_close_dispatch_binding(
+                    cursor,
+                    scope,
+                    command,
+                    recovery_close_authorization,
+                    writer_lease=writer_lease,
+                    created_at_ns=now_ns,
+                )
+                self._require_ctp_recovery_close_authorization(
+                    cursor,
+                    scope,
+                    recovery_close_authorization,
+                    writer_lease=writer_lease,
+                    now_ns=now_ns,
+                    expected_command=command,
+                    require_binding=True,
+                    allow_unqueued_recovery_child=True,
+                    allow_facade_claimed_submit=True,
+                )
             if operation == "CANCEL":
                 assert cancel_target_projection is not None
                 self._record_ctp_order_target_projection_consumption(
@@ -15375,6 +19392,8 @@ class SqliteExecutionStore:
         *,
         owner_handle: CtpCallbackSessionOwnerHandle,
         writer_lease: WriterLease,
+        position_baseline_authorization: CtpPositionBaselineSubmitAuthorization | None = None,
+        recovery_close_authorization: CtpRecoveryCloseDispatchAuthorization | None = None,
     ) -> CtpDispatchCommand:
         """Issue the exact READY command identity for a pre-native failure.
 
@@ -15386,6 +19405,8 @@ class SqliteExecutionStore:
 
         account_key, _, scope_key = self._validate_ctp_order_identity_scope(scope)
         self._validate_command_identifier(command_id, "command_id")
+        if position_baseline_authorization is not None and recovery_close_authorization is not None:
+            raise ContractValidationError("CTP dispatch accepts only one position authorization")
         with self._transaction() as cursor:
             now_ns = time.time_ns()
             self._assert_active_writer_lease(cursor, scope, writer_lease, now_ns=now_ns)
@@ -15410,16 +19431,49 @@ class SqliteExecutionStore:
             if row is None or str(row["status"]) != "READY":
                 raise InvalidStateTransition("CTP command is not staged before native claim")
             if bool(owner["economic_query_observed"]):
-                if str(row["operation"]) != "CANCEL":
+                command = self._ctp_dispatch_command_from_row(row)
+                if command.operation == "SUBMIT" and recovery_close_authorization is not None:
+                    self._require_ctp_recovery_close_authorization(
+                        cursor,
+                        scope,
+                        recovery_close_authorization,
+                        writer_lease=writer_lease,
+                        now_ns=now_ns,
+                        expected_command=command,
+                        require_binding=True,
+                        allow_facade_claimed_submit=True,
+                    )
+                elif command.operation == "SUBMIT" and position_baseline_authorization is not None:
+                    self._require_ctp_position_baseline_authorization(
+                        cursor,
+                        scope,
+                        position_baseline_authorization,
+                        writer_lease=writer_lease,
+                        now_ns=now_ns,
+                        expected_command=command,
+                        require_binding=True,
+                        allow_facade_claimed_submit=True,
+                    )
+                elif command.operation != "CANCEL":
                     raise InvalidStateTransition(
                         "CTP economic query results permanently fence new submits"
                     )
-                self._require_fresh_ctp_cancel_target_row(
-                    cursor,
-                    scope,
-                    row,
-                    now_ns=time.monotonic_ns(),
-                )
+                else:
+                    if (
+                        position_baseline_authorization is not None
+                        or recovery_close_authorization is not None
+                    ):
+                        raise ContractValidationError(
+                            "CANCEL cannot consume a position authorization"
+                        )
+                    self._require_fresh_ctp_cancel_target_row(
+                        cursor,
+                        scope,
+                        row,
+                        now_ns=time.monotonic_ns(),
+                    )
+            elif position_baseline_authorization is not None or recovery_close_authorization is not None:
+                raise InvalidStateTransition("position authorization requires the query-latched owner")
             if (
                 row["callback_owner_intent_id"] not in (None, owner_handle.owner_intent_id)
                 or int(row["native_call_inflight"]) != 0
@@ -17183,6 +21237,8 @@ class SqliteExecutionStore:
         queue_receipt: Mapping[str, Any],
         *,
         writer_lease: WriterLease,
+        position_baseline_authorization: CtpPositionBaselineSubmitAuthorization | None = None,
+        recovery_close_authorization: Any = None,
     ) -> CtpDispatchCommand:
         """Persist the exact local queue ID before a worker can claim the row.
 
@@ -17219,6 +21275,17 @@ class SqliteExecutionStore:
             if row is None:
                 raise ContractValidationError("unknown CTP dispatch command")
             command = self._ctp_dispatch_command_from_row(row)
+            if position_baseline_authorization is not None and recovery_close_authorization is not None:
+                raise ContractValidationError("CTP dispatch accepts only one position authorization")
+            if recovery_close_authorization is not None and type(
+                recovery_close_authorization
+            ) is not CtpRecoveryCloseDispatchAuthorization:
+                raise ContractValidationError("typed CTP recovery-close authorization is required")
+            position_binding = cursor.execute(
+                "SELECT authorization_kind FROM ctp_position_dispatch_authorization_bindings "
+                "WHERE account_key = ? AND command_id = ?",
+                (account_key, command_id),
+            ).fetchone()
             expected_queue_command = "submit" if command.operation == "SUBMIT" else "cancel"
             if (
                 command.local_queue_receipt_id is None
@@ -17233,7 +21300,33 @@ class SqliteExecutionStore:
                 raise IntentConflictError("CTP command already has another queue disposition")
             if command.status != "READY":
                 raise InvalidStateTransition("CTP queue receipt requires a READY command")
-
+            if position_baseline_authorization is not None:
+                self._require_ctp_position_baseline_authorization(
+                    cursor,
+                    scope,
+                    position_baseline_authorization,
+                    writer_lease=writer_lease,
+                    now_ns=now_ns,
+                    expected_command=command,
+                    require_binding=True,
+                    allow_facade_claimed_submit=True,
+                )
+            elif recovery_close_authorization is not None:
+                self._require_ctp_recovery_close_authorization(
+                    cursor,
+                    scope,
+                    recovery_close_authorization,
+                    writer_lease=writer_lease,
+                    now_ns=now_ns,
+                    expected_command=command,
+                    require_binding=True,
+                    allow_unqueued_recovery_child=True,
+                    allow_facade_claimed_submit=True,
+                )
+            elif position_binding is not None:
+                raise ContractValidationError(
+                    "CTP queue receipt requires the command's original position authorization"
+                )
             if queued:
                 cursor.execute(
                     """
@@ -17309,7 +21402,19 @@ class SqliteExecutionStore:
                 (account_key, command_id),
             ).fetchone()
             assert updated is not None
-            return self._ctp_dispatch_command_from_row(updated)
+            updated_command = self._ctp_dispatch_command_from_row(updated)
+            if queued and recovery_close_authorization is not None:
+                self._require_ctp_recovery_close_authorization(
+                    cursor,
+                    scope,
+                    recovery_close_authorization,
+                    writer_lease=writer_lease,
+                    now_ns=time.time_ns(),
+                    expected_command=updated_command,
+                    require_binding=True,
+                    allow_facade_claimed_submit=True,
+                )
+            return updated_command
 
     def claim_ctp_dispatch_command(
         self,
@@ -17320,6 +21425,8 @@ class SqliteExecutionStore:
         authority_verifier: CtpDispatchAuthorityVerifier,
         required_local_queue_receipt_id: str | None = None,
         _callback_session_owner: CtpCallbackSessionOwnerHandle | None = None,
+        position_baseline_authorization: CtpPositionBaselineSubmitAuthorization | None = None,
+        recovery_close_authorization: Any = None,
     ) -> CtpDispatchCommand | None:
         """Verify and condition-claim one READY command after the seed gate.
 
@@ -17346,6 +21453,13 @@ class SqliteExecutionStore:
         # appending to this Store. The final transaction below re-reads and
         # compares the exact command and all mutable admission facts.
         verification_command = self.read_ctp_dispatch_command(scope, command_id)
+        if (
+            recovery_close_authorization is not None
+            and (verification_command is None or verification_command.status != "READY")
+        ):
+            raise InvalidStateTransition(
+                "CTP recovery-close authorization cannot claim a non-ready command"
+            )
         if verification_command is None or verification_command.status != "READY":
             if _callback_session_owner is not None:
                 with self._lock:
@@ -17394,6 +21508,12 @@ class SqliteExecutionStore:
                 + str(existing_source_fence["command_id"])
             )
         verification_started_ns = time.time_ns()
+        if position_baseline_authorization is not None and recovery_close_authorization is not None:
+            raise ContractValidationError("CTP dispatch accepts only one position authorization")
+        if recovery_close_authorization is not None and type(
+            recovery_close_authorization
+        ) is not CtpRecoveryCloseDispatchAuthorization:
+            raise ContractValidationError("typed CTP recovery-close authorization is required")
         authority = self._verify_ctp_dispatch_authority(
             authority_verifier,
             verification_command,
@@ -17415,6 +21535,10 @@ class SqliteExecutionStore:
                 if _callback_session_owner is not None:
                     raise ContractValidationError(
                         "CTP callback session owner is not persisted for this account"
+                    )
+                if position_baseline_authorization is not None or recovery_close_authorization is not None:
+                    raise ContractValidationError(
+                        "CTP position authorization requires its exact callback owner"
                     )
             else:
                 if _callback_session_owner is None:
@@ -17461,12 +21585,42 @@ class SqliteExecutionStore:
             if int(row["correlation_version"]) != 2:
                 raise InvalidStateTransition("legacy CTP command version is audit-only")
             if session_owner is not None:
-                if bool(session_owner["economic_query_observed"]) and str(
-                    row["operation"]
-                ) != "CANCEL":
-                    raise InvalidStateTransition(
-                        "CTP economic query results permanently fence new submits"
-                    )
+                position_binding = cursor.execute(
+                    "SELECT authorization_kind FROM ctp_position_dispatch_authorization_bindings "
+                    "WHERE account_key = ? AND command_id = ?",
+                    (account_key, command_id),
+                ).fetchone()
+                if str(row["operation"]) != "CANCEL":
+                    if recovery_close_authorization is not None:
+                        self._require_ctp_recovery_close_authorization(
+                            cursor,
+                            scope,
+                            recovery_close_authorization,
+                            writer_lease=writer_lease,
+                            now_ns=verification_started_ns,
+                            expected_command=self._ctp_dispatch_command_from_row(row),
+                            require_binding=True,
+                            allow_facade_claimed_submit=True,
+                        )
+                    elif position_baseline_authorization is not None:
+                        self._require_ctp_position_baseline_authorization(
+                            cursor,
+                            scope,
+                            position_baseline_authorization,
+                            writer_lease=writer_lease,
+                            now_ns=verification_started_ns,
+                            expected_command=verification_command,
+                            require_binding=True,
+                            allow_facade_claimed_submit=True,
+                        )
+                    elif position_binding is not None or bool(
+                        session_owner["economic_query_observed"]
+                    ):
+                        raise InvalidStateTransition(
+                            "CTP economic query results permanently fence new submits"
+                        )
+                elif position_baseline_authorization is not None or recovery_close_authorization is not None:
+                    raise ContractValidationError("CANCEL cannot consume a position submit authorization")
                 if (
                     str(session_owner["scope_key"]) != scope_key
                     or str(row["trading_day"]) != str(session_owner["trading_day"])
@@ -17630,12 +21784,46 @@ class SqliteExecutionStore:
                     raise InvalidStateTransition(
                         "active CTP callback session changed during claim verification"
                     )
-                if bool(fresh_owner["economic_query_observed"]) and str(
-                    row_after_verification["operation"]
-                ) != "CANCEL":
-                    raise InvalidStateTransition(
-                        "CTP economic query results permanently fence new submits"
-                    )
+                position_binding = cursor.execute(
+                    "SELECT authorization_kind FROM ctp_position_dispatch_authorization_bindings "
+                    "WHERE account_key = ? AND command_id = ?",
+                    (account_key, command_id),
+                ).fetchone()
+                if str(row_after_verification["operation"]) != "CANCEL":
+                    if recovery_close_authorization is not None:
+                        self._require_ctp_recovery_close_authorization(
+                            cursor,
+                            scope,
+                            recovery_close_authorization,
+                            writer_lease=writer_lease,
+                            now_ns=claim_now_ns,
+                            expected_command=self._ctp_dispatch_command_from_row(
+                                row_after_verification
+                            ),
+                            require_binding=True,
+                            allow_facade_claimed_submit=True,
+                        )
+                    elif position_baseline_authorization is not None:
+                        self._require_ctp_position_baseline_authorization(
+                            cursor,
+                            scope,
+                            position_baseline_authorization,
+                            writer_lease=writer_lease,
+                            now_ns=claim_now_ns,
+                            expected_command=self._ctp_dispatch_command_from_row(
+                                row_after_verification
+                            ),
+                            require_binding=True,
+                            allow_facade_claimed_submit=True,
+                        )
+                    elif position_binding is not None or bool(
+                        fresh_owner["economic_query_observed"]
+                    ):
+                        raise InvalidStateTransition(
+                            "CTP economic query results permanently fence new submits"
+                        )
+                elif position_baseline_authorization is not None or recovery_close_authorization is not None:
+                    raise ContractValidationError("CANCEL cannot consume a position submit authorization")
                 self._require_command_session_binding(row_after_verification, fresh_binding)
             if str(row_after_verification["operation"]) == "CANCEL":
                 fresh_target = self._require_fresh_ctp_cancel_target_row(
@@ -17675,6 +21863,77 @@ class SqliteExecutionStore:
             )
             if cursor.rowcount != 1:
                 return None
+            if position_baseline_authorization is not None:
+                position_binding = cursor.execute(
+                    "SELECT authorization_sha256 FROM ctp_position_dispatch_authorization_bindings "
+                    "WHERE account_key = ? AND command_id = ?",
+                    (account_key, command_id),
+                ).fetchone()
+                if position_binding is None:
+                    raise ContractValidationError("CTP position authorization binding disappeared")
+                command_binding_sha256 = payload_sha256(
+                    {
+                        "authorization_sha256": str(position_binding["authorization_sha256"]),
+                        "command_id": command_id,
+                        "request_payload_sha256": command.request_payload_sha256,
+                        "session_binding_sha256": command.session_binding_sha256,
+                        "order_ref": command.order_ref,
+                    }
+                )
+                cursor.execute(
+                    "INSERT INTO ctp_position_baseline_submit_authorization_uses("
+                    "account_key, authorization_id, command_id, command_binding_sha256, "
+                    "writer_owner_id, writer_fencing_token, consumed_at_ns) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        account_key,
+                        position_baseline_authorization.authorization_id,
+                        command_id,
+                        command_binding_sha256,
+                        writer_lease.owner_id,
+                        writer_lease.fencing_token,
+                        claim_now_ns,
+                    ),
+                )
+            elif recovery_close_authorization is not None:
+                position_binding = cursor.execute(
+                    "SELECT authorization_sha256, authorization_id, authorization_kind "
+                    "FROM ctp_position_dispatch_authorization_bindings "
+                    "WHERE account_key = ? AND command_id = ?",
+                    (account_key, command_id),
+                ).fetchone()
+                if position_binding is None or (
+                    str(position_binding["authorization_kind"]) != "RECOVERY_CLOSE"
+                    or str(position_binding["authorization_id"])
+                    != recovery_close_authorization.authorization_id
+                ):
+                    raise ContractValidationError(
+                        "CTP recovery authorization binding disappeared during claim"
+                    )
+                use_binding_sha256 = payload_sha256(
+                    {
+                        "authorization_sha256": str(position_binding["authorization_sha256"]),
+                        "command_id": command_id,
+                        "request_payload_sha256": command.request_payload_sha256,
+                        "session_binding_sha256": command.session_binding_sha256,
+                        "order_ref": command.order_ref,
+                    }
+                )
+                cursor.execute(
+                    "INSERT INTO ctp_position_recovery_close_authorization_uses("
+                    "account_key, authorization_id, command_id, command_binding_sha256, "
+                    "writer_owner_id, writer_fencing_token, consumed_at_ns) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        account_key,
+                        recovery_close_authorization.authorization_id,
+                        command_id,
+                        use_binding_sha256,
+                        writer_lease.owner_id,
+                        writer_lease.fencing_token,
+                        claim_now_ns,
+                    ),
+                )
             cursor.execute(
                 """
                 INSERT INTO ctp_dispatch_authority_uses (
@@ -17726,6 +21985,8 @@ class SqliteExecutionStore:
         authority_verifier: CtpDispatchAuthorityVerifier,
         required_local_queue_receipt_id: str,
         binding_ttl_ns: int = 5_000_000_000,
+        position_baseline_authorization: CtpPositionBaselineSubmitAuthorization | None = None,
+        recovery_close_authorization: Any = None,
     ) -> CtpSessionNativeCallClaim | None:
         """Claim one queued command under the exact active inbox owner.
 
@@ -17749,6 +22010,8 @@ class SqliteExecutionStore:
             authority_verifier=authority_verifier,
             required_local_queue_receipt_id=required_local_queue_receipt_id,
             _callback_session_owner=owner_handle,
+            position_baseline_authorization=position_baseline_authorization,
+            recovery_close_authorization=recovery_close_authorization,
         )
         if command is None:
             return None
@@ -17893,9 +22156,95 @@ class SqliteExecutionStore:
                     if row is None or str(row["status"]) != "CLAIMED":
                         raise InvalidStateTransition("bound CTP command is no longer CLAIMED")
                     command = self._ctp_dispatch_command_from_row(row)
-                    if bool(owner["economic_query_observed"]) and command.operation != "CANCEL":
+                    if command.operation != "CANCEL":
+                        position_binding = cursor.execute(
+                            "SELECT * FROM ctp_position_dispatch_authorization_bindings "
+                            "WHERE account_key = ? AND command_id = ?",
+                            (account_key, command.command_id),
+                        ).fetchone()
+                        if position_binding is None:
+                            if bool(owner["economic_query_observed"]):
+                                raise InvalidStateTransition(
+                                    "CTP economic query results permanently fence new submits"
+                                )
+                        elif str(position_binding["authorization_kind"]) == "POSITION_BASELINE":
+                            authorization = self._issued_ctp_position_baseline_authorizations.get(
+                                str(position_binding["authorization_id"])
+                            )
+                            if authorization is None:
+                                raise InvalidStateTransition(
+                                    "CTP position baseline authorization is no longer live"
+                                )
+                            self._require_ctp_position_baseline_authorization(
+                                cursor,
+                                scope,
+                                authorization,
+                                writer_lease=writer_lease,
+                                now_ns=now_ns,
+                                expected_command=command,
+                                require_binding=True,
+                                allow_facade_claimed_submit=True,
+                            )
+                            used = cursor.execute(
+                                "SELECT * FROM ctp_position_baseline_submit_authorization_uses "
+                                "WHERE account_key = ? AND authorization_id = ?",
+                                (account_key, authorization.authorization_id),
+                            ).fetchone()
+                            expected_use_binding = payload_sha256(
+                                {
+                                    "authorization_sha256": payload_sha256(
+                                        self._ctp_position_authorization_payload(authorization)
+                                    ),
+                                    "command_id": command.command_id,
+                                    "request_payload_sha256": command.request_payload_sha256,
+                                    "session_binding_sha256": command.session_binding_sha256,
+                                    "order_ref": command.order_ref,
+                                }
+                            )
+                            if used is None or (
+                                str(used["command_id"]) != command.command_id
+                                or str(used["command_binding_sha256"]) != expected_use_binding
+                                or str(used["writer_owner_id"]) != writer_lease.owner_id
+                                or int(used["writer_fencing_token"])
+                                != writer_lease.fencing_token
+                                or int(used["consumed_at_ns"]) <= 0
+                            ):
+                                raise InvalidStateTransition(
+                                    "CTP baseline authorization was not consumed by this claim"
+                                )
+                        elif str(position_binding["authorization_kind"]) == "RECOVERY_CLOSE":
+                            authorization = self._issued_ctp_recovery_authorizations.get(
+                                str(position_binding["authorization_id"])
+                            )
+                            if authorization is None:
+                                raise InvalidStateTransition(
+                                    "CTP recovery-close authorization is no longer live"
+                                )
+                            if authorization.owner_intent_id != owner_handle.owner_intent_id:
+                                raise ContractValidationError(
+                                    "CTP recovery authorization belongs to another callback owner"
+                                )
+                            self._require_ctp_recovery_close_authorization(
+                                cursor,
+                                scope,
+                                authorization,
+                                writer_lease=writer_lease,
+                                now_ns=now_ns,
+                                expected_command=command,
+                                require_binding=True,
+                                allow_facade_claimed_submit=True,
+                            )
+                        else:
+                            raise InvalidStateTransition(
+                                "unsupported CTP economic-query submit authorization"
+                            )
+                    elif cursor.execute(
+                        "SELECT 1 FROM ctp_position_dispatch_authorization_bindings "
+                        "WHERE account_key = ? AND command_id = ?",
+                        (account_key, command.command_id),
+                    ).fetchone() is not None:
                         raise InvalidStateTransition(
-                            "CTP economic query results permanently fence new submits"
+                            "CTP position submit authorization cannot bind a cancel"
                         )
                     correlation = command.correlation_key
                     if (
@@ -22012,7 +26361,7 @@ class SqliteExecutionStore:
                     cursor.execute(
                         """
                         UPDATE execution_records
-                        SET state = ?, unknown_reason = NULL, review_required = 0, updated_at_ns = ?
+                        SET state = ?, updated_at_ns = ?
                         WHERE scope_key = ? AND intent_id = ?
                         """,
                         (

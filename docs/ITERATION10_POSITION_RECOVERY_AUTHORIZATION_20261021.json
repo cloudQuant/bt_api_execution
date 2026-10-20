@@ -1,0 +1,69 @@
+{
+  "round": "iteration10-ctp-position-store-authorization-20261021",
+  "repository": "bt_api_execution",
+  "branch": "dev",
+  "parent_commit": "e7fe7e26ea0c703874e32e985f1b8a510fc01f92",
+  "scope": [
+    "src/bt_api_execution/store.py",
+    "tests/test_ctp_position_recovery_authorization.py",
+    "docs/ITERATION10_POSITION_RECOVERY_AUTHORIZATION_20261021.json"
+  ],
+  "evidence_level": "LOCAL_SQLITE_STORE_WITH_SYNTHETIC_CTP_AND_RISK_AUTHORITY_COMPONENT_ONLY",
+  "formal_pass_delta": 0,
+  "dependencies": {
+    "bt_api_ctp": "ae14a757b8bb441af34610e5c8c3cab3f509b941",
+    "bt_api_risk": "9875c04499b559fb59a8d2d13861796babf1f7e2"
+  },
+  "changes": [
+    "Seal position windows against source/session/request/callback identity, explicit null-pointer marker, exact ErrorID zero and final callback watermark.",
+    "Issue typed single-use baseline and recovery-close authorizations, recheck source and writer fence at atomic READY to CLAIMED consumption, and preserve ordinary economic-query review latches.",
+    "Derive recovery source authority from durable parent scope, fill identities and current positions; preserve full parent risk reservation when fees are unknown.",
+    "Migrate accepted v24/v25 stores to v26; reject missing tables in an already-v26 store before any repair or schema mutation."
+  ],
+  "qa": [
+    {
+      "selection": "earlier dedicated Store component module before final guard additions",
+      "passed": 14,
+      "scope_note": "Historical result, not a complete run of final source."
+    },
+    {
+      "selection": "empty pointer, post-terminal callback, query-after-window, exact e7fe v24 migration/fresh-schema parity, missing-v26-use-table no-repair",
+      "passed": 5,
+      "store_sha256": "56e76c97b9ae7ee30c858e11a89cf8b66f847e1d6975b3de81915aecaf4517e0"
+    },
+    {
+      "selection": "null terminal without response info rejects; valid empty terminal accepts",
+      "passed": 2,
+      "seconds": 2.56,
+      "store_sha256": "2e2ae97c6681948d9aacad8b2c8b91bc6ba23b608ca57d8f13dcd7018be03deb"
+    },
+    {
+      "selection": "adjacent sealed-position-window cross-package node",
+      "passed": 1
+    }
+  ],
+  "qa_notes": [
+    "Separate focused selections, not a summed final-source full suite. No accepted test was repeated solely for delivery.",
+    "Python C:/Anaconda3/python.exe -X utf8; pytest -p no:asyncio. Existing pytest configuration/native-fallback warnings are not formal provider evidence.",
+    "Independent final source review GO at the recorded Store/CTP/test pins. Earlier missing-RspInfo and ambiguous-null findings were repaired.",
+    "The four imported existing test helpers are byte-for-byte and AST identical to accepted execution HEAD; no pending consumer-file changes are needed by this component.",
+    "The ongoing service vertical passed OPEN baseline and QueryTrade, then stopped at a separate cancel-entry fixture/route issue. No end-to-end pass is claimed."
+  ],
+  "limits": [
+    "No real account, provider, native trading or VENUE02 acceptance.",
+    "Pending facade, admission, service runtime and recovery consumer changes are excluded.",
+    "The test Risk-journal verifier and native API leaves are synthetic; production end-to-end risk settlement remains pending."
+  ],
+  "checkout_inputs": {
+    "src/bt_api_execution/store.py": {
+      "bytes": 1374246,
+      "sha256": "2e2ae97c6681948d9aacad8b2c8b91bc6ba23b608ca57d8f13dcd7018be03deb",
+      "git_lf_sha256": "2e2ae97c6681948d9aacad8b2c8b91bc6ba23b608ca57d8f13dcd7018be03deb"
+    },
+    "tests/test_ctp_position_recovery_authorization.py": {
+      "bytes": 91605,
+      "sha256": "5e22bc783eaaa938e013a579061f21ab0d312ef48cd2ce3fb7ee36f3fcdd9e7b",
+      "git_lf_sha256": "5e22bc783eaaa938e013a579061f21ab0d312ef48cd2ce3fb7ee36f3fcdd9e7b"
+    }
+  }
+}
