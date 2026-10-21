@@ -25,6 +25,7 @@ from typing import Any, Literal, Protocol
 from .contracts import ExecutionScope, canonical_json, payload_sha256
 from .errors import ContractValidationError
 from .store import (
+    CtpCallbackSessionOwnerHandle,
     CtpCancelTarget,
     CtpDispatchAuthorityVerifier,
     CtpDispatchCommand,
@@ -435,9 +436,21 @@ class CtpManagedSingleWorkerCandidate:
         prepared: CtpManagedPreparedDispatch,
         *,
         cancel_target_projection: CtpOrderTargetProjectionHandle | None = None,
+        position_baseline_authorization: object | None = None,
+        recovery_close_authorization: object | None = None,
     ) -> CtpManagedDispatchBinding:
         if type(prepared) is not CtpManagedPreparedDispatch:
             raise ContractValidationError("typed managed CTP prepared dispatch is required")
+        if (
+            position_baseline_authorization is not None
+            and recovery_close_authorization is not None
+        ):
+            raise ContractValidationError("CTP position dispatch authorizations are exclusive")
+        if prepared.operation != "submit" and (
+            position_baseline_authorization is not None
+            or recovery_close_authorization is not None
+        ):
+            raise ContractValidationError("position dispatch authorization is SUBMIT-only")
         reservation = self._store.read_ctp_order_identity(self._scope, prepared.managed_intent_id)
         if (
             type(reservation) is not CtpOrderIdentityReservation
@@ -484,6 +497,8 @@ class CtpManagedSingleWorkerCandidate:
             native_request_id=prepared.native_request_id,
             local_queue_receipt_id=prepared.local_queue_receipt_id,
             cancel_target_projection=cancel_target_projection,
+            position_baseline_authorization=position_baseline_authorization,
+            recovery_close_authorization=recovery_close_authorization,
         )
         return CtpManagedDispatchBinding.from_command(command, reservation)
 
@@ -492,13 +507,37 @@ class CtpManagedSingleWorkerCandidate:
         command_id: str,
         binding: CtpManagedDispatchBinding,
         queue_receipt: Mapping[str, Any],
+        *,
+        owner_handle: CtpCallbackSessionOwnerHandle | None = None,
+        position_baseline_authorization: object | None = None,
+        recovery_close_authorization: object | None = None,
     ) -> CtpManagedDispatchBinding:
-        _, reservation = self._read_and_require_binding(command_id, binding)
+        if (
+            position_baseline_authorization is not None
+            and recovery_close_authorization is not None
+        ):
+            raise ContractValidationError("CTP position dispatch authorizations are exclusive")
+        if (
+            position_baseline_authorization is not None
+            or recovery_close_authorization is not None
+        ) and type(owner_handle) is not CtpCallbackSessionOwnerHandle:
+            raise ContractValidationError(
+                "position dispatch authorization requires the exact callback session owner"
+            )
+        _, reservation = self._read_and_require_binding(
+            command_id,
+            binding,
+            owner_handle=owner_handle,
+            position_baseline_authorization=position_baseline_authorization,
+            recovery_close_authorization=recovery_close_authorization,
+        )
         command = self._store.record_ctp_dispatch_queue_receipt(
             self._scope,
             command_id,
             queue_receipt,
             writer_lease=self._writer_lease,
+            position_baseline_authorization=position_baseline_authorization,
+            recovery_close_authorization=recovery_close_authorization,
         )
         return CtpManagedDispatchBinding.from_command(command, reservation)
 
@@ -507,11 +546,33 @@ class CtpManagedSingleWorkerCandidate:
         command_id: str,
         binding: CtpManagedDispatchBinding,
         sender: CtpNativeDispatchSender,
+        *,
+        owner_handle: CtpCallbackSessionOwnerHandle | None = None,
+        position_baseline_authorization: object | None = None,
+        recovery_close_authorization: object | None = None,
     ) -> CtpDispatchProjection:
+        if (
+            position_baseline_authorization is not None
+            and recovery_close_authorization is not None
+        ):
+            raise ContractValidationError("CTP position dispatch authorizations are exclusive")
+        if (
+            position_baseline_authorization is not None
+            or recovery_close_authorization is not None
+        ) and type(owner_handle) is not CtpCallbackSessionOwnerHandle:
+            raise ContractValidationError(
+                "position dispatch authorization requires the exact callback session owner"
+            )
         self._require_binding(command_id, binding)
         if not callable(sender):
             raise ContractValidationError("one managed CTP sender callable is required")
-        command, _ = self._read_and_require_binding(command_id, binding)
+        command, _ = self._read_and_require_binding(
+            command_id,
+            binding,
+            owner_handle=owner_handle,
+            position_baseline_authorization=position_baseline_authorization,
+            recovery_close_authorization=recovery_close_authorization,
+        )
         if command.status in {"COMPLETED", "UNKNOWN", "CLAIMED"}:
             projection = self._store.read_ctp_dispatch_projection(self._scope, command_id)
             if projection is None:
@@ -526,6 +587,9 @@ class CtpManagedSingleWorkerCandidate:
             writer_lease=self._writer_lease,
             authority_verifier=self._authority_verifier,
             required_local_queue_receipt_id=binding.local_queue_receipt_id,
+            _callback_session_owner=owner_handle,
+            position_baseline_authorization=position_baseline_authorization,
+            recovery_close_authorization=recovery_close_authorization,
         )
         if claimed is None:
             projection = self._store.read_ctp_dispatch_projection(self._scope, command_id)
@@ -597,10 +661,30 @@ class CtpManagedSingleWorkerCandidate:
             raise ContractValidationError("managed CTP queue receipt ID is invalid")
 
     def _read_and_require_binding(
-        self, command_id: str, binding: CtpManagedDispatchBinding
+        self,
+        command_id: str,
+        binding: CtpManagedDispatchBinding,
+        *,
+        owner_handle: CtpCallbackSessionOwnerHandle | None = None,
+        position_baseline_authorization: object | None = None,
+        recovery_close_authorization: object | None = None,
     ) -> tuple[CtpDispatchCommand, CtpOrderIdentityReservation]:
         self._require_binding(command_id, binding)
-        command = self._store.read_ctp_dispatch_command(self._scope, command_id)
+        if position_baseline_authorization is not None or recovery_close_authorization is not None:
+            if type(owner_handle) is not CtpCallbackSessionOwnerHandle:
+                raise ContractValidationError(
+                    "position dispatch authorization requires the exact callback session owner"
+                )
+            command = self._store.read_ctp_staged_command_for_session(
+                self._scope,
+                command_id,
+                owner_handle=owner_handle,
+                writer_lease=self._writer_lease,
+                position_baseline_authorization=position_baseline_authorization,
+                recovery_close_authorization=recovery_close_authorization,
+            )
+        else:
+            command = self._store.read_ctp_dispatch_command(self._scope, command_id)
         if type(command) is not CtpDispatchCommand:
             raise ContractValidationError("managed CTP command is missing")
         reservation = self._store.read_ctp_order_identity(self._scope, binding.managed_intent_id)

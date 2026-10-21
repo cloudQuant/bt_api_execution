@@ -1,0 +1,61 @@
+{
+  "date": "2026-10-21",
+  "repository": "bt_api_execution",
+  "branch": "dev",
+  "parent": "2b5654943a73b80c8fed816973bbf790efdfed85",
+  "scope": "Propagate one-use position-baseline and recovery-close Store authorization through BasicAdmission, facade, order entry and CTP worker; preserve target-scoped replay and Risk isolation.",
+  "evidence_level": "SOURCE_FAKE_PRODUCTION_VERTICAL_ONLY",
+  "source_acceptance": {
+    "node": "tests/unit/test_ctp_runtime_zero_fill_risk.py::test_recovery_close_reduces_only_store_proved_fill_and_retains_unknown_fee_risk",
+    "root_result_sha256": "28b03601cd9b9b274166a8e5f2d546344221d6725d9bf50cb4d9590eb63b7fe8",
+    "passed": 1,
+    "seconds": 11.48,
+    "warnings": 3,
+    "sources_unchanged": true,
+    "ctp_native_loaded": false,
+    "actual_account_session": false,
+    "formal_case_increase": 0
+  },
+  "static_review": "Independent read-only review found no P1/P2 source or dependency-closure blockers.",
+  "coverage": [
+    "Initial OPEN baseline and server-authorized recovery CLOSE use different Store authorizations.",
+    "Parent partial fill, owner remainder cancel, child close fill and flat-position confirmation.",
+    "Exact cached/durable same-ID replay has no additional query, reservation, authorization or native submit; changed principal/scope/different child denied.",
+    "Unknown commission keeps review and Risk reservations active."
+  ],
+  "limits": [
+    "Synthetic native leaves; no real account/provider acceptance.",
+    "The integration uses a started ServiceHost and real Registry/SDK client with an in-process Registry transport; not proof of CURVE transmission.",
+    "The two-lot synthetic parent/one-lot fill does not expand the actual SimNow authorization of at most one lot."
+  ],
+  "files": {
+    "src/bt_api_execution/basic_admission.py": {
+      "bytes": 37193,
+      "sha256": "cefedc4f89e40cd3dfcdfe45bbeade610971a0b1f04897d7df7ecc7f75280a88"
+    },
+    "src/bt_api_execution/ctp_single_worker_candidate.py": {
+      "bytes": 33750,
+      "sha256": "556e15299862abb59e4d6334531ffb4089932d1d86af09db350fb337637fbf28"
+    },
+    "src/bt_api_execution/facade.py": {
+      "bytes": 76176,
+      "sha256": "aa3d4949194001fafe222da6b562603fcb4b783585159b623e1c078e94f8bc35"
+    },
+    "src/bt_api_execution/service_order_entry.py": {
+      "bytes": 72281,
+      "sha256": "116cda362fd4a8da47affc9af418a5202719a2e3df31e9c919eb60792c76f5aa"
+    },
+    "tests/test_ctp_order_query_cancel_fence.py": {
+      "bytes": 48591,
+      "sha256": "b49db65e6ca382e7e2415e5dab865d34f16bad0d7087488534e137970cdfed75"
+    },
+    "tests/test_execution_basic_admission.py": {
+      "bytes": 39642,
+      "sha256": "4a88f0f93da4d226e4ed94ebdd896c4063111df07235524febb24f2001be3137"
+    },
+    "tests/test_service_order_entry_position_baseline.py": {
+      "bytes": 10739,
+      "sha256": "e6d8c3441caa1549ef7445ce791a78f6a514f3477dd8d06abfb1b928f7d46a85"
+    }
+  }
+}

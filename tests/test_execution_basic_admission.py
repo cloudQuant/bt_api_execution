@@ -428,6 +428,278 @@ def test_basic_admission_composes_with_existing_risk_gate(tmp_path) -> None:
 
 
 @pytest.mark.unit
+def test_recovery_close_uses_preclaim_store_authority_and_dedicated_dispatch(tmp_path) -> None:
+    class _Permit:
+        def __init__(self, permit_id: str) -> None:
+            self.permit_id = permit_id
+
+    class _RiskGate:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str]] = []
+
+        def reserve(self, intent: OrderIntent):
+            self.calls.append(("reserve", intent.intent_id))
+            return _Permit(f"risk-{intent.intent_id}")
+
+        def claim_for_dispatch(self, reference: str, intent: OrderIntent):
+            self.calls.append(("claim", reference))
+            return reference
+
+        def settle(self, reference: str):
+            self.calls.append(("settle", reference))
+
+        def release(self, reference: str, reason: str):
+            self.calls.append(("release", reference))
+
+    class _RecoveryProvider:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, object]] = []
+
+        def submit_recovery_close_authorized(self, intent, basic_authorization, store_authorization):
+            self.calls.append(("recovery", store_authorization))
+            assert basic_authorization.intent_fingerprint == intent.fingerprint
+            return ProviderObservation.accepted(intent.intent_id, "recovery-order")
+
+        def submit_authorized(self, intent, basic_authorization):
+            self.calls.append(("ordinary", basic_authorization))
+            return ProviderObservation.accepted(intent.intent_id, "ordinary-order")
+
+        def submit(self, intent):
+            raise AssertionError("recovery must not use unauthenticated submit")
+
+        def cancel(self, intent):
+            return CancelObservation.accepted(
+                intent.cancel_id, intent.target_intent_id, intent.provider_order_id
+            )
+
+    store = SqliteExecutionStore(tmp_path / "recovery-close.sqlite3")
+    provider = _RecoveryProvider()
+    risk = _RiskGate()
+    validator = _validator(
+        provider,
+        supported_actions=((Side.SELL, PositionEffect.CLOSE),),
+        supports_reduce_only=True,
+    )
+    basic = ExecutionBasicAdmissionGate(
+        store,
+        ExecutionAdmissionValidatorRegistry((validator,)),
+        permit_ttl_ns=5_000_000_000,
+        clock_ns=_Clock(),
+    )
+    seen: list[tuple[str, str, ExecutionState, int, object]] = []
+    store_authorization = object()
+    recovery_wire_scope = WireScope(
+        "paper:exe04",
+        account_ref="account-a",
+        strategy_ref="strategy-a",
+        run_id="recovery-run-a",
+    )
+
+    def authorize(intent, target_intent_id, pending_record, writer_lease):
+        store.assert_writer_lease(_EXECUTION_SCOPE, writer_lease)
+        seen.append(
+            (
+                intent.intent_id,
+                target_intent_id,
+                pending_record.state,
+                pending_record.dispatch_attempts,
+                pending_record.permit_reference,
+            )
+        )
+        return store_authorization
+
+    service = ExecutionOrderEntryService(
+        store,
+        {recovery_wire_scope: _EXECUTION_SCOPE},
+        provider,
+        admission_gate=risk,
+        basic_admission_gate=basic,
+        recovery_close_authorizer=authorize,
+        writer_id="exe04-recovery-writer",
+        lease_ttl_ns=5_000_000_000,
+    )
+    intent = order_intent_from_payload(
+        {
+            "intent_id": "exe04-recovery-close",
+            "scope": _EXECUTION_SCOPE.to_payload(),
+            "signal_id": "signal-exe04-recovery-close",
+            "instrument": "BTC-USDT",
+            "side": "SELL",
+            "position_effect": "CLOSE",
+            "order_type": "LIMIT",
+            "quantity": "1",
+            "price": "50000",
+            "time_in_force": "GTC",
+            "reduce_only": True,
+            "metadata_version": "metadata-v1",
+            "deadline_ns": None,
+            "tags": {},
+        }
+    )
+    try:
+        reply = service.submit_recovery_close(
+            intent,
+            target_intent_id="exe04-reviewed-open",
+            principal_ref=_IDENTITY.principal_ref,
+            identity=_IDENTITY,
+            scope=recovery_wire_scope,
+        )
+
+        record = store.get(intent.intent_id, scope=_EXECUTION_SCOPE)
+        assert reply["ok"] is True, reply
+        assert record is not None
+        assert record.state is ExecutionState.ACKED
+        assert record.dispatch_attempts == 1
+        assert seen == [
+            (
+                intent.intent_id,
+                "exe04-reviewed-open",
+                ExecutionState.PENDING_DISPATCH,
+                0,
+                f"risk-{intent.intent_id}",
+            )
+        ]
+        assert provider.calls == [("recovery", store_authorization)]
+        assert risk.calls == [
+            ("reserve", intent.intent_id),
+            ("claim", f"risk-{intent.intent_id}"),
+            ("settle", f"risk-{intent.intent_id}"),
+        ]
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+def test_recovery_close_authorization_failure_latches_review_and_never_retries(tmp_path) -> None:
+    class _Permit:
+        permit_id = "risk-recovery-retained"
+
+    class _RiskGate:
+        def __init__(self) -> None:
+            self.reserve_calls = 0
+            self.release_calls: list[tuple[str, str]] = []
+
+        def reserve(self, intent: OrderIntent):
+            self.reserve_calls += 1
+            return _Permit()
+
+        def claim_for_dispatch(self, reference: str, intent: OrderIntent):
+            raise AssertionError("Risk claim must follow trusted source authorization")
+
+        def settle(self, reference: str):
+            raise AssertionError("no close can settle without source authorization")
+
+        def release(self, reference: str, reason: str):
+            self.release_calls.append((reference, reason))
+
+    class _RecoveryProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def submit_recovery_close_authorized(self, *args):
+            self.calls += 1
+            raise AssertionError("invalid source authorization reached dispatch")
+
+        def submit_authorized(self, *args):
+            self.calls += 1
+            raise AssertionError("recovery fell back to ordinary dispatch")
+
+        def submit(self, *args):
+            self.calls += 1
+            raise AssertionError("recovery reached unauthenticated dispatch")
+
+        def cancel(self, intent):
+            return CancelObservation.accepted(
+                intent.cancel_id, intent.target_intent_id, intent.provider_order_id
+            )
+
+    store = SqliteExecutionStore(tmp_path / "recovery-close-review.sqlite3")
+    provider = _RecoveryProvider()
+    risk = _RiskGate()
+    validator = _validator(
+        provider,
+        supported_actions=((Side.SELL, PositionEffect.CLOSE),),
+        supports_reduce_only=True,
+    )
+    basic = ExecutionBasicAdmissionGate(
+        store,
+        ExecutionAdmissionValidatorRegistry((validator,)),
+        permit_ttl_ns=5_000_000_000,
+        clock_ns=_Clock(),
+    )
+    calls: list[str] = []
+    recovery_wire_scope = WireScope(
+        "paper:exe04",
+        account_ref="account-a",
+        strategy_ref="strategy-a",
+        run_id="recovery-run-review",
+    )
+
+    def deny_source_authorization(intent, target_intent_id, pending_record, writer_lease):
+        calls.append(intent.intent_id)
+        raise RuntimeError("source proof unavailable")
+
+    service = ExecutionOrderEntryService(
+        store,
+        {recovery_wire_scope: _EXECUTION_SCOPE},
+        provider,
+        admission_gate=risk,
+        basic_admission_gate=basic,
+        recovery_close_authorizer=deny_source_authorization,
+        writer_id="exe04-recovery-review-writer",
+        lease_ttl_ns=5_000_000_000,
+    )
+    intent = order_intent_from_payload(
+        {
+            "intent_id": "exe04-recovery-close-review",
+            "scope": _EXECUTION_SCOPE.to_payload(),
+            "signal_id": "signal-exe04-recovery-close-review",
+            "instrument": "BTC-USDT",
+            "side": "SELL",
+            "position_effect": "CLOSE",
+            "order_type": "LIMIT",
+            "quantity": "1",
+            "price": "50000",
+            "time_in_force": "GTC",
+            "reduce_only": True,
+            "metadata_version": "metadata-v1",
+            "deadline_ns": None,
+            "tags": {},
+        }
+    )
+    try:
+        first = service.submit_recovery_close(
+            intent,
+            target_intent_id="exe04-reviewed-open",
+            principal_ref=_IDENTITY.principal_ref,
+            identity=_IDENTITY,
+            scope=recovery_wire_scope,
+        )
+        second = service.submit_recovery_close(
+            intent,
+            target_intent_id="exe04-reviewed-open",
+            principal_ref=_IDENTITY.principal_ref,
+            identity=_IDENTITY,
+            scope=recovery_wire_scope,
+        )
+
+        record = store.get(intent.intent_id, scope=_EXECUTION_SCOPE)
+        assert first["ok"] is True, first
+        assert second["ok"] is True, second
+        assert record is not None
+        assert record.state is ExecutionState.PENDING_DISPATCH
+        assert record.review_required is True
+        assert record.dispatch_attempts == 0
+        assert record.permit_reference == _Permit.permit_id
+        assert calls == [intent.intent_id]
+        assert risk.reserve_calls == 1
+        assert risk.release_calls == []
+        assert provider.calls == 0
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize(
     ("failure", "arguments"),
     [

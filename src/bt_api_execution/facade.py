@@ -19,6 +19,7 @@ from .basic_admission import (
     ExecutionAdmissionAuthorizationV1,
     ExecutionAdmissionContextV1,
     ExecutionBasicAdmissionGate,
+    RECOVERY_CLOSE_OPERATION,
 )
 from .contracts import (
     ExecutionEvent,
@@ -52,6 +53,7 @@ if TYPE_CHECKING:
 
 DispatchCallable = Callable[[OrderIntent], ProviderObservation]
 BeforeDispatchCallable = Callable[[OrderIntent], None]
+BeforeDispatchClaimCallable = Callable[[OrderIntent, "ExecutionRecord", WriterLease], object]
 ApprovedTargetConsumeCallable = Callable[[OrderIntent], ApprovedTargetConsumeResultV1]
 AfterGroupClaimCallable = Callable[
     [OrderIntent, GroupPermitBinding, GroupLegAuthorization, "WriterLease", object], None
@@ -264,6 +266,7 @@ class ManagedExecutionFacade:
         dispatcher: DispatchPort | DispatchCallable,
         *,
         before_dispatch: BeforeDispatchCallable | None = None,
+        before_dispatch_claim: BeforeDispatchClaimCallable | None = None,
         admission_context: ExecutionAdmissionContextV1 | None = None,
         owner_strategy_ref: str | None = None,
         owner_run_id: str | None = None,
@@ -271,16 +274,78 @@ class ManagedExecutionFacade:
     ) -> ExecutionRecord:
         """Submit an ordinary intent; group namespace IDs require the group path."""
 
+        if (
+            type(admission_context) is ExecutionAdmissionContextV1
+            and admission_context.action == RECOVERY_CLOSE_OPERATION
+        ):
+            raise ContractValidationError(
+                "recovery close requires its dedicated facade operation"
+            )
         if is_group_leg_intent_id(getattr(intent, "intent_id", None)):
             raise ContractValidationError("group leg intent requires coordinator authorization")
         return self._submit(
             intent,
             dispatcher,
             before_dispatch=before_dispatch,
+            before_dispatch_claim=before_dispatch_claim,
             admission_context=admission_context,
             group_binding=None,
             group_authorization=None,
             writer_lease=None,
+            owner_strategy_ref=owner_strategy_ref,
+            owner_run_id=owner_run_id,
+            owner_wire_scope=owner_wire_scope,
+        )
+
+    def submit_recovery_close(
+        self,
+        intent: OrderIntent,
+        dispatcher: DispatchPort | DispatchCallable,
+        *,
+        admission_context: ExecutionAdmissionContextV1,
+        before_dispatch_claim: BeforeDispatchClaimCallable,
+        owner_strategy_ref: str,
+        owner_run_id: str,
+        owner_wire_scope: Mapping[str, Any],
+    ) -> ExecutionRecord:
+        """Submit one server-derived, source-authorized reduce-only close.
+
+        The caller must provide a context created by the authenticated account
+        owner. Risk admission is still required and the context binds the
+        original reviewed OPEN intent whose newly observed position is being
+        reduced. Ordinary :meth:`submit` cannot select this path.
+        """
+
+        if (
+            type(intent) is not OrderIntent
+            or type(admission_context) is not ExecutionAdmissionContextV1
+            or admission_context.action != RECOVERY_CLOSE_OPERATION
+            or not admission_context.recovery_target_intent_id
+            or admission_context.execution_scope != intent.scope
+            or intent.intent_id == admission_context.recovery_target_intent_id
+            or intent.position_effect.value not in {"CLOSE", "CLOSE_TODAY", "CLOSE_YESTERDAY"}
+            or intent.reduce_only is not True
+            or type(owner_strategy_ref) is not str
+            or not owner_strategy_ref
+            or type(owner_run_id) is not str
+            or not owner_run_id
+            or not isinstance(owner_wire_scope, Mapping)
+            or not callable(before_dispatch_claim)
+        ):
+            raise ContractValidationError("invalid dedicated recovery-close binding")
+        if self._basic_admission_gate is None or self._admission_gate is None:
+            raise AdmissionRequired("recovery closes require Basic and Risk admission")
+        if is_group_leg_intent_id(getattr(intent, "intent_id", None)):
+            raise ContractValidationError("group leg intent cannot use recovery close")
+        return self._submit(
+            intent,
+            dispatcher,
+            before_dispatch_claim=before_dispatch_claim,
+            admission_context=admission_context,
+            group_binding=None,
+            group_authorization=None,
+            writer_lease=None,
+            recovery_close_path=True,
             owner_strategy_ref=owner_strategy_ref,
             owner_run_id=owner_run_id,
             owner_wire_scope=owner_wire_scope,
@@ -294,6 +359,7 @@ class ManagedExecutionFacade:
         admission_context: ExecutionAdmissionContextV1,
         consume_authorization: ApprovedTargetConsumeCallable,
         before_dispatch: BeforeDispatchCallable | None = None,
+        before_dispatch_claim: BeforeDispatchClaimCallable | None = None,
         owner_strategy_ref: str | None = None,
         owner_run_id: str | None = None,
         owner_wire_scope: Mapping[str, Any] | None = None,
@@ -316,6 +382,12 @@ class ManagedExecutionFacade:
             raise ContractValidationError("approved-target admission context is required")
         if not callable(consume_authorization):
             raise ContractValidationError("approved-target consume hook is required")
+        if before_dispatch_claim is not None and not callable(before_dispatch_claim):
+            raise ContractValidationError("invalid before-dispatch-claim hook")
+        if before_dispatch_claim is not None and self._basic_admission_gate is None:
+            raise AdmissionRequired(
+                "position-authorized dispatch requires Basic admission"
+            )
         if self._basic_admission_gate is None or self._admission_gate is None:
             raise AdmissionRequired("approved targets require Basic and Risk admission")
         if is_group_leg_intent_id(getattr(intent, "intent_id", None)):
@@ -324,6 +396,7 @@ class ManagedExecutionFacade:
             intent,
             dispatcher,
             before_dispatch=before_dispatch,
+            before_dispatch_claim=before_dispatch_claim,
             admission_context=admission_context,
             group_binding=None,
             group_authorization=None,
@@ -383,6 +456,7 @@ class ManagedExecutionFacade:
         dispatcher: DispatchPort | DispatchCallable,
         *,
         before_dispatch: BeforeDispatchCallable | None = None,
+        before_dispatch_claim: BeforeDispatchClaimCallable | None = None,
         after_group_claim: AfterGroupClaimCallable | None = None,
         assert_current_group_authorization: CurrentGroupAuthorizationCheck | None = None,
         admission_context: ExecutionAdmissionContextV1 | None = None,
@@ -390,6 +464,7 @@ class ManagedExecutionFacade:
         group_authorization: GroupLegAuthorization | None,
         writer_lease: WriterLease | None,
         approved_target_consume: ApprovedTargetConsumeCallable | None = None,
+        recovery_close_path: bool = False,
         owner_strategy_ref: str | None = None,
         owner_run_id: str | None = None,
         owner_wire_scope: Mapping[str, Any] | None = None,
@@ -412,8 +487,29 @@ class ManagedExecutionFacade:
 
         if before_dispatch is not None and not callable(before_dispatch):
             raise ContractValidationError("invalid pre-dispatch guard")
+        if before_dispatch_claim is not None and not callable(before_dispatch_claim):
+            raise ContractValidationError("invalid before-dispatch-claim hook")
         if approved_target_consume is not None and not callable(approved_target_consume):
             raise ContractValidationError("invalid approved-target consume hook")
+        if type(recovery_close_path) is not bool:
+            raise ContractValidationError("invalid recovery-close dispatch path")
+        is_recovery_context = (
+            type(admission_context) is ExecutionAdmissionContextV1
+            and admission_context.action == RECOVERY_CLOSE_OPERATION
+        )
+        if recovery_close_path != is_recovery_context or (
+            recovery_close_path
+            and (
+                admission_context.recovery_target_intent_id is None
+                or intent.position_effect.value
+                not in {"CLOSE", "CLOSE_TODAY", "CLOSE_YESTERDAY"}
+                or intent.reduce_only is not True
+                or approved_target_consume is not None
+                or group_binding is not None
+                or before_dispatch_claim is None
+            )
+        ):
+            raise ContractValidationError("recovery close requires its dedicated dispatch path")
         approved_target_path = approved_target_consume is not None
         if approved_target_path and (
             group_binding is not None
@@ -484,6 +580,8 @@ class ManagedExecutionFacade:
                 record = self._admit_group_leg(intent, group_binding, writer_lease)
         if record.state is not ExecutionState.PENDING_DISPATCH:
             return record
+        if record.review_required:
+            return record
         if self._basic_admission_gate is not None:
             assert admission_context is not None
             if record.admission_context_sha256 == admission_context.fingerprint and (
@@ -527,6 +625,30 @@ class ManagedExecutionFacade:
                 # new BasicGate cannot safely adopt them under a different
                 # admission contract.
                 pass
+        position_dispatch_authorization: object | None = None
+        if before_dispatch_claim is not None:
+            try:
+                position_dispatch_authorization = before_dispatch_claim(
+                    intent, record, writer_lease
+                )
+            except WriterLeaseUnavailable:
+                raise
+            except Exception:
+                self._release_basic_permit(record.basic_admission_reference)
+                return self._store.mark_review_required(
+                    intent.intent_id,
+                    self._scope,
+                    "before_dispatch_claim_authorization_failed",
+                    writer_lease=writer_lease,
+                )
+            if position_dispatch_authorization is None:
+                self._release_basic_permit(record.basic_admission_reference)
+                return self._store.mark_review_required(
+                    intent.intent_id,
+                    self._scope,
+                    "before_dispatch_claim_authorization_missing",
+                    writer_lease=writer_lease,
+                )
         record, claimed = self._store.claim_for_dispatch(
             intent.intent_id, self._scope, writer_lease=writer_lease
         )
@@ -635,7 +757,13 @@ class ManagedExecutionFacade:
                 writer_lease=writer_lease,
             )
         try:
-            dispatch_result = self._dispatch(dispatcher, intent, authorization=authorization)
+            dispatch_result = self._dispatch(
+                dispatcher,
+                intent,
+                authorization=authorization,
+                position_dispatch_authorization=position_dispatch_authorization,
+                recovery_close_path=recovery_close_path,
+            )
         except Exception:
             return self._store.mark_unknown(
                 intent.intent_id, self._scope, writer_lease=writer_lease
@@ -1516,12 +1644,37 @@ class ManagedExecutionFacade:
         intent: OrderIntent,
         *,
         authorization: ExecutionAdmissionAuthorizationV1 | None = None,
+        position_dispatch_authorization: object | None = None,
+        recovery_close_path: bool = False,
     ) -> ProviderObservation | object:
+        if position_dispatch_authorization is not None and authorization is None:
+            raise ContractValidationError(
+                "position authorization requires a BasicAdmission claim"
+            )
+        if recovery_close_path and position_dispatch_authorization is None:
+            raise ContractValidationError(
+                "recovery close requires its Store-issued dispatch authorization"
+            )
         if authorization is not None:
-            method = getattr(dispatcher, "submit_authorized", None)
-            if not callable(method):
-                raise ContractValidationError("authorized dispatch port is unavailable")
-            result = method(intent, authorization)
+            if position_dispatch_authorization is not None:
+                method_name = (
+                    "submit_recovery_close_authorized"
+                    if recovery_close_path
+                    else "submit_with_position_baseline_authorized"
+                )
+                method = getattr(dispatcher, method_name, None)
+                if not callable(method):
+                    raise ContractValidationError(
+                        "typed CTP position authorization dispatch is unavailable"
+                    )
+                result = method(
+                    intent, authorization, position_dispatch_authorization
+                )
+            else:
+                method = getattr(dispatcher, "submit_authorized", None)
+                if not callable(method):
+                    raise ContractValidationError("authorized dispatch port is unavailable")
+                result = method(intent, authorization)
         else:
             method = getattr(dispatcher, "submit", None)
             if callable(method):

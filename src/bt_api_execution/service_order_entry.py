@@ -34,12 +34,14 @@ from .approved_target import (
     has_reserved_approval_tags,
 )
 from .basic_admission import ExecutionAdmissionContextV1, ExecutionBasicAdmissionGate
+from .basic_admission import RECOVERY_CLOSE_OPERATION
 from .cancellation import CancelBeforeDispatchCallable, ManagedCancellationFacade
 from .contracts import (
     CancelIntent,
     ExecutionScope,
     ExecutionState,
     OrderIntent,
+    PositionEffect,
     cancel_intent_from_payload,
     order_intent_from_payload,
 )
@@ -53,6 +55,7 @@ from .errors import (
 )
 from .facade import (
     AfterGroupClaimCallable,
+    BeforeDispatchClaimCallable,
     ManagedExecutionFacade,
     _validate_borrowed_ctp_writer_lease,
 )
@@ -90,6 +93,9 @@ SUPPORTED_OPERATIONS = frozenset(
 )
 OWNER_CANCEL_QUOTA_WINDOW_NS = 5_000_000_000
 CancelQuotaAdmissionCallable = Callable[[str, str, str, str, str, int], None]
+RecoveryCloseBeforeDispatchClaimCallable = Callable[
+    [OrderIntent, str, ExecutionRecord, WriterLease], object
+]
 
 
 class _GroupAuthorityGuardError(Exception):
@@ -177,6 +183,8 @@ class ExecutionOrderEntryService:
         approved_target_authority: ApprovedTargetAuthorityV1 | None = None,
         cancel_quota_admission: CancelQuotaAdmissionCallable | None = None,
         cancel_before_dispatch: CancelBeforeDispatchCallable | None = None,
+        position_baseline_authorizer: BeforeDispatchClaimCallable | None = None,
+        recovery_close_authorizer: RecoveryCloseBeforeDispatchClaimCallable | None = None,
         allow_unprotected: bool = False,
         writer_id: str = _DEFAULT_WRITER_ID,
         lease_ttl_ns: int = _DEFAULT_LEASE_TTL_NS,
@@ -236,6 +244,16 @@ class ExecutionOrderEntryService:
             raise ContractValidationError("cancellation quota admission must be callable")
         if cancel_before_dispatch is not None and not callable(cancel_before_dispatch):
             raise ContractValidationError("cancellation before-dispatch hook must be callable")
+        if position_baseline_authorizer is not None and not callable(
+            position_baseline_authorizer
+        ):
+            raise ContractValidationError("position baseline authorizer must be callable")
+        if recovery_close_authorizer is not None and not callable(recovery_close_authorizer):
+            raise ContractValidationError("recovery close authorizer must be callable")
+        if recovery_close_authorizer is not None and (
+            basic_admission_gate is None or admission_gate is None
+        ):
+            raise ContractValidationError("recovery close requires Basic and Risk admission")
         if group_coordinator_authority is not None and not callable(
             getattr(group_coordinator_authority, "hold_group_leg_authorization", None)
         ):
@@ -319,6 +337,8 @@ class ExecutionOrderEntryService:
         self._cancel_admission_gate = cancel_admission_gate
         self._cancel_quota_admission = cancel_quota_admission
         self._cancel_before_dispatch = cancel_before_dispatch
+        self._position_baseline_authorizer = position_baseline_authorizer
+        self._recovery_close_authorizer = recovery_close_authorizer
         self._group_coordinator_authority = group_coordinator_authority
         self._paper_owner_domain = paper_owner_domain
         self._approved_target_authority = approved_target_authority
@@ -428,6 +448,115 @@ class ExecutionOrderEntryService:
                 owner_wire_scope=scope if scope.strategy_ref is not None else None,
             )
         return self._cancel(arguments, execution_scope)
+
+    def submit_recovery_close(
+        self,
+        intent: OrderIntent,
+        *,
+        target_intent_id: str,
+        principal_ref: str,
+        identity: WireIdentity,
+        scope: WireScope,
+    ) -> Mapping[str, Any]:
+        """Submit a trusted, server-derived reduction through its own action.
+
+        This method deliberately accepts a typed ``OrderIntent`` from the
+        account-owner composition and is not reachable through ``handle`` or
+        the public ``orders.submit`` payload parser. The caller must first
+        verify the source position/order/trade evidence for ``target_intent_id``.
+        """
+
+        if (
+            type(intent) is not OrderIntent
+            or type(target_intent_id) is not str
+            or not target_intent_id
+            or target_intent_id == intent.intent_id
+            or not _is_principal_ref(principal_ref)
+            or type(identity) is not WireIdentity
+            or identity.principal_ref != principal_ref
+            or identity.role not in _WRITE_ROLES
+            or type(scope) is not WireScope
+        ):
+            return _reply(False, "INVALID_REQUEST", {"found": False, "record": None})
+        execution_scope = self._resolve_scope(scope)
+        if (
+            execution_scope is None
+            or execution_scope != intent.scope
+            or scope.strategy_ref is None
+            or scope.run_id is None
+            or execution_scope.strategy_id != scope.strategy_ref
+            or intent.position_effect.value
+            not in {"CLOSE", "CLOSE_TODAY", "CLOSE_YESTERDAY"}
+            or intent.reduce_only is not True
+            or self._basic_admission_gate is None
+            or self._admission_gate is None
+        ):
+            return _reply(False, "RECOVERY_CLOSE_UNAVAILABLE", {"found": False, "record": None})
+        if (
+            self._approved_target_authority is not None
+            and self._approved_target_authority.requires_approval(scope)
+        ):
+            return _reply(False, "APPROVAL_REQUIRED", {"found": False, "record": None})
+        try:
+            admission_context = ExecutionAdmissionContextV1(
+                principal_ref=principal_ref,
+                identity=identity,
+                wire_scope=scope,
+                execution_scope=execution_scope,
+                action=RECOVERY_CLOSE_OPERATION,
+                recovery_target_intent_id=target_intent_id,
+            )
+            order_facade, _ = self._facade_pair(execution_scope)
+            authorizer = self._recovery_close_authorizer
+            if authorizer is None:
+                return _reply(
+                    False,
+                    "RECOVERY_CLOSE_UNAVAILABLE",
+                    {"found": False, "record": None},
+                )
+
+            def before_dispatch_claim(
+                checked_intent: OrderIntent,
+                pending_record: ExecutionRecord,
+                writer_lease: WriterLease,
+            ) -> object:
+                return authorizer(
+                    checked_intent,
+                    target_intent_id,
+                    pending_record,
+                    writer_lease,
+                )
+
+            record = order_facade.submit_recovery_close(
+                intent,
+                self._dispatch,
+                admission_context=admission_context,
+                before_dispatch_claim=before_dispatch_claim,
+                owner_strategy_ref=scope.strategy_ref,
+                owner_run_id=scope.run_id,
+                owner_wire_scope=_wire_scope_binding(scope),
+            )
+        except IntentConflictError:
+            return self._failure_with_record("INTENT_CONFLICT", intent.intent_id, execution_scope)
+        except ContractValidationError:
+            return _reply(False, "INVALID_REQUEST", {"found": False, "record": None})
+        except AdmissionRequired:
+            return self._failure_with_record(
+                "RECOVERY_CLOSE_ADMISSION_REQUIRED", intent.intent_id, execution_scope
+            )
+        except WriterLeaseUnavailable:
+            return self._failure_with_record(
+                "OWNER_LEASE_UNAVAILABLE", intent.intent_id, execution_scope
+            )
+        except InvalidStateTransition:
+            return self._failure_with_record("STATE_CONFLICT", intent.intent_id, execution_scope)
+        except DurableStoreError:
+            return _reply(False, "STORE_UNAVAILABLE", {"found": False, "record": None})
+        return _reply(
+            True,
+            "OK",
+            {"found": True, "record": _stored_record_dto(self._store, record, execution_scope)},
+        )
 
     def submit_group_leg(
         self,
@@ -821,6 +950,11 @@ class ExecutionOrderEntryService:
                 intent,
                 self._dispatch,
                 admission_context=admission_context,
+                before_dispatch_claim=(
+                    self._position_baseline_authorizer
+                    if intent.position_effect is PositionEffect.OPEN
+                    else None
+                ),
                 owner_strategy_ref=(
                     None if owner_wire_scope is None else owner_wire_scope.strategy_ref
                 ),
@@ -919,6 +1053,11 @@ class ExecutionOrderEntryService:
                     binding,
                     target,
                     intent_sha256=checked_intent.fingerprint,
+                ),
+                before_dispatch_claim=(
+                    self._position_baseline_authorizer
+                    if intent.position_effect is PositionEffect.OPEN
+                    else None
                 ),
                 owner_strategy_ref=wire_scope.strategy_ref,
                 owner_run_id=wire_scope.run_id,

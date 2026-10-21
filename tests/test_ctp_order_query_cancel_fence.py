@@ -12,6 +12,7 @@ import hashlib
 import json
 import time
 from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -20,6 +21,12 @@ from bt_api_ctp.ctp.callback_ingress import (
     CtpTraderCallbackPhase,
     CtpTraderCallbackSourceTagsV2,
     build_callback_ingress_record_v2,
+)
+from bt_api_ctp.containers.ctp.ctp_position_evidence import build_ctp_position_evidence
+from bt_api_ctp.ctp.client import (
+    TraderClient,
+    _TRADER_LOGIN_IDENTITY_SEAL,
+    _TraderLoginIdentityObservation,
 )
 from bt_api_execution import (
     ContractValidationError,
@@ -804,6 +811,184 @@ def test_applied_exact_query_allows_one_cancel_binding_and_preserves_query_fence
             )
         assert _durable_query_bit(store, owner) == 1
     finally:
+        store.close()
+
+
+def test_position_window_requires_sealed_result_and_exact_applied_query_callbacks(tmp_path):
+    store, scope, _, lease, owner, adapter, binding, tags = _new_store_and_session(
+        tmp_path, "position-window.sqlite3"
+    )
+    reservation = _reserve(store, scope, lease, binding, "position-window-intent")
+    row = {
+        "BrokerID": "broker",
+        "InvestorID": "user",
+        "InstrumentID": "rb2710",
+        "ExchangeID": "SHFE",
+        "PosiDirection": "2",
+        "HedgeFlag": "1",
+        "PositionDate": "1",
+        "TradingDay": scope.trading_day,
+        "Position": 2,
+        "TodayPosition": 1,
+        "YdPosition": 1,
+        "LongFrozen": 0,
+        "ShortFrozen": 0,
+    }
+
+    class _PositionQueryApi:
+        def __init__(self, client):
+            self.client = client
+            self.source_sequence = binding.source_high_watermark
+
+        def ReqQryInvestorPosition(self, _field, request_id):
+            for record, is_last in ((row, False), (None, True)):
+                self.source_sequence += 1
+                args = (
+                    None if record is None else SimpleNamespace(**record),
+                    None,
+                    request_id,
+                    is_last,
+                )
+                _append_callback(
+                    adapter,
+                    owner,
+                    tags,
+                    "OnRspQryInvestorPosition",
+                    self.source_sequence,
+                    args,
+                    source_generation=binding.connection_generation,
+                    phase=CtpTraderCallbackPhase.ACTIVE,
+                )
+                self.client._handle_query_callback(
+                    "positions", record, None, request_id, is_last
+                )
+                applied = adapter.apply_next_ingress(
+                    callback_verifier=None, trade_fact_verifier=None
+                )
+                assert applied is not None
+            return 0
+
+    client = TraderClient(
+        "tcp://offline.invalid:0",
+        "broker",
+        "user",
+        "",
+        auto_settlement_confirm=False,
+    )
+    client._connected = True
+    client._authentication_state = "authenticated"
+    client._login_state = "logged_in"
+    client._trading_day = scope.trading_day
+    client._connection_generation = binding.connection_generation
+    client._login_identity_observation = _TraderLoginIdentityObservation(
+        _seal=_TRADER_LOGIN_IDENTITY_SEAL,
+        broker_id="broker",
+        user_id="user",
+        trading_day=scope.trading_day,
+        connection_generation=binding.connection_generation,
+        request_id=17,
+    )
+    client._query_interval = 0.0
+    api = _PositionQueryApi(client)
+    client._api = api
+    # Assigning the fake API uses the SDK's normal replacement hook, which
+    # rotates its source identities. Bind this sourcefake to the exact tags
+    # already owned by the durable callback session.
+    client._native_client_epoch = tags.native_client_epoch
+    client._native_api_generation = tags.native_api_generation
+    client._callback_source_instance_id = tags.source_instance_id
+    client._native_api_source_id = tags.native_api_source_id
+    spi = SimpleNamespace(
+        _native_api=api,
+        _native_spi_source_id=tags.native_spi_source_id,
+        _callback_source_tags=tags,
+    )
+    client._spi = spi
+
+    try:
+        assert client._query_source_tags_locked() == (
+            tags.source_instance_id,
+            tags.native_client_epoch,
+            tags.native_api_source_id,
+            tags.native_spi_source_id,
+            tags.native_api_generation,
+            tags.connection_generation,
+        ), (
+            client._callback_source_instance_id,
+            client._native_client_epoch,
+            client._native_api_source_id,
+            client._native_api_generation,
+            getattr(client._spi, "_native_spi_source_id", None),
+            getattr(client._spi, "_callback_source_tags", None),
+        )
+        fence = store.begin_ctp_position_evidence_window(
+            scope, reservation.managed_intent_id, owner_handle=owner, writer_lease=lease
+        )
+        result = client.query_positions_result(timeout=1.0)
+        query_source = result.query_source
+        assert query_source is not None and result.complete
+        session_scope = client.get_query_session_scope()
+        assert query_source.source_tags is not None
+        assert session_scope.source_tags is not None
+        evidence = build_ctp_position_evidence(
+            result,
+            session_state=session_scope,
+            now_utc=datetime.now(timezone.utc),
+            expires_at_utc=query_source.completed_at_utc + timedelta(seconds=5),
+            monotonic_now=time.monotonic(),
+            monotonic_expires_at=query_source.completed_monotonic + 5.0,
+        )
+        from bt_api_ctp.containers.ctp.ctp_position_evidence import (
+            CtpPositionEvidence,
+            _CTP_POSITION_EVIDENCE_SEAL,
+            _ctp_position_evidence_store_facts,
+        )
+        assert type(evidence) is CtpPositionEvidence
+        assert evidence._seal is _CTP_POSITION_EVIDENCE_SEAL
+        assert evidence._query_issuer is not None
+        assert evidence.complete is True and evidence.request_type == "positions"
+        assert evidence.source_tags is not None
+        assert all(not row.errors for row in evidence.rows)
+        _ctp_position_evidence_store_facts(evidence)
+        forged = replace(evidence, _seal=None)
+        with pytest.raises(ContractValidationError, match="sealed CTP position"):
+            store.finalize_ctp_position_evidence_window(
+                scope,
+                fence,
+                forged,
+                owner_handle=owner,
+                writer_lease=lease,
+            )
+
+        handle = store.finalize_ctp_position_evidence_window(
+            scope,
+            fence,
+            evidence,
+            owner_handle=owner,
+            writer_lease=lease,
+        )
+        window = store.read_ctp_position_evidence_window(
+            scope, handle, owner_handle=owner, writer_lease=lease
+        )
+        assert window.managed_intent_id == reservation.managed_intent_id
+        assert window.runtime_order_id == reservation.runtime_order_id
+        assert window.order_ref == reservation.order_ref
+        assert window.query_request_id == result.request_id
+        assert window.source_hash == evidence.source_hash
+        assert window.positions[0]["raw_record"]["Position"] == 2
+        assert len(window.callback_sequences) == 2
+        assert window.callback_sequences[-1] == window.end_source_sequence
+        assert len(
+            store.read_ctp_position_evidence_windows(
+                scope,
+                reservation.managed_intent_id,
+                owner_handle=owner,
+                writer_lease=lease,
+            )
+        ) == 1
+    finally:
+        client._api = None
+        client._spi = None
         store.close()
 
 

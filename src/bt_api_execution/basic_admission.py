@@ -39,7 +39,10 @@ _INSTRUMENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,191}$")
 _REFERENCE = re.compile(r"^[0-9a-f]{32}$")
 _SUPPORTED_OPERATION = "orders.submit"
 _APPROVED_TARGET_OPERATION = "orders.submit_approved_target"
-_SUPPORTED_OPERATIONS = frozenset({_SUPPORTED_OPERATION, _APPROVED_TARGET_OPERATION})
+RECOVERY_CLOSE_OPERATION = "orders.submit_recovery_close"
+_SUPPORTED_OPERATIONS = frozenset(
+    {_SUPPORTED_OPERATION, _APPROVED_TARGET_OPERATION, RECOVERY_CLOSE_OPERATION}
+)
 
 
 def _text(value: object, field_name: str, *, pattern: re.Pattern[str] = _IDENTIFIER) -> str:
@@ -63,6 +66,7 @@ class ExecutionAdmissionContextV1:
     wire_scope: WireScope
     execution_scope: ExecutionScope
     action: str
+    recovery_target_intent_id: str | None = None
 
     def __post_init__(self) -> None:
         _text(self.principal_ref, "principal_ref")
@@ -84,6 +88,10 @@ class ExecutionAdmissionContextV1:
             raise ContractValidationError("admission scopes are required")
         if type(self.action) is not str or self.action not in _SUPPORTED_OPERATIONS:
             raise ContractValidationError("unsupported execution admission action")
+        if self.action == RECOVERY_CLOSE_OPERATION:
+            _text(self.recovery_target_intent_id, "recovery target intent ID")
+        elif self.recovery_target_intent_id is not None:
+            raise ContractValidationError("recovery target is only valid for recovery close")
         if (
             self.wire_scope.account_ref is not None
             and self.wire_scope.account_ref != self.execution_scope.account_ref
@@ -101,7 +109,7 @@ class ExecutionAdmissionContextV1:
             raise ContractValidationError("trusted strategy scope mapping is inconsistent")
 
     def to_payload(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "principal_ref": self.principal_ref,
             "identity": {
                 "role": self.identity.role.value,
@@ -123,6 +131,9 @@ class ExecutionAdmissionContextV1:
             "execution_scope": self.execution_scope.to_payload(),
             "action": self.action,
         }
+        if self.recovery_target_intent_id is not None:
+            payload["recovery_target_intent_id"] = self.recovery_target_intent_id
+        return payload
 
     @property
     def fingerprint(self) -> str:
@@ -754,6 +765,14 @@ class ExecutionBasicAdmissionGate:
             raise ExecutionBasicAdmissionDenied("trusted admission context is missing")
         if type(intent) is not OrderIntent or intent.scope != context.execution_scope:
             raise ExecutionBasicAdmissionDenied("intent does not match trusted context")
+        if context.action == RECOVERY_CLOSE_OPERATION and (
+            context.recovery_target_intent_id is None
+            or intent.position_effect.value not in {"CLOSE", "CLOSE_TODAY", "CLOSE_YESTERDAY"}
+            or intent.reduce_only is not True
+        ):
+            raise ExecutionBasicAdmissionDenied(
+                "recovery operation requires a bound reduce-only close intent"
+            )
         if type(writer_lease) is not WriterLease:
             raise ExecutionBasicAdmissionDenied("current writer lease is required")
         self._store.assert_writer_lease(intent.scope, writer_lease)
