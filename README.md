@@ -5,6 +5,12 @@ routes.  It deliberately contains no exchange SDK, HTTP client, socket, or
 credential loader.  A caller injects a provider port only after the runtime
 has completed its own configuration, admission, and preflight checks.
 
+## Role in the trading-system architecture
+
+`bt_api_execution` owns provider-neutral managed-intent contracts and a durable local execution journal/outbox, including dispatch and `UNKNOWN` state. A trusted composition injects the provider port and admission authority. Its records describe local attempts and received evidence; they are not provider state or acknowledgement. The package supplies no provider adapter, credentials, risk policy, or external account-wide write fence. `allow_unprotected=True` is for isolated test fixtures only.
+
+[Trading system architecture overview](https://github.com/cloudQuant/backtrader/blob/dev/docs/TRADING_SYSTEM_ARCHITECTURE.md).
+
 The first public release supplies a small, durable execution spine:
 
 - immutable, Decimal-safe contracts for intents, plans, children, allocations,
