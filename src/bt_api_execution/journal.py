@@ -2627,6 +2627,15 @@ class ExecutionDecisionJournal:
                 connection.close()
                 self._closed = True
             raise ExecutionDecisionJournalError("JOURNAL_UNAVAILABLE") from error
+        except BaseException:
+            connection = getattr(self, "_connection", None)
+            if connection is not None:
+                try:
+                    connection.close()
+                except BaseException:
+                    self._failed_closed = True
+                self._closed = True
+            raise
 
     def __enter__(self) -> "ExecutionDecisionJournal":
         self._ensure_open()
@@ -20636,6 +20645,18 @@ class ExecutionDecisionJournal:
             self._backfill_durable_capacity_usage(cursor)
         self._validate_durable_capacity_tables(cursor)
 
+    def _rollback_schema_transaction(self) -> None:
+        """Roll back schema work without masking the failure that triggered it."""
+
+        connection = getattr(self, "_connection", None)
+        if connection is None:
+            return
+        try:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+        except BaseException:
+            self._failed_closed = True
+
     def _create_schema(self) -> None:
         with self._lock:
             version = int(self._connection.execute("PRAGMA user_version").fetchone()[0])
@@ -20779,6 +20800,7 @@ class ExecutionDecisionJournal:
             try:
                 self._connection.executescript(
                     """
+                    BEGIN IMMEDIATE;
                     CREATE TABLE IF NOT EXISTS execution_decisions (
                         decision_id TEXT PRIMARY KEY,
                         business_key_json TEXT NOT NULL UNIQUE,
@@ -21025,10 +21047,11 @@ class ExecutionDecisionJournal:
                         position_attribution.ensure_schema(cursor)
                     finally:
                         cursor.close()
-                self._connection.execute("BEGIN IMMEDIATE")
                 # Multiple processes can read an old user_version before either
-                # obtains the write lock. Re-read under BEGIN IMMEDIATE so a
-                # waiter observes the migration committed by the first opener.
+                # obtains the write lock. BEGIN IMMEDIATE is the first statement
+                # in the schema script, so the lock covers base DDL and the port
+                # schema too. Re-read under that lock so a waiter observes the
+                # migration committed by the first opener.
                 locked_version = int(self._connection.execute("PRAGMA user_version").fetchone()[0])
                 if locked_version not in (
                     0,
@@ -21359,17 +21382,17 @@ class ExecutionDecisionJournal:
                 # candidate JSON bound to the existing source-receipt limit; v16
                 # candidate rows retain their original 16 KiB bound.
             except DurableCapacityError as error:
-                if self._connection.in_transaction:
-                    self._connection.execute("ROLLBACK")
+                self._rollback_schema_transaction()
                 raise ExecutionDecisionJournalError(error.code) from error
             except ExecutionDecisionJournalError:
-                if self._connection.in_transaction:
-                    self._connection.execute("ROLLBACK")
+                self._rollback_schema_transaction()
                 raise
             except sqlite3.Error as error:
-                if self._connection.in_transaction:
-                    self._connection.execute("ROLLBACK")
+                self._rollback_schema_transaction()
                 raise ExecutionDecisionJournalError("JOURNAL_SCHEMA_FAILED") from error
+            except BaseException:
+                self._rollback_schema_transaction()
+                raise
             self._validate_callback_delivery_state_on_open()
 
     @contextmanager

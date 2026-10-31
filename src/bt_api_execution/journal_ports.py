@@ -50,7 +50,10 @@ class JournalPositionAttributionPort(abc.ABC):
     *journal's* live cursor and must write on it inside the caller's
     transaction: the journal neither commits nor rolls back on the
     implementation's behalf, and an implementation failure must abort the whole
-    decision transaction.
+    decision transaction. When invoked by the journal, the transaction is
+    already active; implementations must not begin, commit, or roll back it, or
+    call ``executescript`` (which can implicitly commit). Execute schema
+    statements individually through the supplied cursor.
 
     Invariants an implementation must enforce itself:
 
