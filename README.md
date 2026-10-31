@@ -23,6 +23,26 @@ The first public release supplies a small, durable execution spine:
 - an optional duck-typed admission gate.  The package does not define a second
   risk permit type; deployments inject an adapter for the shared risk contract.
 
+## Planned execution responsibilities
+
+The long-term target is for this optional package to own execution-side handling
+of inputs from authorized, registered strategies: configured aggregation and
+conflict rules, traceability from each contributing strategy input through its
+orders, parent/child order slicing, algorithm scheduling, allocation of fills
+and fees back to contributing strategies, and execution-state recovery. This
+scope starts with strategy intents; Backtrader and strategies remain responsible
+for generating signals and defining strategy rules. Risk independently owns
+admission and limits, providers own execution routes and provider facts, and the
+SDK/runtime owns trusted composition and authorization. The target direct route
+does not require this package; current provider availability must be verified
+separately.
+
+Current source includes durable single-order execution, a limited two- or
+three-leg `GroupOrderCoordinator`, post-trade strategy attribution, and
+parent/child DTOs. These foundations do not implement complete multi-strategy
+signal or intent aggregation, automatic order slicing, or TWAP/VWAP/POV
+scheduling. Those target capabilities are planned, not implemented or accepted.
+
 The facade is intentionally fail-closed.  It needs an admission gate unless a
 test explicitly enables `allow_unprotected=True`; that test-only escape does
 not represent an approved managed provider route.  A managed adapter supplies
@@ -134,11 +154,12 @@ caller rather than reported as a plain failure.
 ## Scope of this release
 
 This package is an execution foundation, not a provider adapter, risk engine,
-or monitor.  Cross-package atomic reservation/journal commits, provider
-capability receipts, aggregation policy, cancellation action state, and SDK
-migration are deliberately left to their owning integration work packages.
-The exposed contracts and outbox are designed to make those additions explicit
-rather than silently falling back to an in-memory or direct route.
+or monitor. The package-level multi-strategy aggregation policy described above
+is planned and not implemented in this release. Cross-package atomic
+reservation/journal commits, provider capability receipts, cancellation action
+state, and SDK migration remain with their respective integration work
+packages. The exposed contracts and outbox are designed to make those additions
+explicit rather than silently falling back to an in-memory or direct route.
 
 `reserve_ctp_order_identity()` binds a CTP execution scope, managed intent ID,
 and stable runtime order ID to one account-wide 12-digit ASCII OrderRef in the
