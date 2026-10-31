@@ -36,32 +36,97 @@ from types import MappingProxyType
 from threading import Lock, RLock
 from typing import Any, Callable, Dict, Iterator, Optional, Tuple, Union
 
-# Optional Backtrader-owned contracts.  The journal itself lives in
-# ``bt_api_execution`` and never imports Backtrader; a Backtrader caller injects
-# the strategy position/fact adapters it needs.
-_BT_CONTRACTS: Dict[str, Any] = {}
+from .journal_ports import (
+    JOURNAL_PORT_NAMES,
+    JournalPorts,
+    validate_journal_port,
+)
+
+# Optional cross-domain ports.  The journal itself lives in ``bt_api_execution``
+# and never imports the injecting application; that application injects typed,
+# versioned port *instances* (see ``journal_ports``) instead of whole modules.
+_JOURNAL_PORTS = JournalPorts()
+_JOURNAL_PORTS_LOCK = RLock()
+
+#: Attribution schema version assumed only when a journal was constructed with
+#: no position-attribution port at all.  It is the documented pre-port value;
+#: an injected port supplies ``expected_schema_version`` and wins.
+_LEGACY_POSITION_BOOK_SCHEMA_VERSION = 6
 
 
-def configure_backtrader_contracts(
+def _validate_journal_port(name: str, port: Any) -> Any:
+    """Reject anything that is not a current-version implementation of *name*."""
+
+    return validate_journal_port(name, port)
+
+
+def configure_journal_ports(
     *,
-    factor_position_book: Any = None,
-    factor_execution_facts: Any = None,
-    registered_sim: Any = None,
+    position_attribution: Any = None,
+    fee_pair_facts: Any = None,
+    registered_sim_attestation: Any = None,
+    replace: bool = False,
 ) -> None:
-    """Inject Backtrader-owned adapters for optional cross-domain checks."""
-    if factor_position_book is not None:
-        _BT_CONTRACTS["factor_position_book"] = factor_position_book
-    if factor_execution_facts is not None:
-        _BT_CONTRACTS["factor_execution_facts"] = factor_execution_facts
-    if registered_sim is not None:
-        _BT_CONTRACTS["registered_sim"] = registered_sim
+    """Inject the optional cross-domain ports for journals without their own set.
+
+    Each supplied port must be a current-version implementation of the matching
+    abstract port.  An already-set port is never replaced by a *different*
+    instance unless the caller passes ``replace=True``: a silent swap would let
+    a later import quietly change the semantics of an already-open journal.
+    Re-configuring the identical instance is always allowed and is a no-op.
+    """
+
+    if type(replace) is not bool:
+        raise ExecutionDecisionJournalError("JOURNAL_PORT_INVALID:replace")
+    supplied = {
+        "position_attribution": position_attribution,
+        "fee_pair_facts": fee_pair_facts,
+        "registered_sim_attestation": registered_sim_attestation,
+    }
+    with _JOURNAL_PORTS_LOCK:
+        current = _JOURNAL_PORTS
+        values: Dict[str, Any] = {name: getattr(current, name) for name in JOURNAL_PORT_NAMES}
+        changed = False
+        for name in JOURNAL_PORT_NAMES:
+            port = supplied[name]
+            if port is None:
+                continue
+            port = _validate_journal_port(name, port)
+            existing = values[name]
+            if existing is not None and existing is not port and not replace:
+                raise ExecutionDecisionJournalError("JOURNAL_PORT_ALREADY_CONFIGURED:" + name)
+            if existing is not port:
+                values[name] = port
+                changed = True
+        if changed:
+            globals()["_JOURNAL_PORTS"] = JournalPorts(**values)
 
 
-def _bt_contract(name: str) -> Any:
-    module = _BT_CONTRACTS.get(name)
-    if module is None:
-        raise ExecutionDecisionJournalError("BT_CONTRACT_UNAVAILABLE:" + name)
-    return module
+def reset_journal_ports() -> None:
+    """Clear the process-registered ports; test isolation only."""
+
+    with _JOURNAL_PORTS_LOCK:
+        globals()["_JOURNAL_PORTS"] = JournalPorts()
+
+
+def _journal_ports() -> JournalPorts:
+    """Return the process-registered port set."""
+
+    return _JOURNAL_PORTS
+
+
+def configure_backtrader_contracts(**_retired: Any) -> None:
+    """Retired module-injection entry point; it accepts nothing.
+
+    Whole-module injection let this SDK reach private symbols of the injecting
+    package and perform exact cross-repo class identity checks.  Callers must
+    now inject typed port instances through ``configure_journal_ports``.  There
+    is deliberately no fallback: a legacy call fails closed instead of silently
+    installing modules.
+    """
+
+    raise ExecutionDecisionJournalError("JOURNAL_PORT_LEGACY_RETIRED")
+
 
 from .journal_archive import (
     DEFAULT_ARCHIVE_TIMEOUT_SECONDS,
@@ -2437,6 +2502,9 @@ class ExecutionDecisionJournal:
     failed persistence step.
     An opt-in run loss guard persists one fixed total-net-P&L policy/state row
     and checks fresh matching context at each OPEN decision, prepare, and claim.
+    ``journal_ports`` supplies this journal's own typed cross-domain port set and
+    wins over the process-registered one; ``None`` uses the registered set, and an
+    explicitly empty ``JournalPorts`` deliberately runs with no optional port.
     """
 
     _SCHEMA_VERSION = _FEE_PAIR_AMOUNT_OPEN_LIFECYCLE_SCHEMA_VERSION
@@ -2459,6 +2527,7 @@ class ExecutionDecisionJournal:
         max_durable_base_bytes: int = DEFAULT_MAX_DURABLE_BASE_BYTES,
         max_durable_settlement_records: int = DEFAULT_MAX_DURABLE_SETTLEMENT_RECORDS,
         max_durable_settlement_bytes: int = DEFAULT_MAX_DURABLE_SETTLEMENT_BYTES,
+        journal_ports: Optional[JournalPorts] = None,
     ) -> None:
         if (
             type(max_pending_intents) is not int
@@ -2493,6 +2562,13 @@ class ExecutionDecisionJournal:
             )
         except DurableCapacityError as error:
             raise ExecutionDecisionJournalError(error.code) from error
+        # Cross-domain ports must exist before the schema is created, because
+        # the application-owned attribution tables are opened during schema
+        # setup.  Constructor injection wins over the process-registered set;
+        # an explicit empty JournalPorts deliberately runs with no ports.
+        if journal_ports is not None and type(journal_ports) is not JournalPorts:
+            raise ExecutionDecisionJournalError("JOURNAL_PORT_INVALID:journal_ports")
+        self._ports = _journal_ports() if journal_ports is None else journal_ports
         self._lock = RLock()
         # Dispatch serialization is deliberately non-reentrant. The file
         # sidecar already rejects nested acquisition; keep the in-memory
@@ -2991,7 +3067,7 @@ class ExecutionDecisionJournal:
                    WHERE account_scope = ? AND strategy_scope = ? AND cohort_id = ?""",
                 cursor_key,
             ).fetchone()
-            record_factor_position_grid = _bt_contract("factor_position_book").record_factor_position_grid
+            record_factor_position_grid = self._ports.require("position_attribution").record_grid
 
             record_factor_position_grid(
                 db_cursor,
@@ -5130,7 +5206,7 @@ class ExecutionDecisionJournal:
             None
             if source_lease is None
             else _fee_pair_facts_source_before_commit(
-                facts, source_lease, operation="OPEN"
+                facts, source_lease, operation="OPEN", ports=self._ports
             )
         )
         with self._transaction(before_commit=source_guard) as cursor:
@@ -6394,14 +6470,14 @@ class ExecutionDecisionJournal:
             )
             if any(value is None for value in query_started + query_completed):
                 raise ValueError("release query timestamps are invalid")
-            _query_set_identifier = _bt_contract("factor_execution_facts")._query_set_identifier
+            query_set_identifier = _journal_ports().require("fee_pair_facts").query_set_identifier
 
             query_ids = tuple((item["family"], item["request_id"]) for item in query_facts)
             if (
                 _fee_pair_release_timestamp_parse(evidence["available_at"])
                 != max(query_completed)
                 or evidence["query_set_id"]
-                != _query_set_identifier(
+                != query_set_identifier(
                     query_facts[0]["account_fingerprint"],
                     query_facts[0]["connection_generation"],
                     query_facts[0]["trading_day"],
@@ -6589,7 +6665,7 @@ class ExecutionDecisionJournal:
         if not _source_sha256(candidate_id):
             raise ExecutionDecisionJournalError("INVALID_FEE_PAIR_CANDIDATE_ID")
         before_commit = _fee_pair_facts_source_before_commit(
-            facts, source_lease, operation="RELEASE"
+            facts, source_lease, operation="RELEASE", ports=self._ports
         )
         now_ns = time.time_ns()
         with self._transaction(before_commit=before_commit) as cursor:
@@ -7527,7 +7603,7 @@ class ExecutionDecisionJournal:
             None
             if source_lease is None
             else _fee_pair_facts_source_before_commit(
-                facts, source_lease, operation="OPEN"
+                facts, source_lease, operation="OPEN", ports=self._ports
             )
         )
         with self._transaction(before_commit=source_guard) as cursor:
@@ -7699,7 +7775,7 @@ class ExecutionDecisionJournal:
             None
             if source_lease is None
             else _fee_pair_facts_source_before_commit(
-                facts, source_lease, operation="OPEN"
+                facts, source_lease, operation="OPEN", ports=self._ports
             )
         )
         with self._transaction(before_commit=source_guard) as cursor:
@@ -8479,7 +8555,7 @@ class ExecutionDecisionJournal:
             None
             if not reserve_for_open
             else _fee_pair_facts_source_before_commit(
-                facts, source_lease, operation="OPEN"
+                facts, source_lease, operation="OPEN", ports=self._ports
             )
         )
         with self._transaction(before_commit=source_guard) as cursor:
@@ -8900,7 +8976,7 @@ class ExecutionDecisionJournal:
                    WHERE account_scope=? AND strategy_scope=? AND cohort_id=?""",
                 cursor_key,
             ).fetchone()
-            record_factor_position_grid = _bt_contract("factor_position_book").record_factor_position_grid
+            record_factor_position_grid = self._ports.require("position_attribution").record_grid
 
             record_factor_position_grid(
                 cursor,
@@ -9039,7 +9115,7 @@ class ExecutionDecisionJournal:
             None
             if context.source_lease is None
             else _fee_pair_facts_source_before_commit(
-                context.facts, context.source_lease, operation="OPEN"
+                context.facts, context.source_lease, operation="OPEN", ports=self._ports
             )
         )
         with self._transaction(before_commit=source_guard) as cursor:
@@ -9468,11 +9544,8 @@ class ExecutionDecisionJournal:
         boundary additionally require the current grant for that one leg.
         """
 
-        try:
-            FactorExecutionFacts = _bt_contract("factor_execution_facts").FactorExecutionFacts
-        except ImportError as error:  # pragma: no cover - package integrity guard
-            raise ExecutionDecisionJournalError("FEE_PAIR_FACTS_UNAVAILABLE") from error
-        if type(facts) is not FactorExecutionFacts or candidate.target_routes is None:
+        is_factor_execution_facts = self._ports.require("fee_pair_facts").is_factor_execution_facts
+        if not is_factor_execution_facts(facts) or candidate.target_routes is None:
             raise ExecutionDecisionJournalError("FEE_PAIR_FACTS_INVALID")
         if required_active_target_ids is None:
             required_active_target_ids = frozenset(candidate.target_ids)
@@ -13075,7 +13148,7 @@ class ExecutionDecisionJournal:
         if context.source_lease is None:
             raise ExecutionDecisionJournalError("FEE_PAIR_SOURCE_BINDING_REQUIRED")
         _fee_pair_facts_source_before_commit(
-            context.facts, context.source_lease, operation="OPEN"
+            context.facts, context.source_lease, operation="OPEN", ports=self._ports
         )()
         return _FeePairAmountOpenAdmission(
             candidate_id=context.candidate_id,
@@ -13299,6 +13372,7 @@ class ExecutionDecisionJournal:
                 fee_pair_open_context.facts,
                 fee_pair_open_context.source_lease,
                 operation="OPEN",
+                ports=self._ports,
             )
             if type(fee_pair_open_context) is ExecutionFeePairOpenContext
             and fee_pair_open_context.source_lease is not None
@@ -13405,7 +13479,9 @@ class ExecutionDecisionJournal:
                     if factor_owned_close:
                         _require_identifier(owner_intent_id, "INVALID_OWNER_INTENT_ID")
                         try:
-                            validate_factor_position_close_owner = _bt_contract("factor_position_book").validate_factor_position_close_owner
+                            validate_factor_position_close_owner = self._ports.require(
+                                "position_attribution"
+                            ).validate_close_owner
 
                             validate_factor_position_close_owner(
                                 cursor,
@@ -15047,7 +15123,9 @@ class ExecutionDecisionJournal:
             if bool(existing["position_flat"]) and _factor_book_checkpoint_required(
                 intent_key, intent_row["economic_payload_json"]
             ):
-                record_factor_position_flat_checkpoint = _bt_contract("factor_position_book").record_factor_position_flat_checkpoint
+                record_factor_position_flat_checkpoint = self._ports.require(
+                    "position_attribution"
+                ).record_flat_checkpoint
 
                 record_factor_position_flat_checkpoint(
                     cursor,
@@ -15087,7 +15165,9 @@ class ExecutionDecisionJournal:
         if bool(reconciliation["position_flat"]) and _factor_book_checkpoint_required(
             intent_key, intent_row["economic_payload_json"]
         ):
-            record_factor_position_flat_checkpoint = _bt_contract("factor_position_book").record_factor_position_flat_checkpoint
+            record_factor_position_flat_checkpoint = self._ports.require(
+                "position_attribution"
+            ).record_flat_checkpoint
 
             record_factor_position_flat_checkpoint(
                 cursor,
@@ -15254,6 +15334,7 @@ class ExecutionDecisionJournal:
                 fee_pair_open_context.facts,
                 fee_pair_open_context.source_lease,
                 operation="OPEN",
+                ports=self._ports,
             )
             if type(fee_pair_open_context) is ExecutionFeePairOpenContext
             and fee_pair_open_context.source_lease is not None
@@ -15417,6 +15498,7 @@ class ExecutionDecisionJournal:
                     fee_pair_open_context.facts,
                     fee_pair_open_context.source_lease,
                     operation="OPEN",
+                    ports=self._ports,
                 )
             except ExecutionDecisionJournalError as error:
                 if not claimed_native_result or error.code != "FEE_PAIR_SOURCE_BINDING_REQUIRED":
@@ -15657,70 +15739,23 @@ class ExecutionDecisionJournal:
     ) -> Mapping[str, Any]:
         """Append the first exact Store-query binding for one KNOWN CTP submit.
 
-        The Store-minted receipt is a trusted in-process caller contract.  This
-        method rechecks its Store/session validity, the full-query digest and
-        unique source row, then compares that row with immutable Journal submit
-        identity and the caller's current local-order projection.  It does not
+        The caller's receipt is a trusted in-process application contract.  Its
+        type, Store binding, field shape and Store-side current-query
+        revalidation belong to the injected attestation port, which the journal
+        calls instead of inspecting the application's private symbols or class
+        identity.  The port returns one neutral projection; the journal then
+        rechecks the full-query digest, the unique source row and its own
+        immutable submit identity, and appends the durable binding.  It does not
         alter ``provider_identity`` and does not authenticate same-process
         arbitrary code or the underlying physical provider source.
         """
         _require_identifier(intent_id, "INVALID_INTENT_ID")
-        _registered_sim = _bt_contract("registered_sim")
-        RegisteredSimOrderIdentityQueryReceipt = _registered_sim.RegisteredSimOrderIdentityQueryReceipt
-        RegisteredSimStore = _registered_sim.RegisteredSimStore
-
-        if type(receipt) is not RegisteredSimOrderIdentityQueryReceipt:
-            raise ExecutionDecisionJournalError("KNOWN_CTP_ORDER_SYSID_QUERY_UNTRUSTED")
-        store = source_store
-        if (
-            type(store) is not RegisteredSimStore
-            or receipt._store is not store
-            or getattr(
-                store.registered_sim_order_identity_query_receipt, "__func__", None
-            ) is not RegisteredSimStore.registered_sim_order_identity_query_receipt
-            or getattr(
-                store.registered_sim_validate_order_identity_query_receipt, "__func__", None
-            ) is not RegisteredSimStore.registered_sim_validate_order_identity_query_receipt
-        ):
-            raise ExecutionDecisionJournalError("KNOWN_CTP_ORDER_SYSID_QUERY_UNTRUSTED")
-        validator = RegisteredSimStore.registered_sim_validate_order_identity_query_receipt
-        if (
-            receipt._issuer is None
-            or type(receipt.request_id) is not int
-            or receipt.request_id <= 0
-            or type(receipt.connection_generation) is not int
-            or receipt.connection_generation <= 0
-            or type(receipt.account_fingerprint) is not str
-            or not receipt.account_fingerprint
-            or receipt.account_fingerprint != receipt.account_fingerprint.strip()
-            or type(receipt.trading_day) is not str
-            or re.fullmatch(r"[0-9]{8}", receipt.trading_day) is None
-            or not isinstance(receipt.started_at_utc, datetime)
-            or receipt.started_at_utc.tzinfo is None
-            or receipt.started_at_utc.utcoffset() is None
-            or not isinstance(receipt.completed_at_utc, datetime)
-            or receipt.completed_at_utc.tzinfo is None
-            or receipt.completed_at_utc.utcoffset() is None
-            or receipt.started_at_utc > receipt.completed_at_utc
-            or type(receipt.front_id) is not int
-            or receipt.front_id <= 0
-            or type(receipt.session_id) is not int
-            or receipt.session_id <= 0
-            or type(receipt.broker_id) is not str
-            or not receipt.broker_id
-            or receipt.broker_id != receipt.broker_id.strip()
-            or type(receipt.investor_id) is not str
-            or not receipt.investor_id
-            or receipt.investor_id != receipt.investor_id.strip()
-            or type(receipt.rows) is not tuple
-            or type(receipt.rows_sha256) is not str
-            or re.fullmatch(r"[0-9a-f]{64}", receipt.rows_sha256) is None
-            or type(receipt.source_expires_monotonic) not in (int, float)
-            or not math.isfinite(receipt.source_expires_monotonic)
-            or time.monotonic() >= receipt.source_expires_monotonic
-            or validator(store, receipt) is not True
-        ):
-            raise ExecutionDecisionJournalError("KNOWN_CTP_ORDER_SYSID_QUERY_STALE")
+        supplied_receipt = receipt
+        attestation_port = self._ports.require("registered_sim_attestation")
+        receipt = attestation_port.attest_order_identity_query(
+            supplied_receipt, source_store=source_store
+        )
+        source_lock = receipt.source_lock
         if (
             type(expected_side) is not str
             or expected_side not in ("BUY", "SELL")
@@ -15839,22 +15874,30 @@ class ExecutionDecisionJournal:
 
         @contextmanager
         def source_locked_transaction():
-            # Query updates take only this Store lock; no Store code calls back
-            # into the Journal while holding it. Use the established Store ->
-            # Journal order and hold it through COMMIT so the validated query
-            # cannot be replaced between the second check and durable append.
-            with store._ctp_query_result_lock:
+            # Query updates take only the application's query lock; no
+            # application code calls back into the Journal while holding it.
+            # Use the established source -> Journal order and hold it through
+            # COMMIT so the validated query cannot be replaced between the
+            # second check and durable append.
+            with source_lock:
                 with self._transaction() as locked_cursor:
                     yield locked_cursor
 
         with source_locked_transaction() as cursor:
             # Revalidate after BEGIN IMMEDIATE: the query must still be current
-            # while the Store cache is locked through the durable COMMIT.
-            if (
-                time.monotonic() >= receipt.source_expires_monotonic
-                or validator(store, receipt) is not True
-            ):
+            # while the source cache is locked through the durable COMMIT.  Any
+            # attestation rejection here is the same stale outcome the Store
+            # validator reported before this refactor.
+            if time.monotonic() >= receipt.source_expires_monotonic:
                 raise ExecutionDecisionJournalError("KNOWN_CTP_ORDER_SYSID_QUERY_STALE")
+            try:
+                attestation_port.attest_order_identity_query(
+                    supplied_receipt, source_store=source_store
+                )
+            except ExecutionDecisionJournalError as error:
+                raise ExecutionDecisionJournalError(
+                    "KNOWN_CTP_ORDER_SYSID_QUERY_STALE"
+                ) from error
             intent = cursor.execute(
                 """SELECT i.*,d.business_key_json AS binding_business_key_json
                    FROM execution_decision_intents AS i
@@ -20300,10 +20343,26 @@ class ExecutionDecisionJournal:
         except sqlite3.Error as error:
             raise ExecutionDecisionJournalError("DURABLE_CAPACITY_BACKFILL_FAILED") from error
 
+        # The attribution table belongs to the injected port, so the expected
+        # version comes from that port instead of a hard-coded number the SDK
+        # would have to re-release every time the application migrates.  The
+        # literal below is only the documented pre-port value for a journal
+        # constructed without an attribution port; it never upgrades or relaxes
+        # the rejection.
+        position_attribution = self._ports.position_attribution
+        expected_book_version = (
+            _LEGACY_POSITION_BOOK_SCHEMA_VERSION
+            if position_attribution is None
+            else position_attribution.expected_schema_version
+        )
         book_meta = cursor.execute(
             "SELECT version FROM factor_position_book_meta WHERE singleton=1"
         ).fetchone()
-        if book_meta is None or type(book_meta["version"]) is not int or book_meta["version"] != 6:
+        if (
+            book_meta is None
+            or type(book_meta["version"]) is not int
+            or book_meta["version"] != expected_book_version
+        ):
             raise ExecutionDecisionJournalError("POSITION_BOOK_SCHEMA_UNAVAILABLE")
 
         totals = {"BASE": [0, 0], "SETTLEMENT": [0, 0]}
@@ -20930,16 +20989,11 @@ class ExecutionDecisionJournal:
                         );
                     """
                 )
-                try:
-                    ensure_factor_position_book_schema = _bt_contract(
-                        "factor_position_book"
-                    ).ensure_factor_position_book_schema
-                except ExecutionDecisionJournalError:
-                    ensure_factor_position_book_schema = None
-                if ensure_factor_position_book_schema is not None:
+                position_attribution = self._ports.position_attribution
+                if position_attribution is not None:
                     cursor = self._connection.cursor()
                     try:
-                        ensure_factor_position_book_schema(cursor)
+                        position_attribution.ensure_schema(cursor)
                     finally:
                         cursor.close()
                 self._connection.execute("BEGIN IMMEDIATE")
@@ -22489,22 +22543,35 @@ def _fee_pair_candidate_owner_token_hash(owner_token: Any) -> str:
 
 
 def _fee_pair_facts_source_before_commit(
-    facts: Any, source_lease: Any, *, operation: str
+    facts: Any,
+    source_lease: Any,
+    *,
+    operation: str,
+    ports: Optional[JournalPorts] = None,
 ) -> Callable[[], None]:
     """Return a guard for one exact Store-issued fee-pair source lease.
 
     The lease object is not an authorization merely because it has a
-    ``require_valid`` method.  The facts module owns the private issuer and
+    ``require_valid`` method.  The facts port owns the private issuer and
     checks the exact projection identity plus the operation-specific source
     dependencies.  The returned callback is installed on the Journal
     transaction so it runs after BEGIN IMMEDIATE and again immediately before
     COMMIT while the source scope still holds its locks.
+
+    ``ports`` lets a journal's constructor-injected set win over the
+    process-registered one; ``None`` falls back to the process global, which is
+    the only set available to the self-less release validator.
     """
 
     if operation not in ("OPEN", "RELEASE") or facts is None or source_lease is None:
         raise ExecutionDecisionJournalError("FEE_PAIR_SOURCE_BINDING_REQUIRED")
+    if ports is not None and type(ports) is not JournalPorts:
+        raise ExecutionDecisionJournalError("JOURNAL_PORT_INVALID:ports")
+    active_ports = _journal_ports() if ports is None else ports
     try:
-        validate_fee_pair_facts_source_lease = _bt_contract("factor_execution_facts").validate_fee_pair_facts_source_lease
+        validate_fee_pair_facts_source_lease = active_ports.require(
+            "fee_pair_facts"
+        ).validate_source_lease
 
         if validate_fee_pair_facts_source_lease(
             source_lease, facts, operation=operation
