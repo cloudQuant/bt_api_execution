@@ -19,6 +19,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping, Optional, Tuple
 
+from .journal_ports import JournalPorts
+
 
 DEFAULT_ARCHIVE_TIMEOUT_SECONDS = 30.0
 MAX_ARCHIVE_TIMEOUT_SECONDS = 300.0
@@ -105,6 +107,7 @@ def _validate_required_schema_objects(
     schema_version: int,
     *,
     tables: Optional[Tuple[str, ...]] = None,
+    journal_ports: Optional[JournalPorts] = None,
 ) -> Tuple[str, ...]:
     """Require cumulative tables and exact fee-pair schema for each version."""
 
@@ -177,7 +180,7 @@ def _validate_required_schema_objects(
                 ),
             )
             journal_module.ExecutionDecisionJournal._validate_fee_pair_amount_open_lifecycle_schema(
-                cursor
+                cursor, ports=journal_ports
             )
     except journal_module.ExecutionDecisionJournalError as error:
         raise ExecutionJournalArchiveError("ARCHIVE_SCHEMA_INCOMPLETE") from error
@@ -441,6 +444,7 @@ def create_verified_execution_journal_archive(
     expected_schema_version: int,
     timeout_seconds: float = DEFAULT_ARCHIVE_TIMEOUT_SECONDS,
     source_path: Optional[object] = None,
+    journal_ports: Optional[JournalPorts] = None,
 ) -> ExecutionJournalArchiveReceipt:
     """Back up ``source`` to an exclusive destination and verify it read-only.
 
@@ -449,11 +453,16 @@ def create_verified_execution_journal_archive(
     into place only after the snapshot passes read-only verification. The
     deadline is cooperative: it is checked between backup, verification, and
     file-read steps, but cannot interrupt a single SQLite or filesystem call.
+    ``journal_ports`` carries the source journal's captured cross-domain port set
+    into both archive verification passes; omitting it preserves the legacy
+    process-global fallback for standalone callers.
     """
 
     timeout = validate_archive_timeout(timeout_seconds)
     if type(expected_schema_version) is not int or expected_schema_version < 1:
         raise ExecutionJournalArchiveError("ARCHIVE_SCHEMA_VERSION_INVALID")
+    if journal_ports is not None and type(journal_ports) is not JournalPorts:
+        raise ExecutionJournalArchiveError("ARCHIVE_JOURNAL_PORTS_INVALID")
     if not isinstance(source, sqlite3.Connection):
         raise ExecutionJournalArchiveError("ARCHIVE_SOURCE_INVALID")
     if source.in_transaction:
@@ -535,6 +544,7 @@ def create_verified_execution_journal_archive(
             temporary_path,
             expected_schema_version=expected_schema_version,
             timeout_seconds=max(0.001, deadline - time.monotonic()),
+            journal_ports=journal_ports,
         )
         _require_before_deadline(deadline)
         try:
@@ -558,6 +568,7 @@ def create_verified_execution_journal_archive(
             expected_schema_version=expected_schema_version,
             expected_sha256=receipt.sha256,
             timeout_seconds=max(0.001, deadline - time.monotonic()),
+            journal_ports=journal_ports,
         )
         _require_path_identity(
             target_path, published_identity, "ARCHIVE_PUBLISHED_IDENTITY_MISMATCH"
@@ -600,17 +611,22 @@ def verify_execution_journal_archive(
     expected_schema_version: int,
     expected_sha256: Optional[str] = None,
     timeout_seconds: float = DEFAULT_ARCHIVE_TIMEOUT_SECONDS,
+    journal_ports: Optional[JournalPorts] = None,
 ) -> ExecutionJournalArchiveReceipt:
     """Verify a standalone archive through a read-only SQLite connection.
 
     The deadline is cooperative between hash chunks and SQLite progress
     callbacks; it cannot interrupt an individual native filesystem or SQLite
-    call.
+    call. ``journal_ports`` supplies the port set that owns this archive's
+    immutable release proof; omitting it preserves the legacy process-global
+    fallback.
     """
 
     timeout = validate_archive_timeout(timeout_seconds)
     if type(expected_schema_version) is not int or expected_schema_version < 1:
         raise ExecutionJournalArchiveError("ARCHIVE_SCHEMA_VERSION_INVALID")
+    if journal_ports is not None and type(journal_ports) is not JournalPorts:
+        raise ExecutionJournalArchiveError("ARCHIVE_JOURNAL_PORTS_INVALID")
     archive_path = _existing_regular_file(path)
     deadline = time.monotonic() + timeout
     before = _file_stat_tuple(archive_path)
@@ -653,7 +669,9 @@ def verify_execution_journal_archive(
             if next(connection.execute("PRAGMA foreign_key_check"), None) is not None:
                 raise ExecutionJournalArchiveError("ARCHIVE_FOREIGN_KEY_CHECK_FAILED")
             schema_sha256, tables = _schema_fingerprint(connection)
-            _validate_required_schema_objects(connection, version, tables=tables)
+            _validate_required_schema_objects(
+                connection, version, tables=tables, journal_ports=journal_ports
+            )
             row_counts = _table_row_counts(connection, tables, deadline)
         except ExecutionJournalArchiveError:
             raise

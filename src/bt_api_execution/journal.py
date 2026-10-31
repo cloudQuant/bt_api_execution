@@ -2769,6 +2769,7 @@ class ExecutionDecisionJournal:
                     expected_schema_version=self._SCHEMA_VERSION,
                     timeout_seconds=remaining,
                     source_path=self.path,
+                    journal_ports=self._ports,
                 )
             except ExecutionJournalArchiveError as error:
                 raise ExecutionDecisionJournalError(error.code) from error
@@ -5927,6 +5928,7 @@ class ExecutionDecisionJournal:
                     candidate_id=candidate_id,
                     source_row=row,
                     open_claim=open_row is not None,
+                    ports=self._ports,
                 )
                 if lifecycle is not None:
                     result.update(lifecycle)
@@ -5993,6 +5995,7 @@ class ExecutionDecisionJournal:
                     candidate_id=candidate_id,
                     source_row=row,
                     open_claim=open_row is not None,
+                    ports=self._ports,
                 )
                 if lifecycle is None or lifecycle.get("status") != "ACTIVE":
                     raise ExecutionDecisionJournalError(
@@ -6371,8 +6374,14 @@ class ExecutionDecisionJournal:
         open_claim: bool,
         evidence: Any,
         evidence_sha256: Any,
+        ports: Optional[JournalPorts] = None,
     ) -> None:
-        """Check an immutable RELEASED event against its durable intent tree."""
+        """Check an immutable RELEASED event against its durable intent tree.
+
+        Journal-owned paths pass their captured ``JournalPorts`` explicitly so
+        constructor injection remains authoritative. ``None`` retains the
+        process-global fallback for the standalone archive schema validator.
+        """
 
         try:
             if not open_claim or not isinstance(evidence, Mapping):
@@ -6470,7 +6479,10 @@ class ExecutionDecisionJournal:
             )
             if any(value is None for value in query_started + query_completed):
                 raise ValueError("release query timestamps are invalid")
-            query_set_identifier = _journal_ports().require("fee_pair_facts").query_set_identifier
+            if ports is not None and type(ports) is not JournalPorts:
+                raise ExecutionDecisionJournalError("JOURNAL_PORT_INVALID:ports")
+            active_ports = _journal_ports() if ports is None else ports
+            query_set_identifier = active_ports.require("fee_pair_facts").query_set_identifier
 
             query_ids = tuple((item["family"], item["request_id"]) for item in query_facts)
             if (
@@ -6697,6 +6709,7 @@ class ExecutionDecisionJournal:
                 candidate_id=candidate_id,
                 source_row=source_row,
                 open_claim=True,
+                ports=self._ports,
             )
             if (
                 active["account_scope"] != source_row["account_scope"]
@@ -6723,6 +6736,7 @@ class ExecutionDecisionJournal:
                 open_claim=True,
                 evidence=evidence,
                 evidence_sha256=evidence_sha256,
+                ports=self._ports,
             )
             event_payload = {
                 "schema": "backtrader.execution_fee_pair_amount_lifecycle_event.v1",
@@ -6793,6 +6807,7 @@ class ExecutionDecisionJournal:
         candidate_id: str,
         source_row: sqlite3.Row,
         open_claim: bool,
+        ports: Optional[JournalPorts] = None,
     ) -> Optional[Mapping[str, Any]]:
         """Validate and project one pair hold, preserving pre-v25 v24 reads."""
 
@@ -6919,6 +6934,7 @@ class ExecutionDecisionJournal:
                 open_claim=open_claim,
                 evidence=release_payload.get("release_evidence"),
                 evidence_sha256=release_payload.get("release_evidence_sha256"),
+                ports=ports,
             )
             state = "RELEASED"
             last_event = second
@@ -6932,7 +6948,10 @@ class ExecutionDecisionJournal:
 
     @staticmethod
     def _ensure_fee_pair_legacy_amount_hold_in_transaction(
-        cursor: sqlite3.Cursor, row: sqlite3.Row
+        cursor: sqlite3.Cursor,
+        row: sqlite3.Row,
+        *,
+        ports: Optional[JournalPorts] = None,
     ) -> None:
         """Materialize v25 holds for immutable legacy amount rows on demand."""
 
@@ -6955,6 +6974,7 @@ class ExecutionDecisionJournal:
                 candidate_id=candidate_id,
                 source_row=row,
                 open_claim=False,
+                ports=ports,
             )
             if state is None:
                 raise ExecutionDecisionJournalError("FEE_PAIR_AMOUNT_LIFECYCLE_CORRUPT")
@@ -7065,7 +7085,9 @@ class ExecutionDecisionJournal:
                 (candidate_id,),
             ).fetchone()
             if existing is not None:
-                self._ensure_fee_pair_legacy_amount_hold_in_transaction(cursor, existing)
+                self._ensure_fee_pair_legacy_amount_hold_in_transaction(
+                    cursor, existing, ports=self._ports
+                )
                 return self._fee_pair_amount_reservation_record_in_transaction(cursor, existing)
             if workflow["state"] != "RECEIPT_VERIFIED" or workflow["grid_decision_id"] is None:
                 raise ExecutionDecisionJournalError("FEE_PAIR_GRID_SETTLEMENT_REQUIRED")
@@ -7232,7 +7254,9 @@ class ExecutionDecisionJournal:
                 "SELECT * FROM execution_fee_pair_amount_reservations WHERE candidate_id=?",
                 (candidate_id,),
             ).fetchone()
-            self._ensure_fee_pair_legacy_amount_hold_in_transaction(cursor, saved)
+            self._ensure_fee_pair_legacy_amount_hold_in_transaction(
+                cursor, saved, ports=self._ports
+            )
             return self._fee_pair_amount_reservation_record_in_transaction(cursor, saved)
 
     def _reserve_fee_pair_grid_open_in_transaction(
@@ -19247,7 +19271,9 @@ class ExecutionDecisionJournal:
             ) from error
 
     @staticmethod
-    def _validate_fee_pair_amount_open_lifecycle_schema(cursor: sqlite3.Cursor) -> None:
+    def _validate_fee_pair_amount_open_lifecycle_schema(
+        cursor: sqlite3.Cursor, *, ports: Optional[JournalPorts] = None
+    ) -> None:
         """Validate the v25 claim, append-only lifecycle, and active-head projection."""
 
         expected = {
@@ -19591,6 +19617,7 @@ class ExecutionDecisionJournal:
                         open_claim=claim is not None,
                         evidence=release_payload.get("release_evidence"),
                         evidence_sha256=release_payload.get("release_evidence_sha256"),
+                        ports=ports,
                     )
                 elif (
                     active is None
@@ -20744,7 +20771,9 @@ class ExecutionDecisionJournal:
             if version >= _FEE_PAIR_AMOUNT_OPEN_LIFECYCLE_SCHEMA_VERSION:
                 cursor = self._connection.cursor()
                 try:
-                    self._validate_fee_pair_amount_open_lifecycle_schema(cursor)
+                    self._validate_fee_pair_amount_open_lifecycle_schema(
+                        cursor, ports=self._ports
+                    )
                 finally:
                     cursor.close()
             try:
@@ -21301,7 +21330,9 @@ class ExecutionDecisionJournal:
                     self._validate_registered_sim_cancel_dispatch_claim_schema(cursor)
                     self._validate_fee_pair_grid_single_row_tape_schema(cursor)
                     self._validate_fee_pair_amount_reservation_schema(cursor)
-                    self._validate_fee_pair_amount_open_lifecycle_schema(cursor)
+                    self._validate_fee_pair_amount_open_lifecycle_schema(
+                        cursor, ports=self._ports
+                    )
                     self._validate_fee_pair_workflow_capacity(cursor)
                 finally:
                     cursor.close()
