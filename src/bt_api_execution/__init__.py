@@ -294,9 +294,17 @@ from .store import (
     WriterLease,
     require_ctp_dispatch_callback_match,
 )
+from .strategy_budget import (
+    STRATEGY_BUDGET_POLICY_V1,
+    StrategyBudgetGate,
+    StrategyBudgetPermit,
+)
 from .strategy_close_capacity import StrategyCloseCapacityGate, StrategyClosePermit
 
 __all__ = [
+    "STRATEGY_BUDGET_POLICY_V1",
+    "StrategyBudgetGate",
+    "StrategyBudgetPermit",
     "StrategyCloseCapacityGate",
     "StrategyClosePermit",
     "APPROVAL_TAG_PREFIX",

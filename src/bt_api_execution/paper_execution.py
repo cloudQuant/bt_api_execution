@@ -14,6 +14,11 @@ from decimal import ROUND_HALF_EVEN, Decimal
 from time import time_ns
 from typing import TYPE_CHECKING, Protocol
 
+from bt_api_base.paper_fill_protocol import (
+    MANAGED_PAPER_FILL_V2_SCHEMA,
+    MANAGED_PAPER_FILL_V2_TIME_SOURCE,
+)
+
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
@@ -44,8 +49,8 @@ PAPER_MODEL_REF = "spot_market_top_of_book"
 PAPER_MODEL_VERSION = "1"
 PAPER_FEE_MODEL_REF = "quote_notional_rate"
 PAPER_FEE_MODEL_VERSION = "1"
-PAPER_MATCH_RECEIPT_SCHEMA_V2 = "managed_paper_fill.v2"
-PAPER_MATCH_TIME_SOURCE_V2 = "MANAGED_PAPER_MATCH"
+PAPER_MATCH_RECEIPT_SCHEMA_V2 = MANAGED_PAPER_FILL_V2_SCHEMA
+PAPER_MATCH_TIME_SOURCE_V2 = MANAGED_PAPER_FILL_V2_TIME_SOURCE
 
 _PAPER_REFUSALS = frozenset(
     {

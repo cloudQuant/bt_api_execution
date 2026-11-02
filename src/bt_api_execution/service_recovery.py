@@ -49,6 +49,8 @@ from pathlib import Path
 from threading import RLock
 from typing import AbstractSet, Any, Callable, Iterator, Optional
 
+from bt_api_base.paper_fill_protocol import MANAGED_PAPER_FILL_V2_FIELDS
+
 from .service_recovery_ports import (
     AttestedRecoveryEventContext,
     AttestedRecoveryExecutionContext,
@@ -142,33 +144,8 @@ class ServiceExecutionRecoveryJournal:
     _STRATEGY_POSITION_BINDING_SCHEMA = "bt_api.strategy-position-binding.v1"
     _STRATEGY_POSITION_REF_PREFIX = "btsp1_"
     _STRATEGY_POSITION_KEY_PREFIX = "btlocal1_"
-    _PAPER_FILL_V2_FIELDS = frozenset(
-        {
-            "schema",
-            "time_source",
-            "fill_id",
-            "match_time_ns",
-            "quantity",
-            "price",
-            "commission",
-            "commission_currency",
-            "commission_model_id",
-            "commission_model_version",
-            "event_id",
-            "event_sequence",
-            "journal_generation",
-            "scope_key",
-            "intent_id",
-            "intent_fingerprint",
-            "account_ref",
-            "strategy_ref",
-            "quote_source_ref",
-            "quote_generation",
-            "quote_cursor",
-            "quote_instrument",
-            "receipt_sha256",
-        }
-    )
+    # Single owner of the wire shape: bt_api_base.paper_fill_protocol.
+    _PAPER_FILL_V2_FIELDS = MANAGED_PAPER_FILL_V2_FIELDS
     _SUBMIT_FIELDS = frozenset(
         {
             "intent_id",

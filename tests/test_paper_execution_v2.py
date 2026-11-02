@@ -456,6 +456,17 @@ def test_managed_paper_v2_uses_one_match_clock_and_reads_exact_fill_after_reopen
         assert receipt.quote.cursor == 1
 
         fill_fact = receipt.to_fill_fact_payload()
+        # The producer's shape is pinned to the single Base contract
+        # (iteration 60): consumers import the same field set.
+        from bt_api_base.paper_fill_protocol import (
+            MANAGED_PAPER_FILL_V2_FIELDS,
+            MANAGED_PAPER_FILL_V2_RECEIPT_FIELDS,
+        )
+
+        assert set(fill_fact) == MANAGED_PAPER_FILL_V2_RECEIPT_FIELDS
+        assert MANAGED_PAPER_FILL_V2_RECEIPT_FIELDS - MANAGED_PAPER_FILL_V2_FIELDS == {
+            "event_created_at_ns"
+        }
         assert fill_fact == {
             "schema": PAPER_MATCH_RECEIPT_SCHEMA_V2,
             "time_source": PAPER_MATCH_TIME_SOURCE_V2,
