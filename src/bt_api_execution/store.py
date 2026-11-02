@@ -24771,6 +24771,37 @@ class SqliteExecutionStore:
                 raise DurableStoreError("unable to read execution record") from error
         return None if row is None else self._record_from_row(row)
 
+    def list_scope_intents(
+        self, scope: ExecutionScope
+    ) -> tuple[tuple[ExecutionRecord, OrderIntent], ...]:
+        """Return every durable record of one scope with its immutable intent.
+
+        Read-only projection used by owner-scoped admission (for example the
+        strategy close-capacity gate) to recompute exposure from durable facts
+        after a restart instead of trusting in-memory counters.
+        """
+
+        with self._lock:
+            try:
+                rows = self._connection.execute(
+                    """
+                    SELECT * FROM execution_records
+                    WHERE scope_key = ?
+                    ORDER BY created_at_ns ASC, intent_id ASC
+                    """,
+                    (scope.key,),
+                ).fetchall()
+            except sqlite3.Error as error:
+                raise DurableStoreError("unable to list scope execution records") from error
+        result = []
+        for row in rows:
+            try:
+                payload = json.loads(row["payload_json"])
+            except (TypeError, json.JSONDecodeError) as error:
+                raise DurableStoreError("stored intent payload is unreadable") from error
+            result.append((self._record_from_row(row), order_intent_from_payload(payload)))
+        return tuple(result)
+
     def list_dispatching(self, scope: ExecutionScope) -> tuple[ExecutionRecord, ...]:
         """Return in-flight records in one scope without provider activity.
 
