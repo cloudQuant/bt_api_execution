@@ -26,7 +26,7 @@ import sqlite3
 import stat
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -38,21 +38,22 @@ from typing import Any, Callable, Dict, Iterator, Optional, Tuple, Union
 
 from .journal_ports import (
     JOURNAL_PORT_NAMES,
+    JournalPositionCapabilityUnavailable,
+    JournalPositionCapacityRow,
+    JournalPositionCurrent,
+    JournalPositionFill,
+    JournalPositionGridIdentity,
+    JournalPositionIssue,
     JournalPorts,
     validate_journal_port,
 )
+from .journal_catalog import is_execution_journal_catalog_object
 
 # Optional cross-domain ports.  The journal itself lives in ``bt_api_execution``
 # and never imports the injecting application; that application injects typed,
 # versioned port *instances* (see ``journal_ports``) instead of whole modules.
 _JOURNAL_PORTS = JournalPorts()
 _JOURNAL_PORTS_LOCK = RLock()
-
-#: Attribution schema version assumed only when a journal was constructed with
-#: no position-attribution port at all.  It is the documented pre-port value;
-#: an injected port supplies ``expected_schema_version`` and wins.
-_LEGACY_POSITION_BOOK_SCHEMA_VERSION = 6
-
 
 def _validate_journal_port(name: str, port: Any) -> Any:
     """Reject anything that is not a current-version implementation of *name*."""
@@ -113,6 +114,28 @@ def _journal_ports() -> JournalPorts:
     """Return the process-registered port set."""
 
     return _JOURNAL_PORTS
+
+
+def _has_unrecognized_journal_object(cursor: sqlite3.Cursor) -> bool:
+    """Fail closed if the database contains an object outside declared owners."""
+
+    try:
+        rows = cursor.execute(
+            "SELECT type,name FROM sqlite_master "
+            "WHERE type IN ('table','view','index','trigger')"
+        ).fetchall()
+    except sqlite3.Error:
+        return True
+    for row in rows:
+        try:
+            object_type, name = row[0], row[1]
+        except (IndexError, TypeError):
+            return True
+        if type(name) is str and name.lower().startswith("sqlite_"):
+            continue
+        if not is_execution_journal_catalog_object(object_type, name):
+            return True
+    return False
 
 
 def configure_backtrader_contracts(**_retired: Any) -> None:
@@ -233,6 +256,61 @@ _REGISTERED_SIM_CANCEL_DISPATCH_CLAIM_SCHEMA_VERSION = 22
 _FEE_PAIR_GRID_SINGLE_ROW_TAPE_SCHEMA_VERSION = 23
 _FEE_PAIR_AMOUNT_RESERVATION_SCHEMA_VERSION = 24
 _FEE_PAIR_AMOUNT_OPEN_LIFECYCLE_SCHEMA_VERSION = 25
+_REGISTERED_SIM_CALLBACK_UNKNOWN_SCHEMA_VERSION = 26
+_MAX_REGISTERED_SIM_CALLBACK_UNKNOWN_EVIDENCE_BYTES = 4096
+_REGISTERED_SIM_CALLBACK_UNKNOWN_REASON_CODES = frozenset(
+    {
+        "UNKNOWN_STATUS",
+        "CALLBACK_IDENTITY_INCOMPLETE",
+        "CALLBACK_PARSE_FAILURE",
+        "CALLBACK_OVERFLOW",
+    }
+)
+_REGISTERED_SIM_CALLBACK_UNKNOWN_TABLE = (
+    "execution_registered_sim_callback_unknown_incidents"
+)
+_REGISTERED_SIM_CALLBACK_UNKNOWN_TABLE_SQL = """CREATE TABLE execution_registered_sim_callback_unknown_incidents (
+    incident_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    incident_id TEXT NOT NULL UNIQUE CHECK(length(incident_id)=64),
+    account_scope TEXT CHECK(account_scope IS NULL OR length(account_scope) BETWEEN 1 AND 256),
+    source_instance_id TEXT NOT NULL CHECK(length(source_instance_id) BETWEEN 1 AND 256),
+    source_event_id TEXT NOT NULL CHECK(length(source_event_id) BETWEEN 1 AND 256),
+    process_instance_id TEXT NOT NULL CHECK(length(process_instance_id) BETWEEN 1 AND 128),
+    reason_code TEXT NOT NULL CHECK(reason_code IN (
+        'UNKNOWN_STATUS','CALLBACK_IDENTITY_INCOMPLETE',
+        'CALLBACK_PARSE_FAILURE','CALLBACK_OVERFLOW')),
+    connection_generation INTEGER CHECK(connection_generation IS NULL OR connection_generation > 0),
+    trading_day TEXT CHECK(trading_day IS NULL OR length(trading_day)=8),
+    front_id INTEGER CHECK(front_id IS NULL OR front_id > 0),
+    session_id INTEGER CHECK(session_id IS NULL OR session_id > 0),
+    order_ref TEXT CHECK(order_ref IS NULL OR length(order_ref) BETWEEN 1 AND 256),
+    instrument TEXT CHECK(instrument IS NULL OR length(instrument) BETWEEN 1 AND 256),
+    exchange TEXT CHECK(exchange IS NULL OR length(exchange) BETWEEN 1 AND 256),
+    order_sys_id TEXT CHECK(order_sys_id IS NULL OR length(order_sys_id) BETWEEN 1 AND 256),
+    identity_complete INTEGER NOT NULL CHECK(identity_complete IN (0,1)),
+    evidence_json TEXT NOT NULL CHECK(length(evidence_json) <= 4096),
+    evidence_sha256 TEXT NOT NULL CHECK(length(evidence_sha256)=64),
+    created_at_ns INTEGER NOT NULL CHECK(created_at_ns > 0),
+    UNIQUE(source_instance_id,source_event_id)
+)"""
+_REGISTERED_SIM_CALLBACK_UNKNOWN_SCOPE_INDEX_SQL = """CREATE INDEX execution_registered_sim_callback_unknown_scope_sequence
+    ON execution_registered_sim_callback_unknown_incidents(account_scope,incident_sequence)"""
+_REGISTERED_SIM_CALLBACK_UNKNOWN_NO_UPDATE_TRIGGER_SQL = """CREATE TRIGGER execution_registered_sim_callback_unknown_no_update
+    BEFORE UPDATE ON execution_registered_sim_callback_unknown_incidents
+    BEGIN SELECT RAISE(ABORT, 'callback UNKNOWN incidents are append only'); END"""
+_REGISTERED_SIM_CALLBACK_UNKNOWN_NO_DELETE_TRIGGER_SQL = """CREATE TRIGGER execution_registered_sim_callback_unknown_no_delete
+    BEFORE DELETE ON execution_registered_sim_callback_unknown_incidents
+    BEGIN SELECT RAISE(ABORT, 'callback UNKNOWN incidents are append only'); END"""
+_REGISTERED_SIM_CALLBACK_UNKNOWN_DISPATCH_GUARD_TRIGGER_SQL = """CREATE TRIGGER execution_registered_sim_callback_unknown_dispatch_guard
+    BEFORE UPDATE OF state ON execution_decision_intents
+    WHEN OLD.state='PREPARED' AND NEW.state='DISPATCHING' AND EXISTS (
+        SELECT 1 FROM execution_registered_sim_callback_unknown_incidents AS u
+        WHERE u.account_scope IS NULL OR u.account_scope=(
+            SELECT json_extract(d.business_key_json,'$.account_scope')
+            FROM execution_decisions AS d WHERE d.decision_id=NEW.decision_id
+        )
+    )
+    BEGIN SELECT RAISE(ABORT, 'CALLBACK_UNKNOWN_UNRESOLVED'); END"""
 _FEE_PAIR_SINGLE_ROW_TAPE_MAX_HEADER_BYTES = 1024 * 1024
 _SOURCE_ORIGIN_PARTITION_SCHEMA = "backtrader.execution_source_origin_partition.v1"
 _SOURCE_ORIGIN_PARTITION_FIELDS = (
@@ -1803,6 +1881,32 @@ class ExecutionCallbackReceipt:
 
 
 @dataclass(frozen=True)
+class ExecutionCallbackUnknownIncidentReceipt:
+    """One durable, append-only provider callback UNKNOWN observation."""
+
+    incident_id: str
+    incident_sequence: int
+    account_scope: Optional[str]
+    source_instance_id: str
+    source_event_id: str
+    process_instance_id: str
+    reason_code: str
+    connection_generation: Optional[int]
+    trading_day: Optional[str]
+    front_id: Optional[int]
+    session_id: Optional[int]
+    order_ref: Optional[str]
+    instrument: Optional[str]
+    exchange: Optional[str]
+    order_sys_id: Optional[str]
+    identity_complete: bool
+    evidence: Mapping[str, Any]
+    evidence_sha256: str
+    created_at_ns: int
+    is_new: bool = False
+
+
+@dataclass(frozen=True)
 class ExecutionCallbackQueryDisposition:
     """Exact query evidence that supersedes delivery of one unacknowledged callback."""
 
@@ -2454,7 +2558,7 @@ class ExecutionIntentSnapshotPage:
 
     The page includes all unresolved intents and KNOWN intents that still own
     an account/instrument dispatch slot. Position holdings are projected by
-    ``factor_position_book`` separately; a KNOWN OPEN whose order slot has
+    application-owned position attribution separately; a KNOWN OPEN whose order slot has
     been reconciled does not appear here merely because a holding exists.
     """
 
@@ -2507,7 +2611,7 @@ class ExecutionDecisionJournal:
     explicitly empty ``JournalPorts`` deliberately runs with no optional port.
     """
 
-    _SCHEMA_VERSION = _FEE_PAIR_AMOUNT_OPEN_LIFECYCLE_SCHEMA_VERSION
+    _SCHEMA_VERSION = _REGISTERED_SIM_CALLBACK_UNKNOWN_SCHEMA_VERSION
     _NATIVE_IDENTITY_SCHEMA_VERSION = 8
     _DECISION_CAPACITY_SCHEMA_VERSION = 9
     _DURABLE_CAPACITY_SCHEMA_VERSION = 12
@@ -2570,6 +2674,12 @@ class ExecutionDecisionJournal:
             raise ExecutionDecisionJournalError("JOURNAL_PORT_INVALID:journal_ports")
         self._ports = _journal_ports() if journal_ports is None else journal_ports
         self._lock = RLock()
+        # Callback UNKNOWN persistence uses its own connection and lock.  The
+        # dispatch gate deliberately retains _lock across a provider call, so
+        # callback threads must never wait for that long-lived Python lock.
+        self._callback_connection_lock = Lock()
+        self._callback_connection: Optional[sqlite3.Connection] = None
+        self._creation_process_id = os.getpid()
         # Dispatch serialization is deliberately non-reentrant. The file
         # sidecar already rejects nested acquisition; keep the in-memory
         # branch's contract identical instead of letting an RLock create a
@@ -2580,7 +2690,8 @@ class ExecutionDecisionJournal:
         self._closed = False
         self._fee_pair_scope_prewarm_validation_cache = None
 
-        if str(database_path) == ":memory:":
+        raw_database_path = str(database_path)
+        if raw_database_path == ":memory:":
             self.path = ":memory:"
             connect_path = ":memory:"
         else:
@@ -2590,7 +2701,7 @@ class ExecutionDecisionJournal:
             connect_path = str(path)
         try:
             self._connection = sqlite3.connect(
-                connect_path, isolation_level=None, check_same_thread=False
+                connect_path, isolation_level=None, check_same_thread=False, uri=False
             )
             self._connection.row_factory = sqlite3.Row
             self._connection.create_function("sha256_text", 1, _sha256_text, deterministic=True)
@@ -2615,19 +2726,16 @@ class ExecutionDecisionJournal:
             self._connection.execute("PRAGMA synchronous = FULL")
             self._connection.execute("PRAGMA foreign_keys = ON")
             self._create_schema()
+            if self.path != ":memory:":
+                self._callback_connection = self._open_callback_connection(connect_path)
         except ExecutionDecisionJournalError:
-            connection = getattr(self, "_connection", None)
-            if connection is not None:
-                connection.close()
-                self._closed = True
-            raise
-        except (OSError, sqlite3.Error) as error:
-            connection = getattr(self, "_connection", None)
-            if connection is not None:
-                connection.close()
-                self._closed = True
-            raise ExecutionDecisionJournalError("JOURNAL_UNAVAILABLE") from error
-        except BaseException:
+            callback_connection = getattr(self, "_callback_connection", None)
+            if callback_connection is not None:
+                try:
+                    callback_connection.close()
+                except BaseException:
+                    self._failed_closed = True
+                self._callback_connection = None
             connection = getattr(self, "_connection", None)
             if connection is not None:
                 try:
@@ -2635,6 +2743,103 @@ class ExecutionDecisionJournal:
                 except BaseException:
                     self._failed_closed = True
                 self._closed = True
+            raise
+        except (OSError, sqlite3.Error) as error:
+            callback_connection = getattr(self, "_callback_connection", None)
+            if callback_connection is not None:
+                try:
+                    callback_connection.close()
+                except BaseException:
+                    self._failed_closed = True
+                self._callback_connection = None
+            connection = getattr(self, "_connection", None)
+            if connection is not None:
+                try:
+                    connection.close()
+                except BaseException:
+                    self._failed_closed = True
+                self._closed = True
+            raise ExecutionDecisionJournalError("JOURNAL_UNAVAILABLE") from error
+        except BaseException:
+            callback_connection = getattr(self, "_callback_connection", None)
+            if callback_connection is not None:
+                try:
+                    callback_connection.close()
+                except BaseException:
+                    self._failed_closed = True
+                self._callback_connection = None
+            connection = getattr(self, "_connection", None)
+            if connection is not None:
+                try:
+                    connection.close()
+                except BaseException:
+                    self._failed_closed = True
+                self._closed = True
+            raise
+
+    def _open_callback_connection(self, connect_path: str) -> sqlite3.Connection:
+        """Open a file-backed callback writer independent of the dispatch lock."""
+
+        connection: Optional[sqlite3.Connection] = None
+        try:
+            connection = sqlite3.connect(
+                connect_path,
+                timeout=5.0,
+                isolation_level=None,
+                check_same_thread=False,
+                uri=False,
+            )
+            connection.row_factory = sqlite3.Row
+            connection.create_function("sha256_text", 1, _sha256_text, deterministic=True)
+            connection.create_function(
+                "dispatching_cancel_absence_ack_id",
+                4,
+                _dispatching_cancel_absence_ack_id_sql,
+                deterministic=True,
+            )
+            connection.create_function(
+                "dispatching_cancel_absence_ack_query_id",
+                4,
+                _dispatching_cancel_absence_ack_query_id_sql,
+                deterministic=True,
+            )
+            connection.create_function(
+                "journal_identifier", 1, lambda value: int(_identifier(value)), deterministic=True
+            )
+            connection.execute("PRAGMA busy_timeout = 5000")
+            connection.execute("PRAGMA synchronous = FULL")
+            connection.execute("PRAGMA foreign_keys = ON")
+            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            if version != self._SCHEMA_VERSION:
+                raise ExecutionDecisionJournalError("JOURNAL_CALLBACK_WRITER_SCHEMA_MISMATCH")
+            cursor = connection.cursor()
+            try:
+                self._validate_callback_unknown_schema(cursor)
+                self._validate_durable_capacity_tables(cursor)
+            finally:
+                cursor.close()
+            capacity = connection.execute(
+                "SELECT * FROM execution_journal_capacity WHERE singleton=1"
+            ).fetchone()
+            if capacity is None or (
+                int(capacity["max_decision_records"]),
+                int(capacity["settlement_decision_reserve_records"]),
+                int(capacity["max_decision_bytes"]),
+                int(capacity["settlement_decision_reserve_bytes"]),
+            ) != (
+                self.max_decision_records,
+                self.settlement_decision_reserve_records,
+                self.max_decision_bytes,
+                self.settlement_decision_reserve_bytes,
+            ):
+                raise ExecutionDecisionJournalError("JOURNAL_CAPACITY_CONFIG_MISMATCH")
+            return connection
+        except BaseException:
+            if connection is not None:
+                try:
+                    connection.close()
+                except BaseException:
+                    self._failed_closed = True
             raise
 
     def __enter__(self) -> "ExecutionDecisionJournal":
@@ -2657,8 +2862,18 @@ class ExecutionDecisionJournal:
                 self._retained_dispatch_gate_context = None
                 if retained_gate is not None:
                     retained_gate.__exit__(None, None, None)
-                self._connection.close()
-                self._closed = True
+                # Callback writers take only this lock, never ``_lock``.  The
+                # close order is therefore _lock -> callback lock, with no
+                # reverse acquisition path that could deadlock a callback
+                # waiting for SQLite while a provider call owns the dispatch
+                # gate.
+                with self._callback_connection_lock:
+                    callback_connection = self._callback_connection
+                    if callback_connection is not None:
+                        callback_connection.close()
+                        self._callback_connection = None
+                    self._connection.close()
+                    self._closed = True
         finally:
             self._lock.release()
 
@@ -3077,9 +3292,9 @@ class ExecutionDecisionJournal:
                    WHERE account_scope = ? AND strategy_scope = ? AND cohort_id = ?""",
                 cursor_key,
             ).fetchone()
-            record_factor_position_grid = self._ports.require("position_attribution").record_grid
+            record_position_grid = self._ports.require("position_attribution").record_grid
 
-            record_factor_position_grid(
+            record_position_grid(
                 db_cursor,
                 account_scope=key.account_scope,
                 strategy_scope=key.strategy_scope,
@@ -6275,24 +6490,30 @@ class ExecutionDecisionJournal:
                     or position.owner_strategy_scope is not None
                 ):
                     raise ValueError("pair target is not durably flat")
-                current = cursor.execute(
-                    "SELECT * FROM factor_position_current "
-                    "WHERE account_scope=? AND instrument=? AND exchange=?",
-                    (source_row["account_scope"], instrument, exchange),
-                ).fetchone()
+                position_port = self._ports.require("position_attribution")
+                try:
+                    current = position_port.read_current_position(
+                        cursor,
+                        account_scope=source_row["account_scope"],
+                        instrument=instrument,
+                        exchange=exchange,
+                    )
+                except JournalPositionCapabilityUnavailable as error:
+                    raise ExecutionDecisionJournalError(error.code) from error
                 if (
                     current is None
-                    or current["state"] != "FLAT"
-                    or current["blocker_code"] is not None
-                    or current["owner_intent_id"] is not None
-                    or current["flat_reconciliation_id"] is None
-                    or current["flat_checkpoint_ns"] is None
-                    or current["last_callback_at_ns"] is not None
-                    or current["open_quantity"] != "0"
-                    or current["close_quantity"] != "0"
-                    or current["open_notional"] != "0"
-                    or int(current["opening_fee_unknown_count"]) != 0
-                    or int(current["fill_time_unknown_count"]) != 0
+                    or type(current) is not JournalPositionCurrent
+                    or current.state != "FLAT"
+                    or current.blocker_code is not None
+                    or current.owner_intent_id is not None
+                    or current.flat_reconciliation_id is None
+                    or current.flat_checkpoint_ns is None
+                    or current.last_callback_at_ns is not None
+                    or current.open_quantity != "0"
+                    or current.close_quantity != "0"
+                    or current.open_notional != "0"
+                    or current.opening_fee_unknown_count != 0
+                    or current.fill_time_unknown_count != 0
                 ):
                     raise ValueError("pair target has no current durable flat checkpoint")
                 flat_resolution = cursor.execute(
@@ -6304,7 +6525,7 @@ class ExecutionDecisionJournal:
                          ON q.intent_id=r.intent_id AND q.reconciliation_id=r.reconciliation_id
                        WHERE r.reconciliation_id=? AND r.account_scope=? AND r.instrument=?""",
                     (
-                        current["flat_reconciliation_id"],
+                        current.flat_reconciliation_id,
                         source_row["account_scope"],
                         instrument,
                     ),
@@ -9009,9 +9230,9 @@ class ExecutionDecisionJournal:
                    WHERE account_scope=? AND strategy_scope=? AND cohort_id=?""",
                 cursor_key,
             ).fetchone()
-            record_factor_position_grid = self._ports.require("position_attribution").record_grid
+            record_position_grid = self._ports.require("position_attribution").record_grid
 
-            record_factor_position_grid(
+            record_position_grid(
                 cursor,
                 account_scope=candidate.key.account_scope,
                 strategy_scope=candidate.key.strategy_scope,
@@ -13512,11 +13733,11 @@ class ExecutionDecisionJournal:
                     if factor_owned_close:
                         _require_identifier(owner_intent_id, "INVALID_OWNER_INTENT_ID")
                         try:
-                            validate_factor_position_close_owner = self._ports.require(
+                            validate_position_close_owner = self._ports.require(
                                 "position_attribution"
                             ).validate_close_owner
 
-                            validate_factor_position_close_owner(
+                            validate_position_close_owner(
                                 cursor,
                                 account_scope=account_scope,
                                 strategy_scope=json.loads(decision_row["business_key_json"])[
@@ -14093,53 +14314,68 @@ class ExecutionDecisionJournal:
                     return ExecutionCallbackProjectionStatus(
                         "BLOCKED", receipt_id, "CALLBACK_EVIDENCE_CONFLICT"
                     )
-                issue = self._connection.execute(
-                    """SELECT blocker_code FROM factor_position_evidence_issues
-                       WHERE receipt_id=?""",
-                    (receipt_id,),
-                ).fetchone()
-                if issue is not None:
+                position_port = self._ports.position_attribution
+                if position_port is None:
                     return ExecutionCallbackProjectionStatus(
-                        "BLOCKED", receipt_id, issue["blocker_code"]
+                        "BLOCKED",
+                        receipt_id,
+                        "JOURNAL_PORT_UNAVAILABLE:position_attribution",
                     )
-                intent = self._connection.execute(
-                    """SELECT i.intent_key_json, i.economic_payload_json,
-                              d.business_key_json
-                       FROM execution_decision_intents AS i
-                       JOIN execution_decisions AS d ON d.decision_id=i.decision_id
-                       WHERE i.intent_id=?""",
-                    (intent_id,),
-                ).fetchone()
-                if intent is None:
-                    return ExecutionCallbackProjectionStatus(
-                        "BLOCKED", receipt_id, "CALLBACK_INTENT_NOT_FOUND"
+                position_cursor = self._connection.cursor()
+                try:
+                    issue = position_port.read_evidence_issue(
+                        position_cursor, receipt_id=receipt_id
                     )
-                key = json.loads(intent["intent_key_json"])
-                economics = json.loads(intent["economic_payload_json"])
-                business_key = json.loads(intent["business_key_json"])
-                fill = self._connection.execute(
-                    """SELECT * FROM factor_position_fills
-                       WHERE account_scope=? AND instrument=? AND exchange=?
-                         AND execution_id=?""",
-                    (
-                        business_key.get("account_scope"),
-                        key.get("instrument"),
-                        economics.get("exchange"),
-                        execution_id,
-                    ),
-                ).fetchone()
+                    if issue is not None and type(issue) is not JournalPositionIssue:
+                        raise ExecutionDecisionJournalError(
+                            "JOURNAL_PORT_RESULT_INVALID:position_attribution"
+                        )
+                    if issue is not None:
+                        return ExecutionCallbackProjectionStatus(
+                            "BLOCKED", receipt_id, issue.blocker_code
+                        )
+                    intent = self._connection.execute(
+                        """SELECT i.intent_key_json, i.economic_payload_json,
+                                  d.business_key_json
+                           FROM execution_decision_intents AS i
+                           JOIN execution_decisions AS d ON d.decision_id=i.decision_id
+                           WHERE i.intent_id=?""",
+                        (intent_id,),
+                    ).fetchone()
+                    if intent is None:
+                        return ExecutionCallbackProjectionStatus(
+                            "BLOCKED", receipt_id, "CALLBACK_INTENT_NOT_FOUND"
+                        )
+                    key = json.loads(intent["intent_key_json"])
+                    economics = json.loads(intent["economic_payload_json"])
+                    business_key = json.loads(intent["business_key_json"])
+                    fill = position_port.read_fill(
+                        position_cursor,
+                        account_scope=business_key.get("account_scope"),
+                        instrument=key.get("instrument"),
+                        exchange=economics.get("exchange"),
+                        execution_id=execution_id,
+                    )
+                    if fill is not None and type(fill) is not JournalPositionFill:
+                        raise ExecutionDecisionJournalError(
+                            "JOURNAL_PORT_RESULT_INVALID:position_attribution"
+                        )
+                finally:
+                    position_cursor.close()
+        except JournalPositionCapabilityUnavailable as error:
+            return ExecutionCallbackProjectionStatus("BLOCKED", receipt_id, error.code)
         except (sqlite3.Error, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
             raise ExecutionDecisionJournalError("JOURNAL_READ_FAILED") from error
         if fill is None:
             return ExecutionCallbackProjectionStatus("UNRECONCILED", receipt_id)
         if (
-            fill["intent_id"] != intent_id
-            or fill["strategy_scope"] != business_key.get("strategy_scope")
-            or fill["position_effect"] != key.get("position_effect")
-            or fill["order_side"] != key.get("side")
-            or fill["quantity"] != _canonical_decimal(evidence_payload.get("quantity"))
-            or fill["price"] != _canonical_decimal(evidence_payload.get("price"))
-            or fill["filled_at_ns"] != evidence_payload.get("filled_at_ns")
+            fill.intent_id != intent_id
+            or fill.strategy_scope != business_key.get("strategy_scope")
+            or fill.position_effect != key.get("position_effect")
+            or fill.order_side != key.get("side")
+            or fill.quantity != _canonical_decimal(evidence_payload.get("quantity"))
+            or fill.price != _canonical_decimal(evidence_payload.get("price"))
+            or fill.filled_at_ns != evidence_payload.get("filled_at_ns")
         ):
             return ExecutionCallbackProjectionStatus(
                 "BLOCKED", receipt_id, "CALLBACK_FILL_PROJECTION_CONFLICT"
@@ -14147,7 +14383,7 @@ class ExecutionDecisionJournal:
         # A query observation may omit commission. That absence does not
         # contradict a fee already observed on the native callback.
         fee = evidence_payload.get("fee")
-        if fee is not None and fill["fee"] != _canonical_decimal(fee):
+        if fee is not None and fill.fee != _canonical_decimal(fee):
             return ExecutionCallbackProjectionStatus(
                 "BLOCKED", receipt_id, "CALLBACK_FILL_FEE_CONFLICT"
             )
@@ -15156,11 +15392,11 @@ class ExecutionDecisionJournal:
             if bool(existing["position_flat"]) and _factor_book_checkpoint_required(
                 intent_key, intent_row["economic_payload_json"]
             ):
-                record_factor_position_flat_checkpoint = self._ports.require(
+                record_position_flat_checkpoint = self._ports.require(
                     "position_attribution"
                 ).record_flat_checkpoint
 
-                record_factor_position_flat_checkpoint(
+                record_position_flat_checkpoint(
                     cursor,
                     intent_id=intent_id,
                     reconciliation_id=reconciliation_id,
@@ -15198,11 +15434,11 @@ class ExecutionDecisionJournal:
         if bool(reconciliation["position_flat"]) and _factor_book_checkpoint_required(
             intent_key, intent_row["economic_payload_json"]
         ):
-            record_factor_position_flat_checkpoint = self._ports.require(
+            record_position_flat_checkpoint = self._ports.require(
                 "position_attribution"
             ).record_flat_checkpoint
 
-            record_factor_position_flat_checkpoint(
+            record_position_flat_checkpoint(
                 cursor,
                 intent_id=intent_id,
                 reconciliation_id=reconciliation_id,
@@ -15390,6 +15626,26 @@ class ExecutionDecisionJournal:
                 ).fetchone()
             ):
                 raise ExecutionDecisionJournalError("INTENT_ABANDONED")
+            decision_row = cursor.execute(
+                "SELECT * FROM execution_decisions WHERE decision_id = ?",
+                (row["decision_id"],),
+            ).fetchone()
+            if decision_row is None:
+                raise ExecutionDecisionJournalError("DECISION_NOT_FOUND")
+            try:
+                decision_key = ExecutionDecisionKey(
+                    **_parse_object_json(
+                        decision_row["business_key_json"], "INVALID_DECISION_KEY"
+                    )
+                )
+            except (ExecutionDecisionJournalError, TypeError, ValueError) as error:
+                raise ExecutionDecisionJournalError("INVALID_DECISION_KEY") from error
+            if cursor.execute(
+                """SELECT 1 FROM execution_registered_sim_callback_unknown_incidents
+                   WHERE account_scope IS NULL OR account_scope=? LIMIT 1""",
+                (decision_key.account_scope,),
+            ).fetchone():
+                raise ExecutionDecisionJournalError("CALLBACK_UNKNOWN_UNRESOLVED")
             intent_key = ExecutionIntentKey(**json.loads(row["intent_key_json"]))
             fee_pair_open_admission = self._reject_unreserved_fee_pair_open_in_transaction(
                 cursor,
@@ -15399,20 +15655,7 @@ class ExecutionDecisionJournal:
                 context=fee_pair_open_context,
             )
             if intent_key.action == "CANCEL":
-                decision_row = cursor.execute(
-                    "SELECT * FROM execution_decisions WHERE decision_id = ?",
-                    (row["decision_id"],),
-                ).fetchone()
-                if decision_row is None:
-                    raise ExecutionDecisionJournalError("DECISION_NOT_FOUND")
-                try:
-                    cancel_decision_key = ExecutionDecisionKey(
-                        **_parse_object_json(
-                            decision_row["business_key_json"], "INVALID_DECISION_KEY"
-                        )
-                    )
-                except (ExecutionDecisionJournalError, TypeError, ValueError) as error:
-                    raise ExecutionDecisionJournalError("INVALID_DECISION_KEY") from error
+                cancel_decision_key = decision_key
                 account_scope = cancel_decision_key.account_scope
                 owner_row = cursor.execute(
                     """SELECT owner_intent_id FROM execution_instrument_owners
@@ -15450,12 +15693,6 @@ class ExecutionDecisionJournal:
             )
             if prior_unresolved:
                 raise ExecutionDecisionJournalError("PRIOR_INTENT_NOT_KNOWN")
-            decision_row = cursor.execute(
-                "SELECT * FROM execution_decisions WHERE decision_id = ?",
-                (row["decision_id"],),
-            ).fetchone()
-            if decision_row is None:
-                raise ExecutionDecisionJournalError("DECISION_NOT_FOUND")
             intent_capacity_class = (
                 "SETTLEMENT"
                 if intent_key.action == "CANCEL" or intent_key.position_effect == "CLOSE"
@@ -16482,6 +16719,205 @@ class ExecutionDecisionJournal:
                 )
         return DispatchingCancelAbsenceCandidatePage(tuple(candidates), truncated)
 
+    def record_registered_sim_callback_unknown_incident(
+        self,
+        *,
+        account_scope: Optional[str],
+        source_instance_id: str,
+        source_event_id: str,
+        reason_code: str,
+        identity_complete: bool,
+        connection_generation: Optional[int] = None,
+        trading_day: Optional[str] = None,
+        front_id: Optional[int] = None,
+        session_id: Optional[int] = None,
+        order_ref: Optional[str] = None,
+        instrument: Optional[str] = None,
+        exchange: Optional[str] = None,
+        order_sys_id: Optional[str] = None,
+    ) -> ExecutionCallbackUnknownIncidentReceipt:
+        """Persist one source-keyed provider UNKNOWN incident and fail closed.
+
+        This evidence is independent of execution intents.  Exact event replay
+        returns the original append-only row; reuse of a source event key for
+        different evidence is rejected. ``source_instance_id`` must remain
+        stable across process restarts for the same provider stream generation,
+        and ``source_event_id`` must be stable and unique within it.
+        ``process_instance_id`` records only the first writer as provenance; it
+        is not part of replay identity. This method never clears an incident and
+        does not authorize another dispatch.
+        """
+
+        if self.path == ":memory:":
+            raise ExecutionDecisionJournalError("CALLBACK_UNKNOWN_DURABLE_JOURNAL_REQUIRED")
+        for value, code in (
+            (source_instance_id, "CALLBACK_UNKNOWN_SOURCE_INSTANCE_INVALID"),
+            (source_event_id, "CALLBACK_UNKNOWN_SOURCE_EVENT_INVALID"),
+        ):
+            _require_identifier(value, code)
+        if account_scope is not None:
+            _require_identifier(account_scope, "CALLBACK_UNKNOWN_ACCOUNT_SCOPE_INVALID")
+        if (
+            type(reason_code) is not str
+            or reason_code not in _REGISTERED_SIM_CALLBACK_UNKNOWN_REASON_CODES
+        ):
+            raise ExecutionDecisionJournalError("CALLBACK_UNKNOWN_REASON_INVALID")
+        if type(identity_complete) is not bool:
+            raise ExecutionDecisionJournalError("CALLBACK_UNKNOWN_IDENTITY_FLAG_INVALID")
+        for value, code in (
+            (order_ref, "CALLBACK_UNKNOWN_ORDER_REF_INVALID"),
+            (instrument, "CALLBACK_UNKNOWN_INSTRUMENT_INVALID"),
+            (exchange, "CALLBACK_UNKNOWN_EXCHANGE_INVALID"),
+            (order_sys_id, "CALLBACK_UNKNOWN_ORDER_SYS_ID_INVALID"),
+        ):
+            if value is not None:
+                _require_identifier(value, code)
+        if connection_generation is not None and (
+            type(connection_generation) is not int or connection_generation <= 0
+        ):
+            raise ExecutionDecisionJournalError("CALLBACK_UNKNOWN_GENERATION_INVALID")
+        if trading_day is not None and (
+            type(trading_day) is not str or re.fullmatch(r"[0-9]{8}", trading_day) is None
+        ):
+            raise ExecutionDecisionJournalError("CALLBACK_UNKNOWN_TRADING_DAY_INVALID")
+        for value, code in (
+            (front_id, "CALLBACK_UNKNOWN_FRONT_ID_INVALID"),
+            (session_id, "CALLBACK_UNKNOWN_SESSION_ID_INVALID"),
+        ):
+            if value is not None and (type(value) is not int or value <= 0):
+                raise ExecutionDecisionJournalError(code)
+        if identity_complete and any(
+            value is None
+            for value in (
+                account_scope,
+                connection_generation,
+                trading_day,
+                front_id,
+                session_id,
+                order_ref,
+                instrument,
+                exchange,
+            )
+        ):
+            raise ExecutionDecisionJournalError("CALLBACK_UNKNOWN_IDENTITY_INCOMPLETE")
+
+        evidence = {
+            "schema_version": 1,
+            "account_scope": account_scope,
+            "reason_code": reason_code,
+            "identity_complete": identity_complete,
+            "connection_generation": connection_generation,
+            "trading_day": trading_day,
+            "front_id": front_id,
+            "session_id": session_id,
+            "order_ref": order_ref,
+            "instrument": instrument,
+            "exchange": exchange,
+            "order_sys_id": order_sys_id,
+        }
+        try:
+            evidence_json = _canonical_json(evidence)
+        except (TypeError, ValueError, InvalidOperation, OverflowError) as error:
+            raise ExecutionDecisionJournalError("CALLBACK_UNKNOWN_EVIDENCE_INVALID") from error
+        if len(evidence_json.encode("utf-8")) > _MAX_REGISTERED_SIM_CALLBACK_UNKNOWN_EVIDENCE_BYTES:
+            raise ExecutionDecisionJournalError("CALLBACK_UNKNOWN_EVIDENCE_TOO_LARGE")
+        evidence_sha256 = hashlib.sha256(evidence_json.encode("utf-8")).hexdigest()
+        source_key_json = _canonical_json(
+            {
+                "source_instance_id": source_instance_id,
+                "source_event_id": source_event_id,
+            }
+        )
+        incident_id = _stable_id("registered-sim-callback-unknown", source_key_json)
+        process_instance_id = _current_process_instance_id()
+        created_at_ns = time.time_ns()
+
+        with self._callback_unknown_transaction() as cursor:
+            existing = cursor.execute(
+                """SELECT * FROM execution_registered_sim_callback_unknown_incidents
+                   WHERE source_instance_id=? AND source_event_id=?""",
+                (source_instance_id, source_event_id),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["incident_id"] != incident_id
+                    or existing["account_scope"] != account_scope
+                    or existing["reason_code"] != reason_code
+                    or existing["connection_generation"] != connection_generation
+                    or existing["trading_day"] != trading_day
+                    or existing["front_id"] != front_id
+                    or existing["session_id"] != session_id
+                    or existing["order_ref"] != order_ref
+                    or existing["instrument"] != instrument
+                    or existing["exchange"] != exchange
+                    or existing["order_sys_id"] != order_sys_id
+                    or existing["identity_complete"] != int(identity_complete)
+                    or existing["evidence_json"] != evidence_json
+                    or existing["evidence_sha256"] != evidence_sha256
+                ):
+                    raise ExecutionDecisionJournalError(
+                        "CALLBACK_UNKNOWN_INCIDENT_CONFLICT"
+                    )
+                return _callback_unknown_incident_record(existing, is_new=False)
+
+            with track_durable_row_change(
+                cursor,
+                _REGISTERED_SIM_CALLBACK_UNKNOWN_TABLE,
+                (incident_id,),
+                "SETTLEMENT",
+            ):
+                cursor.execute(
+                    """INSERT INTO execution_registered_sim_callback_unknown_incidents
+                       (incident_id,account_scope,source_instance_id,source_event_id,
+                        process_instance_id,reason_code,connection_generation,trading_day,
+                        front_id,session_id,order_ref,instrument,exchange,order_sys_id,
+                        identity_complete,evidence_json,evidence_sha256,created_at_ns)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        incident_id,
+                        account_scope,
+                        source_instance_id,
+                        source_event_id,
+                        process_instance_id,
+                        reason_code,
+                        connection_generation,
+                        trading_day,
+                        front_id,
+                        session_id,
+                        order_ref,
+                        instrument,
+                        exchange,
+                        order_sys_id,
+                        int(identity_complete),
+                        evidence_json,
+                        evidence_sha256,
+                        created_at_ns,
+                    ),
+                )
+            row = cursor.execute(
+                """SELECT * FROM execution_registered_sim_callback_unknown_incidents
+                   WHERE incident_id=?""",
+                (incident_id,),
+            ).fetchone()
+            if row is None:
+                raise ExecutionDecisionJournalError("CALLBACK_UNKNOWN_INCIDENT_WRITE_FAILED")
+            return _callback_unknown_incident_record(row, is_new=True)
+
+    def registered_sim_callback_unknown_incident(
+        self, source_instance_id: str, source_event_id: str
+    ) -> Optional[ExecutionCallbackUnknownIncidentReceipt]:
+        """Read one append-only incident by its caller-supplied idempotency key."""
+
+        _require_identifier(source_instance_id, "CALLBACK_UNKNOWN_SOURCE_INSTANCE_INVALID")
+        _require_identifier(source_event_id, "CALLBACK_UNKNOWN_SOURCE_EVENT_INVALID")
+        with self._read_lock():
+            row = self._connection.execute(
+                """SELECT * FROM execution_registered_sim_callback_unknown_incidents
+                   WHERE source_instance_id=? AND source_event_id=?""",
+                (source_instance_id, source_event_id),
+            ).fetchone()
+            return None if row is None else _callback_unknown_incident_record(row)
+
     def record_callback(
         self, intent_id: str, callback_id: str, evidence_payload: Mapping[str, Any]
     ) -> ExecutionCallbackReceipt:
@@ -17151,16 +17587,19 @@ class ExecutionDecisionJournal:
                 raise ExecutionDecisionJournalError("CALLBACK_QUERY_PROOF_TIME_INVALID") from error
             if parsed.tzinfo is None or parsed.utcoffset() is None:
                 raise ExecutionDecisionJournalError("CALLBACK_QUERY_PROOF_TIME_INVALID")
-        fill = cursor.execute(
-            """SELECT * FROM factor_position_fills
-               WHERE account_scope=? AND instrument=? AND exchange=? AND execution_id=?""",
-            (
-                expected_original["account_scope"],
-                expected_original["instrument"],
-                expected_original["exchange"],
-                execution_id,
-            ),
-        ).fetchone()
+        position_port = self._ports.require("position_attribution")
+        try:
+            fill = position_port.read_fill(
+                cursor,
+                account_scope=expected_original["account_scope"],
+                instrument=expected_original["instrument"],
+                exchange=expected_original["exchange"],
+                execution_id=execution_id,
+            )
+        except JournalPositionCapabilityUnavailable as error:
+            raise ExecutionDecisionJournalError(error.code) from error
+        if fill is not None and type(fill) is not JournalPositionFill:
+            raise ExecutionDecisionJournalError("JOURNAL_PORT_RESULT_INVALID:position_attribution")
         if fill is None:
             raise ExecutionDecisionJournalError("CALLBACK_QUERY_POSITION_FILL_MISSING")
         try:
@@ -17174,14 +17613,14 @@ class ExecutionDecisionJournal:
         except (InvalidOperation, TypeError, ValueError) as error:
             raise ExecutionDecisionJournalError("CALLBACK_QUERY_ECONOMICS_INVALID") from error
         if (
-            fill["intent_id"] != intent_id
-            or fill["strategy_scope"] != expected_original["strategy_scope"]
-            or fill["position_effect"] != intent_key["position_effect"]
-            or fill["order_side"] != intent_key["side"]
-            or fill["quantity"] != query_quantity
-            or fill["price"] != query_price
-            or fill["filled_at_ns"] != query_time
-            or (query_fee is not None and fill["fee"] != query_fee)
+            fill.intent_id != intent_id
+            or fill.strategy_scope != expected_original["strategy_scope"]
+            or fill.position_effect != intent_key["position_effect"]
+            or fill.order_side != intent_key["side"]
+            or fill.quantity != query_quantity
+            or fill.price != query_price
+            or fill.filled_at_ns != query_time
+            or (query_fee is not None and fill.fee != query_fee)
         ):
             raise ExecutionDecisionJournalError("CALLBACK_QUERY_POSITION_FILL_CONFLICT")
 
@@ -18248,7 +18687,11 @@ class ExecutionDecisionJournal:
             # not delivered. Keep those exact historical CTP CANCEL intents
             # permanently ambiguous instead of granting them a fresh v22
             # one-shot claim on restart.
-            with durable_capacity_transaction(cursor, self.durable_capacity_limits):
+            with durable_capacity_transaction(
+                cursor,
+                self.durable_capacity_limits,
+                position_attribution=self._ports.position_attribution,
+            ):
                 pending = cursor.connection.cursor()
                 try:
                     pending.execute(
@@ -19648,6 +20091,117 @@ class ExecutionDecisionJournal:
             raise ExecutionDecisionJournalError("FEE_PAIR_AMOUNT_LIFECYCLE_SCHEMA_CORRUPT") from error
 
     @staticmethod
+    def _validate_callback_unknown_schema(cursor: sqlite3.Cursor) -> None:
+        """Validate the exact durable callback UNKNOWN latch and DB guard."""
+
+        expected = {
+            _REGISTERED_SIM_CALLBACK_UNKNOWN_TABLE: (
+                "table",
+                _REGISTERED_SIM_CALLBACK_UNKNOWN_TABLE,
+                _REGISTERED_SIM_CALLBACK_UNKNOWN_TABLE_SQL,
+            ),
+            "execution_registered_sim_callback_unknown_scope_sequence": (
+                "index",
+                _REGISTERED_SIM_CALLBACK_UNKNOWN_TABLE,
+                _REGISTERED_SIM_CALLBACK_UNKNOWN_SCOPE_INDEX_SQL,
+            ),
+            "execution_registered_sim_callback_unknown_no_update": (
+                "trigger",
+                _REGISTERED_SIM_CALLBACK_UNKNOWN_TABLE,
+                _REGISTERED_SIM_CALLBACK_UNKNOWN_NO_UPDATE_TRIGGER_SQL,
+            ),
+            "execution_registered_sim_callback_unknown_no_delete": (
+                "trigger",
+                _REGISTERED_SIM_CALLBACK_UNKNOWN_TABLE,
+                _REGISTERED_SIM_CALLBACK_UNKNOWN_NO_DELETE_TRIGGER_SQL,
+            ),
+            "execution_registered_sim_callback_unknown_dispatch_guard": (
+                "trigger",
+                "execution_decision_intents",
+                _REGISTERED_SIM_CALLBACK_UNKNOWN_DISPATCH_GUARD_TRIGGER_SQL,
+            ),
+        }
+        try:
+            rows = cursor.execute(
+                "SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name IN ({})".format(
+                    ",".join("?" for _ in expected)
+                ),
+                tuple(expected),
+            ).fetchall()
+            actual = {row["name"]: row for row in rows}
+            if set(actual) != set(expected):
+                raise ExecutionDecisionJournalError("CALLBACK_UNKNOWN_SCHEMA_CORRUPT")
+            for name, (expected_type, expected_table, expected_sql) in expected.items():
+                row = actual[name]
+                if (
+                    row["type"] != expected_type
+                    or row["tbl_name"] != expected_table
+                    or _normalize_schema_sql(row["sql"])
+                    != _normalize_schema_sql(expected_sql)
+                ):
+                    raise ExecutionDecisionJournalError("CALLBACK_UNKNOWN_SCHEMA_CORRUPT")
+
+            columns = tuple(
+                (row["name"], row["type"].upper(), int(row["notnull"]), int(row["pk"]))
+                for row in cursor.execute(
+                    "PRAGMA table_info(execution_registered_sim_callback_unknown_incidents)"
+                ).fetchall()
+            )
+            if columns != (
+                ("incident_sequence", "INTEGER", 0, 1),
+                ("incident_id", "TEXT", 1, 0),
+                ("account_scope", "TEXT", 0, 0),
+                ("source_instance_id", "TEXT", 1, 0),
+                ("source_event_id", "TEXT", 1, 0),
+                ("process_instance_id", "TEXT", 1, 0),
+                ("reason_code", "TEXT", 1, 0),
+                ("connection_generation", "INTEGER", 0, 0),
+                ("trading_day", "TEXT", 0, 0),
+                ("front_id", "INTEGER", 0, 0),
+                ("session_id", "INTEGER", 0, 0),
+                ("order_ref", "TEXT", 0, 0),
+                ("instrument", "TEXT", 0, 0),
+                ("exchange", "TEXT", 0, 0),
+                ("order_sys_id", "TEXT", 0, 0),
+                ("identity_complete", "INTEGER", 1, 0),
+                ("evidence_json", "TEXT", 1, 0),
+                ("evidence_sha256", "TEXT", 1, 0),
+                ("created_at_ns", "INTEGER", 1, 0),
+            ):
+                raise ExecutionDecisionJournalError("CALLBACK_UNKNOWN_SCHEMA_CORRUPT")
+
+            indexes = cursor.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' "
+                "AND tbl_name=? AND name NOT LIKE 'sqlite_autoindex%'",
+                (_REGISTERED_SIM_CALLBACK_UNKNOWN_TABLE,),
+            ).fetchall()
+            if {row["name"] for row in indexes} != {
+                "execution_registered_sim_callback_unknown_scope_sequence"
+            }:
+                raise ExecutionDecisionJournalError("CALLBACK_UNKNOWN_SCHEMA_CORRUPT")
+            incident_triggers = cursor.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name=?",
+                (_REGISTERED_SIM_CALLBACK_UNKNOWN_TABLE,),
+            ).fetchall()
+            if {row["name"] for row in incident_triggers} != {
+                "execution_registered_sim_callback_unknown_no_update",
+                "execution_registered_sim_callback_unknown_no_delete",
+            }:
+                raise ExecutionDecisionJournalError("CALLBACK_UNKNOWN_SCHEMA_CORRUPT")
+            dispatch_triggers = cursor.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger' "
+                "AND tbl_name='execution_decision_intents'"
+            ).fetchall()
+            if {row["name"] for row in dispatch_triggers} != {
+                "execution_registered_sim_callback_unknown_dispatch_guard"
+            }:
+                raise ExecutionDecisionJournalError("CALLBACK_UNKNOWN_SCHEMA_CORRUPT")
+        except ExecutionDecisionJournalError:
+            raise
+        except (KeyError, TypeError, ValueError, sqlite3.Error) as error:
+            raise ExecutionDecisionJournalError("CALLBACK_UNKNOWN_SCHEMA_CORRUPT") from error
+
+    @staticmethod
     def _validate_registered_sim_cancel_dispatch_claim_schema(
         cursor: sqlite3.Cursor,
     ) -> None:
@@ -20379,27 +20933,31 @@ class ExecutionDecisionJournal:
         except sqlite3.Error as error:
             raise ExecutionDecisionJournalError("DURABLE_CAPACITY_BACKFILL_FAILED") from error
 
-        # The attribution table belongs to the injected port, so the expected
-        # version comes from that port instead of a hard-coded number the SDK
-        # would have to re-release every time the application migrates.  The
-        # literal below is only the documented pre-port value for a journal
-        # constructed without an attribution port; it never upgrades or relaxes
-        # the rejection.
         position_attribution = self._ports.position_attribution
-        expected_book_version = (
-            _LEGACY_POSITION_BOOK_SCHEMA_VERSION
-            if position_attribution is None
-            else position_attribution.expected_schema_version
-        )
-        book_meta = cursor.execute(
-            "SELECT version FROM factor_position_book_meta WHERE singleton=1"
-        ).fetchone()
-        if (
-            book_meta is None
-            or type(book_meta["version"]) is not int
-            or book_meta["version"] != expected_book_version
-        ):
-            raise ExecutionDecisionJournalError("POSITION_BOOK_SCHEMA_UNAVAILABLE")
+        position_capacity_rows: Any = ()
+        if position_attribution is None:
+            # Empty SDK-only journals do not need the optional position port.
+            # An unknown object, including an undeclared execution_* object,
+            # could carry legacy owner rows or capacity not visible to SDK.
+            if _has_unrecognized_journal_object(cursor):
+                raise ExecutionDecisionJournalError(
+                    "JOURNAL_PORT_UNAVAILABLE:position_attribution"
+                )
+        else:
+            try:
+                schema_valid = position_attribution.validate_schema(cursor)
+            except Exception as error:
+                raise ExecutionDecisionJournalError(
+                    "POSITION_BOOK_SCHEMA_UNAVAILABLE"
+                ) from error
+            if schema_valid is not True:
+                raise ExecutionDecisionJournalError("POSITION_BOOK_SCHEMA_UNAVAILABLE")
+            try:
+                position_capacity_rows = position_attribution.iter_capacity_rows(cursor)
+            except JournalPositionCapabilityUnavailable as error:
+                raise ExecutionDecisionJournalError(error.code) from error
+            except Exception as error:
+                raise ExecutionDecisionJournalError("POSITION_BOOK_CAPACITY_UNAVAILABLE") from error
 
         totals = {"BASE": [0, 0], "SETTLEMENT": [0, 0]}
 
@@ -20445,20 +21003,6 @@ class ExecutionDecisionJournal:
             lambda row: decision_classes.get(row["decision_id"])
             or self._raise_capacity_classification_invalid(),
         )
-
-        def history_class(row: sqlite3.Row) -> str:
-            identity = (
-                row["account_scope"],
-                row["strategy_scope"],
-                row["cohort_id"],
-                row["close_time"],
-            )
-            candidates = grid_candidates.get(identity, ())
-            if len(candidates) != 1:
-                return self._raise_capacity_classification_invalid()
-            return candidates[0][1]
-
-        account_rows("factor_position_grid_history", history_class)
 
         def intent_class(row: sqlite3.Row) -> str:
             if (
@@ -20526,16 +21070,49 @@ class ExecutionDecisionJournal:
             "execution_callback_query_dispositions",
             "execution_intent_abandonments",
             "execution_slot_abandonments",
-            "factor_position_openings",
-            "factor_position_fills",
-            "factor_position_evidence_issues",
-            "factor_position_dated_trade_facts",
-            "factor_position_current",
-            "factor_position_active_issues",
-            "factor_position_fill_attributes",
-            "factor_position_open_intent_totals",
         ):
             account_rows(table, lambda _row: "SETTLEMENT")
+
+        try:
+            for position_row in position_capacity_rows:
+                if type(position_row) is not JournalPositionCapacityRow:
+                    raise ExecutionDecisionJournalError(
+                        "JOURNAL_PORT_RESULT_INVALID:position_attribution"
+                    )
+                if position_row.capacity_role == "GRID_HISTORY":
+                    grid_identity = position_row.grid_identity
+                    if type(grid_identity) is not JournalPositionGridIdentity:
+                        raise ExecutionDecisionJournalError(
+                            "JOURNAL_PORT_RESULT_INVALID:position_attribution"
+                        )
+                    identity = (
+                        grid_identity.account_scope,
+                        grid_identity.strategy_scope,
+                        grid_identity.cohort_id,
+                        grid_identity.close_time,
+                    )
+                    candidates = grid_candidates.get(identity, ())
+                    if len(candidates) != 1:
+                        self._raise_capacity_classification_invalid()
+                    capacity_class = self._durable_decision_class(candidates[0][1])
+                elif position_row.capacity_role == "SETTLEMENT":
+                    capacity_class = "SETTLEMENT"
+                else:
+                    raise ExecutionDecisionJournalError(
+                        "JOURNAL_PORT_RESULT_INVALID:position_attribution"
+                    )
+                totals[capacity_class][0] += 1
+                totals[capacity_class][1] += position_row.row_size_bytes
+                if any(
+                    value > 9_223_372_036_854_775_807 for value in totals[capacity_class]
+                ):
+                    raise ExecutionDecisionJournalError("DURABLE_CAPACITY_BACKFILL_OVERFLOW")
+        except JournalPositionCapabilityUnavailable as error:
+            raise ExecutionDecisionJournalError(error.code) from error
+        except ExecutionDecisionJournalError:
+            raise
+        except Exception as error:
+            raise ExecutionDecisionJournalError("POSITION_BOOK_CAPACITY_UNAVAILABLE") from error
 
         single_row_intent_table = cursor.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' "
@@ -20686,6 +21263,7 @@ class ExecutionDecisionJournal:
                 _REGISTERED_SIM_CANCEL_DISPATCH_CLAIM_SCHEMA_VERSION,
                 _FEE_PAIR_GRID_SINGLE_ROW_TAPE_SCHEMA_VERSION,
                 _FEE_PAIR_AMOUNT_RESERVATION_SCHEMA_VERSION,
+                _FEE_PAIR_AMOUNT_OPEN_LIFECYCLE_SCHEMA_VERSION,
                 self._SCHEMA_VERSION,
             ):
                 raise ExecutionDecisionJournalError("UNSUPPORTED_SCHEMA_VERSION")
@@ -20795,6 +21373,12 @@ class ExecutionDecisionJournal:
                     self._validate_fee_pair_amount_open_lifecycle_schema(
                         cursor, ports=self._ports
                     )
+                finally:
+                    cursor.close()
+            if version >= _REGISTERED_SIM_CALLBACK_UNKNOWN_SCHEMA_VERSION:
+                cursor = self._connection.cursor()
+                try:
+                    self._validate_callback_unknown_schema(cursor)
                 finally:
                     cursor.close()
             try:
@@ -20985,6 +21569,69 @@ class ExecutionDecisionJournal:
                         proof_sha256 TEXT NOT NULL CHECK(length(proof_sha256) = 64),
                         created_at_ns INTEGER NOT NULL
                     );
+                    CREATE TABLE IF NOT EXISTS execution_registered_sim_callback_unknown_incidents (
+                        incident_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                        incident_id TEXT NOT NULL UNIQUE CHECK(length(incident_id)=64),
+                        account_scope TEXT
+                            CHECK(account_scope IS NULL OR length(account_scope) BETWEEN 1 AND 256),
+                        source_instance_id TEXT NOT NULL
+                            CHECK(length(source_instance_id) BETWEEN 1 AND 256),
+                        source_event_id TEXT NOT NULL
+                            CHECK(length(source_event_id) BETWEEN 1 AND 256),
+                        process_instance_id TEXT NOT NULL
+                            CHECK(length(process_instance_id) BETWEEN 1 AND 128),
+                        reason_code TEXT NOT NULL CHECK(reason_code IN (
+                            'UNKNOWN_STATUS','CALLBACK_IDENTITY_INCOMPLETE',
+                            'CALLBACK_PARSE_FAILURE','CALLBACK_OVERFLOW')),
+                        connection_generation INTEGER
+                            CHECK(connection_generation IS NULL OR connection_generation > 0),
+                        trading_day TEXT CHECK(trading_day IS NULL OR length(trading_day)=8),
+                        front_id INTEGER CHECK(front_id IS NULL OR front_id > 0),
+                        session_id INTEGER CHECK(session_id IS NULL OR session_id > 0),
+                        order_ref TEXT
+                            CHECK(order_ref IS NULL OR length(order_ref) BETWEEN 1 AND 256),
+                        instrument TEXT
+                            CHECK(instrument IS NULL OR length(instrument) BETWEEN 1 AND 256),
+                        exchange TEXT
+                            CHECK(exchange IS NULL OR length(exchange) BETWEEN 1 AND 256),
+                        order_sys_id TEXT
+                            CHECK(order_sys_id IS NULL OR length(order_sys_id) BETWEEN 1 AND 256),
+                        identity_complete INTEGER NOT NULL CHECK(identity_complete IN (0,1)),
+                        evidence_json TEXT NOT NULL
+                            CHECK(length(evidence_json) <= 4096),
+                        evidence_sha256 TEXT NOT NULL CHECK(length(evidence_sha256)=64),
+                        created_at_ns INTEGER NOT NULL CHECK(created_at_ns > 0),
+                        UNIQUE(source_instance_id,source_event_id)
+                    );
+                    CREATE INDEX IF NOT EXISTS
+                        execution_registered_sim_callback_unknown_scope_sequence
+                    ON execution_registered_sim_callback_unknown_incidents
+                        (account_scope,incident_sequence);
+                    CREATE TRIGGER IF NOT EXISTS
+                        execution_registered_sim_callback_unknown_no_update
+                    BEFORE UPDATE ON execution_registered_sim_callback_unknown_incidents
+                    BEGIN
+                        SELECT RAISE(ABORT, 'callback UNKNOWN incidents are append only');
+                    END;
+                    CREATE TRIGGER IF NOT EXISTS
+                        execution_registered_sim_callback_unknown_no_delete
+                    BEFORE DELETE ON execution_registered_sim_callback_unknown_incidents
+                    BEGIN
+                        SELECT RAISE(ABORT, 'callback UNKNOWN incidents are append only');
+                    END;
+                    CREATE TRIGGER IF NOT EXISTS
+                        execution_registered_sim_callback_unknown_dispatch_guard
+                    BEFORE UPDATE OF state ON execution_decision_intents
+                    WHEN OLD.state='PREPARED' AND NEW.state='DISPATCHING' AND EXISTS (
+                        SELECT 1
+                        FROM execution_registered_sim_callback_unknown_incidents AS u
+                        WHERE u.account_scope IS NULL OR u.account_scope=(
+                            SELECT json_extract(d.business_key_json,'$.account_scope')
+                            FROM execution_decisions AS d
+                            WHERE d.decision_id=NEW.decision_id
+                        )
+                    )
+                    BEGIN SELECT RAISE(ABORT, 'CALLBACK_UNKNOWN_UNRESOLVED'); END;
                     CREATE TRIGGER IF NOT EXISTS execution_callback_query_disposition_no_update
                     BEFORE UPDATE ON execution_callback_query_dispositions
                     BEGIN SELECT RAISE(ABORT, 'callback query disposition is append only'); END;
@@ -21041,12 +21688,33 @@ class ExecutionDecisionJournal:
                     """
                 )
                 position_attribution = self._ports.position_attribution
-                if position_attribution is not None:
-                    cursor = self._connection.cursor()
-                    try:
-                        position_attribution.ensure_schema(cursor)
-                    finally:
-                        cursor.close()
+                cursor = self._connection.cursor()
+                try:
+                    if position_attribution is None:
+                        # This is checked on every open, not only during the
+                        # original capacity backfill. A current-version journal
+                        # may still contain an older application-owned position
+                        # book whose rows cannot be accounted for without its
+                        # owning port.
+                        if _has_unrecognized_journal_object(cursor):
+                            raise ExecutionDecisionJournalError(
+                                "JOURNAL_PORT_UNAVAILABLE:position_attribution"
+                            )
+                    else:
+                        try:
+                            if position_attribution.preflight_schema(cursor) is not True:
+                                raise ExecutionDecisionJournalError(
+                                    "POSITION_BOOK_SCHEMA_UNAVAILABLE"
+                                )
+                            position_attribution.ensure_schema(cursor)
+                        except ExecutionDecisionJournalError:
+                            raise
+                        except Exception as error:
+                            raise ExecutionDecisionJournalError(
+                                "POSITION_BOOK_SCHEMA_UNAVAILABLE"
+                            ) from error
+                finally:
+                    cursor.close()
                 # Multiple processes can read an old user_version before either
                 # obtains the write lock. BEGIN IMMEDIATE is the first statement
                 # in the schema script, so the lock covers base DDL and the port
@@ -21079,6 +21747,7 @@ class ExecutionDecisionJournal:
                     _REGISTERED_SIM_CANCEL_DISPATCH_CLAIM_SCHEMA_VERSION,
                     _FEE_PAIR_GRID_SINGLE_ROW_TAPE_SCHEMA_VERSION,
                     _FEE_PAIR_AMOUNT_RESERVATION_SCHEMA_VERSION,
+                    _FEE_PAIR_AMOUNT_OPEN_LIFECYCLE_SCHEMA_VERSION,
                     self._SCHEMA_VERSION,
                 ):
                     raise ExecutionDecisionJournalError("UNSUPPORTED_SCHEMA_VERSION")
@@ -21322,7 +21991,7 @@ class ExecutionDecisionJournal:
                                 if locked_version == _FEE_PAIR_GRID_SINGLE_ROW_TAPE_SCHEMA_VERSION
                                 else _FEE_PAIR_AMOUNT_RESERVATION_SCHEMA_VERSION
                                 if locked_version == _FEE_PAIR_AMOUNT_RESERVATION_SCHEMA_VERSION
-                                else self._SCHEMA_VERSION
+                                else _FEE_PAIR_AMOUNT_OPEN_LIFECYCLE_SCHEMA_VERSION
                             ),
                         )
                     if locked_version == _FEE_PAIR_WORKFLOW_SCHEMA_VERSION:
@@ -21356,6 +22025,7 @@ class ExecutionDecisionJournal:
                     self._validate_fee_pair_amount_open_lifecycle_schema(
                         cursor, ports=self._ports
                     )
+                    self._validate_callback_unknown_schema(cursor)
                     self._validate_fee_pair_workflow_capacity(cursor)
                 finally:
                     cursor.close()
@@ -21404,12 +22074,21 @@ class ExecutionDecisionJournal:
             cursor = self._connection.cursor()
             try:
                 cursor.execute("BEGIN IMMEDIATE")
+                # The callback writer uses a separate connection and can
+                # fail-close this instance while this BEGIN waits for SQLite's
+                # writer lock. Recheck after acquiring the lock before any
+                # claim or other mutation is allowed to proceed.
+                self._ensure_writable()
                 # A source-scoped fee-pair transaction may wait for SQLite's
                 # writer lock. Revalidate as soon as that wait ends, then once
                 # more after the mutation body and immediately before commit.
                 if before_commit is not None:
                     before_commit()
-                with durable_capacity_transaction(cursor, self.durable_capacity_limits):
+                with durable_capacity_transaction(
+                    cursor,
+                    self.durable_capacity_limits,
+                    position_attribution=self._ports.position_attribution,
+                ):
                     yield cursor
                 # Some narrowly scoped callers hold an external source lease
                 # across this transaction. Recheck it after SQLite has
@@ -21434,6 +22113,69 @@ class ExecutionDecisionJournal:
                     pass
                 raise ExecutionDecisionJournalError("JOURNAL_WRITE_FAILED") from error
             except BaseException:
+                try:
+                    cursor.execute("ROLLBACK")
+                except sqlite3.Error:
+                    self._failed_closed = True
+                raise
+            finally:
+                cursor.close()
+
+    @contextmanager
+    def _callback_unknown_transaction(self) -> Iterator[sqlite3.Cursor]:
+        """Write callback UNKNOWN evidence without waiting on the dispatch lock.
+
+        The dedicated connection is serialized by its own process-local lock;
+        SQLite ``BEGIN IMMEDIATE`` orders it against every Journal connection
+        and the dispatch guard trigger.  It never acquires ``self._lock`` or
+        the cross-process dispatch sidecar.
+        """
+
+        if self.path == ":memory:":
+            raise ExecutionDecisionJournalError("CALLBACK_UNKNOWN_DURABLE_JOURNAL_REQUIRED")
+        if os.getpid() != self._creation_process_id:
+            raise ExecutionDecisionJournalError("CALLBACK_UNKNOWN_FORKED_JOURNAL_UNSUPPORTED")
+        with self._callback_connection_lock:
+            self._ensure_writable()
+            connection = self._callback_connection
+            if connection is None:
+                raise ExecutionDecisionJournalError(
+                    "CALLBACK_UNKNOWN_DURABLE_JOURNAL_REQUIRED"
+                )
+            cursor = connection.cursor()
+            try:
+                cursor.execute("BEGIN IMMEDIATE")
+                with durable_capacity_transaction(
+                    cursor,
+                    self.durable_capacity_limits,
+                    position_attribution=self._ports.position_attribution,
+                ):
+                    yield cursor
+                cursor.execute("COMMIT")
+            except DurableCapacityError as error:
+                try:
+                    cursor.execute("ROLLBACK")
+                except sqlite3.Error:
+                    self._failed_closed = True
+                # An incident which did not commit cannot be claimed as
+                # restart-safe.  Keep this Journal instance closed so local
+                # callers cannot continue dispatching after the persistence
+                # failure; the Store must also keep its in-memory latch.
+                self._failed_closed = True
+                raise ExecutionDecisionJournalError(error.code) from error
+            except sqlite3.Error as error:
+                self._failed_closed = True
+                try:
+                    cursor.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise ExecutionDecisionJournalError("JOURNAL_WRITE_FAILED") from error
+            except BaseException:
+                # The caller may have observed a provider UNKNOWN before an
+                # asynchronous cancellation/interrupt reached this scope.
+                # Unless the durable receipt commits, this process must not
+                # allow another dispatch to proceed.
+                self._failed_closed = True
                 try:
                     cursor.execute("ROLLBACK")
                 except sqlite3.Error:
@@ -22991,6 +23733,140 @@ def _callback_record(row: sqlite3.Row, *, is_new: bool = False) -> ExecutionCall
         evidence_payload=_deep_freeze(json.loads(row["evidence_payload_json"])),
         acknowledged=bool(row["acknowledged"]),
         created_at_ns=int(row["created_at_ns"]),
+        is_new=is_new,
+    )
+
+
+def _callback_unknown_incident_record(
+    row: sqlite3.Row, *, is_new: bool = False
+) -> ExecutionCallbackUnknownIncidentReceipt:
+    try:
+        evidence_json = row["evidence_json"]
+        if (
+            type(evidence_json) is not str
+            or len(evidence_json.encode("utf-8"))
+            > _MAX_REGISTERED_SIM_CALLBACK_UNKNOWN_EVIDENCE_BYTES
+        ):
+            raise ValueError("evidence size")
+        evidence = json.loads(evidence_json)
+        canonical_evidence = _canonical_json(evidence)
+        evidence_sha256 = hashlib.sha256(evidence_json.encode("utf-8")).hexdigest()
+        optional_identifiers = ("order_ref", "instrument", "exchange", "order_sys_id")
+        if any(
+            row[name] is not None and not _identifier(row[name])
+            for name in optional_identifiers
+        ):
+            raise ValueError("optional identifier")
+        if (
+            type(row["incident_id"]) is not str
+            or type(row["source_instance_id"]) is not str
+            or not _identifier(row["source_instance_id"])
+            or type(row["source_event_id"]) is not str
+            or not _identifier(row["source_event_id"])
+            or type(row["process_instance_id"]) is not str
+            or not _identifier(row["process_instance_id"])
+            or len(row["process_instance_id"]) > 128
+            or (row["account_scope"] is not None and not _identifier(row["account_scope"]))
+            or type(row["reason_code"]) is not str
+            or row["reason_code"] not in _REGISTERED_SIM_CALLBACK_UNKNOWN_REASON_CODES
+            or (
+                row["connection_generation"] is not None
+                and (
+                    type(row["connection_generation"]) is not int
+                    or row["connection_generation"] <= 0
+                )
+            )
+            or (
+                row["trading_day"] is not None
+                and (
+                    type(row["trading_day"]) is not str
+                    or re.fullmatch(r"[0-9]{8}", row["trading_day"]) is None
+                )
+            )
+            or any(
+                row[name] is not None and (type(row[name]) is not int or row[name] <= 0)
+                for name in ("front_id", "session_id")
+            )
+            or type(row["identity_complete"]) is not int
+            or row["identity_complete"] not in (0, 1)
+            or type(row["incident_sequence"]) is not int
+            or row["incident_sequence"] <= 0
+            or type(row["created_at_ns"]) is not int
+            or row["created_at_ns"] <= 0
+            or type(row["evidence_sha256"]) is not str
+            or len(row["evidence_sha256"]) != 64
+            or any(character not in "0123456789abcdef" for character in row["evidence_sha256"])
+        ):
+            raise ValueError("row shape")
+    except (KeyError, TypeError, ValueError, UnicodeError) as error:
+        raise ExecutionDecisionJournalError("CALLBACK_UNKNOWN_INCIDENT_CORRUPT") from error
+    expected_evidence = {
+        "schema_version": 1,
+        "account_scope": row["account_scope"],
+        "reason_code": row["reason_code"],
+        "identity_complete": row["identity_complete"] == 1,
+        "connection_generation": row["connection_generation"],
+        "trading_day": row["trading_day"],
+        "front_id": row["front_id"],
+        "session_id": row["session_id"],
+        "order_ref": row["order_ref"],
+        "instrument": row["instrument"],
+        "exchange": row["exchange"],
+        "order_sys_id": row["order_sys_id"],
+    }
+    if (
+        type(evidence) is not dict
+        or canonical_evidence != evidence_json
+        or evidence != expected_evidence
+        or row["evidence_sha256"] != evidence_sha256
+        or row["incident_id"]
+        != _stable_id(
+            "registered-sim-callback-unknown",
+            _canonical_json(
+                {
+                    "source_instance_id": row["source_instance_id"],
+                    "source_event_id": row["source_event_id"],
+                }
+            ),
+        )
+        or (
+            row["identity_complete"] == 1
+            and any(
+                row[name] is None
+                for name in (
+                    "account_scope",
+                    "connection_generation",
+                    "trading_day",
+                    "front_id",
+                    "session_id",
+                    "order_ref",
+                    "instrument",
+                    "exchange",
+                )
+            )
+        )
+    ):
+        raise ExecutionDecisionJournalError("CALLBACK_UNKNOWN_INCIDENT_CORRUPT")
+    return ExecutionCallbackUnknownIncidentReceipt(
+        incident_id=row["incident_id"],
+        incident_sequence=row["incident_sequence"],
+        account_scope=row["account_scope"],
+        source_instance_id=row["source_instance_id"],
+        source_event_id=row["source_event_id"],
+        process_instance_id=row["process_instance_id"],
+        reason_code=row["reason_code"],
+        connection_generation=row["connection_generation"],
+        trading_day=row["trading_day"],
+        front_id=row["front_id"],
+        session_id=row["session_id"],
+        order_ref=row["order_ref"],
+        instrument=row["instrument"],
+        exchange=row["exchange"],
+        order_sys_id=row["order_sys_id"],
+        identity_complete=bool(row["identity_complete"]),
+        evidence=MappingProxyType(dict(evidence)),
+        evidence_sha256=evidence_sha256,
+        created_at_ns=row["created_at_ns"],
         is_new=is_new,
     )
 

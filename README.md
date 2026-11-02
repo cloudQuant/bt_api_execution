@@ -1,5 +1,7 @@
 # bt_api_execution
 
+The working-tree `source_projection` projects exact Execution and cancel events/records for callers; the SDK Execution/Risk bridge owns cross-package source binding and the Risk journal owns its fencing. This optional cross-package path has not been behavior-validated.
+
 `bt_api_execution` is the provider-neutral execution boundary for managed
 routes.  It deliberately contains no exchange SDK, HTTP client, socket, or
 credential loader.  A caller injects a provider port only after the runtime
@@ -10,6 +12,12 @@ has completed its own configuration, admission, and preflight checks.
 `bt_api_execution` owns provider-neutral managed-intent contracts and a durable local execution journal/outbox, including dispatch and `UNKNOWN` state. A trusted composition injects the provider port and admission authority. Its records describe local attempts and received evidence; they are not provider state or acknowledgement. The package supplies no provider adapter, credentials, risk policy, or external account-wide write fence. `allow_unprotected=True` is for isolated test fixtures only.
 
 [Trading system architecture overview](https://github.com/cloudQuant/backtrader/blob/dev/docs/TRADING_SYSTEM_ARCHITECTURE.md).
+
+CTP managed-dispatch contracts and request/OrderRef binding methods are provider-owned in the working tree. The durable worker retains claim, UNKNOWN and completion in Execution and composes the provider binding mixin; its former contract imports alias the provider types; this source split is unvalidated.
+
+The working tree also moves CTP callback session, source bridge and ledger adapter implementations into the CTP provider. Prior package and submodule names are lazy compatibility aliases; event types and store remain here. Class module paths change, and cross-package behavior and installation remain unvalidated.
+
+The working-tree CTP ingress snapshot schema/digest validation and native field projection also reside in the provider; Execution Store retains transaction, owner and durable state and supplies its digest-shape validator and error type. This provider is a source-validation dependency and behavior is unaccepted. The working tree moves CTP native callback mapping to the CTP provider. Execution retains existing CTP-specific event/correlation types and lazy compatibility functions; other CTP-specific Execution adapters and store logic remain to be separated. This is source work in progress without behavior or installation acceptance.
 
 The first public release supplies a small, durable execution spine:
 

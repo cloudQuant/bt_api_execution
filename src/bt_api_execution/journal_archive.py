@@ -91,6 +91,7 @@ _REQUIRED_TABLES_BY_MINIMUM_SCHEMA_VERSION = {
             "execution_fee_pair_amount_active_holds",
         }
     ),
+    26: frozenset({"execution_registered_sim_callback_unknown_incidents"}),
 }
 
 
@@ -108,8 +109,9 @@ def _validate_required_schema_objects(
     *,
     tables: Optional[Tuple[str, ...]] = None,
     journal_ports: Optional[JournalPorts] = None,
+    deadline: Optional[float] = None,
 ) -> Tuple[str, ...]:
-    """Require cumulative tables and exact fee-pair schema for each version."""
+    """Require cumulative tables and exact versioned journal schemas."""
 
     if tables is None:
         _schema_sha256, tables = _schema_fingerprint(connection)
@@ -134,7 +136,11 @@ def _validate_required_schema_objects(
             journal_module.ExecutionDecisionJournal._validate_fee_pair_candidate_schema(cursor)
         if schema_version >= 17:
             journal_module.ExecutionDecisionJournal._validate_fee_pair_workflow_schema(
-                cursor, schema_version=schema_version
+                cursor,
+                schema_version=min(
+                    schema_version,
+                    journal_module._FEE_PAIR_AMOUNT_OPEN_LIFECYCLE_SCHEMA_VERSION,
+                ),
             )
         _validate_fee_pair_candidate_payload_bounds(
             connection,
@@ -182,6 +188,17 @@ def _validate_required_schema_objects(
             journal_module.ExecutionDecisionJournal._validate_fee_pair_amount_open_lifecycle_schema(
                 cursor, ports=journal_ports
             )
+        if schema_version >= journal_module._REGISTERED_SIM_CALLBACK_UNKNOWN_SCHEMA_VERSION:
+            journal_module.ExecutionDecisionJournal._validate_callback_unknown_schema(cursor)
+            incidents = cursor.execute(
+                "SELECT * FROM execution_registered_sim_callback_unknown_incidents "
+                "ORDER BY incident_sequence"
+            )
+            while rows := incidents.fetchmany(256):
+                if deadline is not None:
+                    _require_before_deadline(deadline)
+                for row in rows:
+                    journal_module._callback_unknown_incident_record(row)
     except journal_module.ExecutionDecisionJournalError as error:
         raise ExecutionJournalArchiveError("ARCHIVE_SCHEMA_INCOMPLETE") from error
     finally:
@@ -670,7 +687,11 @@ def verify_execution_journal_archive(
                 raise ExecutionJournalArchiveError("ARCHIVE_FOREIGN_KEY_CHECK_FAILED")
             schema_sha256, tables = _schema_fingerprint(connection)
             _validate_required_schema_objects(
-                connection, version, tables=tables, journal_ports=journal_ports
+                connection,
+                version,
+                tables=tables,
+                journal_ports=journal_ports,
+                deadline=deadline,
             )
             row_counts = _table_row_counts(connection, tables, deadline)
         except ExecutionJournalArchiveError:

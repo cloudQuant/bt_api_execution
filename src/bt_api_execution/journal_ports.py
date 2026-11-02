@@ -14,9 +14,9 @@ This module replaces it with three explicit ``abc.ABC`` ports:
 
 * the SDK depends only on these abstract signatures;
 * the implementing application depends on the SDK, never the reverse;
-* every port carries a ``port_version`` class attribute checked against
-  :data:`JOURNAL_PORT_SCHEMA_VERSION` at injection time, so an old or newer
-  implementation fails closed instead of half-working;
+* every port carries a ``port_version`` class attribute checked against its
+  slot's schema version at injection time, so an old or newer implementation
+  fails closed instead of half-working;
 * implementations are real subclasses, so ``isinstance`` is a genuine boundary
   check rather than a duck-typed guess.
 
@@ -30,23 +30,174 @@ import abc
 from dataclasses import dataclass
 from datetime import datetime
 from types import MappingProxyType
-from typing import Any, ClassVar, Mapping, Optional, Tuple
+from typing import Any, ClassVar, Iterable, Mapping, Optional, Tuple
 
-#: Wire/schema version of the port contract below.  Every injected port must
-#: declare ``port_version`` as exactly this value; anything else is refused by
-#: ``configure_journal_ports`` with ``JOURNAL_PORT_VERSION_UNSUPPORTED``.
+#: Version retained by the fee-pair and registered-sim attestation port slots.
 JOURNAL_PORT_SCHEMA_VERSION = 1
+
+#: Position attribution v3 delegates reads and durable-capacity rows to the
+#: application-owned schema implementation.
+JOURNAL_POSITION_ATTRIBUTION_PORT_SCHEMA_VERSION = 3
 
 #: Port slot names accepted by ``configure_journal_ports`` and reported by the
 #: ``JOURNAL_PORT_INVALID:<name>`` / ``JOURNAL_PORT_UNAVAILABLE:<name>`` codes.
 JOURNAL_PORT_NAMES = ("position_attribution", "fee_pair_facts", "registered_sim_attestation")
 
+_POSITION_CAPABILITY_NAMES = frozenset(
+    {
+        "current_position",
+        "fill",
+        "evidence_issue",
+        "capacity_rows",
+        "capacity_row_size",
+    }
+)
+_POSITION_CAPACITY_ROLES = frozenset({"GRID_HISTORY", "SETTLEMENT"})
+_MAX_POSITION_ROW_SIZE = 9_223_372_036_854_775_807
+
+
+class JournalPositionCapabilityUnavailable(RuntimeError):
+    """One exact position-port capability is not implemented by its owner."""
+
+    def __init__(self, capability: str) -> None:
+        if type(capability) is not str or capability not in _POSITION_CAPABILITY_NAMES:
+            raise ValueError("invalid position capability")
+        self.capability = capability
+        self.code = "JOURNAL_POSITION_CAPABILITY_UNAVAILABLE:" + capability
+        super().__init__(self.code)
+
+
+@dataclass(frozen=True)
+class JournalPositionGridIdentity:
+    """Neutral join key for classifying an owner's eligible grid history."""
+
+    account_scope: str
+    strategy_scope: str
+    cohort_id: str
+    close_time: str
+
+    def __post_init__(self) -> None:
+        if any(
+            type(value) is not str or not value
+            for value in (
+                self.account_scope,
+                self.strategy_scope,
+                self.cohort_id,
+                self.close_time,
+            )
+        ):
+            raise ValueError("invalid position grid identity")
+
+
+@dataclass(frozen=True)
+class JournalPositionCapacityRow:
+    """One owner row's canonical byte size and SDK-neutral accounting role."""
+
+    capacity_role: str
+    row_size_bytes: int
+    grid_identity: Optional[JournalPositionGridIdentity] = None
+
+    def __post_init__(self) -> None:
+        if type(self.capacity_role) is not str or self.capacity_role not in _POSITION_CAPACITY_ROLES:
+            raise ValueError("invalid position capacity role")
+        if type(self.row_size_bytes) is not int or not 1 <= self.row_size_bytes <= _MAX_POSITION_ROW_SIZE:
+            raise ValueError("invalid position capacity row size")
+        if self.capacity_role == "GRID_HISTORY":
+            if type(self.grid_identity) is not JournalPositionGridIdentity:
+                raise ValueError("grid history row requires a grid identity")
+        elif self.grid_identity is not None:
+            raise ValueError("settlement row cannot carry a grid identity")
+
+
+@dataclass(frozen=True)
+class JournalPositionCurrent:
+    """Typed application-owned current-position projection used by the journal."""
+
+    state: str
+    blocker_code: Optional[str]
+    owner_intent_id: Optional[str]
+    owner_strategy_scope: Optional[str]
+    flat_reconciliation_id: Optional[str]
+    flat_checkpoint_ns: Optional[int]
+    last_callback_at_ns: Optional[int]
+    open_quantity: str
+    close_quantity: str
+    open_notional: str
+    opening_fee_unknown_count: int
+    fill_time_unknown_count: int
+
+    def __post_init__(self) -> None:
+        if type(self.state) is not str or not self.state:
+            raise ValueError("invalid current-position state")
+        for value in (
+            self.blocker_code,
+            self.owner_intent_id,
+            self.owner_strategy_scope,
+            self.flat_reconciliation_id,
+        ):
+            if value is not None and (type(value) is not str or not value):
+                raise ValueError("invalid current-position identifier")
+        for value in (self.flat_checkpoint_ns, self.last_callback_at_ns):
+            if value is not None and type(value) is not int:
+                raise ValueError("invalid current-position timestamp")
+        if any(
+            type(value) is not str
+            for value in (self.open_quantity, self.close_quantity, self.open_notional)
+        ):
+            raise ValueError("invalid current-position amount")
+        if any(
+            type(value) is not int or value < 0
+            for value in (self.opening_fee_unknown_count, self.fill_time_unknown_count)
+        ):
+            raise ValueError("invalid current-position count")
+
+
+@dataclass(frozen=True)
+class JournalPositionFill:
+    """Typed application-owned fill projection matched by a journal receipt."""
+
+    intent_id: str
+    strategy_scope: str
+    position_effect: str
+    order_side: str
+    quantity: str
+    price: str
+    fee: Optional[str]
+    filled_at_ns: int
+
+    def __post_init__(self) -> None:
+        for value in (
+            self.intent_id,
+            self.strategy_scope,
+            self.position_effect,
+            self.order_side,
+            self.quantity,
+            self.price,
+        ):
+            if type(value) is not str or not value:
+                raise ValueError("invalid position fill field")
+        if self.fee is not None and type(self.fee) is not str:
+            raise ValueError("invalid position fill fee")
+        if type(self.filled_at_ns) is not int:
+            raise ValueError("invalid position fill timestamp")
+
+
+@dataclass(frozen=True)
+class JournalPositionIssue:
+    """Typed issue blocker associated with an application-owned receipt."""
+
+    blocker_code: str
+
+    def __post_init__(self) -> None:
+        if type(self.blocker_code) is not str or not self.blocker_code:
+            raise ValueError("invalid position issue blocker")
+
 
 class JournalPositionAttributionPort(abc.ABC):
-    """Application-owned strategy position attribution written in-transaction.
+    """Strategy position attribution exposed to the journal in-transaction.
 
-    Implementations own the ``factor_position_*`` tables that live inside the
-    execution journal's own SQLite database.  Every method receives the
+    Implementations may use SDK-owned local attribution storage inside the
+    execution journal's own SQLite database. Every method receives the
     *journal's* live cursor and must write on it inside the caller's
     transaction: the journal neither commits nor rolls back on the
     implementation's behalf, and an implementation failure must abort the whole
@@ -57,7 +208,9 @@ class JournalPositionAttributionPort(abc.ABC):
 
     Invariants an implementation must enforce itself:
 
-    * schema creation/migration and the reported ``expected_schema_version``;
+    * a write-free schema preflight before creation, creation only for an empty
+      owner schema, exact validation of its metadata row, and the reported
+      ``expected_schema_version``;
     * identifier validation of every scope/quantity argument;
     * append-only immutable fill/grid/issue evidence, rejecting identity or
       ordinal collisions instead of silently overwriting;
@@ -77,17 +230,36 @@ class JournalPositionAttributionPort(abc.ABC):
     @property
     @abc.abstractmethod
     def expected_schema_version(self) -> int:
-        """Current schema version an open journal must observe.
+        """Current schema version the implementation validates on its tables.
 
-        The journal compares its durable ``position_book_meta`` row to this
-        value during its capacity migration and rejects a mismatch with
-        ``POSITION_BOOK_SCHEMA_UNAVAILABLE``.  Implementations must return a
-        positive ``int``; the journal no longer hard-codes the number.
+        Implementations must return a positive ``int`` and use this value in
+        ``validate_schema``.  The SDK journal does not interpret the port's
+        metadata table.
+        """
+
+    @abc.abstractmethod
+    def preflight_schema(self, cursor: Any) -> bool:
+        """Return exact ``True`` before writes only for empty/current owned schema.
+
+        ``False`` means existing owner data or schema is not proven compatible
+        with this port version. The journal calls this before ``ensure_schema``
+        so an unsupported legacy schema cannot be silently upgraded or altered.
         """
 
     @abc.abstractmethod
     def ensure_schema(self, cursor: Any) -> None:
-        """Create or migrate the attribution tables on the journal cursor."""
+        """Create the owned attribution schema only after a successful preflight."""
+
+    @abc.abstractmethod
+    def validate_schema(self, cursor: Any) -> bool:
+        """Return exact ``True`` only when owned schema metadata is current.
+
+        The journal passes its active cursor.  Implementations must validate
+        their own metadata table against ``expected_schema_version`` and must
+        not start, commit, or roll back a transaction.  A missing, malformed,
+        or mismatched schema returns ``False``; the journal maps that result to
+        ``POSITION_BOOK_SCHEMA_UNAVAILABLE``.
+        """
 
     @abc.abstractmethod
     def record_grid(
@@ -128,6 +300,57 @@ class JournalPositionAttributionPort(abc.ABC):
         owner_intent_id: str,
     ) -> None:
         """Require a reconciled, positively owned residual before CLOSE prepares."""
+
+    @abc.abstractmethod
+    def read_current_position(
+        self, cursor: Any, *, account_scope: str, instrument: str, exchange: str
+    ) -> Optional[JournalPositionCurrent]:
+        """Read one exact current projection; ``None`` means no matching row.
+
+        Raise :class:`JournalPositionCapabilityUnavailable` when this owner
+        does not store the requested fact family. Do not substitute a different
+        local or provider projection.
+        """
+
+    @abc.abstractmethod
+    def read_fill(
+        self,
+        cursor: Any,
+        *,
+        account_scope: str,
+        instrument: str,
+        exchange: str,
+        execution_id: str,
+    ) -> Optional[JournalPositionFill]:
+        """Read one exact stored fill; ``None`` means no matching row."""
+
+    @abc.abstractmethod
+    def read_evidence_issue(
+        self, cursor: Any, *, receipt_id: str
+    ) -> Optional[JournalPositionIssue]:
+        """Read one receipt issue; ``None`` means no matching issue row."""
+
+    @abc.abstractmethod
+    def iter_capacity_rows(
+        self, cursor: Any
+    ) -> Iterable[JournalPositionCapacityRow]:
+        """Yield every owner row charged during capacity backfill.
+
+        A complete empty iterator is valid only after this port has validated
+        the complete, current owner schema. Raw row/column names never cross the
+        port boundary.
+        """
+
+    @abc.abstractmethod
+    def snapshot_capacity_row_size(
+        self, cursor: Any, *, owner_table_ref: str, key_values: Tuple[Any, ...]
+    ) -> Optional[int]:
+        """Return a keyed owner row's canonical byte size, or ``None`` if absent.
+
+        ``owner_table_ref`` and ``key_values`` are opaque to the SDK. The port
+        validates and interprets them against its own schema and uses the SDK's
+        canonical row-size helper; the SDK never constructs owner SQL.
+        """
 
 
 class JournalFeePairFactsPort(abc.ABC):
@@ -229,6 +452,14 @@ JOURNAL_PORT_TYPES: Mapping[str, type] = MappingProxyType(
     }
 )
 
+_JOURNAL_PORT_SCHEMA_VERSIONS: Mapping[str, int] = MappingProxyType(
+    {
+        "position_attribution": JOURNAL_POSITION_ATTRIBUTION_PORT_SCHEMA_VERSION,
+        "fee_pair_facts": JOURNAL_PORT_SCHEMA_VERSION,
+        "registered_sim_attestation": JOURNAL_PORT_SCHEMA_VERSION,
+    }
+)
+
 
 def validate_journal_port(name: str, port: Any) -> Any:
     """Return *port* when it is a current-version implementation of slot *name*.
@@ -236,7 +467,7 @@ def validate_journal_port(name: str, port: Any) -> Any:
     ``isinstance`` here is a genuine subclass test, not duck typing: an
     application module, a look-alike object, or the abstract class itself is
     refused with ``JOURNAL_PORT_INVALID:<name>``.  ``port_version`` must be an
-    ``int`` equal to :data:`JOURNAL_PORT_SCHEMA_VERSION`; the ABCs carry only an
+    exact ``int`` equal to the version for this slot; the ABCs carry only an
     annotation, so an implementation that forgets to declare it is refused with
     ``JOURNAL_PORT_VERSION_UNSUPPORTED`` instead of inheriting a permissive
     default.
@@ -249,7 +480,8 @@ def validate_journal_port(name: str, port: Any) -> Any:
     if not isinstance(port, JOURNAL_PORT_TYPES[name]):
         raise ExecutionDecisionJournalError("JOURNAL_PORT_INVALID:" + name)
     declared_version = getattr(type(port), "port_version", None)
-    if type(declared_version) is not int or declared_version != JOURNAL_PORT_SCHEMA_VERSION:
+    expected_version = _JOURNAL_PORT_SCHEMA_VERSIONS[name]
+    if type(declared_version) is not int or declared_version != expected_version:
         raise ExecutionDecisionJournalError("JOURNAL_PORT_VERSION_UNSUPPORTED")
     return port
 
@@ -318,12 +550,19 @@ class JournalPorts:
 
 __all__ = [
     "JOURNAL_PORT_NAMES",
+    "JOURNAL_POSITION_ATTRIBUTION_PORT_SCHEMA_VERSION",
     "JOURNAL_PORT_SCHEMA_VERSION",
     "JOURNAL_PORT_TYPES",
     "AttestedCtpOrderIdentityQuery",
     "JournalFeePairFactsPort",
     "JournalPorts",
     "JournalPositionAttributionPort",
+    "JournalPositionCapabilityUnavailable",
+    "JournalPositionCapacityRow",
+    "JournalPositionCurrent",
+    "JournalPositionFill",
+    "JournalPositionGridIdentity",
+    "JournalPositionIssue",
     "JournalRegisteredSimAttestationPort",
     "validate_journal_port",
 ]

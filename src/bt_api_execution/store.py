@@ -8408,143 +8408,25 @@ class SqliteExecutionStore:
             self._ctp_callback_ingress_record_types[owner_handle.owner_intent_id] = record_type
 
     @staticmethod
-    def _ctp_callback_payload_from_record(
-        record: Any, *, expected_record_type: type
-    ) -> tuple[dict[str, Any], str, str]:
-        """Validate the immutable callback snapshot without importing the SDK."""
+    def _ctp_callback_payload_from_record(record: Any, *, expected_record_type: type) -> tuple[dict[str, Any], str, str]:
+        from bt_api_ctp.callback_ingress_projection import callback_payload_from_record
 
-        if type(expected_record_type) is not type or type(record) is not expected_record_type:
-            raise ContractValidationError("typed CTP callback ingress record is required")
-        to_payload = getattr(record, "to_payload", None)
-        if not callable(to_payload):
-            raise ContractValidationError("typed CTP callback ingress record is malformed")
-        try:
-            payload = to_payload()
-            if type(payload) is not dict:
-                raise ValueError
-            expected = {
-                "schema",
-                "owner_intent_id",
-                "callback_name",
-                "callback_class",
-                "phase",
-                "source_instance_id",
-                "native_client_epoch",
-                "native_api_source_id",
-                "native_spi_source_id",
-                "native_api_generation",
-                "source_connection_generation",
-                "connection_generation",
-                "sequence",
-                "monotonic_ns",
-                "named_args",
-                "flattened_fields",
-                "capture_complete",
-                "missing_getters",
-                "digest",
-            }
-            if set(payload) != expected or payload["schema"] != "ctp_trader_callback_ingress.v2":
-                raise ValueError
-            digest = payload["digest"]
-            if not _is_sha256(digest):
-                raise ValueError
-            unsigned = dict(payload)
-            del unsigned["digest"]
-            digest_bytes = json.dumps(
-                unsigned,
-                sort_keys=True,
-                separators=(",", ":"),
-                ensure_ascii=False,
-                allow_nan=False,
-            ).encode("utf-8")
-            if hashlib.sha256(digest_bytes).hexdigest() != digest:
-                raise ValueError
-            canonical_bytes = json.dumps(
-                payload,
-                sort_keys=True,
-                separators=(",", ":"),
-                ensure_ascii=False,
-                allow_nan=False,
-            ).encode("utf-8")
-            if len(canonical_bytes) > 32 * 1024:
-                raise ValueError
-            if (
-                payload["capture_complete"] is not True
-                or payload["missing_getters"] != []
-                or type(payload["sequence"]) is not int
-                or payload["sequence"] <= 0
-                or type(payload["monotonic_ns"]) is not int
-                or payload["monotonic_ns"] <= 0
-                or type(payload["native_api_generation"]) is not int
-                or payload["native_api_generation"] <= 0
-                or type(payload["source_connection_generation"]) is not int
-                or payload["source_connection_generation"] < 0
-                or type(payload["connection_generation"]) is not int
-                or payload["connection_generation"] < 0
-                or type(payload["named_args"]) is not list
-                or type(payload["flattened_fields"]) is not list
-            ):
-                raise ValueError
-            for key in (
-                "owner_intent_id",
-                "callback_name",
-                "callback_class",
-                "phase",
-                "source_instance_id",
-                "native_client_epoch",
-                "native_api_source_id",
-                "native_spi_source_id",
-            ):
-                if type(payload[key]) is not str or not payload[key] or len(payload[key]) > 128:
-                    raise ValueError
-            if payload["callback_class"] not in {
-                "PRE_LOGIN",
-                "ROUTEABLE",
-                "AUDIT_QUERY",
-                "AUDIT_INFORMATIONAL",
-                "LIFECYCLE_POISON",
-                "UNSUPPORTED_FINANCIAL",
-            }:
-                raise ValueError
-            if payload["phase"] not in {"PRE_LOGIN", "ACTIVE", "POISONED"}:
-                raise ValueError
-            # The SDK snapshot format is scalar-only. Recanonicalization also
-            # rejects arbitrary objects, bytes, non-finite floats and NaN.
-            encoded = json.dumps(
-                payload,
-                sort_keys=True,
-                separators=(",", ":"),
-                ensure_ascii=False,
-                allow_nan=False,
-            )
-            self_digest = str(digest)
-            return payload, encoded, self_digest
-        except (AttributeError, TypeError, ValueError, KeyError, UnicodeError):
-            raise ContractValidationError("CTP callback ingress record is invalid") from None
+        return callback_payload_from_record(
+            record, expected_record_type=expected_record_type,
+            _is_sha256=_is_sha256, ContractValidationError=ContractValidationError,
+        )
 
     @staticmethod
     def _ctp_callback_field(payload: Mapping[str, Any], argument_slot: int, field_name: str) -> Any:
-        for item in payload["flattened_fields"]:
-            if (
-                type(item) is dict
-                and item.get("argument_slot") == argument_slot
-                and item.get("field_name") == field_name
-            ):
-                if item.get("present") is not True or item.get("scalar_captured") is not True:
-                    return None
-                return item.get("value")
-        return None
+        from bt_api_ctp.callback_ingress_projection import callback_field
+
+        return callback_field(payload, argument_slot, field_name)
 
     @staticmethod
     def _ctp_callback_named_arg(payload: Mapping[str, Any], slot: int) -> Any:
-        if slot < 0 or slot >= len(payload["named_args"]):
-            return None
-        item = payload["named_args"][slot]
-        if type(item) is not dict or item.get("present") is not True:
-            return None
-        if item.get("scalar_captured") is not True:
-            return None
-        return item.get("value")
+        from bt_api_ctp.callback_ingress_projection import callback_named_arg
+
+        return callback_named_arg(payload, slot)
 
     def append_ctp_callback_ingress(
         self,
@@ -12945,6 +12827,55 @@ class SqliteExecutionStore:
                 raise DurableStoreError("unable to read CTP order identity") from error
         return None if row is None else self._ctp_order_identity_from_row(row)
 
+    def read_ctp_order_identity_by_order_ref(
+        self,
+        scope: ExecutionScope,
+        order_ref: str,
+    ) -> CtpOrderIdentityReservation | None:
+        """Resolve one native OrderRef only inside the exact durable scope.
+
+        The reverse index is read-only and account-wide uniqueness is enforced
+        by the existing reservation table. A row owned by another trading day
+        or scope is deliberately indistinguishable from an absent mapping.
+        The returned DTO remains SDK-internal; callers must not expose its
+        native ``order_ref`` to the neutral API.
+        """
+
+        account_key, trading_day, scope_key = self._validate_ctp_order_identity_scope(scope)
+        if (
+            type(order_ref) is not str
+            or len(order_ref) != 12
+            or not order_ref.isascii()
+            or not order_ref.isdigit()
+        ):
+            raise ContractValidationError("invalid CTP order reference")
+        with self._lock:
+            try:
+                with self._read_transaction() as cursor:
+                    self._assert_store_scope_binding(cursor, scope)
+                    row = cursor.execute(
+                        """SELECT account_key, trading_day, scope_key, managed_intent_id,
+                                  runtime_order_id, order_ref, created_at_ns
+                           FROM ctp_order_identity_reservations
+                           WHERE account_key=? AND order_ref=?""",
+                        (account_key, order_ref),
+                    ).fetchone()
+            except sqlite3.Error as error:
+                raise DurableStoreError(
+                    "unable to read CTP order identity by native reference"
+                ) from error
+        if row is None:
+            return None
+        identity = self._ctp_order_identity_from_row(row)
+        if (
+            identity.account_key != account_key
+            or identity.trading_day != trading_day
+            or identity.scope_key != scope_key
+            or identity.order_ref != order_ref
+        ):
+            return None
+        return identity
+
     @staticmethod
     def _ctp_order_target_projection_from_payload(
         payload: Any,
@@ -12999,29 +12930,6 @@ class SqliteExecutionStore:
             or reservation.trading_day != scope.trading_day
         ):
             raise ContractValidationError("verified CTP order target differs from I9 reservation")
-
-    @staticmethod
-    def _ctp_query_named_scalar(
-        payload: Mapping[str, Any], slot: int, expected_name: str
-    ) -> Any:
-        named = payload.get("named_args")
-        if type(named) is not list:
-            raise ContractValidationError("CTP query callback arguments are not captured")
-        matches = [
-            item
-            for item in named
-            if isinstance(item, dict) and item.get("argument_slot") == slot
-        ]
-        if len(matches) != 1:
-            raise ContractValidationError("CTP query callback argument slot is ambiguous")
-        item = matches[0]
-        if (
-            item.get("name") != expected_name
-            or item.get("present") is not True
-            or item.get("scalar_captured") is not True
-        ):
-            raise ContractValidationError("CTP query callback argument is incomplete")
-        return item.get("value")
 
     @staticmethod
     def _ctp_position_window_from_row(
@@ -13381,8 +13289,14 @@ class SqliteExecutionStore:
             terminal_flags: list[bool] = []
             position_payloads: list[dict[str, Any]] = []
             for source_row, payload, _ in query_events:
-                request_id_value = self._ctp_query_named_scalar(payload, 2, "nRequestID")
-                terminal = self._ctp_query_named_scalar(payload, 3, "bIsLast")
+                from bt_api_ctp.callback_ingress_projection import query_named_scalar
+
+                request_id_value = query_named_scalar(
+                    payload, 2, "nRequestID", error_type=ContractValidationError
+                )
+                terminal = query_named_scalar(
+                    payload, 3, "bIsLast", error_type=ContractValidationError
+                )
                 error_id = self._ctp_callback_field(payload, 1, "ErrorID")
                 if (
                     request_id_value != request_id
@@ -14090,8 +14004,14 @@ class SqliteExecutionStore:
                     or canonical_json(payload) != payload_json
                 ):
                     raise ContractValidationError("CTP callback window is not one exact query")
-                request_id = self._ctp_query_named_scalar(payload, 2, "nRequestID")
-                is_last = self._ctp_query_named_scalar(payload, 3, "bIsLast")
+                from bt_api_ctp.callback_ingress_projection import query_named_scalar
+
+                request_id = query_named_scalar(
+                    payload, 2, "nRequestID", error_type=ContractValidationError
+                )
+                is_last = query_named_scalar(
+                    payload, 3, "bIsLast", error_type=ContractValidationError
+                )
                 first_arg = payload.get("named_args")
                 first_arg = (
                     first_arg[0]
@@ -15037,7 +14957,12 @@ class SqliteExecutionStore:
             if (
                 payload.get("digest") != str(row["record_digest_sha256"])
                 or payload.get("sequence") != sequence
-                or self._ctp_query_named_scalar(payload, 2, "nRequestID")
+            ):
+                raise ContractValidationError("CTP query provenance request binding changed")
+            from bt_api_ctp.callback_ingress_projection import query_named_scalar
+
+            if (
+                query_named_scalar(payload, 2, "nRequestID", error_type=ContractValidationError)
                 != provenance.query_request_id
             ):
                 raise ContractValidationError("CTP query provenance request binding changed")
@@ -15779,53 +15704,11 @@ class SqliteExecutionStore:
         if type(target) is not CtpCancelTarget:
             raise ContractValidationError("CANCEL requires a typed exact CTP target")
         cls._validate_ctp_order_ref(target.order_ref, "cancel target OrderRef")
-        if (
-            not isinstance(target.exchange_id, str)
-            or not target.exchange_id
-            or len(target.exchange_id) > 9
-            or not target.exchange_id.isascii()
-            or not target.exchange_id.isalnum()
-            or not isinstance(target.order_sys_id, str)
-            or not target.order_sys_id
-            or len(target.order_sys_id) > 21
-            or not target.order_sys_id.isascii()
-            or target.order_sys_id != target.order_sys_id.strip()
-            or type(target.front_id) is not int
-            or target.front_id <= 0
-            or type(target.session_id) is not int
-            or target.session_id <= 0
-        ):
-            raise ContractValidationError("invalid exact CTP cancel target")
-        expected = {
-            "OrderRef": target.order_ref,
-            "ExchangeID": target.exchange_id,
-            "OrderSysID": target.order_sys_id,
-            "FrontID": target.front_id,
-            "SessionID": target.session_id,
-        }
-        for key, value in expected.items():
-            if key not in request_payload or type(request_payload[key]) is not type(value):
-                raise ContractValidationError("CTP cancel request lacks exact target echo: " + key)
-            if request_payload[key] != value:
-                raise ContractValidationError("CTP cancel request target mismatch: " + key)
-        # CTP encodes delete as '0' and modify as '3'. A command whose
-        # operation is CANCEL must never carry the valid modify action.
-        if (
-            type(request_payload.get("ActionFlag")) is not str
-            or request_payload["ActionFlag"] != "0"
-        ):
-            raise ContractValidationError(
-                "CTP cancel request requires native delete ActionFlag '0'"
-            )
-        # These fields on CThostFtdcInputOrderActionField are meaningful for
-        # modify actions. Leave them at their native zero defaults for deletes.
-        limit_price = request_payload.get("LimitPrice", 0.0)
-        if type(limit_price) not in (int, float) or limit_price != 0:
-            raise ContractValidationError("CTP cancel request must not change LimitPrice")
-        volume_change = request_payload.get("VolumeChange", 0)
-        if type(volume_change) is not int or volume_change != 0:
-            raise ContractValidationError("CTP cancel request must not change VolumeChange")
-        return target
+        from bt_api_ctp.cancel_target_projection import validate_ctp_cancel_target_fields
+
+        return validate_ctp_cancel_target_fields(
+            target, request_payload, error_type=ContractValidationError
+        )
 
     def record_ctp_order_ref_seed(
         self,
@@ -16523,44 +16406,6 @@ class SqliteExecutionStore:
             if name != "_store_seal"
         }
 
-    @staticmethod
-    def _ctp_window_field_value(position: Mapping[str, Any], name: str) -> Any:
-        fields = position.get("fields")
-        if not isinstance(fields, Mapping):
-            raise ContractValidationError("stored CTP position fields are unavailable")
-        field = fields.get(name)
-        if not isinstance(field, Mapping) or field.get("state") != "value":
-            raise ContractValidationError("stored CTP position field is not known")
-        return field.get("value")
-
-    @classmethod
-    def _ctp_position_window_instrument_rows(
-        cls, window: CtpPositionEvidenceWindowRow, instrument: str
-    ) -> tuple[Mapping[str, Any], ...]:
-        matching: list[Mapping[str, Any]] = []
-        for position in window.positions:
-            if not isinstance(position, Mapping) or position.get("errors") not in ([], ()):
-                raise ContractValidationError("stored CTP position row is incomplete")
-            instrument_id = cls._ctp_window_field_value(position, "InstrumentID")
-            if type(instrument_id) is not str or not instrument_id:
-                raise ContractValidationError("stored CTP position instrument is invalid")
-            if instrument_id != instrument:
-                continue
-            total = cls._ctp_window_field_value(position, "Position")
-            today = cls._ctp_window_field_value(position, "TodayPosition")
-            yesterday = cls._ctp_window_field_value(position, "YdPosition")
-            direction = cls._ctp_window_field_value(position, "PosiDirection")
-            hedge = cls._ctp_window_field_value(position, "HedgeFlag")
-            if (
-                any(type(value) is not int or value < 0 for value in (total, today, yesterday))
-                or total != today + yesterday
-                or direction not in {"2", "3"}
-                or type(hedge) is not str
-            ):
-                raise ContractValidationError("stored CTP position quantities are invalid")
-            matching.append(position)
-        return tuple(matching)
-
     def _require_ctp_position_baseline_authorization(
         self,
         cursor: sqlite3.Cursor,
@@ -16744,10 +16589,18 @@ class SqliteExecutionStore:
             or str(reservation["order_ref"]) != authorization.order_ref
         ):
             raise ContractValidationError("position baseline OrderRef reservation changed")
-        if self._ctp_position_window_instrument_rows(window, intent.instrument):
-            for position in self._ctp_position_window_instrument_rows(window, intent.instrument):
+        from bt_api_ctp.position_window_projection import (
+            ctp_position_window_instrument_rows, ctp_window_field_value,
+        )
+
+        if ctp_position_window_instrument_rows(
+            window.positions, intent.instrument, error_type=ContractValidationError
+        ):
+            for position in ctp_position_window_instrument_rows(
+                window.positions, intent.instrument, error_type=ContractValidationError
+            ):
                 if any(
-                    self._ctp_window_field_value(position, name) != 0
+                    ctp_window_field_value(position, name, error_type=ContractValidationError) != 0
                     for name in ("Position", "TodayPosition", "YdPosition")
                 ):
                     raise InvalidStateTransition("pre-submit position baseline is not flat")
@@ -17050,10 +16903,18 @@ class SqliteExecutionStore:
             ).fetchone()
             if unresolved_ctp is not None:
                 raise InvalidStateTransition("unresolved CTP command blocks baseline authorization")
-            if self._ctp_position_window_instrument_rows(window, intent.instrument):
-                for position in self._ctp_position_window_instrument_rows(window, intent.instrument):
+            from bt_api_ctp.position_window_projection import (
+                ctp_position_window_instrument_rows, ctp_window_field_value,
+            )
+
+            if ctp_position_window_instrument_rows(
+                window.positions, intent.instrument, error_type=ContractValidationError
+            ):
+                for position in ctp_position_window_instrument_rows(
+                    window.positions, intent.instrument, error_type=ContractValidationError
+                ):
                     if any(
-                        self._ctp_window_field_value(position, name) != 0
+                        ctp_window_field_value(position, name, error_type=ContractValidationError) != 0
                         for name in ("Position", "TodayPosition", "YdPosition")
                     ):
                         raise InvalidStateTransition("pre-submit baseline is not flat for OPEN instrument")
@@ -17461,11 +17322,15 @@ class SqliteExecutionStore:
             or baseline.created_at_ns >= window.created_at_ns
         ):
             raise InvalidStateTransition("recovery baseline window provenance changed")
-        for position in self._ctp_position_window_instrument_rows(
-            baseline, parent_order_intent.instrument
+        from bt_api_ctp.position_window_projection import (
+            ctp_position_window_instrument_rows, ctp_window_field_value,
+        )
+
+        for position in ctp_position_window_instrument_rows(
+            baseline.positions, parent_order_intent.instrument, error_type=ContractValidationError
         ):
             if any(
-                self._ctp_window_field_value(position, field_name) != 0
+                ctp_window_field_value(position, field_name, error_type=ContractValidationError) != 0
                 for field_name in ("Position", "TodayPosition", "YdPosition")
             ):
                 raise InvalidStateTransition("recovery source OPEN baseline was not flat")
@@ -17588,16 +17453,22 @@ class SqliteExecutionStore:
             raise InvalidStateTransition("parent Risk position side differs from its CTP OPEN")
         if parent_permit.position_bucket not in {"ALL", "TODAY", "YESTERDAY"}:
             raise InvalidStateTransition("parent Risk position bucket is invalid")
-        positions = self._ctp_position_window_instrument_rows(window, parent_order_intent.instrument)
+        positions = ctp_position_window_instrument_rows(
+            window.positions, parent_order_intent.instrument, error_type=ContractValidationError
+        )
         if not positions:
             raise InvalidStateTransition("fresh CTP recovery position query has no parent instrument")
         selected: dict[str, int] = {"TODAY": 0, "YESTERDAY": 0}
         instrument_total = 0
         for position in positions:
-            row_direction = self._ctp_window_field_value(position, "PosiDirection")
-            hedge = self._ctp_window_field_value(position, "HedgeFlag")
-            position_date = self._ctp_window_field_value(position, "PositionDate")
-            amount = self._ctp_window_field_value(position, "Position")
+            row_direction = ctp_window_field_value(
+                position, "PosiDirection", error_type=ContractValidationError
+            )
+            hedge = ctp_window_field_value(position, "HedgeFlag", error_type=ContractValidationError)
+            position_date = ctp_window_field_value(
+                position, "PositionDate", error_type=ContractValidationError
+            )
+            amount = ctp_window_field_value(position, "Position", error_type=ContractValidationError)
             if (
                 row_direction not in {"2", "3"}
                 or hedge != request_hedge

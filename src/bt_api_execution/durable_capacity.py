@@ -18,6 +18,8 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Iterator, Optional, Tuple
 
+from .journal_ports import JournalPositionCapabilityUnavailable
+
 
 _MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
 _CAPACITY_CLASSES = ("BASE", "SETTLEMENT")
@@ -61,36 +63,13 @@ _DURABLE_ROW_KEYS = {
     "execution_registered_sim_cancel_dispatch_claims": ("cancel_intent_id",),
     "execution_registered_sim_cancel_dispatch_tombstones": ("cancel_intent_id",),
     "execution_decision_callbacks": ("receipt_id",),
+    "execution_registered_sim_callback_unknown_incidents": ("incident_id",),
     "execution_instrument_owners": ("account_scope", "instrument"),
     "execution_intent_resolutions": ("intent_id",),
     "execution_intent_reconciliations": ("reconciliation_id",),
     "execution_callback_query_dispositions": ("native_receipt_id",),
     "execution_intent_abandonments": ("abandonment_id",),
     "execution_slot_abandonments": ("abandonment_id",),
-    "factor_position_grid_history": (
-        "account_scope",
-        "strategy_scope",
-        "cohort_id",
-        "ordinal",
-    ),
-    "factor_position_openings": ("intent_id",),
-    "factor_position_fills": ("account_scope", "instrument", "exchange", "execution_id"),
-    "factor_position_evidence_issues": ("receipt_id",),
-    "factor_position_dated_trade_facts": (
-        "account_scope",
-        "instrument",
-        "exchange",
-        "execution_id",
-    ),
-    "factor_position_current": ("account_scope", "instrument", "exchange"),
-    "factor_position_active_issues": ("account_scope", "instrument", "exchange_key"),
-    "factor_position_fill_attributes": (
-        "account_scope",
-        "instrument",
-        "exchange",
-        "execution_id",
-    ),
-    "factor_position_open_intent_totals": ("intent_id",),
 }
 
 DEFAULT_MAX_DURABLE_BASE_RECORDS = 500_000
@@ -179,6 +158,33 @@ class DurableCapacityCharge:
         return cls(settlement_records=records, settlement_bytes=byte_growth)
 
     @classmethod
+    def for_row_size_change(
+        cls,
+        capacity_class: str,
+        before_size: Optional[int],
+        after_size: Optional[int],
+    ) -> DurableCapacityCharge:
+        """Measure a row whose owner exposes only its canonical byte size."""
+
+        if capacity_class not in _CAPACITY_CLASSES:
+            raise DurableCapacityError("INVALID_DURABLE_CAPACITY_CLASS")
+        for size in (before_size, after_size):
+            if size is not None and (
+                type(size) is not int or not 1 <= size <= _MAX_SQLITE_INTEGER
+            ):
+                raise DurableCapacityError("DURABLE_ROW_VALUE_INVALID")
+        records = 0
+        byte_growth = 0
+        if before_size is None and after_size is not None:
+            records = 1
+            byte_growth = after_size
+        elif before_size is not None and after_size is not None:
+            byte_growth = max(0, after_size - before_size)
+        if capacity_class == "BASE":
+            return cls(base_records=records, base_bytes=byte_growth)
+        return cls(settlement_records=records, settlement_bytes=byte_growth)
+
+    @classmethod
     def combine(cls, *charges: DurableCapacityCharge) -> DurableCapacityCharge:
         """Combine row changes so each capacity class is written at most once."""
 
@@ -205,9 +211,15 @@ class DurableCapacityUsage:
 class DurableCapacityRecorder:
     """Collect explicit row changes for one journal write transaction."""
 
-    def __init__(self, connection: sqlite3.Connection, limits: DurableCapacityLimits) -> None:
+    def __init__(
+        self,
+        connection: sqlite3.Connection,
+        limits: DurableCapacityLimits,
+        position_attribution: Any = None,
+    ) -> None:
         self.connection = connection
         self.limits = limits
+        self.position_attribution = position_attribution
         self.charge = DurableCapacityCharge()
         self.active = True
 
@@ -219,10 +231,27 @@ class DurableCapacityRecorder:
             DurableCapacityCharge.for_row_change(capacity_class, before, after),
         )
 
+    def add_sizes(
+        self,
+        capacity_class: str,
+        before_size: Optional[int],
+        after_size: Optional[int],
+    ) -> None:
+        if not self.active:
+            raise DurableCapacityError("DURABLE_CAPACITY_TRANSACTION_REQUIRED")
+        self.charge = DurableCapacityCharge.combine(
+            self.charge,
+            DurableCapacityCharge.for_row_size_change(
+                capacity_class, before_size, after_size
+            ),
+        )
+
 
 @contextmanager
 def durable_capacity_transaction(
-    cursor: sqlite3.Cursor, limits: DurableCapacityLimits
+    cursor: sqlite3.Cursor,
+    limits: DurableCapacityLimits,
+    position_attribution: Any = None,
 ) -> Iterator[DurableCapacityRecorder]:
     """Bind a transaction-local recorder and charge its aggregate before commit."""
 
@@ -235,7 +264,7 @@ def durable_capacity_transaction(
     active = _ACTIVE_RECORDER.get()
     if active is not None and active.active and active.connection is cursor.connection:
         raise DurableCapacityError("DURABLE_CAPACITY_TRANSACTION_NESTED")
-    recorder = DurableCapacityRecorder(cursor.connection, limits)
+    recorder = DurableCapacityRecorder(cursor.connection, limits, position_attribution)
     token = _ACTIVE_RECORDER.set(recorder)
     try:
         yield recorder
@@ -252,16 +281,15 @@ def durable_capacity_transaction(
 @contextmanager
 def track_durable_row_change(
     cursor: sqlite3.Cursor,
-    table: str,
+    owner_table_ref: str,
     key_values: tuple[Any, ...],
     capacity_class: str,
 ) -> Iterator[None]:
-    """Measure one explicit keyed payload-row write without parsing its SQL."""
+    """Measure one keyed row without interpreting application-owned schema."""
 
     if not isinstance(cursor, sqlite3.Cursor) or not cursor.connection.in_transaction:
         raise DurableCapacityError("DURABLE_CAPACITY_TRANSACTION_REQUIRED")
-    key_columns = _DURABLE_ROW_KEYS.get(table)
-    if key_columns is None or len(key_values) != len(key_columns):
+    if type(owner_table_ref) is not str or not owner_table_ref or type(key_values) is not tuple:
         raise DurableCapacityError("DURABLE_ROW_KEY_INVALID")
     if capacity_class not in _CAPACITY_CLASSES:
         raise DurableCapacityError("INVALID_DURABLE_CAPACITY_CLASS")
@@ -277,6 +305,37 @@ def track_durable_row_change(
         yield
         return
 
+    key_columns = _DURABLE_ROW_KEYS.get(owner_table_ref)
+    if key_columns is None:
+        position_attribution = recorder.position_attribution
+        if position_attribution is None:
+            raise DurableCapacityError("JOURNAL_PORT_UNAVAILABLE:position_attribution")
+
+        def owner_row_size() -> Optional[int]:
+            try:
+                size = position_attribution.snapshot_capacity_row_size(
+                    cursor, owner_table_ref=owner_table_ref, key_values=key_values
+                )
+            except JournalPositionCapabilityUnavailable as error:
+                raise DurableCapacityError(error.code) from error
+            if size is not None and (
+                type(size) is not int or not 1 <= size <= _MAX_SQLITE_INTEGER
+            ):
+                raise DurableCapacityError("DURABLE_ROW_VALUE_INVALID")
+            return size
+
+        before_size = owner_row_size()
+        try:
+            yield
+        except BaseException:
+            raise
+        else:
+            recorder.add_sizes(capacity_class, before_size, owner_row_size())
+        return
+
+    if type(key_values) is not tuple or len(key_values) != len(key_columns):
+        raise DurableCapacityError("DURABLE_ROW_KEY_INVALID")
+
     predicate = " AND ".join("{}=?".format(column) for column in key_columns)
 
     def snapshot() -> Any:
@@ -285,7 +344,7 @@ def track_durable_row_change(
         read_cursor = cursor.connection.cursor()
         try:
             return read_cursor.execute(
-                "SELECT * FROM {} WHERE {}".format(table, predicate), key_values
+                "SELECT * FROM {} WHERE {}".format(owner_table_ref, predicate), key_values
             ).fetchone()
         finally:
             read_cursor.close()
@@ -321,6 +380,12 @@ def canonical_sql_row_bytes(row: Any) -> bytes:
         raise
     except (KeyError, TypeError, ValueError, OverflowError) as error:
         raise DurableCapacityError("DURABLE_ROW_VALUE_INVALID") from error
+
+
+def canonical_sql_row_size(row: Any) -> int:
+    """Return the SDK canonical serialized size without exposing row columns."""
+
+    return len(canonical_sql_row_bytes(row))
     return payload.encode("utf-8")
 
 
@@ -570,6 +635,7 @@ __all__ = [
     "DurableCapacityLimits",
     "DurableCapacityUsage",
     "canonical_sql_row_bytes",
+    "canonical_sql_row_size",
     "charge_durable_capacity",
     "durable_capacity_transaction",
     "ensure_durable_capacity_usage_schema",

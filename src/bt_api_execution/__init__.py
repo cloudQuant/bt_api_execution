@@ -132,17 +132,6 @@ from .contracts import (
     order_intent_from_payload,
     payload_sha256,
 )
-from .ctp_callback_ledger_adapter import CtpNativeCallbackLedgerAdapter
-from .ctp_callback_session import (
-    CtpCallbackIngressAuditResultV1,
-    CtpCallbackSessionIngressSink,
-    CtpCallbackSessionStoreAdapter,
-)
-from .ctp_callback_source_bridge import (
-    CtpLifecycleBoundNativeCallbackEnvelope,
-    CtpNativeCallbackSourceBridge,
-    ctp_native_callback_source_facts,
-)
 from .ctp_native_callbacks import (
     CtpNativeCallbackEnvelope,
     CtpNativeSessionContext,
@@ -579,3 +568,26 @@ __all__ = [
     "writer_lease_fingerprint",
     "require_ctp_dispatch_callback_match",
 ]
+
+
+# CTP integration is optional and loaded only when its named export is used.
+_CTP_PROVIDER_EXPORTS = {
+    "CtpNativeCallbackLedgerAdapter": "ctp_callback_ledger_adapter",
+    "CtpCallbackIngressAuditResultV1": "ctp_callback_session",
+    "CtpCallbackSessionIngressSink": "ctp_callback_session",
+    "CtpCallbackSessionStoreAdapter": "ctp_callback_session",
+    "CtpLifecycleBoundNativeCallbackEnvelope": "ctp_callback_source_bridge",
+    "CtpNativeCallbackSourceBridge": "ctp_callback_source_bridge",
+    "ctp_native_callback_source_facts": "ctp_callback_source_bridge",
+}
+
+
+def __getattr__(name):
+    module_name = _CTP_PROVIDER_EXPORTS.get(name)
+    if module_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    from importlib import import_module
+
+    value = getattr(import_module("bt_api_ctp." + module_name), name)
+    globals()[name] = value
+    return value
