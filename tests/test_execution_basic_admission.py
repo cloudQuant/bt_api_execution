@@ -978,7 +978,7 @@ def test_schema_v20_migration_adds_nullable_basic_admission_binding_columns(tmp_
                 "PRAGMA table_info(execution_records)"
             ).fetchall()
         }
-        assert version == "24"
+        assert version == str(SqliteExecutionStore._SCHEMA_VERSION)
         assert {"basic_admission_reference", "admission_context_sha256"}.issubset(columns)
         assert record is not None and record.state is ExecutionState.PENDING_DISPATCH
         assert record.permit_reference == "risk-permit-migration"

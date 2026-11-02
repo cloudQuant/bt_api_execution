@@ -1593,7 +1593,7 @@ def test_v11_resolved_guard_migrates_to_permanent_fence_and_stays_after_reopen(t
         version = migrated._connection.execute(
             "SELECT value FROM execution_meta WHERE key = 'schema_version'"
         ).fetchone()["value"]
-        assert version == "24"
+        assert version == str(SqliteExecutionStore._SCHEMA_VERSION)
         assert migrated.read_ctp_dispatch_command(bound.scope, bound.command_id).status == (
             "COMPLETED"
         )
@@ -1681,7 +1681,7 @@ def test_v12_permanent_fence_and_projectionless_cancel_migrate_to_v19(tmp_path):
             migrated._connection.execute(
                 "SELECT value FROM execution_meta WHERE key = 'schema_version'"
             ).fetchone()[0]
-            == "24"
+            == str(SqliteExecutionStore._SCHEMA_VERSION)
         )
         command = migrated.read_ctp_dispatch_command(bound.scope, bound.command_id)
         assert command is not None

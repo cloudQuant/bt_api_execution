@@ -79,7 +79,7 @@ def test_v2_execution_store_adds_nullable_cumulative_commission_column(tmp_path)
             "SELECT value FROM execution_meta WHERE key = 'schema_version'"
         ).fetchone()["value"]
         assert "cumulative_commission" in columns
-        assert version == "24"
+        assert version == str(SqliteExecutionStore._SCHEMA_VERSION)
     finally:
         store.close()
 
@@ -110,7 +110,7 @@ def test_v3_execution_store_adds_ctp_order_identity_reservations(tmp_path) -> No
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-        assert version == "24"
+        assert version == str(SqliteExecutionStore._SCHEMA_VERSION)
         assert "ctp_order_identity_reservations" in tables
         assert "ctp_dispatch_commands" in tables
         assert "ctp_dispatch_authority_uses" in tables
@@ -146,7 +146,7 @@ def test_v10_execution_store_adds_callback_lifecycle_fence_schema(tmp_path) -> N
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-        assert version == "24"
+        assert version == str(SqliteExecutionStore._SCHEMA_VERSION)
         assert "ctp_dispatch_callback_source_lifecycle_fences" in tables
         assert "ctp_dispatch_callback_ingestion_resolutions" not in tables
         assert "ctp_order_target_projections" in tables
@@ -203,7 +203,7 @@ def test_v10_execution_store_migrates_immutable_cancel_target_projection_tables(
                 "SELECT name FROM sqlite_master WHERE type = 'trigger'"
             ).fetchall()
         }
-        assert version == "24"
+        assert version == str(SqliteExecutionStore._SCHEMA_VERSION)
         assert {
             "ctp_order_target_projections",
             "ctp_order_target_projection_consumptions",
@@ -242,7 +242,7 @@ def test_v11_projection_lineage_migrates_without_inventing_callback_fence(tmp_pa
             migrated._connection.execute(
                 "SELECT value FROM execution_meta WHERE key = 'schema_version'"
             ).fetchone()[0]
-            == "24"
+            == str(SqliteExecutionStore._SCHEMA_VERSION)
         )
         tables = {
             str(row["name"])
@@ -270,7 +270,7 @@ def test_v11_projection_lineage_migrates_without_inventing_callback_fence(tmp_pa
             reopened._connection.execute(
                 "SELECT value FROM execution_meta WHERE key = 'schema_version'"
             ).fetchone()[0]
-            == "24"
+            == str(SqliteExecutionStore._SCHEMA_VERSION)
         )
         assert (
             reopened._connection.execute(

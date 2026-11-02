@@ -1006,7 +1006,7 @@ def test_v22_store_migration_adds_financial_schema_without_changing_journal(tmp_
             schema_version = connection.execute(
                 "SELECT value FROM execution_meta WHERE key = 'schema_version'"
             ).fetchone()[0]
-            assert schema_version == "24"
+            assert schema_version == str(SqliteExecutionStore._SCHEMA_VERSION)
             tables = {
                 row[0]
                 for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")

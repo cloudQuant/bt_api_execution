@@ -2261,7 +2261,7 @@ def test_v17_upgrade_preserves_possibly_sent_cancel_as_pending_postcondition(tmp
             upgraded._connection.execute(
                 "SELECT value FROM execution_meta WHERE key = 'schema_version'"
             ).fetchone()[0]
-            == "24"
+            == str(SqliteExecutionStore._SCHEMA_VERSION)
         )
         row = upgraded._connection.execute(
             "SELECT identity_state, target_submit_command_id, owner_intent_id "

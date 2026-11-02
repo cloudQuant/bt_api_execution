@@ -23,6 +23,7 @@ from bt_api_execution.journal import (
 )
 from bt_api_execution.journal_ports import (
     JOURNAL_PORT_SCHEMA_VERSION,
+    JOURNAL_POSITION_ATTRIBUTION_PORT_SCHEMA_VERSION,
     AttestedCtpOrderIdentityQuery,
     JournalFeePairFactsPort,
     JournalPorts,
@@ -58,7 +59,7 @@ def _rows_sha256(rows: tuple) -> str:
 class _PositionPort(JournalPositionAttributionPort):
     """Minimal attribution port that really creates the book meta table."""
 
-    port_version = JOURNAL_PORT_SCHEMA_VERSION
+    port_version = JOURNAL_POSITION_ATTRIBUTION_PORT_SCHEMA_VERSION
 
     def __init__(self, *, label: str = "global", stored_version: int = 6) -> None:
         self.label = label
@@ -97,6 +98,41 @@ class _PositionPort(JournalPositionAttributionPort):
                ON CONFLICT(singleton) DO UPDATE SET version=excluded.version""",
             (self.stored_version,),
         )
+
+    # Port protocol methods added after this double was written. The double
+    # owns one meta table and no position rows; reads therefore find nothing.
+    def _stored_meta_version(self, cursor: Any) -> int | None:
+        exists = cursor.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='factor_position_book_meta'"
+        ).fetchone()
+        if exists is None:
+            return None
+        row = cursor.execute("SELECT version FROM factor_position_book_meta").fetchone()
+        return None if row is None else int(row[0])
+
+    def preflight_schema(self, cursor: Any) -> bool:
+        stored = self._stored_meta_version(cursor)
+        return stored is None or stored == self.expected_schema_version
+
+    def validate_schema(self, cursor: Any) -> bool:
+        return self._stored_meta_version(cursor) == self.expected_schema_version
+
+    def read_current_position(self, cursor: Any, **_key: Any) -> None:
+        return None
+
+    def read_fill(self, cursor: Any, **_key: Any) -> None:
+        return None
+
+    def read_evidence_issue(self, cursor: Any, *, receipt_id: str) -> None:
+        return None
+
+    def iter_capacity_rows(self, cursor: Any):
+        return iter(())
+
+    def snapshot_capacity_row_size(
+        self, cursor: Any, *, owner_table_ref: str, key_values: tuple
+    ) -> int | None:
+        return None
 
     def record_grid(
         self,
@@ -255,7 +291,7 @@ def test_abstract_class_itself_is_not_an_instance():
 
 def test_incomplete_subclass_cannot_be_instantiated():
     class Incomplete(JournalPositionAttributionPort):
-        port_version = JOURNAL_PORT_SCHEMA_VERSION
+        port_version = JOURNAL_POSITION_ATTRIBUTION_PORT_SCHEMA_VERSION
 
     with pytest.raises(TypeError):
         Incomplete()
@@ -280,7 +316,7 @@ def test_missing_version_is_unsupported():
 
 
 def test_stale_and_forward_versions_are_unsupported():
-    for declared in (JOURNAL_PORT_SCHEMA_VERSION - 1, JOURNAL_PORT_SCHEMA_VERSION + 1, "1"):
+    for declared in (JOURNAL_POSITION_ATTRIBUTION_PORT_SCHEMA_VERSION - 1, JOURNAL_POSITION_ATTRIBUTION_PORT_SCHEMA_VERSION + 1, "1"):
         candidate = _PositionPort()
         candidate.__class__.port_version = declared
         try:
@@ -288,7 +324,7 @@ def test_stale_and_forward_versions_are_unsupported():
                 configure_journal_ports(position_attribution=candidate)
             assert _code(captured.value) == "JOURNAL_PORT_VERSION_UNSUPPORTED"
         finally:
-            candidate.__class__.port_version = JOURNAL_PORT_SCHEMA_VERSION
+            candidate.__class__.port_version = JOURNAL_POSITION_ATTRIBUTION_PORT_SCHEMA_VERSION
 
 
 # --- rule (c): no silent overwrite; replace=True is explicit ---

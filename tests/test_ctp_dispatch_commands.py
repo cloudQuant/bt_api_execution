@@ -631,7 +631,7 @@ def test_v4_execution_store_migrates_to_verified_callback_ledger_v8(tmp_path):
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-        assert version == "24"
+        assert version == str(SqliteExecutionStore._SCHEMA_VERSION)
         assert "ctp_dispatch_commands" in tables
         assert "ctp_order_ref_watermarks" in tables
         assert "ctp_dispatch_authority_uses" in tables
@@ -686,7 +686,7 @@ def test_v5_execution_store_migrates_one_use_authority_table(tmp_path):
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-        assert version == "24"
+        assert version == str(SqliteExecutionStore._SCHEMA_VERSION)
         assert "ctp_dispatch_authority_uses" in tables
     finally:
         migrated.close()
@@ -789,7 +789,7 @@ def test_v7_typed_command_migrates_to_callback_ledger_without_reopening_dispatch
             migrated._connection.execute(
                 "SELECT value FROM execution_meta WHERE key = 'schema_version'"
             ).fetchone()[0]
-            == "24"
+            == str(SqliteExecutionStore._SCHEMA_VERSION)
         )
         assert (
             migrated._connection.execute(
@@ -832,7 +832,7 @@ def test_v8_store_migrates_orderref_cutover_state_fail_closed(tmp_path):
         version = migrated._connection.execute(
             "SELECT value FROM execution_meta WHERE key = 'schema_version'"
         ).fetchone()["value"]
-        assert version == "24"
+        assert version == str(SqliteExecutionStore._SCHEMA_VERSION)
         command = migrated.read_ctp_dispatch_command(scope, staged.command_id)
         assert command is not None
         assert command.status == "UNKNOWN"
@@ -3065,7 +3065,7 @@ def test_schema_v15_to_v19_preserves_unknown_command_and_permanent_owner_fence(t
             migrated._connection.execute(
                 "SELECT value FROM execution_meta WHERE key = 'schema_version'"
             ).fetchone()[0]
-            == "24"
+            == str(SqliteExecutionStore._SCHEMA_VERSION)
         )
         command = migrated.read_ctp_dispatch_command(scope, staged.command_id)
         assert command.status == "UNKNOWN"
@@ -3113,7 +3113,7 @@ def test_schema_v15_to_v19_preserves_unknown_command_and_permanent_owner_fence(t
             reopened._connection.execute(
                 "SELECT value FROM execution_meta WHERE key = 'schema_version'"
             ).fetchone()[0]
-            == "24"
+            == str(SqliteExecutionStore._SCHEMA_VERSION)
         )
         assert reopened.read_ctp_dispatch_command(scope, staged.command_id).status == "UNKNOWN"
         owner_row = reopened._connection.execute(
@@ -3150,7 +3150,7 @@ def test_schema_v16_to_v19_migrates_valid_completed_submit(tmp_path):
             migrated._connection.execute(
                 "SELECT value FROM execution_meta WHERE key = 'schema_version'"
             ).fetchone()[0]
-            == "24"
+            == str(SqliteExecutionStore._SCHEMA_VERSION)
         )
         command = migrated.read_ctp_dispatch_command(scope, staged.command_id)
         assert command is not None and command.status == "COMPLETED"

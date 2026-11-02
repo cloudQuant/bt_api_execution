@@ -180,7 +180,7 @@ def test_v18_history_migrates_to_permanent_unmapped_family_fence(tmp_path) -> No
             migrated._connection.execute(
                 "SELECT value FROM execution_meta WHERE key = 'schema_version'"
             ).fetchone()[0]
-            == "24"
+            == str(SqliteExecutionStore._SCHEMA_VERSION)
         )
         fence = migrated._connection.execute(
             "SELECT reason_code, source_schema_version FROM ctp_account_family_legacy_fences"
