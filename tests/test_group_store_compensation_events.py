@@ -4,17 +4,22 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import replace
 from decimal import Decimal
 
 import pytest
 
 from bt_api_execution import (
     ExecutionScope,
+    GroupBudgetLegQuote,
+    GroupBudgetQuote,
+    GroupCompensationBudgetPolicy,
     GroupOrderIntent,
     GroupOrderLegPlan,
     GroupOrderState,
     OrderIntent,
     OrderType,
+    PortfolioGroupBudgetPolicy,
     PositionEffect,
     Side,
     SqliteOrderGroupStore,
@@ -23,7 +28,6 @@ from bt_api_execution import (
     payload_sha256,
 )
 from bt_api_execution.errors import ContractValidationError, DurableStoreError
-
 
 _CREATED_AT_NS = 1_800_000_000_000_000_000
 _DEADLINE_NS = _CREATED_AT_NS + 10_000_000_000
@@ -73,12 +77,57 @@ def _request(group_id: str) -> GroupOrderIntent:
     )
 
 
-def test_compensation_events_are_durable_and_recovery_can_enter_unwinding(tmp_path) -> None:
+def test_budgeted_v3_rejects_legacy_compensation_plan_and_preserves_history(tmp_path) -> None:
     path = tmp_path / "group-compensation.sqlite"
-    store = SqliteOrderGroupStore(path)
     request = _request("group-compensation-events-01")
+    legs = tuple(replace(leg, ratio=Decimal("1")) for leg in request.legs)
+    third_intent = replace(
+        legs[1].maximum_intent,
+        intent_id=group_leg_intent_id(request.group_id, "leg-third"),
+        signal_id=f"{request.group_id}-leg-third",
+    )
+    third_leg = replace(legs[1], leg_id="leg-third", maximum_intent=third_intent)
+    request = replace(
+        request,
+        version=3,
+        legs=(*legs, third_leg),
+        compensation_budget_policy=GroupCompensationBudgetPolicy(
+            "compensation-policy-test", 1, Decimal("100"), "USD"
+        ),
+    )
+
+    # Synthetic quote and policy only establish a local group-store fixture;
+    # they are not provider or Risk admission evidence for a compensation.
+    policy = PortfolioGroupBudgetPolicy(
+        _PORTFOLIO,
+        "portfolio-budget-test",
+        1,
+        "USD",
+        Decimal("100"),
+        Decimal("100"),
+        1,
+    )
+    quote_legs = tuple(
+        GroupBudgetLegQuote(
+            leg_id=leg.leg_id,
+            account_ref=leg.account_ref,
+            intent_fingerprint=leg.maximum_intent.fingerprint,
+            metadata_digest=leg.maximum_intent.tags["instrument_metadata_digest"],
+            assessment_fingerprint=payload_sha256({"synthetic": leg.leg_id}),
+            valuation_unit="USD",
+            gross_notional=Decimal("20"),
+            assessed_at_ns=_CREATED_AT_NS,
+            valid_until_ns=_DEADLINE_NS,
+        )
+        for leg in request.legs
+    )
+    request = replace(
+        request,
+        budget_quote=GroupBudgetQuote(policy.fingerprint, "USD", Decimal("60"), quote_legs),
+    )
+    store = SqliteOrderGroupStore(path)
     try:
-        snapshot = store.create_or_get(request, now_ns=_CREATED_AT_NS)
+        snapshot = store.create_or_get(request, budget_policy=policy, now_ns=_CREATED_AT_NS)
         snapshot = store.update(
             snapshot,
             event_type="GROUP_RECOVERY_REQUIRED",
@@ -86,67 +135,49 @@ def test_compensation_events_are_durable_and_recovery_can_enter_unwinding(tmp_pa
             state=GroupOrderState.RECOVERY_REQUIRED,
             now_ns=_CREATED_AT_NS + 1,
         )
-        action = {
-            "action_id": "compensation-action-0001",
-            "ordinal": 1,
-            "authorization_digest": payload_sha256({"authorization": "fixed"}),
+        expected_events = store.events(_PORTFOLIO, request.group_id)
+        # The old list of actions and a bare digest does not carry the v4
+        # authorization binding to source facts and the compensation budget.
+        legacy_plan = {
+            "actions": [
+                {
+                    "action_id": "compensation-action-0001",
+                    "ordinal": 1,
+                    "authorization_digest": payload_sha256({"authorization": "fixed"}),
+                }
+            ]
         }
-        snapshot = store.update(
-            snapshot,
-            event_type="GROUP_COMPENSATION_PLAN_RECORDED",
-            event_payload={"actions": [action]},
-            state=GroupOrderState.UNWINDING,
-            now_ns=_CREATED_AT_NS + 2,
+        with pytest.raises(
+            ContractValidationError, match="a compensation plan requires no pending action"
+        ):
+            store.update(
+                snapshot,
+                event_type="GROUP_COMPENSATION_PLAN_RECORDED",
+                event_payload=legacy_plan,
+                state=GroupOrderState.UNWINDING,
+                now_ns=_CREATED_AT_NS + 2,
+            )
+        persisted = store.get(_PORTFOLIO, request.group_id)
+        assert persisted == snapshot
+        assert store.events(_PORTFOLIO, request.group_id) == expected_events
+        assert tuple(event.event_type for event in expected_events) == (
+            "GROUP_ACCEPTED",
+            "GROUP_RECOVERY_REQUIRED",
         )
-        snapshot = store.update(
-            snapshot,
-            event_type="GROUP_COMPENSATION_SUBMIT_STARTED",
-            event_payload={**action, "client_order_id": "client-comp-0001"},
-            now_ns=_CREATED_AT_NS + 3,
-        )
-        snapshot = store.update(
-            snapshot,
-            event_type="GROUP_COMPENSATION_STATUS_OBSERVED",
-            event_payload={**action, "state": "UNKNOWN"},
-            state=GroupOrderState.RECOVERY_REQUIRED,
-            now_ns=_CREATED_AT_NS + 4,
-        )
-        # Recovery can resume the durable unwind without returning to the
-        # opening-leg progression or changing the accepted group intent.
-        snapshot = store.update(
-            snapshot,
-            event_type="GROUP_COMPENSATION_STATUS_OBSERVED",
-            event_payload={**action, "state": "FILLED"},
-            state=GroupOrderState.UNWINDING,
-            now_ns=_CREATED_AT_NS + 5,
-        )
-        snapshot = store.update(
-            snapshot,
-            event_type="GROUP_COMPENSATION_RESOLVED",
-            event_payload={**action, "resolution_kind": "TERMINAL_CLOSE_RESOLVED"},
-            now_ns=_CREATED_AT_NS + 6,
-        )
-        expected_revision = snapshot.revision
-        expected_request = request.to_payload()
+        assert expected_events[-1].payload == {
+            "code": "chain_residual_unresolved",
+            "budget_state": "RESERVED",
+        }
     finally:
         store.close()
 
     reopened = SqliteOrderGroupStore(path)
     try:
         recovered = reopened.get(_PORTFOLIO, request.group_id)
-        assert recovered is not None
-        assert recovered.request.to_payload() == expected_request
-        assert recovered.revision == expected_revision
-        assert recovered.state is GroupOrderState.UNWINDING
-        events = reopened.events(_PORTFOLIO, request.group_id)
-        assert tuple(item.event_type for item in events[-5:]) == (
-            "GROUP_COMPENSATION_PLAN_RECORDED",
-            "GROUP_COMPENSATION_SUBMIT_STARTED",
-            "GROUP_COMPENSATION_STATUS_OBSERVED",
-            "GROUP_COMPENSATION_STATUS_OBSERVED",
-            "GROUP_COMPENSATION_RESOLVED",
-        )
-        assert events[-1].payload["resolution_kind"] == "TERMINAL_CLOSE_RESOLVED"
+        assert recovered == snapshot
+        assert recovered.request.to_payload() == request.to_payload()
+        assert recovered.state is GroupOrderState.RECOVERY_REQUIRED
+        assert reopened.events(_PORTFOLIO, request.group_id) == expected_events
     finally:
         reopened.close()
 
