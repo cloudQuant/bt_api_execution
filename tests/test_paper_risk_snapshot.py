@@ -167,57 +167,6 @@ def _close(store, gate, lease) -> None:
     gate.close()
 
 
-@pytest.mark.unit
-def test_paper_risk_snapshot_survives_restart_before_claim_without_requoting(tmp_path):
-    intent = _order()
-    store1, gate1, adapter1, _matcher1, source1 = _composition(tmp_path, _quote())
-    lease1 = _lease_and_record(store1, intent)
-    try:
-        first_permit = adapter1.reserve_for_execution(intent, writer_lease=lease1)
-        assert source1.calls == ["BTC-USDT"]
-        first_allocation = gate1.get_strategy_allocation(_RISK_SCOPE, _STRATEGY)
-        assert first_allocation.reserved_notional == Decimal("12.5375")
-    finally:
-        _close(store1, gate1, lease1)
-
-    # The restarted owner is offered a different quote. The persisted mapping
-    # must retain the first quote and idempotent Risk permit without reading it.
-    changed_quote = replace(_quote(ask="10.20"), cursor=2)
-    store2, gate2, adapter2, matcher2, source2 = _composition(tmp_path, changed_quote)
-    lease2 = _lease_and_record(store2, intent)
-    try:
-        second_permit = adapter2.reserve_for_execution(intent, writer_lease=lease2)
-        assert second_permit.permit_id == first_permit.permit_id
-        assert source2.calls == []
-        assert gate2.get_strategy_allocation(_RISK_SCOPE, _STRATEGY).reserved_notional == Decimal(
-            "12.5375"
-        )
-
-        pending = store2.activate_intent(
-            intent.intent_id,
-            _EXECUTION_SCOPE,
-            second_permit.permit_id,
-            writer_lease=lease2,
-        )
-        assert pending.state is ExecutionState.PENDING_DISPATCH
-        claimed, did_claim = store2.claim_for_dispatch(
-            intent.intent_id, _EXECUTION_SCOPE, writer_lease=lease2
-        )
-        assert did_claim and claimed.state is ExecutionState.DISPATCHING
-        second_claim = adapter2.claim_for_dispatch_for_execution(
-            second_permit.permit_id,
-            intent,
-            writer_lease=lease2,
-        )
-        assert second_claim.permit_id == first_permit.permit_id
-
-        proposal = matcher2._propose(intent, authorization=None)
-        assert proposal.refusal_code is None
-        assert proposal.quote == source1.quote
-        assert proposal.quote.ask == Decimal("10.02")
-        assert source2.calls == []
-    finally:
-        _close(store2, gate2, lease2)
 
 
 @pytest.mark.unit

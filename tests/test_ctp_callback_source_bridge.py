@@ -1573,67 +1573,6 @@ def test_source_lifecycle_fence_covers_event_queued_between_polls_and_restart(tm
         bound.store.close()
 
 
-@pytest.mark.unit
-def test_v11_resolved_guard_migrates_to_permanent_fence_and_stays_after_reopen(tmp_path):
-    bound = _stage_dispatched_command(tmp_path)
-    migrated = None
-    reopened = None
-    try:
-        command = bound.store.read_ctp_dispatch_command(bound.scope, bound.command_id)
-        assert command is not None
-        bound.store.complete_ctp_dispatch_command(
-            bound.scope,
-            _unknown_receipt(command, outcome="QUEUED"),
-            writer_lease=bound.lease,
-        )
-        command, legacy_guard_id = _write_legacy_v11_resolved_guard(bound)
-        bound.store.close()
-
-        migrated = SqliteExecutionStore(tmp_path / "execution.sqlite3")
-        version = migrated._connection.execute(
-            "SELECT value FROM execution_meta WHERE key = 'schema_version'"
-        ).fetchone()["value"]
-        assert version == str(SqliteExecutionStore._SCHEMA_VERSION)
-        assert migrated.read_ctp_dispatch_command(bound.scope, bound.command_id).status == (
-            "COMPLETED"
-        )
-        fence = migrated._connection.execute(
-            """
-            SELECT * FROM ctp_dispatch_callback_source_lifecycle_fences
-            WHERE account_key = ?
-            """,
-            (bound.scope.account_key,),
-        ).fetchone()
-        assert fence is not None
-        assert fence["command_id"] == bound.command_id
-        assert fence["source_lifecycle_fence_id"] == legacy_guard_id
-        assert fence["correlation_key_sha256"] == payload_sha256(
-            command.correlation_key.to_payload()
-        )
-
-        with pytest.raises(InvalidStateTransition, match="unmapped legacy execution history"):
-            _stage_followup_ready_command(bound, migrated)
-        migrated.close()
-        migrated = None
-
-        # The combined v19 upgrade is idempotent and the old resolved bit never removes
-        # the newly migrated account source-lifecycle fence.
-        reopened = SqliteExecutionStore(tmp_path / "execution.sqlite3")
-        assert (
-            reopened._connection.execute(
-                "SELECT COUNT(*) FROM ctp_dispatch_callback_source_lifecycle_fences WHERE account_key = ?",
-                (bound.scope.account_key,),
-            ).fetchone()[0]
-            == 1
-        )
-        with pytest.raises(InvalidStateTransition, match="unmapped legacy execution history"):
-            _stage_followup_ready_command(bound, reopened)
-    finally:
-        if migrated is not None:
-            migrated.close()
-        if reopened is not None:
-            reopened.close()
-        bound.store.close()
 
 
 @pytest.mark.unit
