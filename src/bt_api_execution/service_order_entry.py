@@ -42,6 +42,7 @@ from .contracts import (
     ExecutionState,
     OrderIntent,
     PositionEffect,
+    ProviderObservation,
     cancel_intent_from_payload,
     order_intent_from_payload,
 )
@@ -869,6 +870,31 @@ class ExecutionOrderEntryService:
             "OK",
             {"found": True, "record": _stored_record_dto(self._store, record, execution_scope)},
         )
+
+    def record_provider_observation(
+        self, scope: WireScope, observation: ProviderObservation
+    ) -> ExecutionRecord:
+        """Persist one later provider observation for a served scope (public host entry).
+
+        For composition roots and provider adapters that receive fills, fees or
+        terminal states after the submit returned (for example from an order or
+        fill subscription). ``scope`` is the trusted ``WireScope`` of the order
+        and resolves with the same template rule as ``orders.submit``; an
+        unserved scope raises :class:`ContractValidationError`. The observation
+        is recorded through the same managed facade (and writer lease) the
+        order entry uses, so it never races the order entry's own writes.
+        No provider I/O happens here. Semantics are those of
+        :meth:`ManagedExecutionFacade.record_provider_observation`, including
+        the fee-only correction of a terminal record.
+        """
+
+        if type(scope) is not WireScope or type(observation) is not ProviderObservation:
+            raise ContractValidationError("invalid provider observation")
+        execution_scope = self._resolve_scope(scope)
+        if execution_scope is None:
+            raise ContractValidationError("provider observation scope is not served here")
+        order_facade, _cancel_facade = self._facade_pair(execution_scope)
+        return order_facade.record_provider_observation(observation)
 
     def recover_interrupted_dispatches(self) -> tuple[ExecutionRecord, ...]:
         """Recover configured scopes before this service accepts writes.

@@ -27273,6 +27273,103 @@ class SqliteExecutionStore:
             assert updated is not None
             return self._record_from_row(updated), appended_event
 
+    def record_terminal_fee_correction_with_event(
+        self,
+        observation: ProviderObservation,
+        *,
+        scope: ExecutionScope,
+        source: str = "reconcile",
+        writer_lease: WriterLease | None = None,
+    ) -> tuple[ExecutionRecord, ExecutionEvent | None]:
+        """Journal a later cumulative fee for a terminal record (iteration 60 R3).
+
+        A terminal record is otherwise immutable. A provider may still report
+        the order's corrected *cumulative* fee after the terminal state (a
+        late commission). Such a fee-only report is journaled as one
+        ``provider_commission_evidence`` event (the journal's fee-only event
+        kind, so every journal consumer projects it like any fee evidence):
+
+        * the report must restate the terminal state, the recorded cumulative
+          filled quantity, and (when given) the provider order id and average
+          price; anything else raises :class:`InvalidStateTransition`;
+        * the fee needs an explicit currency equal to the intent's recorded fee
+          currency (one fee currency per intent, as on the open path); a fee
+          recorded earlier without a currency cannot be corrected;
+        * the same cumulative total is an idempotent duplicate (no event); a
+          lower total is refused (``provider fee correction regressed``).
+
+        Nothing is changed when a check fails.
+        """
+
+        if source not in {"provider", "reconcile"}:
+            raise ContractValidationError("invalid observation source")
+        if getattr(scope, "provider", None) == "paper":
+            raise ContractValidationError(
+                "paper outcomes must be persisted with their atomic match receipt"
+            )
+        fee = observation.cumulative_commission
+        currency = observation.cumulative_commission_currency
+        if fee is None or currency is None:
+            raise InvalidStateTransition("fee correction requires a fee and its currency")
+        now_ns = time.time_ns()
+        with self._transaction() as cursor:
+            self._assert_active_writer_lease(cursor, scope, writer_lease)
+            row = self._fetch_record(cursor, scope.key, observation.intent_id)
+            if row is None:
+                raise ContractValidationError("unknown intent_id")
+            record = self._record_from_row(row)
+            if not record.is_terminal or observation.state is not record.state:
+                raise InvalidStateTransition("fee correction must restate the terminal state")
+            if observation.filled_quantity != record.filled_quantity or (
+                observation.provider_order_id is not None
+                and observation.provider_order_id != record.provider_order_id
+            ) or (
+                observation.average_price is not None
+                and observation.average_price != record.average_price
+            ):
+                raise InvalidStateTransition("fee correction changes execution facts")
+            previous_currency = self._previous_observed_commission_currency(
+                cursor, scope.key, observation.intent_id
+            )
+            prior = record.cumulative_commission
+            if prior is not None and previous_currency is None:
+                raise InvalidStateTransition("recorded fee has no currency")
+            if previous_currency is not None and previous_currency != currency:
+                raise InvalidStateTransition("provider commission currency changed")
+            if prior is not None and fee == prior:
+                return record, None
+            if prior is not None and fee < prior:
+                raise InvalidStateTransition("provider fee correction regressed")
+            cursor.execute(
+                """
+                UPDATE execution_records
+                SET cumulative_commission = ?, updated_at_ns = ?
+                WHERE scope_key = ? AND intent_id = ?
+                """,
+                (format(fee, "f"), now_ns, scope.key, observation.intent_id),
+            )
+            appended_event = self._append_event(
+                cursor,
+                intent_id=observation.intent_id,
+                scope_key=scope.key,
+                event_type="provider_commission_evidence",
+                state=record.state,
+                payload={
+                    "provider_order_id": record.provider_order_id,
+                    "filled_quantity": format(record.filled_quantity, "f"),
+                    "average_price": (
+                        None if record.average_price is None else format(record.average_price, "f")
+                    ),
+                    "cumulative_commission": format(fee, "f"),
+                    "source": source,
+                    "cumulative_commission_currency": currency,
+                },
+                now_ns=now_ns,
+            )
+            updated = self._fetch_record(cursor, scope.key, observation.intent_id)
+            assert updated is not None
+            return self._record_from_row(updated), appended_event
+
     @staticmethod
     def _validate_fill_progress(
         record: ExecutionRecord,

@@ -928,6 +928,22 @@ class ManagedExecutionFacade:
         writer_lease = self.acquire_writer_lease()
         record = self._require_owned_record(observation.intent_id)
         if record.state not in _OBSERVATION_RECORDING_STATES:
+            if (
+                record.is_terminal
+                and observation.state is record.state
+                and observation.filled_quantity == record.filled_quantity
+                and observation.cumulative_commission is not None
+            ):
+                # A late cumulative fee for a terminal order (iteration 60 R3):
+                # journaled as fee evidence; a regression, another currency or
+                # changed execution facts raise (refused, nothing written).
+                record, event = self._store.record_terminal_fee_correction_with_event(
+                    observation,
+                    scope=self._scope,
+                    source="reconcile",
+                    writer_lease=writer_lease,
+                )
+                return record, event, False
             return record, None, record.review_required
         previous_state = record.state
         try:
