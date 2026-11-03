@@ -843,9 +843,10 @@ def test_position_window_requires_sealed_result_and_exact_applied_query_callback
         def ReqQryInvestorPosition(self, _field, request_id):
             for record, is_last in ((row, False), (None, True)):
                 self.source_sequence += 1
+                response_info = SimpleNamespace(ErrorID=0, ErrorMsg="")
                 args = (
                     None if record is None else SimpleNamespace(**record),
-                    None,
+                    response_info,
                     request_id,
                     is_last,
                 )
@@ -860,7 +861,7 @@ def test_position_window_requires_sealed_result_and_exact_applied_query_callback
                     phase=CtpTraderCallbackPhase.ACTIVE,
                 )
                 self.client._handle_query_callback(
-                    "positions", record, None, request_id, is_last
+                    "positions", record, response_info, request_id, is_last
                 )
                 applied = adapter.apply_next_ingress(
                     callback_verifier=None, trade_fact_verifier=None

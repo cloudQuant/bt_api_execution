@@ -10,6 +10,7 @@ import contextlib
 import hashlib
 import json
 import sqlite3
+import threading
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -29,13 +30,44 @@ from bt_api_execution import (
     InvalidStateTransition,
     SqliteExecutionStore,
 )
-import test_ctp_callback_ingress_client as ctp_fixtures
 
 
-class _SyntheticLoginApi(ctp_fixtures._FakeTraderApi):
+class _SyntheticLoginApi:
     def __init__(self, max_order_ref: str) -> None:
-        super().__init__()
+        self.spi = None
+        self.calls = []
+        self.join_started = threading.Event()
         self._login_max_order_ref = max_order_ref
+
+    def RegisterSpi(self, spi):
+        self.spi = spi
+
+    def SubscribePrivateTopic(self, _topic):
+        pass
+
+    def SubscribePublicTopic(self, _topic):
+        pass
+
+    def RegisterFront(self, _front):
+        pass
+
+    def Init(self):
+        self.spi.OnFrontConnected()
+
+    def Join(self):
+        self.join_started.set()
+        return 0
+
+    def Release(self):
+        self.calls.append(("Release",))
+
+    def ReqAuthenticate(self, field, request_id):  # noqa: N802 - CTP SPI name
+        self.calls.append(("ReqAuthenticate", request_id))
+        response = SimpleNamespace(BrokerID=field.BrokerID, UserID=field.UserID)
+        self.spi.OnRspAuthenticate(
+            response, SimpleNamespace(ErrorID=0, ErrorMsg=""), request_id, True
+        )
+        return 0
 
     def ReqUserLogin(self, field, request_id):  # noqa: N802 - CTP SPI name
         self.calls.append(("ReqUserLogin", request_id))

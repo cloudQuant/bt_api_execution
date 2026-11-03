@@ -283,7 +283,7 @@ def test_callback_owner_default_scope_is_singleton_and_persisted_handle_is_not_r
 
 
 @pytest.mark.unit
-def test_schema_23_upgrade_preserves_ready_dispatch_and_only_adds_source_scope(tmp_path):
+def test_schema_23_upgrade_preserves_ready_dispatch_and_adds_current_schema(tmp_path):
     path = tmp_path / "owner-scope-schema-23.sqlite3"
     source = _scope("strategy.migration-source")
     store = SqliteExecutionStore.open_ctp_account_store(path, source)
@@ -304,7 +304,7 @@ def test_schema_23_upgrade_preserves_ready_dispatch_and_only_adds_source_scope(t
         (command_id,),
     )
     assert before_command["status"] == "READY"
-    v24_schema = _schema_signature(store._connection)
+    current_schema = _schema_signature(store._connection)
     store.close()
 
     scope_objects = {
@@ -312,6 +312,28 @@ def test_schema_23_upgrade_preserves_ready_dispatch_and_only_adds_source_scope(t
         "ctp_callback_session_owner_scopes_owner_match",
         "ctp_callback_session_owner_scopes_immutable_update",
         "ctp_callback_session_owner_scopes_immutable_delete",
+    }
+    newer_objects = {
+        "ctp_dispatch_position_evidence_windows",
+        "ctp_position_baseline_submit_authorizations",
+        "ctp_position_baseline_submit_authorization_uses",
+        "ctp_position_dispatch_authorization_bindings",
+        "ctp_position_recovery_close_authorizations",
+        "ctp_position_recovery_close_authorization_uses",
+        "ctp_position_window_intent_latest",
+        "ctp_position_recovery_close_auth_child",
+        "ctp_position_evidence_windows_immutable_update",
+        "ctp_position_evidence_windows_immutable_delete",
+        "ctp_position_baseline_authorizations_immutable_update",
+        "ctp_position_baseline_authorizations_immutable_delete",
+        "ctp_position_baseline_uses_immutable_update",
+        "ctp_position_baseline_uses_immutable_delete",
+        "ctp_position_dispatch_authorization_bindings_immutable_update",
+        "ctp_position_dispatch_authorization_bindings_immutable_delete",
+        "ctp_position_recovery_authorizations_immutable_update",
+        "ctp_position_recovery_authorizations_immutable_delete",
+        "ctp_position_recovery_uses_immutable_update",
+        "ctp_position_recovery_uses_immutable_delete",
     }
     legacy = sqlite3.connect(path)
     legacy.row_factory = sqlite3.Row
@@ -322,14 +344,18 @@ def test_schema_23_upgrade_preserves_ready_dispatch_and_only_adds_source_scope(t
                 "SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"
             ).fetchall()
         }
-        assert existing_names == {name for _, name, _, _ in v24_schema}
-        assert scope_objects <= existing_names
-        for trigger in sorted(scope_objects - {"ctp_dispatch_callback_session_owner_scopes"}):
-            legacy.execute(f'DROP TRIGGER "{trigger}"')
-        legacy.execute("DROP TABLE ctp_dispatch_callback_session_owner_scopes")
+        assert existing_names == {name for _, name, _, _ in current_schema}
+        omitted_objects = scope_objects | newer_objects
+        assert omitted_objects <= existing_names
+        for kind, name, _, _ in current_schema:
+            if name in omitted_objects and kind != "table":
+                legacy.execute(f'DROP {kind.upper()} "{name}"')
+        for kind, name, _, _ in current_schema:
+            if name in omitted_objects and kind == "table":
+                legacy.execute(f'DROP TABLE "{name}"')
         legacy.execute("UPDATE execution_meta SET value = '23' WHERE key = 'schema_version'")
         expected_v23_schema = tuple(
-            row for row in v24_schema if row[1] not in scope_objects
+            row for row in current_schema if row[1] not in omitted_objects
         )
         assert _schema_signature(legacy) == expected_v23_schema
         assert legacy.execute(
@@ -343,7 +369,7 @@ def test_schema_23_upgrade_preserves_ready_dispatch_and_only_adds_source_scope(t
     assert inspection.kind == "CTP_EXECUTION_STORE"
     migrated = SqliteExecutionStore.open_ctp_account_store(path, source)
     try:
-        assert _schema_signature(migrated._connection) == v24_schema
+        assert _schema_signature(migrated._connection) == current_schema
         assert _row_dict(
             migrated._connection,
             "ctp_dispatch_callback_session_owners",
@@ -375,7 +401,7 @@ def test_schema_23_upgrade_preserves_ready_dispatch_and_only_adds_source_scope(t
         )
         assert migrated._connection.execute(
             "SELECT value FROM execution_meta WHERE key = 'schema_version'"
-        ).fetchone()[0] == "24"
+        ).fetchone()[0] == str(SqliteExecutionStore._SCHEMA_VERSION)
         with pytest.raises(ContractValidationError, match="same-Store"):
             migrated.ctp_callback_session_owner_scope_keys(owner)
     finally:

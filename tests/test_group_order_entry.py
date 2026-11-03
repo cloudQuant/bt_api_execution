@@ -46,7 +46,7 @@ _STRATEGY = "strategy-a"
 _ACCOUNT = "account-a"
 _DEADLINE_NS = 9_999_999_999_999_999_999
 _RISK_SCOPE_KEY = json.dumps(
-    {"account_id": "mapped-a", "environment": "demo", "provider": "paper"},
+    {"account_id": "mapped-a", "environment": "demo", "provider": "fake"},
     sort_keys=True,
     separators=(",", ":"),
 )
@@ -91,7 +91,7 @@ class _GroupRiskAdapter:
         self.intent = intent
         self.binding = binding
         self.scope = SimpleNamespace(
-            provider="paper",
+            provider="fake",
             environment="demo",
             account_id="mapped-a",
             key=_RISK_SCOPE_KEY,
@@ -344,7 +344,7 @@ def _make_service(
     bind_account_scope: bool = True,
     run_id: str | None = None,
 ):
-    execution_scope = ExecutionScope("paper", "demo", _ACCOUNT, _STRATEGY)
+    execution_scope = ExecutionScope("fake", "demo", _ACCOUNT, _STRATEGY)
     intent = OrderIntent.limit(
         intent_id=group_leg_intent_id(_GROUP, _LEG),
         scope=execution_scope,
@@ -373,13 +373,13 @@ def _make_service(
         deadline_ns=_DEADLINE_NS,
     )
     base_scope = WireScope(
-        execution_domain_ref="paper-demo",
+        execution_domain_ref="fake-demo",
         account_ref=_ACCOUNT,
         strategy_ref=_STRATEGY,
         portfolio_ref=_PORTFOLIO,
     )
     group_scope = WireScope(
-        execution_domain_ref="paper-demo",
+        execution_domain_ref="fake-demo",
         account_ref=_ACCOUNT,
         strategy_ref=_STRATEGY,
         run_id=run_id,
@@ -716,7 +716,7 @@ def test_after_group_result_failure_preserves_terminal_record_and_authority_hold
     store.close()
 
 
-def test_acknowledged_group_result_is_not_treated_as_terminal_resolution(tmp_path) -> None:
+def test_acknowledged_group_result_keeps_authority_hold_after_callback(tmp_path) -> None:
     values = _make_service(str(tmp_path / "group-result-acked.sqlite"))
     service, store, risk, provider, authority, identity, group_scope, _, intent, binding = values
     dispatcher = _EvidenceDispatcher(ProviderObservation.accepted(intent.intent_id, "order-1"))
@@ -745,7 +745,14 @@ def test_acknowledged_group_result_is_not_treated_as_terminal_resolution(tmp_pat
     assert result["result"]["record"]["state"] == ExecutionState.ACKED.value
     assert durable is not None and durable.state is ExecutionState.ACKED
     assert dispatcher.submitted == [intent.intent_id]
-    assert resolution_calls == []
+    assert len(resolution_calls) == 1
+    received_intent, received_binding, authorization, writer_lease, claim, record = resolution_calls[0]
+    assert received_intent is intent
+    assert received_binding is binding
+    assert authorization is authority.authorizations[-1]
+    assert writer_lease is not None
+    assert claim is dispatcher.claim_receipt
+    assert record == durable
     assert risk.group_claims == 1
     assert authority.persisted_hold_id == authority.authorizations[-1].authorization_attempt_id
     store.close()
@@ -1274,11 +1281,11 @@ def test_group_claim_receipt_must_match_trusted_risk_scope(tmp_path) -> None:
         _binding,
     ) = values
     risk.receipt_scope_override = SimpleNamespace(
-        provider="paper",
+        provider="fake",
         environment="demo",
         account_id="mapped-b",
         key=json.dumps(
-            {"account_id": "mapped-b", "environment": "demo", "provider": "paper"},
+            {"account_id": "mapped-b", "environment": "demo", "provider": "fake"},
             sort_keys=True,
             separators=(",", ":"),
         ),

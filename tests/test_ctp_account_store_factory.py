@@ -463,6 +463,39 @@ def test_factory_rejects_incomplete_v20_schema_before_recreating_guard(tmp_path)
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    ("trigger", "table", "operation"),
+    [
+        ("ctp_position_recovery_authorizations_immutable_update", "ctp_position_recovery_close_authorizations", "UPDATE"),
+        ("ctp_position_recovery_authorizations_immutable_delete", "ctp_position_recovery_close_authorizations", "DELETE"),
+        ("ctp_position_recovery_uses_immutable_update", "ctp_position_recovery_close_authorization_uses", "UPDATE"),
+        ("ctp_position_recovery_uses_immutable_delete", "ctp_position_recovery_close_authorization_uses", "DELETE"),
+    ],
+)
+@pytest.mark.parametrize("tamper", ["missing", "body"])
+def test_factory_rejects_damaged_recovery_trigger_before_writes(
+    tmp_path, trigger, table, operation, tamper
+) -> None:
+    path = tmp_path / "damaged-recovery-trigger.sqlite3"
+    store = SqliteExecutionStore.open_ctp_account_store(path, _scope())
+    store.close()
+    with sqlite3.connect(path) as connection:
+        connection.execute(f'DROP TRIGGER "{trigger}"')
+        if tamper == "body":
+            connection.execute(
+                f'CREATE TRIGGER "{trigger}" BEFORE {operation} ON "{table}" '
+                "BEGIN SELECT 1; END"
+            )
+    before = path.read_bytes()
+    with pytest.raises(DurableStoreError, match="schema definitions do not match"):
+        SqliteExecutionStore.inspect_ctp_account_store_file(path, _scope())
+    assert path.read_bytes() == before
+    with pytest.raises(DurableStoreError, match="schema definitions do not match"):
+        SqliteExecutionStore.open_ctp_account_store(path, _scope())
+    assert path.read_bytes() == before
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize("tamper", ["trigger_body", "identity_column"])
 def test_factory_rejects_same_name_but_malformed_v20_schema_before_writes(tmp_path, tamper) -> None:
     path = tmp_path / f"malformed-schema-{tamper}.sqlite3"

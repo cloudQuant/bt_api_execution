@@ -574,16 +574,16 @@ def test_managed_paper_v2_match_time_tampering_fails_closed(tmp_path):
         ).fetchone()
         payload = json.loads(row[0])
         payload["match_time_ns"] += 1
+        trigger_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' "
+            "AND name='paper_match_receipts_immutable_update'"
+        ).fetchone()[0]
         connection.execute("DROP TRIGGER paper_match_receipts_immutable_update")
         connection.execute(
             "UPDATE paper_match_receipts SET receipt_json = ? WHERE event_id = ?",
             (json.dumps(payload, sort_keys=True, separators=(",", ":")), event.event_id),
         )
-        connection.execute(
-            """CREATE TRIGGER paper_match_receipts_immutable_update
-               BEFORE UPDATE ON paper_match_receipts
-               BEGIN SELECT RAISE(ABORT, 'paper match receipts are immutable'); END"""
-        )
+        connection.execute(trigger_sql)
         connection.commit()
     finally:
         connection.close()
@@ -752,6 +752,10 @@ def test_persisted_legacy_v1_fill_is_readable_but_never_promoted_to_v2(tmp_path)
 
     connection = sqlite3.connect(database)
     try:
+        trigger_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' "
+            "AND name='paper_match_receipts_immutable_update'"
+        ).fetchone()[0]
         connection.execute("DROP TRIGGER paper_match_receipts_immutable_update")
         connection.execute(
             "UPDATE paper_match_receipts SET receipt_json = ?, receipt_sha256 = ? "
@@ -762,11 +766,7 @@ def test_persisted_legacy_v1_fill_is_readable_but_never_promoted_to_v2(tmp_path)
                 event.event_id,
             ),
         )
-        connection.execute(
-            """CREATE TRIGGER paper_match_receipts_immutable_update
-               BEFORE UPDATE ON paper_match_receipts
-               BEGIN SELECT RAISE(ABORT, 'paper match receipts are immutable'); END"""
-        )
+        connection.execute(trigger_sql)
         connection.commit()
     finally:
         connection.close()

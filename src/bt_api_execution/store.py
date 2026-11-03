@@ -365,10 +365,10 @@ _CTP_ACCOUNT_STORE_TRIGGERS = frozenset(
         "ctp_position_baseline_uses_immutable_delete",
         "ctp_position_dispatch_authorization_bindings_immutable_update",
         "ctp_position_dispatch_authorization_bindings_immutable_delete",
-        "ctp_position_recovery_close_authorizations_immutable_update",
-        "ctp_position_recovery_close_authorizations_immutable_delete",
-        "ctp_position_recovery_close_uses_immutable_update",
-        "ctp_position_recovery_close_uses_immutable_delete",
+        "ctp_position_recovery_authorizations_immutable_update",
+        "ctp_position_recovery_authorizations_immutable_delete",
+        "ctp_position_recovery_uses_immutable_update",
+        "ctp_position_recovery_uses_immutable_delete",
         "ctp_dispatch_commands_immutable",
         "ctp_dispatch_queue_receipt_once",
     }
@@ -7387,13 +7387,23 @@ class SqliteExecutionStore:
             ).fetchone()
             if version_row is None or str(version_row[0]) != str(cls._SCHEMA_VERSION):
                 return
-            if tables - {"sqlite_sequence"} != _CTP_ACCOUNT_STORE_TABLES:
+            paper_version_row = connection.execute(
+                "SELECT value FROM execution_meta WHERE key = 'paper_schema_version'"
+            ).fetchone()
+            paper_version = None if paper_version_row is None else str(paper_version_row[0])
+            if paper_version not in {None, "1", "2"}:
+                raise DurableStoreError("unsupported paper execution schema version")
+            expected_schema_objects = cls._code_owned_ctp_store_schema_objects(paper_version)
+            expected_tables = {
+                item[1] for item in expected_schema_objects if item[0] == "table"
+            }
+            if tables - {"sqlite_sequence"} != expected_tables:
                 raise DurableStoreError(
                     "current CTP execution store schema is incomplete or unknown"
                 )
             if (
                 cls._ctp_store_schema_objects(connection)
-                != cls._code_owned_ctp_store_schema_objects()
+                != expected_schema_objects
             ):
                 raise DurableStoreError(
                     "current CTP execution store schema definitions do not match code"
@@ -7411,12 +7421,19 @@ class SqliteExecutionStore:
                 connection.close()
 
     @classmethod
-    @lru_cache(maxsize=1)
-    def _code_owned_ctp_store_schema_objects(cls) -> tuple[tuple[str, ...], ...]:
-        """Build the exact current schema from code in an isolated memory DB."""
+    @lru_cache(maxsize=3)
+    def _code_owned_ctp_store_schema_objects(
+        cls, paper_version: str | None = None
+    ) -> tuple[tuple[str, ...], ...]:
+        """Build the exact current schema, including optional Paper objects."""
 
         reference = cls(":memory:")
         try:
+            if paper_version is not None:
+                cursor = reference._connection.cursor()
+                cls._ensure_paper_schema(cursor, create=True)
+                if paper_version == "2":
+                    cls._upgrade_paper_schema_v2(cursor)
             return cls._ctp_store_schema_objects(reference._connection)
         finally:
             reference.close()

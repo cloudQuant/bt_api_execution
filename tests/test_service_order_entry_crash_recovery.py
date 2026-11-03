@@ -134,16 +134,16 @@ if mode == "crash":
         def crash_before_observation_write(self, *args, **kwargs):
             os._exit(expected_code)
 
-        SqliteExecutionStore.record_observation = crash_before_observation_write
+        SqliteExecutionStore.record_observation_with_event = crash_before_observation_write
     elif phase == "after_report":
-        original = ManagedExecutionFacade._settle_after_evidenced_outcome
+        original = ManagedExecutionFacade._settle_after_evidenced_outcome_result
 
         def crash_after_observation_write(self, *args, **kwargs):
             record = original(self, *args, **kwargs)
             os._exit(expected_code)
             return record
 
-        ManagedExecutionFacade._settle_after_evidenced_outcome = crash_after_observation_write
+        ManagedExecutionFacade._settle_after_evidenced_outcome_result = crash_after_observation_write
 
     handle_original()
     raise SystemExit("crash injection boundary was not reached")

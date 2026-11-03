@@ -54,6 +54,35 @@ _EXECUTION_SCOPE = ExecutionScope(
 _IDENTITY = WireIdentity(WireRole.STRATEGY_CLIENT, "paper-principal", _STRATEGY)
 
 
+@pytest.mark.parametrize("version", ["1", "2"])
+@pytest.mark.parametrize("tamper", ["missing_trigger", "changed_trigger", "extra_object"])
+def test_paper_schema_preflight_rejects_tampering_before_writes(tmp_path, version, tamper):
+    path = tmp_path / "paper-schema.sqlite3"
+    store = SqliteExecutionStore(path)
+    with store._transaction() as cursor:
+        store._ensure_paper_schema(cursor, create=True)
+        if version == "2":
+            store._upgrade_paper_schema_v2(cursor)
+    store.close()
+
+    reopened = SqliteExecutionStore(path)
+    reopened.close()
+    with sqlite3.connect(path) as connection:
+        if tamper == "extra_object":
+            connection.execute("CREATE TABLE unexpected_object (value TEXT)")
+        else:
+            connection.execute("DROP TRIGGER paper_owner_domains_immutable_update")
+            if tamper == "changed_trigger":
+                connection.execute(
+                    "CREATE TRIGGER paper_owner_domains_immutable_update "
+                    "BEFORE UPDATE ON paper_owner_domains BEGIN SELECT 1; END"
+                )
+    before = path.read_bytes()
+    with pytest.raises(DurableStoreError, match="schema"):
+        SqliteExecutionStore(path)
+    assert path.read_bytes() == before
+
+
 def _domain(
     *,
     execution_domain_ref: str = _DOMAIN_REF,
