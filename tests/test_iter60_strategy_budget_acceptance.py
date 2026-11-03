@@ -221,3 +221,33 @@ def test_budget_survives_restart(tmp_path):
         assert _admitted(second.submit("a", "a3", quantity="1"))
     finally:
         second.close()
+
+
+@pytest.mark.unit
+def test_unconfigured_multiplier_is_unknown_not_one(tmp_path):
+    item = _Account(tmp_path / "no-multiplier.sqlite3")
+    item.budget._multipliers = {}  # the instrument's multiplier is not configured
+    try:
+        reply = item.submit("a", "a1", quantity="1")
+        assert not _admitted(reply)
+        assert "a1" not in item.provider.submitted
+    finally:
+        item.close()
+
+
+@pytest.mark.unit
+def test_a_fill_without_average_price_makes_the_budget_unknown(account):
+    assert _admitted(account.submit("a", "a1", quantity="1"))
+    account.observe("a", "a1", ExecutionState.FILLED, "1")
+    # Force the persisted fill to carry no price, as an incomplete report would.
+    original = account.store.list_scope_intents
+
+    def without_price(scope):
+        return [
+            (dataclasses.replace(record, average_price=None), stored)
+            for record, stored in original(scope)
+        ]
+
+    account.store.list_scope_intents = without_price
+    assert not _admitted(account.submit("a", "a2", quantity="1"))
+    assert "a2" not in account.provider.submitted

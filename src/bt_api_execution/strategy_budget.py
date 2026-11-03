@@ -113,7 +113,11 @@ class StrategyBudgetGate:
     # ------------------------------------------------------------------
 
     def _multiplier(self, instrument: str) -> Decimal:
-        return self._multipliers.get(instrument, Decimal("1"))
+        # Acceptance report P1-1: an unconfigured multiplier is unknown, never 1.
+        multiplier = self._multipliers.get(instrument)
+        if multiplier is None:
+            raise AdmissionDenied("strategy budget unknown: contract multiplier not configured")
+        return multiplier
 
     def _intent_notional(self, intent: OrderIntent) -> Decimal | None:
         price = intent.price
@@ -136,7 +140,10 @@ class StrategyBudgetGate:
         for record, stored in self._store.list_scope_intents(scope):
             persisted[record.intent_id] = record.state
             filled = record.filled_quantity
-            if filled and record.average_price is not None:
+            if filled and record.average_price is None:
+                # Acceptance report P1-1: a fill without a price has unknown cost.
+                raise AdmissionDenied("strategy budget unknown: fill without average price")
+            if filled:
                 key = (stored.instrument, stored.position_side)
                 quantity, cost = positions.get(key, (_ZERO, _ZERO))
                 signed = filled if stored.side is Side.BUY else -filled
