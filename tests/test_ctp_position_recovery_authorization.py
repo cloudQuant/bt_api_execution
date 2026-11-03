@@ -2502,9 +2502,28 @@ def test_committed_v24_store_migrates_to_v26_with_fresh_schema_parity(tmp_path):
         assert migrated_store._connection.execute(
             "SELECT value FROM execution_meta WHERE key = 'journal_incarnation_id'"
         ).fetchone()["value"] == journal_incarnation_id
-        assert _sqlite_schema_signature(migrated_store._connection) == (
-            _sqlite_schema_signature(fresh_store._connection)
+        # Only a newly created store can prove it never held a Paper Risk
+        # admission snapshot, so only it carries the marker and its triggers.
+        # A migrated store stays unmarked; everything else must match.
+        marker_triggers = {
+            "execution_paper_risk_marker_insert",
+            "execution_paper_risk_marker_update",
+            "execution_paper_risk_marker_delete",
+        }
+        migrated_objects, migrated_columns = _sqlite_schema_signature(
+            migrated_store._connection
         )
+        fresh_objects, fresh_columns = _sqlite_schema_signature(fresh_store._connection)
+        assert {row[1] for row in fresh_objects} - {
+            row[1] for row in migrated_objects
+        } == marker_triggers
+        assert migrated_objects == tuple(
+            row for row in fresh_objects if row[1] not in marker_triggers
+        )
+        assert migrated_columns == fresh_columns
+        assert migrated_store._connection.execute(
+            "SELECT value FROM execution_meta WHERE key = 'paper_risk_snapshot_schema_version'"
+        ).fetchone() is None
     finally:
         if legacy_store is not None:
             legacy_store.close()

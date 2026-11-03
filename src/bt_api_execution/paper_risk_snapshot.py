@@ -19,7 +19,15 @@ from typing import Any
 
 from .contracts import ExecutionScope, OrderIntent, canonical_json
 from .errors import ContractValidationError
-from .store import SqliteExecutionStore, WriterLease
+from .store import (
+    _PAPER_RISK_MARKER_TRIGGER_NAMES,
+    _PAPER_RISK_SNAPSHOT_META,
+    _PAPER_RISK_SNAPSHOT_TABLE,
+    _PAPER_RISK_SNAPSHOT_TABLE_DDL,
+    _PAPER_RISK_SNAPSHOT_TRIGGER_DDL,
+    SqliteExecutionStore,
+    WriterLease,
+)
 
 
 class PaperRiskSnapshotStoreError(ValueError):
@@ -56,7 +64,7 @@ class PaperRiskAdmissionSnapshotV1:
 class PaperRiskAdmissionSnapshotStore:
     """Append-only Paper/Risk snapshots fenced by the live Execution lease."""
 
-    _TABLE = "execution_paper_risk_admission_snapshots"
+    _TABLE = _PAPER_RISK_SNAPSHOT_TABLE
     _SELECT_SQL = (
         "SELECT intent_fingerprint, snapshot_sha256, snapshot_json "
         "FROM execution_paper_risk_admission_snapshots WHERE scope_key=? AND intent_id=?"
@@ -130,6 +138,7 @@ class PaperRiskAdmissionSnapshotStore:
                 (self._scope.key, intent.intent_id),
             ).fetchone()
             if row is None:
+                self._reject_unverifiable_legacy_absence(cursor)
                 return None
             return self._decode_row(row, intent)
 
@@ -154,6 +163,7 @@ class PaperRiskAdmissionSnapshotStore:
                 if existing.snapshot_sha256 != digest or canonical_json(dict(existing.body)) != serialized:
                     raise PaperRiskSnapshotStoreError("PAPER_ADMISSION_SNAPSHOT_CONFLICT")
                 return existing
+            self._reject_unverifiable_legacy_absence(cursor)
             cursor.execute(
                 self._INSERT_SQL,
                 (
@@ -166,6 +176,62 @@ class PaperRiskAdmissionSnapshotStore:
                 ),
             )
         return PaperRiskAdmissionSnapshotV1(payload, digest)
+
+    @staticmethod
+    def _reject_unverifiable_legacy_absence(cursor: sqlite3.Cursor) -> None:
+        # An old, unmarked journal cannot distinguish a never-created row from
+        # a deleted snapshot. It must not reserve again using a new quote.
+        if cursor.execute(
+            "SELECT value FROM execution_meta WHERE key=?", (_PAPER_RISK_SNAPSHOT_META,)
+        ).fetchone() is None:
+            raise PaperRiskSnapshotStoreError("PAPER_ADMISSION_SNAPSHOT_LEGACY_UNVERIFIED")
+
+    @staticmethod
+    def _prepare_snapshot_schema(cursor: sqlite3.Cursor) -> None:
+        marker_row = cursor.execute(
+            "SELECT value FROM execution_meta WHERE key=?", (_PAPER_RISK_SNAPSHOT_META,)
+        ).fetchone()
+        marker = None if marker_row is None else str(marker_row[0])
+        objects = SqliteExecutionStore._ctp_store_schema_objects(cursor.connection)
+        actual = tuple(row for row in objects if row[2] == _PAPER_RISK_SNAPSHOT_TABLE)
+        actual_marker_triggers = tuple(
+            row for row in objects if row[1] in _PAPER_RISK_MARKER_TRIGGER_NAMES
+        )
+        expected_marker_triggers = tuple(
+            row
+            for row in SqliteExecutionStore._code_owned_ctp_store_schema_objects()
+            if row[1] in _PAPER_RISK_MARKER_TRIGGER_NAMES
+        )
+        if (marker is None and actual_marker_triggers) or (
+            marker in {"0", "1"} and actual_marker_triggers != expected_marker_triggers
+        ):
+            raise PaperRiskSnapshotStoreError("PAPER_ADMISSION_SNAPSHOT_SCHEMA_INVALID")
+        if marker == "0" and not actual:
+            # The fresh-db marker and schema creation are durable in the same
+            # transaction. A missing marked table is never recreated.
+            cursor.execute(_PAPER_RISK_SNAPSHOT_TABLE_DDL)
+            for statement in _PAPER_RISK_SNAPSHOT_TRIGGER_DDL:
+                cursor.execute(statement)
+            cursor.execute(
+                "UPDATE execution_meta SET value='1' WHERE key=? AND value='0'",
+                (_PAPER_RISK_SNAPSHOT_META,),
+            )
+            if cursor.rowcount != 1:
+                raise PaperRiskSnapshotStoreError("PAPER_ADMISSION_SNAPSHOT_SCHEMA_INVALID")
+            return
+        if marker == "1":
+            layout = "current"
+        elif marker is None and actual:
+            layout = "legacy"
+        else:
+            raise PaperRiskSnapshotStoreError("PAPER_ADMISSION_SNAPSHOT_SCHEMA_INVALID")
+        expected = tuple(
+            row
+            for row in SqliteExecutionStore._code_owned_ctp_store_schema_objects(None, layout)
+            if row[2] == _PAPER_RISK_SNAPSHOT_TABLE
+        )
+        if actual != expected:
+            raise PaperRiskSnapshotStoreError("PAPER_ADMISSION_SNAPSHOT_SCHEMA_INVALID")
 
     def _decode_row(self, row: sqlite3.Row, intent: OrderIntent) -> PaperRiskAdmissionSnapshotV1:
         raw = str(row["snapshot_json"])
@@ -211,14 +277,6 @@ class PaperRiskAdmissionSnapshotStore:
             connection.execute("PRAGMA busy_timeout = 5000")
             connection.execute("PRAGMA foreign_keys = ON")
             connection.execute("BEGIN IMMEDIATE")
-            connection.execute(
-                f"CREATE TABLE IF NOT EXISTS {self._TABLE} ("
-                "scope_key TEXT NOT NULL, intent_id TEXT NOT NULL, "
-                "intent_fingerprint TEXT NOT NULL, snapshot_sha256 TEXT NOT NULL, "
-                "snapshot_json TEXT NOT NULL, created_at_ns INTEGER NOT NULL, "
-                "PRIMARY KEY(scope_key, intent_id), "
-                "FOREIGN KEY(scope_key, intent_id) REFERENCES execution_records(scope_key, intent_id))"
-            )
             now = time_ns()
             lease = connection.execute(
                 "SELECT owner_id, fencing_token, expires_at_ns FROM execution_writer_leases "
@@ -261,8 +319,20 @@ class PaperRiskAdmissionSnapshotStore:
                 connection.rollback()
                 connection.close()
                 raise PaperRiskSnapshotStoreError("PAPER_ADMISSION_SOURCE_STATE_INVALID")
+            cursor = connection.cursor()
+            try:
+                self._prepare_snapshot_schema(cursor)
+            finally:
+                cursor.close()
             return _SqliteSnapshotTransaction(connection)
         except PaperRiskSnapshotStoreError:
+            if connection is not None:
+                from contextlib import suppress
+
+                with suppress(sqlite3.Error):
+                    connection.rollback()
+                with suppress(sqlite3.Error):
+                    connection.close()
             raise
         except (sqlite3.Error, OSError):
             if connection is not None:

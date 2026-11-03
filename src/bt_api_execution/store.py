@@ -68,6 +68,49 @@ _MAX_RECOVERY_PAGE_SIZE = 128
 _MAX_CTP_DISPATCH_TRADE_FACT_PAGE_SIZE = 100
 _MAX_CTP_OWNER_CALLBACK_SNAPSHOT_TRADE_FACTS = 4096
 _MAX_CTP_CALLBACK_OWNER_SCOPES = 256
+_PAPER_RISK_SNAPSHOT_META = "paper_risk_snapshot_schema_version"
+_PAPER_RISK_SNAPSHOT_TABLE = "execution_paper_risk_admission_snapshots"
+_PAPER_RISK_MARKER_TRIGGER_NAMES = frozenset(
+    {
+        "execution_paper_risk_marker_insert",
+        "execution_paper_risk_marker_update",
+        "execution_paper_risk_marker_delete",
+    }
+)
+_PAPER_RISK_MARKER_TRIGGER_DDL = (
+    "CREATE TRIGGER execution_paper_risk_marker_insert BEFORE INSERT ON execution_meta "
+    "WHEN NEW.key='paper_risk_snapshot_schema_version' AND EXISTS "
+    "(SELECT 1 FROM execution_meta WHERE key=NEW.key) "
+    "BEGIN SELECT RAISE(ABORT, 'Paper Risk snapshot marker cannot be replaced'); END",
+    "CREATE TRIGGER execution_paper_risk_marker_update BEFORE UPDATE ON execution_meta "
+    "WHEN OLD.key='paper_risk_snapshot_schema_version' "
+    "AND (NEW.key!=OLD.key OR OLD.value!='0' OR NEW.value!='1') "
+    "BEGIN SELECT RAISE(ABORT, 'Paper Risk snapshot marker is monotonic'); END",
+    "CREATE TRIGGER execution_paper_risk_marker_delete BEFORE DELETE ON execution_meta "
+    "WHEN OLD.key='paper_risk_snapshot_schema_version' "
+    "BEGIN SELECT RAISE(ABORT, 'Paper Risk snapshot marker is permanent'); END",
+)
+_PAPER_RISK_SNAPSHOT_TABLE_DDL = (
+    "CREATE TABLE execution_paper_risk_admission_snapshots ("
+    "scope_key TEXT NOT NULL, intent_id TEXT NOT NULL, "
+    "intent_fingerprint TEXT NOT NULL, snapshot_sha256 TEXT NOT NULL, "
+    "snapshot_json TEXT NOT NULL, created_at_ns INTEGER NOT NULL, "
+    "PRIMARY KEY(scope_key, intent_id), "
+    "FOREIGN KEY(scope_key, intent_id) REFERENCES execution_records(scope_key, intent_id))"
+)
+_PAPER_RISK_SNAPSHOT_TRIGGER_DDL = (
+    "CREATE TRIGGER execution_paper_risk_snapshot_immutable_insert "
+    "BEFORE INSERT ON execution_paper_risk_admission_snapshots WHEN EXISTS "
+    "(SELECT 1 FROM execution_paper_risk_admission_snapshots "
+    "WHERE scope_key=NEW.scope_key AND intent_id=NEW.intent_id) "
+    "BEGIN SELECT RAISE(ABORT, 'Paper Risk snapshot cannot be replaced'); END",
+    "CREATE TRIGGER execution_paper_risk_snapshot_immutable_update "
+    "BEFORE UPDATE ON execution_paper_risk_admission_snapshots "
+    "BEGIN SELECT RAISE(ABORT, 'Paper Risk snapshot is immutable'); END",
+    "CREATE TRIGGER execution_paper_risk_snapshot_immutable_delete "
+    "BEFORE DELETE ON execution_paper_risk_admission_snapshots "
+    "BEGIN SELECT RAISE(ABORT, 'Paper Risk snapshot is permanent'); END",
+)
 _CTP_CALLBACK_OWNER_SCOPE_SET_SCHEMA = "ctp-callback-owner-scope-set.v1"
 _OWNER_CANCEL_OPEN_STATES = frozenset(
     {
@@ -7393,7 +7436,32 @@ class SqliteExecutionStore:
             paper_version = None if paper_version_row is None else str(paper_version_row[0])
             if paper_version not in {None, "1", "2"}:
                 raise DurableStoreError("unsupported paper execution schema version")
-            expected_schema_objects = cls._code_owned_ctp_store_schema_objects(paper_version)
+            snapshot_row = connection.execute(
+                "SELECT value FROM execution_meta WHERE key = ?", (_PAPER_RISK_SNAPSHOT_META,)
+            ).fetchone()
+            snapshot_version = None if snapshot_row is None else str(snapshot_row[0])
+            has_snapshot_table = _PAPER_RISK_SNAPSHOT_TABLE in tables
+            if snapshot_version not in {None, "0", "1"} or (
+                snapshot_version == "0" and has_snapshot_table
+            ) or (snapshot_version == "1" and not has_snapshot_table):
+                raise DurableStoreError("Paper Risk snapshot schema is incomplete or unknown")
+            # Existing unmarked tables are the legacy layout. Missing legacy
+            # tables remain ambiguous and are never recreated by the snapshot
+            # store. Current marked tables require the immutable triggers.
+            if snapshot_version == "1":
+                snapshot_layout = "current"
+            elif has_snapshot_table:
+                snapshot_layout = "legacy"
+            else:
+                snapshot_layout = None
+            expected_schema_objects = cls._code_owned_ctp_store_schema_objects(
+                paper_version, snapshot_layout
+            )
+            if snapshot_version is None:
+                expected_schema_objects = tuple(
+                    row for row in expected_schema_objects
+                    if row[1] not in _PAPER_RISK_MARKER_TRIGGER_NAMES
+                )
             expected_tables = {
                 item[1] for item in expected_schema_objects if item[0] == "table"
             }
@@ -7421,9 +7489,9 @@ class SqliteExecutionStore:
                 connection.close()
 
     @classmethod
-    @lru_cache(maxsize=3)
+    @lru_cache(maxsize=9)
     def _code_owned_ctp_store_schema_objects(
-        cls, paper_version: str | None = None
+        cls, paper_version: str | None = None, snapshot_layout: str | None = None
     ) -> tuple[tuple[str, ...], ...]:
         """Build the exact current schema, including optional Paper objects."""
 
@@ -7434,6 +7502,13 @@ class SqliteExecutionStore:
                 cls._ensure_paper_schema(cursor, create=True)
                 if paper_version == "2":
                     cls._upgrade_paper_schema_v2(cursor)
+            if snapshot_layout is not None:
+                if snapshot_layout not in {"legacy", "current"}:
+                    raise DurableStoreError("unknown Paper Risk snapshot layout")
+                reference._connection.execute(_PAPER_RISK_SNAPSHOT_TABLE_DDL)
+                if snapshot_layout == "current":
+                    for statement in _PAPER_RISK_SNAPSHOT_TRIGGER_DDL:
+                        reference._connection.execute(statement)
             return cls._ctp_store_schema_objects(reference._connection)
         finally:
             reference.close()
@@ -7531,6 +7606,9 @@ class SqliteExecutionStore:
             schema_version = metadata.get("schema_version")
             if schema_version not in {"23", "24", "25", str(cls._SCHEMA_VERSION)}:
                 raise DurableStoreError("existing CTP execution store schema is not current")
+            snapshot_marker = metadata.get(_PAPER_RISK_SNAPSHOT_META)
+            if snapshot_marker not in {None, "0"}:
+                raise DurableStoreError("CTP execution store has an incompatible Paper Risk schema")
             non_internal_tables = tables - {"sqlite_sequence"}
             legacy_scope_set_table = "ctp_dispatch_callback_session_owner_scopes"
             position_tables = {
@@ -7555,6 +7633,11 @@ class SqliteExecutionStore:
                     "existing CTP execution store schema is incomplete or unknown"
                 )
             expected_schema_objects = cls._code_owned_ctp_store_schema_objects()
+            if snapshot_marker is None:
+                expected_schema_objects = tuple(
+                    row for row in expected_schema_objects
+                    if row[1] not in _PAPER_RISK_MARKER_TRIGGER_NAMES
+                )
             if schema_version in {"23", "24", "25"}:
                 legacy_position_objects = recovery_tables | {
                     "ctp_position_recovery_close_auth_child",
@@ -7609,6 +7692,8 @@ class SqliteExecutionStore:
                 ).fetchall()
             }
             expected_triggers = _CTP_ACCOUNT_STORE_TRIGGERS
+            if snapshot_marker == "0":
+                expected_triggers = expected_triggers | _PAPER_RISK_MARKER_TRIGGER_NAMES
             if schema_version in {"23", "24", "25"}:
                 expected_triggers = expected_triggers - {
                     "ctp_position_dispatch_authorization_bindings_immutable_update",
@@ -12065,6 +12150,15 @@ class SqliteExecutionStore:
                     "INSERT INTO execution_meta(key, value) VALUES (?, ?)",
                     ("schema_version", str(self._SCHEMA_VERSION)),
                 )
+                if not previous_tables:
+                    # Only a newly initialized database can prove this
+                    # subsystem has never stored an admission snapshot.
+                    cursor.execute(
+                        "INSERT INTO execution_meta(key, value) VALUES (?, ?)",
+                        (_PAPER_RISK_SNAPSHOT_META, "0"),
+                    )
+                    for statement in _PAPER_RISK_MARKER_TRIGGER_DDL:
+                        cursor.execute(statement)
                 version = str(self._SCHEMA_VERSION)
             else:
                 version = str(row["value"])
