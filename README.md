@@ -51,6 +51,20 @@ parent/child DTOs. These foundations do not implement complete multi-strategy
 signal or intent aggregation, automatic order slicing, or TWAP/VWAP/POV
 scheduling. Those target capabilities are planned, not implemented or accepted.
 
+The working tree adds an opt-in `ParentAuthority` in the same SQLite journal.
+It persists an immutable parent before any selected Risk reservation or Gateway
+registration, retains uncertain outcomes for same-operation reconciliation,
+and fences new children until Gateway confirms registration. Child quantities,
+original identities, cancellation targets and unresolved observations survive
+restart and trading-day changes. `ExecutionGatewaySession` composes this
+journal with an explicitly configured SDK SERVICE runtime and ZMQ transport;
+the application supplies trusted admission, scope bindings, peer identities,
+credentials, and the account writer lease. Its `start` verifies required runtime
+registrations; `close` returns the SDK cleanup status, and neither owns or
+releases the caller's journal/lease. A selected Risk child path remains closed
+until a trusted Risk service and child authority are available. This source and
+synthetic service evidence do not establish live or exchange acceptance.
+
 The facade is intentionally fail-closed.  It needs an admission gate unless a
 test explicitly enables `allow_unprotected=True`; that test-only escape does
 not represent an approved managed provider route.  A managed adapter supplies

@@ -156,6 +156,9 @@ from .errors import (
     WriterLeaseUnavailable,
 )
 from .facade import ManagedExecutionFacade
+from .gateway_delegate_host import ExecutionGatewayDelegateHost
+from .gateway_session import ExecutionGatewaySession
+from .parent_authority import ParentAuthority
 from .group_budget import (
     GroupBudgetUnsupportedOrderError,
     build_instrument_risk_group_budget_quote,
@@ -302,6 +305,9 @@ from .strategy_budget import (
 from .strategy_close_capacity import StrategyCloseCapacityGate, StrategyClosePermit
 
 __all__ = [
+    "ExecutionGatewayDelegateHost",
+    "ExecutionGatewaySession",
+    "ParentAuthority",
     "STRATEGY_BUDGET_POLICY_V1",
     "StrategyBudgetGate",
     "StrategyBudgetPermit",

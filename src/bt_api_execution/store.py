@@ -282,6 +282,11 @@ _CTP_ACCOUNT_STORE_TABLES = frozenset(
         "cancellation_records",
         "cancellation_outbox",
         "execution_writer_leases",
+        "execution_parent_records",
+        "execution_parent_children",
+        "execution_parent_delegates",
+        "execution_parent_child_evidence",
+        "execution_parent_child_cancels",
         "account_financial_baselines",
         "account_financial_events",
         "account_financial_ledger_heads",
@@ -3408,7 +3413,7 @@ class SqliteExecutionStore:
     # Version 25 adds append-only position-query audit windows and one-use
     # baseline-before-first-submit authorization records. Version 26 adds
     # exact command bindings and one-use typed recovery-close dispatch proofs.
-    _SCHEMA_VERSION = 26
+    _SCHEMA_VERSION = 27
 
     def __init__(self, path: str | Path, *, busy_timeout_ms: int = 5_000) -> None:
         if type(busy_timeout_ms) is not int or busy_timeout_ms <= 0:
@@ -7428,7 +7433,7 @@ class SqliteExecutionStore:
             version_row = connection.execute(
                 "SELECT value FROM execution_meta WHERE key = 'schema_version'"
             ).fetchone()
-            if version_row is None or str(version_row[0]) != str(cls._SCHEMA_VERSION):
+            if version_row is None or str(version_row[0]) not in {"26", str(cls._SCHEMA_VERSION)}:
                 return
             paper_version_row = connection.execute(
                 "SELECT value FROM execution_meta WHERE key = 'paper_schema_version'"
@@ -7457,6 +7462,11 @@ class SqliteExecutionStore:
             expected_schema_objects = cls._code_owned_ctp_store_schema_objects(
                 paper_version, snapshot_layout
             )
+            if str(version_row[0]) == "26":
+                expected_schema_objects = tuple(
+                    item for item in expected_schema_objects
+                    if item[1] not in {"execution_parent_records", "execution_parent_children", "execution_parent_delegates", "execution_parent_child_evidence", "execution_parent_child_cancels"}
+                )
             if snapshot_version is None:
                 expected_schema_objects = tuple(
                     row for row in expected_schema_objects
@@ -7604,7 +7614,7 @@ class SqliteExecutionStore:
                 for row in connection.execute("SELECT key, value FROM execution_meta").fetchall()
             }
             schema_version = metadata.get("schema_version")
-            if schema_version not in {"23", "24", "25", str(cls._SCHEMA_VERSION)}:
+            if schema_version not in {"23", "24", "25", "26", str(cls._SCHEMA_VERSION)}:
                 raise DurableStoreError("existing CTP execution store schema is not current")
             snapshot_marker = metadata.get(_PAPER_RISK_SNAPSHOT_META)
             if snapshot_marker not in {None, "0"}:
@@ -7622,6 +7632,8 @@ class SqliteExecutionStore:
                 "ctp_position_recovery_close_authorization_uses",
             }
             expected_tables = _CTP_ACCOUNT_STORE_TABLES
+            if schema_version != str(cls._SCHEMA_VERSION):
+                expected_tables = expected_tables - {"execution_parent_records", "execution_parent_children", "execution_parent_delegates", "execution_parent_child_evidence", "execution_parent_child_cancels"}
             if schema_version in {"23", "24"}:
                 expected_tables = expected_tables - position_tables
             if schema_version in {"23", "24", "25"}:
@@ -7633,6 +7645,11 @@ class SqliteExecutionStore:
                     "existing CTP execution store schema is incomplete or unknown"
                 )
             expected_schema_objects = cls._code_owned_ctp_store_schema_objects()
+            if schema_version != str(cls._SCHEMA_VERSION):
+                expected_schema_objects = tuple(
+                    item for item in expected_schema_objects
+                    if item[1] not in {"execution_parent_records", "execution_parent_children", "execution_parent_delegates", "execution_parent_child_evidence", "execution_parent_child_cancels"}
+                )
             if snapshot_marker is None:
                 expected_schema_objects = tuple(
                     row for row in expected_schema_objects
@@ -10768,6 +10785,33 @@ class SqliteExecutionStore:
                     "SELECT name FROM sqlite_master WHERE type = 'table'"
                 ).fetchall()
             }
+            # A v26 journal is migrated only from the exact previously owned
+            # schema. Repeat the check under the write transaction so a change
+            # after the read-only preflight cannot silently recreate history.
+            if "execution_meta" in previous_tables:
+                marker = cursor.execute(
+                    "SELECT value FROM execution_meta WHERE key = 'schema_version'"
+                ).fetchone()
+                if marker is not None and str(marker[0]) == "26":
+                    paper = cursor.execute(
+                        "SELECT value FROM execution_meta WHERE key = 'paper_schema_version'"
+                    ).fetchone()
+                    snapshot = cursor.execute(
+                        "SELECT value FROM execution_meta WHERE key = ?", (_PAPER_RISK_SNAPSHOT_META,)
+                    ).fetchone()
+                    paper_version = None if paper is None else str(paper[0])
+                    snapshot_version = None if snapshot is None else str(snapshot[0])
+                    has_snapshot = _PAPER_RISK_SNAPSHOT_TABLE in previous_tables
+                    if paper_version not in {None, '1', '2'} or snapshot_version not in {None, '0', '1'} or (snapshot_version == '0' and has_snapshot) or (snapshot_version == '1' and not has_snapshot):
+                        raise DurableStoreError("invalid v26 optional schema")
+                    layout = 'current' if snapshot_version == '1' else ('legacy' if has_snapshot else None)
+                    expected = self._code_owned_ctp_store_schema_objects(paper_version, layout)
+                    omitted = {'execution_parent_records', 'execution_parent_children', 'execution_parent_delegates', 'execution_parent_child_evidence', 'execution_parent_child_cancels'}
+                    if snapshot_version is None:
+                        omitted |= _PAPER_RISK_MARKER_TRIGGER_NAMES
+                    expected = tuple(item for item in expected if item[1] not in omitted)
+                    if self._ctp_store_schema_objects(self._connection) != expected:
+                        raise DurableStoreError("v26 execution store schema does not match code")
             if "ctp_dispatch_commands" in previous_tables:
                 existing_command_columns = {
                     str(item["name"])
@@ -10792,6 +10836,75 @@ class SqliteExecutionStore:
                 CREATE TABLE IF NOT EXISTS execution_meta (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS execution_parent_records (
+                    scope_key TEXT NOT NULL,
+                    account_key TEXT NOT NULL,
+                    parent_id TEXT NOT NULL,
+                    request_json TEXT NOT NULL,
+                    request_sha256 TEXT NOT NULL,
+                    risk_operation_id TEXT NOT NULL,
+                    gateway_operation_id TEXT NOT NULL,
+                    risk_state TEXT NOT NULL,
+                    gateway_state TEXT NOT NULL,
+                    cancel_state TEXT NOT NULL,
+                    cancel_operation_id TEXT,
+                    cancel_request_json TEXT,
+                    cancel_receipt_json TEXT,
+                    risk_receipt_json TEXT,
+                    gateway_receipt_json TEXT,
+                    created_at_ns INTEGER NOT NULL,
+                    updated_at_ns INTEGER NOT NULL,
+                    PRIMARY KEY(scope_key, parent_id),
+                    UNIQUE(scope_key, risk_operation_id),
+                    UNIQUE(scope_key, gateway_operation_id)
+                );
+                CREATE TABLE IF NOT EXISTS execution_parent_children (
+                    scope_key TEXT NOT NULL,
+                    parent_id TEXT NOT NULL,
+                    child_id TEXT NOT NULL,
+                    request_json TEXT NOT NULL,
+                    request_sha256 TEXT NOT NULL,
+                    quantity TEXT NOT NULL,
+                    filled_quantity TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    updated_at_ns INTEGER NOT NULL,
+                    PRIMARY KEY(scope_key, parent_id, child_id),
+                    FOREIGN KEY(scope_key, parent_id)
+                        REFERENCES execution_parent_records(scope_key, parent_id)
+                );
+                CREATE TABLE IF NOT EXISTS execution_parent_delegates (
+                    scope_key TEXT NOT NULL,
+                    request_key TEXT NOT NULL,
+                    intent_json TEXT NOT NULL,
+                    observation_json TEXT,
+                    dispatch_marker_json TEXT,
+                    PRIMARY KEY(scope_key, request_key)
+                );
+                CREATE TABLE IF NOT EXISTS execution_parent_child_evidence (
+                    scope_key TEXT NOT NULL,
+                    parent_id TEXT NOT NULL,
+                    child_id TEXT NOT NULL,
+                    event_id TEXT NOT NULL,
+                    evidence_json TEXT NOT NULL,
+                    received_at_ns INTEGER NOT NULL,
+                    PRIMARY KEY(scope_key, parent_id, child_id, event_id),
+                    FOREIGN KEY(scope_key, parent_id, child_id)
+                        REFERENCES execution_parent_children(scope_key, parent_id, child_id)
+                );
+                CREATE TABLE IF NOT EXISTS execution_parent_child_cancels (
+                    scope_key TEXT NOT NULL,
+                    parent_id TEXT NOT NULL,
+                    child_id TEXT NOT NULL,
+                    operation_id TEXT NOT NULL,
+                    frozen_json TEXT NOT NULL,
+                    intent_json TEXT,
+                    observation_json TEXT,
+                    dispatch_marker_json TEXT,
+                    PRIMARY KEY(scope_key, operation_id),
+                    UNIQUE(scope_key, parent_id, child_id),
+                    FOREIGN KEY(scope_key, parent_id, child_id)
+                        REFERENCES execution_parent_children(scope_key, parent_id, child_id)
                 );
                 CREATE TABLE IF NOT EXISTS execution_records (
                     scope_key TEXT NOT NULL,
@@ -12328,6 +12441,7 @@ class SqliteExecutionStore:
                 "23",
                 "24",
                 "25",
+                "26",
                 str(self._SCHEMA_VERSION),
             }:
                 raise DurableStoreError("unsupported execution store schema")
@@ -12374,7 +12488,7 @@ class SqliteExecutionStore:
                     )
             if version != str(self._SCHEMA_VERSION):
                 scope_set_table = "ctp_dispatch_callback_session_owner_scopes"
-                scope_set_was_versioned = version in {"24", "25"}
+                scope_set_was_versioned = version in {"24", "25", "26"}
                 scope_set_was_present = scope_set_table in previous_tables
                 if scope_set_was_present and not scope_set_was_versioned:
                     raise DurableStoreError(
@@ -12391,7 +12505,7 @@ class SqliteExecutionStore:
                 # V26 adds one-use recovery-close authority.
                 # Do not rerun historical CTP cutover migrations or downgrade
                 # existing READY/CLAIMED commands for these additive schemas.
-                if version not in {"20", "21", "22", "23", "24", "25"}:
+                if version not in {"20", "21", "22", "23", "24", "25", "26"}:
                     self._migrate_ctp_account_family_legacy_fence(
                         cursor,
                         previous_tables=previous_tables,
