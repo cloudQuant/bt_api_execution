@@ -125,7 +125,6 @@ validator = ExecutionProviderValidatorV1(
     dispatch_port=provider,
     instrument_map={"BTC-USDT": "BTCUSDT"},
     quantity_steps={"BTC-USDT": __import__("decimal").Decimal("1")},
-    max_quantities={"BTC-USDT": __import__("decimal").Decimal("100")},
     price_ticks={"BTC-USDT": __import__("decimal").Decimal("0.5")},
     supported_order_types=(OrderType.LIMIT,),
     supported_time_in_force=(TimeInForce.GTC,),
@@ -286,7 +285,6 @@ def _validator(provider: _AuthorizedProvider, **overrides) -> ExecutionProviderV
         "dispatch_port": provider,
         "instrument_map": {"BTC-USDT": "BTCUSDT"},
         "quantity_steps": {"BTC-USDT": Decimal("1")},
-        "max_quantities": {"BTC-USDT": Decimal("100")},
         "price_ticks": {"BTC-USDT": Decimal("0.5")},
         "supported_order_types": (OrderType.LIMIT,),
         "supported_time_in_force": (TimeInForce.GTC,),
@@ -705,7 +703,6 @@ def test_recovery_close_authorization_failure_latches_review_and_never_retries(t
     [
         ("action", {"side": "SELL"}),
         ("quantity_step", {"quantity": "1.5"}),
-        ("quantity_maximum", {"quantity": "101"}),
         ("price_tick", {"price": "50000.1"}),
         ("unknown_instrument", {"instrument": "ETH-USDT"}),
         ("missing_validator", {}),
@@ -732,6 +729,36 @@ def test_registered_provider_policy_denials_never_reach_provider(
         assert record is not None and record.state is ExecutionState.BLOCKED
         assert provider.submitted == []
         assert provider.unauthorized_calls == []
+    finally:
+        store.close()
+
+
+@pytest.mark.unit
+def test_provider_validator_carries_no_business_quantity_cap(tmp_path) -> None:
+    """D64-14: the per-order quantity cap belongs to the selected Risk service only.
+
+    The basic provider policy keeps the increment, tick and capability checks,
+    but a large quantity on a valid increment is no longer refused here, the
+    former ``max_quantities`` field is rejected at construction, and the
+    capability fingerprint no longer covers it.
+    """
+
+    store = SqliteExecutionStore(tmp_path / "execution.sqlite3")
+    provider = _AuthorizedProvider()
+    validator = _validator(provider)
+    with pytest.raises(TypeError):
+        _validator(provider, max_quantities={"BTC-USDT": Decimal("100")})
+    assert not hasattr(validator, "max_quantities")
+    service, _gate = _service(store, provider, validator=validator)
+    request = _arguments()
+    request["quantity"] = "100000"
+    try:
+        reply = _submit(service, request)
+        record = store.get("exe04-basic-order", scope=_EXECUTION_SCOPE)
+
+        assert reply["ok"] is True
+        assert record is not None and record.state is ExecutionState.ACKED
+        assert provider.submitted == ["exe04-basic-order"]
     finally:
         store.close()
 

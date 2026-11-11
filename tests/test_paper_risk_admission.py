@@ -157,7 +157,6 @@ def test_managed_paper_risk_reserves_same_quote_used_by_durable_fill(tmp_path):
             dispatch_port=matcher,
             instrument_map={"BTC-USDT": "BTC-USDT"},
             quantity_steps={"BTC-USDT": Decimal("0.25")},
-            max_quantities={"BTC-USDT": Decimal("10")},
             price_ticks={"BTC-USDT": Decimal("0.01")},
             supported_order_types=(OrderType.MARKET,),
             supported_time_in_force=(TimeInForce.FOK,),

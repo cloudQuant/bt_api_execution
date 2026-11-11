@@ -204,7 +204,6 @@ def _service(tmp_path, *, intent_id: str, effect: str):
         dispatch_port=dispatcher,
         instrument_map={"BTC-USDT": "BTCUSDT"},
         quantity_steps={"BTC-USDT": Decimal("0.25")},
-        max_quantities={"BTC-USDT": Decimal("100")},
         price_ticks={"BTC-USDT": Decimal("0.5")},
         supported_order_types=(OrderType.LIMIT,),
         supported_time_in_force=(TimeInForce.GTC,),

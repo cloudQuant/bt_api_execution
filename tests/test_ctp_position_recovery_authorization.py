@@ -1181,7 +1181,7 @@ def _resolve_store_tracked_risk_parent(
             ).encode("utf-8")
         ).hexdigest(),
     )
-    return gate.resolve_dispatch_freeze(proof), proof
+    return gate.resolve_dispatch_inflight(proof), proof
 
 
 def _authorization_use_count(store):

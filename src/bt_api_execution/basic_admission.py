@@ -221,8 +221,15 @@ class ExecutionProviderValidatorV1:
 
     Registration is a trusted composition-time operation.  It is deliberately
     data-bearing: allowed order/action/time-in-force sets, instrument mapping,
-    quantity increments and maxima, and price ticks are required facts rather
-    than a boolean allow callback.
+    quantity increments, and price ticks are required facts rather than a
+    boolean allow callback.
+
+    It carries no per-order business quantity cap (D64-14, iteration 64): the
+    per-principal single-order limit belongs to the selected Risk service only,
+    and venue-native limits stay with the venue. Removing the former
+    ``max_quantities`` field changed :meth:`capability_fingerprint`; an
+    authorization issued under the old fingerprint never matches the current
+    validator and is refused ("provider capability changed after admission").
     """
 
     provider_id: str
@@ -231,7 +238,6 @@ class ExecutionProviderValidatorV1:
     dispatch_port: ExecutionAuthorizedDispatchPort
     instrument_map: Mapping[str, str]
     quantity_steps: Mapping[str, Decimal]
-    max_quantities: Mapping[str, Decimal]
     price_ticks: Mapping[str, Decimal]
     supported_order_types: tuple[OrderType, ...]
     supported_time_in_force: tuple[TimeInForce, ...]
@@ -246,7 +252,7 @@ class ExecutionProviderValidatorV1:
             raise ContractValidationError("provider policy requires authorized dispatch port")
         if type(self.supports_reduce_only) is not bool:
             raise ContractValidationError("invalid reduce-only capability")
-        mappings = (self.instrument_map, self.quantity_steps, self.max_quantities)
+        mappings = (self.instrument_map, self.quantity_steps)
         if any(not isinstance(item, Mapping) or not item for item in mappings):
             raise ContractValidationError("provider order policy maps are required")
 
@@ -259,9 +265,8 @@ class ExecutionProviderValidatorV1:
             instruments[instrument] = provider_instrument
         keys = set(instruments)
         steps = self._decimal_map(self.quantity_steps, "quantity step")
-        maxima = self._decimal_map(self.max_quantities, "maximum quantity")
         ticks = self._decimal_map(self.price_ticks, "price tick", allow_empty=True)
-        if set(steps) != keys or set(maxima) != keys or not set(ticks).issubset(keys):
+        if set(steps) != keys or not set(ticks).issubset(keys):
             raise ContractValidationError("provider order policy instrument maps disagree")
 
         order_types = self._enum_tuple(self.supported_order_types, OrderType, "order types")
@@ -284,7 +289,6 @@ class ExecutionProviderValidatorV1:
 
         object.__setattr__(self, "instrument_map", MappingProxyType(instruments))
         object.__setattr__(self, "quantity_steps", MappingProxyType(steps))
-        object.__setattr__(self, "max_quantities", MappingProxyType(maxima))
         object.__setattr__(self, "price_ticks", MappingProxyType(ticks))
         object.__setattr__(self, "supported_order_types", order_types)
         object.__setattr__(self, "supported_time_in_force", time_in_force)
@@ -319,9 +323,6 @@ class ExecutionProviderValidatorV1:
                 "instrument_map": dict(self.instrument_map),
                 "quantity_steps": {
                     key: format(value, "f") for key, value in self.quantity_steps.items()
-                },
-                "max_quantities": {
-                    key: format(value, "f") for key, value in self.max_quantities.items()
                 },
                 "price_ticks": {key: format(value, "f") for key, value in self.price_ticks.items()},
                 "supported_order_types": [item.value for item in self.supported_order_types],
@@ -363,8 +364,6 @@ class ExecutionProviderValidatorV1:
             raise ExecutionBasicAdmissionDenied("reduce-only is not enabled by provider policy")
         if intent.quantity % self.quantity_steps[intent.instrument] != 0:
             raise ExecutionBasicAdmissionDenied("quantity does not match provider increment")
-        if intent.quantity > self.max_quantities[intent.instrument]:
-            raise ExecutionBasicAdmissionDenied("quantity exceeds provider policy maximum")
         if intent.order_type is OrderType.LIMIT:
             tick = self.price_ticks.get(intent.instrument)
             if tick is None or intent.price is None or intent.price % tick != 0:

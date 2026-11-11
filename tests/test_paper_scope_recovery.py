@@ -167,7 +167,6 @@ def _build_owner(tmp_path, *, initialize_allocation: bool = True):
         dispatch_port=matcher,
         instrument_map={_INSTRUMENT: _INSTRUMENT},
         quantity_steps={_INSTRUMENT: Decimal("0.25")},
-        max_quantities={_INSTRUMENT: Decimal("10")},
         price_ticks={_INSTRUMENT: Decimal("0.01")},
         supported_order_types=(OrderType.MARKET,),
         supported_time_in_force=(TimeInForce.FOK,),
